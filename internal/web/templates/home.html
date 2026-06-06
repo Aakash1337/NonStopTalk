@@ -1,0 +1,135 @@
+{{define "home"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Don't Stop Talking</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="/static/js/htmx.min.js?v=2" defer></script>
+</head>
+<body>
+  {{template "setup" .}}
+</body>
+</html>
+{{end}}
+
+{{define "setup"}}
+  <main class="shell" id="app">
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">Local desktop game</p>
+        <h1>Don't Stop Talking</h1>
+      </div>
+      <form hx-post="/game/reset" hx-target="#app" hx-swap="outerHTML">
+        <button class="button ghost" type="submit">Reset</button>
+      </form>
+    </header>
+
+    {{if .Error}}<div class="notice danger">{{.Error}}</div>{{end}}
+
+    <section class="setup-grid">
+      <div class="panel">
+        <div class="section-title">
+          <h2>Players</h2>
+          <span>{{len .Session.Players}} ready</span>
+        </div>
+        {{template "players" .}}
+        <form class="inline-form" hx-post="/players" hx-target="#players" hx-swap="outerHTML">
+          <input name="name" type="text" placeholder="Add player" aria-label="Player name">
+          <button class="button" type="submit">Add</button>
+        </form>
+      </div>
+
+      <div class="panel">
+        <div class="section-title">
+          <h2>Game Setup</h2>
+          <span>{{.Selected.Name}}</span>
+        </div>
+        {{template "settings" .}}
+      </div>
+
+      <div class="panel wide">
+        <div class="section-title">
+          <h2>Custom Topics</h2>
+          <span id="topic-summary">{{len .Session.Topics}} topics loaded</span>
+        </div>
+        <form hx-post="/topics/custom" hx-target="#app" hx-swap="outerHTML">
+          <textarea name="topics" rows="5" placeholder="One topic per line"></textarea>
+          <button class="button secondary" type="submit">Use Custom List</button>
+        </form>
+      </div>
+    </section>
+
+    <section class="start-band">
+      <div>
+        <p class="eyebrow">Classic mode</p>
+        <h2>{{.Session.Settings.SpeakingDurationSeconds}}s to survive, {{.Session.Settings.SilenceTimeoutSeconds}}s silence limit.</h2>
+      </div>
+      <form hx-post="/game/start" hx-target="#app" hx-swap="outerHTML">
+        <button class="button primary large" type="submit">Start Game</button>
+      </form>
+    </section>
+  </main>
+{{end}}
+
+{{define "players"}}
+<div class="player-list" id="players">
+  {{range .Session.Players}}
+  <div class="player-row">
+    <form class="player-name-form" hx-post="/players/rename" hx-target="#players" hx-swap="outerHTML">
+      <input type="hidden" name="id" value="{{.ID}}">
+      <input name="name" type="text" value="{{.Name}}" aria-label="Rename {{.Name}}">
+      <button class="icon-button" type="submit" aria-label="Save {{.Name}}">OK</button>
+    </form>
+    <span>{{.Score}} pts</span>
+    <div class="player-tools">
+      <form hx-post="/players/move" hx-target="#players" hx-swap="outerHTML">
+        <input type="hidden" name="id" value="{{.ID}}">
+        <input type="hidden" name="offset" value="-1">
+        <button class="icon-button" type="submit" aria-label="Move {{.Name}} up">Up</button>
+      </form>
+      <form hx-post="/players/move" hx-target="#players" hx-swap="outerHTML">
+        <input type="hidden" name="id" value="{{.ID}}">
+        <input type="hidden" name="offset" value="1">
+        <button class="icon-button" type="submit" aria-label="Move {{.Name}} down">Down</button>
+      </form>
+    </div>
+    <form hx-post="/players/remove" hx-target="#players" hx-swap="outerHTML">
+      <input type="hidden" name="id" value="{{.ID}}">
+      <button class="icon-button" type="submit" aria-label="Remove {{.Name}}">×</button>
+    </form>
+  </div>
+  {{end}}
+</div>
+{{end}}
+
+{{define "settings"}}
+<form class="settings-grid" id="settings" hx-post="/settings" hx-target="#app" hx-swap="outerHTML">
+  <label>
+    <span>Talk time</span>
+    <input name="duration" type="number" min="10" max="300" value="{{.Session.Settings.SpeakingDurationSeconds}}">
+  </label>
+  <label>
+    <span>Silence limit</span>
+    <input name="silence" type="number" min="1" max="10" value="{{.Session.Settings.SilenceTimeoutSeconds}}">
+  </label>
+  <label>
+    <span>Rounds</span>
+    <input name="rounds" type="number" min="1" max="10" value="{{.Session.Settings.Rounds}}">
+  </label>
+  <label>
+    <span>Topic pack</span>
+    <select name="topicPack">
+      {{range .Packs}}
+      <option value="{{.ID}}" {{if eq $.Session.Settings.TopicPackID .ID}}selected{{end}}>{{.Name}}</option>
+      {{end}}
+    </select>
+  </label>
+  <button class="button secondary" type="submit">Apply Settings</button>
+</form>
+{{end}}
+
+{{define "topicSummary"}}
+<span id="topic-summary">{{len .Session.Topics}} custom topics loaded</span>
+{{end}}

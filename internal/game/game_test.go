@@ -1,0 +1,119 @@
+package game
+
+import "testing"
+
+func TestClassicScoreAwardsCompletionBonus(t *testing.T) {
+	score := Score(ScoreInput{
+		DurationSeconds: 60,
+		SpokenSeconds:   60,
+		Completed:       true,
+	})
+
+	if score != 85 {
+		t.Fatalf("expected 85, got %d", score)
+	}
+}
+
+func TestScorePartsExplainClassicScore(t *testing.T) {
+	parts := ScoreParts(ScoreInput{
+		DurationSeconds: 60,
+		SpokenSeconds:   60,
+		Completed:       true,
+	})
+
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 score parts, got %d", len(parts))
+	}
+	if parts[0].Label != "Speaking time" || parts[0].Points != 60 {
+		t.Fatalf("unexpected speaking part: %#v", parts[0])
+	}
+	if parts[1].Label != "Completion bonus" || parts[1].Points != CompletionBonus {
+		t.Fatalf("unexpected completion part: %#v", parts[1])
+	}
+}
+
+func TestSessionCompletesAfterAllPlayersAndRounds(t *testing.T) {
+	session := NewSession("test")
+	session.AddPlayer("Avery")
+	session.AddPlayer("Blair")
+	session.SetTopics([]string{"Topic one", "Topic two"})
+	session.UpdateSettings(Settings{
+		SpeakingDurationSeconds: 10,
+		SilenceTimeoutSeconds:   2,
+		Rounds:                  1,
+		TopicPackID:             "test",
+	})
+
+	if err := session.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.StartTurn(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.SubmitTurn(10, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if session.Finished {
+		t.Fatal("game finished after one player")
+	}
+	if _, err := session.StartTurn(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.SubmitTurn(7, false, true); err != nil {
+		t.Fatal(err)
+	}
+	if !session.Finished {
+		t.Fatal("expected game to be finished")
+	}
+}
+
+func TestRenameAndMovePlayer(t *testing.T) {
+	session := NewSession("test")
+	avery := session.AddPlayer("Avery")
+	blair := session.AddPlayer("Blair")
+	casey := session.AddPlayer("Casey")
+
+	if !session.RenamePlayer(blair.ID, "Bea") {
+		t.Fatal("expected rename to succeed")
+	}
+	if session.Players[1].Name != "Bea" {
+		t.Fatalf("expected renamed player, got %q", session.Players[1].Name)
+	}
+
+	if !session.MovePlayer(casey.ID, -1) {
+		t.Fatal("expected move to succeed")
+	}
+	if session.Players[0].ID != avery.ID || session.Players[1].ID != casey.ID || session.Players[2].ID != blair.ID {
+		t.Fatalf("unexpected order: %#v", session.Players)
+	}
+
+	if session.MovePlayer(avery.ID, -1) {
+		t.Fatal("expected first player to stay in place")
+	}
+}
+
+func TestRedrawActiveTurnAdvancesTopic(t *testing.T) {
+	session := NewSession("test")
+	session.AddPlayer("Avery")
+	session.AddPlayer("Blair")
+	session.SetTopics([]string{"Topic one", "Topic two", "Topic three"})
+
+	turn, err := session.StartTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if turn.Topic != "Topic one" {
+		t.Fatalf("expected first topic, got %q", turn.Topic)
+	}
+
+	redrawn, err := session.RedrawActiveTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if redrawn.Topic != "Topic two" {
+		t.Fatalf("expected redrawn topic, got %q", redrawn.Topic)
+	}
+	if session.TopicCursor != 2 {
+		t.Fatalf("expected topic cursor to advance, got %d", session.TopicCursor)
+	}
+}

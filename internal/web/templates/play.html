@@ -1,0 +1,155 @@
+{{define "playPage"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Don't Stop Talking</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="/static/js/htmx.min.js?v=2" defer></script>
+</head>
+<body>
+  {{template "play" .}}
+</body>
+</html>
+{{end}}
+
+{{define "play"}}
+<main class="shell play-shell" id="app">
+  <section class="turn-stage"
+    data-turn
+    data-duration="{{.CurrentTurn.Duration}}"
+    data-silence="{{.CurrentTurn.SilenceLimit}}">
+    <div class="turn-meta">
+      <span>Round {{.CurrentTurn.Round}} of {{.Session.Settings.Rounds}}</span>
+      <span>{{.CurrentTurn.PlayerName}}</span>
+    </div>
+
+    <div class="topic-block">
+      <p class="eyebrow">Topic</p>
+      <h1>{{.CurrentTurn.Topic}}</h1>
+    </div>
+
+      <div class="timer-row">
+      <div class="timer" data-timer>{{.CurrentTurn.Duration}}</div>
+      <div class="voice-panel">
+        <div class="voice-label" data-voice-label>Mic ready</div>
+        <div class="meter"><span data-meter></span></div>
+        <div class="silence" data-silence-label>Silence limit: {{.CurrentTurn.SilenceLimit}}s</div>
+      </div>
+    </div>
+
+    <form class="turn-result" data-result-form hx-post="/turn/submit" hx-target="#app" hx-swap="outerHTML">
+      <input type="hidden" name="spokenSeconds" data-spoken value="0">
+      <input type="hidden" name="completed" data-completed value="false">
+      <input type="hidden" name="eliminated" data-eliminated value="false">
+      <div class="host-bar">
+        <button class="button primary large" type="button" data-start-turn>Start Talking</button>
+        <button class="button secondary" type="button" data-start-manual>Manual Timer</button>
+        <button class="button secondary" type="button" data-redraw-topic hx-post="/turn/redraw" hx-target="#app" hx-swap="outerHTML">Redraw Topic</button>
+        <button class="button secondary" type="button" data-manual-complete>Mark Complete</button>
+        <button class="button ghost" type="submit">End Turn</button>
+      </div>
+    </form>
+  </section>
+
+  <aside class="standings-panel">
+    {{template "standings" .}}
+  </aside>
+  <script src="/static/js/turn.js?v=3" defer></script>
+</main>
+{{end}}
+
+{{define "scorePage"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Don't Stop Talking</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="/static/js/htmx.min.js?v=2" defer></script>
+</head>
+<body>
+  {{template "score" .}}
+</body>
+</html>
+{{end}}
+
+{{define "score"}}
+<main class="shell" id="app">
+  <section class="result-band">
+    <p class="eyebrow">Turn scored</p>
+    <h1>{{.LastTurn.PlayerName}} earned {{.LastTurn.Score}} points.</h1>
+    <p>{{.LastTurn.SpokenSeconds}} of {{.LastTurn.Duration}} seconds spoken{{if .LastTurn.Completed}}, full-time bonus included{{end}}.</p>
+    <div class="score-breakdown" aria-label="Score breakdown">
+      {{range .LastTurn.ScoreParts}}
+      <div>
+        <span>{{.Label}}</span>
+        <strong>{{.Points}}</strong>
+      </div>
+      {{end}}
+      <div class="score-breakdown-total">
+        <span>Total</span>
+        <strong>{{.LastTurn.Score}}</strong>
+      </div>
+    </div>
+    <form hx-post="/turn/start" hx-target="#app" hx-swap="outerHTML">
+      <button class="button primary large" type="submit">Next Turn</button>
+    </form>
+  </section>
+  {{template "standings" .}}
+</main>
+{{end}}
+
+{{define "winnerPage"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Don't Stop Talking</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="/static/js/htmx.min.js?v=2" defer></script>
+</head>
+<body>
+  {{template "winner" .}}
+</body>
+</html>
+{{end}}
+
+{{define "winner"}}
+<main class="shell" id="app">
+  <section class="winner-band">
+    <p class="eyebrow">Winner</p>
+    {{with .Session.Winner}}
+    <h1>{{.Name}}</h1>
+    <p>{{.Score}} points</p>
+    {{end}}
+    <form hx-post="/game/reset" hx-target="#app" hx-swap="outerHTML">
+      <button class="button primary large" type="submit">Play Again</button>
+    </form>
+  </section>
+  {{template "standings" .}}
+</main>
+{{end}}
+
+{{define "standings"}}
+<section class="standings" id="standings">
+  <div class="section-title">
+    <h2>Scoreboard</h2>
+    <span>{{len .Session.CompletedTurns}} turns</span>
+  </div>
+  {{range .Standings}}
+  <div class="score-row">
+    <strong>{{.Name}}</strong>
+    <span>{{.Score}}</span>
+    <form class="score-tools" hx-post="/score/override" hx-target="#standings" hx-swap="outerHTML">
+      <input type="hidden" name="playerID" value="{{.ID}}">
+      <button class="icon-button" name="delta" value="-5" type="submit" aria-label="Remove 5 points from {{.Name}}">-5</button>
+      <button class="icon-button" name="delta" value="5" type="submit" aria-label="Add 5 points to {{.Name}}">+5</button>
+    </form>
+  </div>
+  {{end}}
+</section>
+{{end}}

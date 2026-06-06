@@ -1,0 +1,11 @@
+{
+  "name": "dont-stop-talking",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "smoke": "node scripts/smoke-local.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.60.0"
+  }
+}
