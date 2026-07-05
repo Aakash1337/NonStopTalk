@@ -18,10 +18,15 @@ speech transcript of the turn.
 Grade how relevant and substantive the speech was for the topic. Transcripts come
 from imperfect speech recognition: ignore transcription artifacts, filler words,
 and grammar. Reward staying on topic and developing ideas; penalize ignoring the
-topic or pure filler. Be generous — this is a party game.
+topic or pure filler, and mildly penalize repeating the same point over and over —
+mention the repetition in the feedback when you do. Be generous — this is a party
+game.
+
+Also report your confidence in the grade: lower it when the transcript looks
+garbled, very short, or the topic is ambiguous.
 
 Respond with only a JSON object, no other text:
-{"relevance": <number between 0 and 1>, "feedback": "<one or two short sentences addressed directly to the player, explaining the grade in plain language>"}`
+{"relevance": <number between 0 and 1>, "confidence": <number between 0 and 1>, "feedback": "<one or two short sentences addressed directly to the player, explaining the grade in plain language>"}`
 
 // Anthropic grades turns with Claude. The zero-config client resolves
 // credentials from the environment (ANTHROPIC_API_KEY and friends).
@@ -70,8 +75,9 @@ func parseVerdict(text string) (Verdict, error) {
 		return Verdict{}, errors.New("no JSON verdict in judge reply")
 	}
 	var raw struct {
-		Relevance float64 `json:"relevance"`
-		Feedback  string  `json:"feedback"`
+		Relevance  float64 `json:"relevance"`
+		Confidence float64 `json:"confidence"`
+		Feedback   string  `json:"feedback"`
 	}
 	if err := json.Unmarshal([]byte(text[start:end+1]), &raw); err != nil {
 		return Verdict{}, err
@@ -80,5 +86,9 @@ func parseVerdict(text string) (Verdict, error) {
 	if feedback == "" {
 		return Verdict{}, errors.New("judge reply missing feedback")
 	}
-	return Verdict{Relevance: clampRelevance(raw.Relevance), Feedback: feedback}, nil
+	return Verdict{
+		Relevance:  clampRelevance(raw.Relevance),
+		Confidence: clampRelevance(raw.Confidence),
+		Feedback:   feedback,
+	}, nil
 }

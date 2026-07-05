@@ -105,6 +105,14 @@ type ViewData struct {
 func NewServer(templatePattern string) (*Server, error) {
 	tmpl, err := template.New("app").Funcs(template.FuncMap{
 		"joinLines": func(lines []string) string { return strings.Join(lines, "\n") },
+		"fmtTime":   func(t time.Time) string { return t.Format("Jan 2, 15:04") },
+		"reverseHistory": func(records []game.GameRecord) []game.GameRecord {
+			reversed := make([]game.GameRecord, len(records))
+			for i, record := range records {
+				reversed[len(records)-1-i] = record
+			}
+			return reversed
+		},
 	}).ParseGlob(templatePattern)
 	if err != nil {
 		return nil, err
@@ -156,6 +164,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /room/{code}/score/override", s.roomHandler(s.handleScoreOverride))
 	mux.HandleFunc("POST /room/{code}/host/transfer", s.roomHandler(s.handleTransferHost))
 	mux.HandleFunc("POST /room/{code}/host/claim", s.roomHandler(s.handleClaimHost))
+	mux.HandleFunc("POST /room/{code}/presets/apply", s.roomHandler(s.handleApplyPreset))
 
 	fileServer := http.FileServer(http.Dir("web/static"))
 	mux.Handle("/static/", http.StripPrefix("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -576,6 +585,36 @@ func (s *Server) handleGenerateTopics(w http.ResponseWriter, r *http.Request, rr
 	s.renderRoomState(w, rr, "", false)
 }
 
+// handleApplyPreset applies settings and topics in one request. Presets are
+// stored on the host's device; this endpoint just installs one atomically.
+func (s *Server) handleApplyPreset(w http.ResponseWriter, r *http.Request, rr roomRequest) {
+	if !rr.isHost() {
+		s.renderRoomState(w, rr, "Only the host can apply presets.", false)
+		return
+	}
+	packID := r.FormValue("topicPack")
+	raw := strings.ReplaceAll(r.FormValue("topics"), "\r\n", "\n")
+	customTopics := strings.Split(raw, "\n")
+
+	rr.room.Do(func() {
+		session := rr.room.Session
+		settings := game.Settings{
+			SpeakingDurationSeconds: parseInt(r.FormValue("duration"), session.Settings.SpeakingDurationSeconds),
+			SilenceTimeoutSeconds:   parseInt(r.FormValue("silence"), session.Settings.SilenceTimeoutSeconds),
+			Rounds:                  parseInt(r.FormValue("rounds"), session.Settings.Rounds),
+			TopicPackID:             packID,
+			AIJudgeEnabled:          r.FormValue("aiJudge") == "on",
+		}
+		session.UpdateSettings(settings)
+		if pack, ok := topics.FindPack(packID); ok {
+			session.SetTopics(pack.Topics)
+		} else if strings.TrimSpace(raw) != "" {
+			session.SetTopics(customTopics)
+		}
+	})
+	s.renderRoomState(w, rr, "", false)
+}
+
 // --- Game flow ---
 
 func (s *Server) handleStartGame(w http.ResponseWriter, r *http.Request, rr roomRequest) {
@@ -720,7 +759,7 @@ func (s *Server) handleSubmitTurn(w http.ResponseWriter, r *http.Request, rr roo
 		}
 		index := session.MarkTurnAIPending()
 		if transcript == "" {
-			session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, nil,
+			session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, nil, nil,
 				"No transcript was captured, so there is no relevance bonus.", game.AIStatusSkipped)
 			return
 		}
@@ -745,12 +784,13 @@ func (s *Server) gradeTurn(rm *room.Room, index int, turn game.Turn, transcript 
 	verdict, err := s.judge.Grade(ctx, turn.Topic, transcript)
 	rm.Do(func() {
 		if err != nil {
-			rm.Session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, nil,
+			rm.Session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, nil, nil,
 				"The judge could not review this turn, so scoring stays classic.", game.AIStatusFailed)
 			return
 		}
 		relevance := verdict.Relevance
-		rm.Session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, &relevance, verdict.Feedback, game.AIStatusDone)
+		confidence := verdict.Confidence
+		rm.Session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, &relevance, &confidence, verdict.Feedback, game.AIStatusDone)
 	})
 }
 

@@ -94,6 +94,23 @@ type Turn struct {
 	AIStatus    string
 	AIRelevance *float64
 	AIFeedback  string
+	// AIConfidence (0..1) is how sure the judge was; nil when unknown.
+	AIConfidence *float64
+}
+
+// AIConfidenceLabel renders the judge's confidence for players.
+func (t Turn) AIConfidenceLabel() string {
+	if t.AIConfidence == nil {
+		return ""
+	}
+	switch {
+	case *t.AIConfidence >= 0.75:
+		return "high confidence"
+	case *t.AIConfidence >= 0.4:
+		return "medium confidence"
+	default:
+		return "low confidence"
+	}
 }
 
 func (t Turn) ScoreParts() []ScorePart {
@@ -104,6 +121,16 @@ func (t Turn) ScoreParts() []ScorePart {
 		AIRelevanceScore: t.AIRelevance,
 	})
 }
+
+// GameRecord summarizes one finished game for the room's history.
+type GameRecord struct {
+	FinishedAt time.Time
+	Standings  []Player
+	Turns      int
+}
+
+// MaxHistory caps how many finished games a room remembers.
+const MaxHistory = 20
 
 type Session struct {
 	ID               string
@@ -117,6 +144,7 @@ type Session struct {
 	Finished         bool
 	ActiveTurn       *Turn
 	CompletedTurns   []Turn
+	History          []GameRecord
 	CreatedAt        time.Time
 	// NextPlayerNumber is exported so sessions survive serialization; new
 	// player IDs must not collide with ones handed out before a restart.
@@ -252,9 +280,27 @@ func (s *Session) SetTopics(topics []string) {
 	s.TopicCursor = 0
 }
 
+// archiveFinishedGame records a completed game in the room history before
+// its turns and scores are cleared.
+func (s *Session) archiveFinishedGame() {
+	if !s.Finished || len(s.CompletedTurns) == 0 {
+		return
+	}
+	record := GameRecord{
+		FinishedAt: time.Now(),
+		Standings:  s.Standings(),
+		Turns:      len(s.CompletedTurns),
+	}
+	s.History = append(s.History, record)
+	if len(s.History) > MaxHistory {
+		s.History = s.History[len(s.History)-MaxHistory:]
+	}
+}
+
 // ResetForNewGame clears play state while keeping the roster, settings, and
 // topics so remote players stay bound to their seats across games.
 func (s *Session) ResetForNewGame() {
+	s.archiveFinishedGame()
 	s.Started = false
 	s.Finished = false
 	s.CurrentPlayer = 0
@@ -278,6 +324,7 @@ func (s *Session) Start() error {
 	if len(s.Topics) == 0 {
 		return errors.New("choose at least one topic")
 	}
+	s.archiveFinishedGame()
 	s.Started = true
 	s.Finished = false
 	s.CurrentPlayer = 0
@@ -392,7 +439,7 @@ func (s *Session) MarkTurnAIPending() int {
 // ResolveTurnAI records the judge's outcome for a previously submitted turn
 // and applies the bonus to the player's score. The playerID and topic guard
 // against the roster or game changing while the judge was thinking.
-func (s *Session) ResolveTurnAI(index int, playerID, topic string, relevance *float64, feedback string, status string) bool {
+func (s *Session) ResolveTurnAI(index int, playerID, topic string, relevance *float64, confidence *float64, feedback string, status string) bool {
 	if index < 0 || index >= len(s.CompletedTurns) {
 		return false
 	}
@@ -402,6 +449,7 @@ func (s *Session) ResolveTurnAI(index int, playerID, topic string, relevance *fl
 	}
 	turn.AIStatus = status
 	turn.AIFeedback = feedback
+	turn.AIConfidence = confidence
 	if relevance == nil || status != AIStatusDone {
 		return true
 	}

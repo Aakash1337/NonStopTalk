@@ -2,9 +2,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Don't Stop Talking</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=10">
+  <link rel="stylesheet" href="/static/css/app.css?v=11">
   <script src="/static/js/htmx.min.js?v=3" defer></script>
-  <script src="/static/js/setup.js?v=2" defer></script>
+  <script src="/static/js/setup.js?v=3" defer></script>
   <script src="/static/js/room.js?v=2" defer></script>
 {{end}}
 
@@ -139,6 +139,24 @@
           <span>{{.Selected.Name}}</span>
         </div>
         {{template "settings" .}}
+        {{if .IsHost}}
+        <div class="preset-bar" data-presets>
+          <select data-preset-list aria-label="Saved presets"></select>
+          <button class="button secondary compact" type="button" data-preset-apply>Apply</button>
+          <button class="icon-button" type="button" data-preset-delete aria-label="Delete selected preset">×</button>
+          <input type="text" maxlength="40" placeholder="Preset name" data-preset-name aria-label="Preset name">
+          <button class="button secondary compact" type="button" data-preset-save>Save Preset</button>
+        </div>
+        <p class="hint">Presets save these settings and your custom topics on this device.</p>
+        <form hidden data-preset-form hx-post="{{.Base}}/presets/apply" hx-target="#app" hx-swap="outerHTML">
+          <input type="hidden" name="duration">
+          <input type="hidden" name="silence">
+          <input type="hidden" name="rounds">
+          <input type="hidden" name="topicPack">
+          <input type="hidden" name="aiJudge">
+          <input type="hidden" name="topics">
+        </form>
+        {{end}}
       </div>
 
       {{if .IsHost}}
@@ -154,12 +172,34 @@
         <p class="hint">Generates a themed topic list. Only the theme text is sent to the AI provider; without one, simple offline templates are used. Edit the result below.</p>
         <form hx-post="{{.Base}}/topics/custom" hx-target="#app" hx-swap="outerHTML">
           <textarea name="topics" rows="5" maxlength="20000" placeholder="One topic per line">{{if eq .Session.Settings.TopicPackID "custom"}}{{joinLines .Session.Topics}}{{end}}</textarea>
-          <button class="button secondary" type="submit">Use Custom List</button>
-          <p class="hint">Your custom list is saved on this device.</p>
+          <div class="inline-form">
+            <button class="button secondary" type="submit">Use Custom List</button>
+            <button class="button ghost" type="button" data-export-topics>Export List</button>
+            <label class="button ghost import-label">Import List<input type="file" accept=".txt,text/plain" data-import-topics hidden></label>
+          </div>
+          <p class="hint">Your custom list is saved on this device. Export writes a text file you can share; import loads one into the editor.</p>
         </form>
       </div>
       {{end}}
     </section>
+
+    {{if .Session.History}}
+    <section class="panel wide history-panel">
+      <div class="section-title">
+        <h2>Game History</h2>
+        <span>{{len .Session.History}} finished {{if eq (len .Session.History) 1}}game{{else}}games{{end}} in this room</span>
+      </div>
+      <div class="history-list">
+        {{range reverseHistory .Session.History}}
+        <div class="history-row">
+          <strong>{{with index .Standings 0}}{{.Name}} won{{end}}</strong>
+          <span>{{range $i, $p := .Standings}}{{if $i}} · {{end}}{{$p.Name}} {{$p.Score}}{{end}}</span>
+          <span class="history-time">{{.Turns}} turns · {{fmtTime .FinishedAt}}</span>
+        </div>
+        {{end}}
+      </div>
+    </section>
+    {{end}}
 
     <section class="start-band">
       <div>
@@ -243,6 +283,9 @@
   <label>
     <span>Topic pack</span>
     <select name="topicPack">
+      {{if eq .Session.Settings.TopicPackID "custom"}}
+      <option value="custom" selected>Custom · your list</option>
+      {{end}}
       {{range .Packs}}
       <option value="{{.ID}}" {{if eq $.Session.Settings.TopicPackID .ID}}selected{{end}}>{{.Name}} · {{.Difficulty}}</option>
       {{end}}

@@ -288,6 +288,21 @@ async function runManualFallbackScenario(browser, baseURL) {
 
   await page.getByRole("button", { name: "Play Again" }).click();
   await page.waitForSelector(".setup-grid");
+
+  // The finished game lands in the room history.
+  await expectText(page, ".history-panel", "Player 2 won");
+
+  // Presets: save the current setup, change it, then restore it.
+  await page.locator("[data-preset-name]").fill("Fast game");
+  await page.getByRole("button", { name: "Save Preset" }).click();
+  await page.getByLabel("Talk time").fill("25");
+  await page.getByRole("button", { name: "Apply Settings" }).click();
+  await expectText(page, ".start-band", "25s to survive");
+  await page.locator("[data-preset-list]").selectOption("Fast game");
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
+  await expectText(page, ".start-band", "10s to survive");
+  await expectText(page, "#topic-summary", "2 topics loaded");
+
   await context.close();
 }
 

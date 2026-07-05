@@ -228,6 +228,61 @@ func TestInputLimits(t *testing.T) {
 	}
 }
 
+func TestFinishedGamesAreArchivedToHistory(t *testing.T) {
+	session := NewSession("test")
+	session.AddPlayer("Avery")
+	session.AddPlayer("Blair")
+	session.SetTopics([]string{"Topic one"})
+
+	playGame := func() {
+		for !session.Finished {
+			if _, err := session.StartTurn(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := session.SubmitTurn(10, false, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	playGame()
+	session.ResetForNewGame()
+	if len(session.History) != 1 {
+		t.Fatalf("expected one archived game, got %d", len(session.History))
+	}
+	record := session.History[0]
+	if record.Turns != 2 || len(record.Standings) != 2 {
+		t.Fatalf("unexpected record: %+v", record)
+	}
+	if record.FinishedAt.IsZero() {
+		t.Fatal("expected a finish time")
+	}
+
+	// Starting a new game directly from the winner screen archives too.
+	playGame()
+	if err := session.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if len(session.History) != 2 {
+		t.Fatalf("expected two archived games, got %d", len(session.History))
+	}
+
+	// Resetting an unfinished game archives nothing.
+	session.ResetForNewGame()
+	if len(session.History) != 2 {
+		t.Fatalf("expected reset of fresh game to archive nothing, got %d", len(session.History))
+	}
+
+	// History is capped.
+	for i := 0; i < MaxHistory+5; i++ {
+		playGame()
+		session.ResetForNewGame()
+	}
+	if len(session.History) != MaxHistory {
+		t.Fatalf("expected history capped at %d, got %d", MaxHistory, len(session.History))
+	}
+}
+
 func TestResolveTurnAIAppliesBonus(t *testing.T) {
 	session := NewSession("test")
 	avery := session.AddPlayer("Avery")
@@ -247,7 +302,8 @@ func TestResolveTurnAIAppliesBonus(t *testing.T) {
 	}
 
 	relevance := 0.8
-	if !session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, &relevance, "Nice focus.", AIStatusDone) {
+	confidence := 0.9
+	if !session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, &relevance, &confidence, "Nice focus.", AIStatusDone) {
 		t.Fatal("expected verdict to apply")
 	}
 	graded := session.CompletedTurns[0]
@@ -289,11 +345,11 @@ func TestResolveTurnAIRejectsStaleVerdicts(t *testing.T) {
 	index := session.MarkTurnAIPending()
 
 	relevance := 1.0
-	if session.ResolveTurnAI(index, "someone-else", turn.Topic, &relevance, "x", AIStatusDone) {
+	if session.ResolveTurnAI(index, "someone-else", turn.Topic, &relevance, nil, "x", AIStatusDone) {
 		t.Fatal("expected mismatched player to be rejected")
 	}
 	session.ResetForNewGame()
-	if session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, &relevance, "x", AIStatusDone) {
+	if session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, &relevance, nil, "x", AIStatusDone) {
 		t.Fatal("expected verdict after reset to be rejected")
 	}
 }
