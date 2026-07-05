@@ -23,9 +23,11 @@
   const spokenInput = stage.querySelector("[data-spoken]");
   const completedInput = stage.querySelector("[data-completed]");
   const eliminatedInput = stage.querySelector("[data-eliminated]");
+  const soundToggle = stage.querySelector("[data-sound-toggle]");
 
   const autoMicValue = "auto";
   const micStorageKey = "dont-stop-talking.mic-id";
+  const soundStorageKey = "dont-stop-talking.sound";
   const speakingThreshold = 0.035;
   const barCount = 8;
 
@@ -47,6 +49,30 @@
   let micDevicesLoaded = false;
   let micDevices = [];
   let selectedMicID = readSavedMic();
+  let cueContext;
+  let lastTickSecond = -1;
+  let silenceWarned = false;
+  let soundEnabled = readSoundSetting();
+
+  function readSoundSetting() {
+    try {
+      return window.localStorage.getItem(soundStorageKey) !== "off";
+    } catch {
+      return true;
+    }
+  }
+
+  const saveSoundSetting = () => {
+    try {
+      if (soundEnabled) {
+        window.localStorage.removeItem(soundStorageKey);
+      } else {
+        window.localStorage.setItem(soundStorageKey, "off");
+      }
+    } catch {
+      // Persistence is best-effort.
+    }
+  };
 
   function readSavedMic() {
     try {
@@ -69,6 +95,68 @@
   };
 
   const audioContextConstructor = () => window.AudioContext || window.webkitAudioContext;
+
+  const cueContextFor = () => {
+    if (!soundEnabled) return null;
+    const AudioContextConstructor = audioContextConstructor();
+    if (!AudioContextConstructor) return null;
+    if (!cueContext || cueContext.state === "closed") {
+      try {
+        cueContext = new AudioContextConstructor();
+      } catch {
+        return null;
+      }
+    }
+    if (cueContext.state === "suspended") {
+      cueContext.resume();
+    }
+    return cueContext;
+  };
+
+  const playTone = (frequency, startDelay, duration, { type = "sine", gain = 0.08 } = {}) => {
+    try {
+      const context = cueContextFor();
+      if (!context) return;
+      const oscillator = context.createOscillator();
+      const amp = context.createGain();
+      const at = context.currentTime + startDelay;
+      oscillator.type = type;
+      oscillator.frequency.value = frequency;
+      amp.gain.setValueAtTime(0.0001, at);
+      amp.gain.exponentialRampToValueAtTime(gain, at + 0.01);
+      amp.gain.exponentialRampToValueAtTime(0.0001, at + duration);
+      oscillator.connect(amp);
+      amp.connect(context.destination);
+      oscillator.start(at);
+      oscillator.stop(at + duration + 0.05);
+    } catch {
+      // Sound cues are best-effort; never block the game on audio failures.
+    }
+  };
+
+  const cues = {
+    start: () => {
+      playTone(660, 0, 0.12);
+      playTone(880, 0.14, 0.16);
+    },
+    tick: () => playTone(880, 0, 0.06, { gain: 0.05 }),
+    silenceWarning: () => playTone(440, 0, 0.16, { type: "triangle", gain: 0.1 }),
+    eliminated: () => {
+      playTone(220, 0, 0.22, { type: "sawtooth", gain: 0.06 });
+      playTone(160, 0.2, 0.32, { type: "sawtooth", gain: 0.06 });
+    },
+    completed: () => {
+      playTone(523, 0, 0.12);
+      playTone(659, 0.13, 0.12);
+      playTone(784, 0.26, 0.2);
+    },
+  };
+
+  const syncSoundToggle = () => {
+    if (!soundToggle) return;
+    soundToggle.textContent = soundEnabled ? "Sound On" : "Sound Off";
+    soundToggle.setAttribute("aria-pressed", soundEnabled ? "true" : "false");
+  };
 
   const stopStream = (activeStream) => {
     if (activeStream) {
@@ -429,6 +517,12 @@
     const elapsed = elapsedSeconds();
     const remaining = Math.max(0, Math.ceil(duration - (performance.now() - startedAt) / 1000));
     timer.textContent = String(remaining);
+    timer.classList.toggle("is-low", running && remaining <= 10 && remaining > 5);
+    timer.classList.toggle("is-critical", running && remaining <= 5);
+    if (running && remaining <= 5 && remaining > 0 && remaining !== lastTickSecond) {
+      lastTickSecond = remaining;
+      cues.tick();
+    }
     return elapsed;
   };
 
@@ -438,6 +532,12 @@
     cancelAnimationFrame(raf);
     stopPreview();
     stopMic();
+    if (cueContext) {
+      // Give the end-of-turn cue time to play before releasing the context.
+      const closingContext = cueContext;
+      cueContext = null;
+      setTimeout(() => closeAudioContext(closingContext), 1200);
+    }
     spokenInput.value = String(spokenSeconds);
     completedInput.value = completed ? "true" : "false";
     eliminatedInput.value = eliminated ? "true" : "false";
@@ -447,6 +547,11 @@
   const finish = (completed, eliminated, options = {}) => {
     const elapsed = running ? elapsedSeconds() : Number(spokenInput.value || 0);
     const spokenSeconds = options.fullDuration ? duration : elapsed;
+    if (eliminated) {
+      cues.eliminated();
+    } else if (completed) {
+      cues.completed();
+    }
     submitResult(spokenSeconds, completed, eliminated);
   };
 
@@ -460,6 +565,7 @@
     const speaking = volume > speakingThreshold;
     if (speaking) {
       lastVoiceAt = now;
+      silenceWarned = false;
       setStatus("Speaking", Math.min(1, volume * 8), false);
       silenceLabel.textContent = `Silence limit: ${silenceLimit}s`;
     } else {
@@ -467,6 +573,10 @@
       const left = Math.max(0, silenceLimit - silentFor);
       setStatus("Silence", Math.min(1, volume * 8), left <= 1);
       silenceLabel.textContent = `Silence left: ${left.toFixed(1)}s`;
+      if (left <= 1 && !silenceWarned) {
+        silenceWarned = true;
+        cues.silenceWarning();
+      }
       if (silentFor >= silenceLimit) {
         finish(false, true);
         return;
@@ -523,6 +633,9 @@
       running = true;
       startedAt = performance.now();
       lastVoiceAt = startedAt;
+      lastTickSecond = -1;
+      silenceWarned = false;
+      cues.start();
       raf = requestAnimationFrame(micTick);
     } catch {
       running = false;
@@ -541,6 +654,8 @@
     mode = "manual";
     running = true;
     startedAt = performance.now();
+    lastTickSecond = -1;
+    cues.start();
     setStartedControls();
     setStatus("Manual timing", 1, false);
     silenceLabel.textContent = "Host controlled";
@@ -549,6 +664,14 @@
 
   startButton.addEventListener("click", start);
   if (manualButton) manualButton.addEventListener("click", startManual);
+  if (soundToggle) {
+    soundToggle.addEventListener("click", () => {
+      soundEnabled = !soundEnabled;
+      saveSoundSetting();
+      syncSoundToggle();
+      if (soundEnabled) cues.tick();
+    });
+  }
   if (openMicButton) {
     openMicButton.addEventListener("click", openMicDialog);
   }
@@ -583,6 +706,7 @@
   });
 
   fillLevelMeter(micSummaryLevel);
+  syncSoundToggle();
   renderMicList();
   populateMics();
 })();

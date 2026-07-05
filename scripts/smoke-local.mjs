@@ -69,16 +69,27 @@ function stopProcessTree(child) {
     spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
     return;
   }
-  child.kill("SIGTERM");
+  // Kill the whole process group: `go run` starts the server as a grandchild
+  // that would otherwise survive and keep our stdio pipes open.
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch {
+    child.kill("SIGTERM");
+  }
 }
 
 async function launchBrowser() {
   const headless = process.env.HEADED !== "1";
+  // Chromium's sandbox cannot run as root (common in CI containers).
+  const chromiumSandbox = process.getuid?.() === 0 ? false : undefined;
   const attempts = [{}, { channel: "chrome" }, { channel: "msedge" }];
+  if (process.env.SMOKE_CHROMIUM) {
+    attempts.unshift({ executablePath: process.env.SMOKE_CHROMIUM });
+  }
   let lastError;
   for (const attempt of attempts) {
     try {
-      return await chromium.launch({ headless, ...attempt });
+      return await chromium.launch({ headless, chromiumSandbox, ...attempt });
     } catch (error) {
       lastError = error;
     }
@@ -292,6 +303,7 @@ async function main() {
     cwd: root,
     env: { ...process.env, PORT: port },
     stdio: ["ignore", "pipe", "pipe"],
+    detached: process.platform !== "win32",
   });
   const output = [];
   server.stdout.on("data", (chunk) => output.push(chunk.toString()));

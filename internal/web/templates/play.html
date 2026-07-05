@@ -5,8 +5,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Don't Stop Talking</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=5">
+  <link rel="stylesheet" href="/static/css/app.css?v=6">
   <script src="/static/js/htmx.min.js?v=2" defer></script>
+  <script src="/static/js/setup.js?v=1" defer></script>
 </head>
 <body>
   {{template "play" .}}
@@ -66,6 +67,7 @@
         <button class="button secondary" type="button" data-start-manual>Manual Timer</button>
         <button class="button secondary" type="button" data-redraw-topic hx-post="/turn/redraw" hx-target="#app" hx-swap="outerHTML">Redraw Topic</button>
         <button class="button secondary" type="button" data-manual-complete>Mark Complete</button>
+        <button class="button ghost" type="button" data-sound-toggle aria-pressed="true">Sound On</button>
         <button class="button ghost" type="submit">End Turn</button>
       </div>
     </form>
@@ -74,7 +76,7 @@
   <aside class="standings-panel">
     {{template "standings" .}}
   </aside>
-  <script src="/static/js/turn.js?v=5" defer></script>
+  <script src="/static/js/turn.js?v=6" defer></script>
 </main>
 {{end}}
 
@@ -85,8 +87,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Don't Stop Talking</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=5">
+  <link rel="stylesheet" href="/static/css/app.css?v=6">
   <script src="/static/js/htmx.min.js?v=2" defer></script>
+  <script src="/static/js/setup.js?v=1" defer></script>
 </head>
 <body>
   {{template "score" .}}
@@ -127,8 +130,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Don't Stop Talking</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=5">
+  <link rel="stylesheet" href="/static/css/app.css?v=6">
   <script src="/static/js/htmx.min.js?v=2" defer></script>
+  <script src="/static/js/setup.js?v=1" defer></script>
 </head>
 <body>
   {{template "winner" .}}

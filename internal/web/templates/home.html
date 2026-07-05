@@ -5,8 +5,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Don't Stop Talking</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=5">
+  <link rel="stylesheet" href="/static/css/app.css?v=6">
   <script src="/static/js/htmx.min.js?v=2" defer></script>
+  <script src="/static/js/setup.js?v=1" defer></script>
 </head>
 <body>
   {{template "setup" .}}
@@ -57,6 +58,7 @@
         <form hx-post="/topics/custom" hx-target="#app" hx-swap="outerHTML">
           <textarea name="topics" rows="5" placeholder="One topic per line"></textarea>
           <button class="button secondary" type="submit">Use Custom List</button>
+          <p class="hint">Your custom list is saved on this device.</p>
         </form>
       </div>
     </section>
@@ -122,10 +124,11 @@
     <span>Topic pack</span>
     <select name="topicPack">
       {{range .Packs}}
-      <option value="{{.ID}}" {{if eq $.Session.Settings.TopicPackID .ID}}selected{{end}}>{{.Name}}</option>
+      <option value="{{.ID}}" {{if eq $.Session.Settings.TopicPackID .ID}}selected{{end}}>{{.Name}} · {{.Difficulty}}</option>
       {{end}}
     </select>
   </label>
+  <p class="pack-note">{{.Selected.Description}}{{if .Selected.Difficulty}} Difficulty: {{.Selected.Difficulty}}.{{end}}</p>
   <button class="button secondary" type="submit">Apply Settings</button>
 </form>
 {{end}}
