@@ -279,6 +279,21 @@ textarea {
   font-weight: 700;
 }
 
+.claim-host {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-color: var(--color-warning);
+  font-weight: 700;
+}
+
+.host-tag {
+  border-color: var(--color-accent-strong);
+  color: var(--color-accent-strong);
+}
+
 .generate-form {
   margin-block-end: 10px;
 }

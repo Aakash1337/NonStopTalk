@@ -2,7 +2,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Don't Stop Talking</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=9">
+  <link rel="stylesheet" href="/static/css/app.css?v=10">
   <script src="/static/js/htmx.min.js?v=3" defer></script>
   <script src="/static/js/setup.js?v=2" defer></script>
   <script src="/static/js/room.js?v=2" defer></script>
@@ -76,6 +76,17 @@
 </html>
 {{end}}
 
+{{define "claimHost"}}
+{{if .CanClaimHost}}
+<div class="notice claim-host">
+  <span>The host seems to be gone.</span>
+  <form hx-post="{{.Base}}/host/claim" hx-target="#app" hx-swap="outerHTML">
+    <button class="button secondary" type="submit">Take Over as Host</button>
+  </form>
+</div>
+{{end}}
+{{end}}
+
 {{define "setup"}}
   <main class="shell" id="app" data-room-base="{{.Base}}">
     <header class="app-header">
@@ -105,6 +116,7 @@
     </section>
 
     {{if .Error}}<div class="notice danger">{{.Error}}</div>{{end}}
+    {{template "claimHost" .}}
 
     <section class="setup-grid">
       <div class="panel">
@@ -180,11 +192,18 @@
     {{end}}
     <span class="player-meta">
       {{if index $.Online .ID}}<span class="presence" title="Connected">●</span>{{end}}
+      {{if and $.HostPlayerID (eq .ID $.HostPlayerID)}}<span class="you-tag host-tag">host</span>{{end}}
       {{if eq .ID $.YouID}}<span class="you-tag">you</span>{{end}}
       {{.Score}} pts
     </span>
     {{if $.IsHost}}
     <div class="player-tools">
+      {{if and (index $.Bound .ID) (ne .ID $.HostPlayerID)}}
+      <form hx-post="{{$.Base}}/host/transfer" hx-target="#app" hx-swap="outerHTML">
+        <input type="hidden" name="playerID" value="{{.ID}}">
+        <button class="icon-button" type="submit" aria-label="Make {{.Name}} the host">Make Host</button>
+      </form>
+      {{end}}
       <form hx-post="{{$.Base}}/players/move" hx-target="#app" hx-swap="outerHTML">
         <input type="hidden" name="id" value="{{.ID}}">
         <input type="hidden" name="offset" value="-1">

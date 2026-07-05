@@ -13,6 +13,7 @@
 {{define "play"}}
 <main class="shell play-shell" id="app" data-room-base="{{.Base}}">
   {{if .Error}}<div class="notice danger">{{.Error}}</div>{{end}}
+  {{template "claimHost" .}}
   {{if or .IsActor (and .IsHost (not .ActorIsRemote))}}
   <section class="turn-stage"
     data-turn
@@ -149,6 +150,7 @@
 {{define "score"}}
 <main class="shell" id="app" data-room-base="{{.Base}}">
   {{if .Error}}<div class="notice danger">{{.Error}}</div>{{end}}
+  {{template "claimHost" .}}
   <section class="result-band">
     <div>
       <p class="eyebrow">Turn scored</p>
@@ -199,6 +201,7 @@
 {{define "winner"}}
 <main class="shell" id="app" data-room-base="{{.Base}}">
   {{if .Error}}<div class="notice danger">{{.Error}}</div>{{end}}
+  {{template "claimHost" .}}
   <section class="winner-band">
     <div>
       <p class="eyebrow">Winner</p>

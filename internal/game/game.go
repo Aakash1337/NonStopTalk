@@ -117,8 +117,10 @@ type Session struct {
 	Finished         bool
 	ActiveTurn       *Turn
 	CompletedTurns   []Turn
-	createdAt        time.Time
-	nextPlayerNumber int
+	CreatedAt        time.Time
+	// NextPlayerNumber is exported so sessions survive serialization; new
+	// player IDs must not collide with ones handed out before a restart.
+	NextPlayerNumber int
 }
 
 func NewSession(id string) *Session {
@@ -126,21 +128,21 @@ func NewSession(id string) *Session {
 		ID:               id,
 		Settings:         DefaultSettings(),
 		CurrentRound:     1,
-		createdAt:        time.Now(),
-		nextPlayerNumber: 1,
+		CreatedAt:        time.Now(),
+		NextPlayerNumber: 1,
 	}
 }
 
 func (s *Session) AddPlayer(name string) Player {
 	name = cleanName(name)
 	if name == "" {
-		name = "Player " + itoa(s.nextPlayerNumber)
+		name = "Player " + itoa(s.NextPlayerNumber)
 	}
 	player := Player{
-		ID:   "p" + itoa(s.nextPlayerNumber),
+		ID:   "p" + itoa(s.NextPlayerNumber),
 		Name: name,
 	}
-	s.nextPlayerNumber++
+	s.NextPlayerNumber++
 	s.Players = append(s.Players, player)
 	return player
 }

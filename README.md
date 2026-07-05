@@ -34,6 +34,8 @@ Every game runs in a room with a six-character join code:
 - Pass-and-play still works: local seats the host adds run from the host's screen.
 - The current speaker runs the mic on their own device; the server keeps its own turn clock, so remote players cannot claim more speaking time than the server observed.
 - Reconnecting is automatic: rejoin with the same browser and you keep your seat.
+- Hosting can move: the host can hand control to any player on their own device ("Make Host"), and if the host disappears for more than 30 seconds, any seated player can take over.
+- Rooms survive server restarts: game state is snapshotted to `data/rooms.json` every 10 seconds (set `DST_DATA_FILE` to relocate it, or `DST_DATA_FILE=off` to keep everything in memory).
 
 Protections: same-origin checks on all state changes, per-IP rate limits on room create/join, capped request bodies, name/topic length limits, room and seat caps, and idle-room cleanup.
 
