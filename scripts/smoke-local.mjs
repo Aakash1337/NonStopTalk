@@ -159,6 +159,28 @@ const fakeMicInit = () => {
   Object.defineProperty(window, "AudioContext", { configurable: true, value: FakeAudioContext });
 };
 
+const fakeSpeechInit = () => {
+  class FakeSpeechRecognition {
+    start() {
+      setTimeout(() => {
+        const result = Object.assign(
+      [{ transcript: "pancakes are the best breakfast food and I eat pancakes with syrup for breakfast every single morning" }],
+          { isFinal: true },
+        );
+        this.onresult?.({ resultIndex: 0, results: [result] });
+      }, 250);
+    }
+    stop() {
+      this.onend?.();
+    }
+    abort() {}
+  }
+  Object.defineProperty(window, "SpeechRecognition", {
+    configurable: true,
+    value: FakeSpeechRecognition,
+  });
+};
+
 async function createRoom(page, baseURL, hostName) {
   await page.goto(baseURL);
   if (hostName) {
@@ -321,6 +343,44 @@ async function runAutomaticEndingScenario(browser, baseURL) {
   await context.close();
 }
 
+// AI judge mode: the speaker's browser transcribes (mocked SpeechRecognition),
+// the transcript is graded server-side (offline heuristic judge in the smoke
+// environment), and the score screen shows the relevance bonus and feedback.
+async function runAIJudgeScenario(browser, baseURL) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  await page.addInitScript(fakeMicInit);
+  await page.addInitScript(fakeSpeechInit);
+
+  await createRoom(page, baseURL, "Avery");
+  await page.getByLabel("Player name").fill("Blair");
+  await page.getByRole("button", { name: "Add" }).click();
+  await page.waitForSelector('input[aria-label="Rename Blair"]');
+
+  await page.getByLabel("Talk time").fill("10");
+  await page.getByLabel("Silence limit").fill("1");
+  await page.getByLabel("AI judge (optional relevance bonus)").check();
+  await page.getByRole("button", { name: "Apply Settings" }).click();
+  await expectText(page, ".start-band", "10s to survive, 1s silence limit");
+
+  await page.getByPlaceholder("One topic per line").fill("Talk about pancakes and breakfast food");
+  await page.getByRole("button", { name: "Use Custom List" }).click();
+  await expectText(page, "#topic-summary", "1 topics loaded");
+
+  await page.getByRole("button", { name: "Start Game" }).click();
+  await page.waitForSelector("[data-turn][data-ai='1']");
+  await expectText(page, ".ai-banner", "Audio never leaves this device");
+
+  // Speak with the fake mic: the mocked recognizer emits an on-topic
+  // transcript, then the silent mic eliminates the player after ~1s.
+  await page.getByRole("button", { name: "Start Talking" }).click();
+  await page.waitForSelector(".result-band", { timeout: 15000 });
+  await expectText(page, ".ai-verdict", "Offline judge");
+  await expectText(page, ".score-breakdown", "AI relevance");
+
+  await context.close();
+}
+
 // Two real browser sessions: a host and a remote player joined by room code,
 // kept in sync through server-sent events.
 async function runRemoteRoomScenario(browser, baseURL) {
@@ -398,9 +458,12 @@ async function runRemoteRoomScenario(browser, baseURL) {
 async function main() {
   const port = process.env.SMOKE_PORT || String(await getFreePort());
   const baseURL = `http://127.0.0.1:${port}`;
+  // Force the offline judge so the AI scenario is deterministic and free.
+  const env = { ...process.env, PORT: port };
+  delete env.ANTHROPIC_API_KEY;
   const server = spawn("go", ["run", "./cmd/web"], {
     cwd: root,
-    env: { ...process.env, PORT: port },
+    env,
     stdio: ["ignore", "pipe", "pipe"],
     detached: process.platform !== "win32",
   });
@@ -415,7 +478,8 @@ async function main() {
     await runManualFallbackScenario(browser, baseURL);
     await runAutomaticEndingScenario(browser, baseURL);
     await runRemoteRoomScenario(browser, baseURL);
-    console.log("Smoke test passed (local, automatic ending, remote room)");
+    await runAIJudgeScenario(browser, baseURL);
+    console.log("Smoke test passed (local, automatic ending, remote room, AI judge)");
   } catch (error) {
     console.error("Smoke test failed");
     console.error(error);

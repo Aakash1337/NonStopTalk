@@ -23,6 +23,9 @@ type Settings struct {
 	SilenceTimeoutSeconds   int
 	Rounds                  int
 	TopicPackID             string
+	// AIJudgeEnabled turns on the optional relevance bonus. Off by default:
+	// AI is an optional judge, never the core game.
+	AIJudgeEnabled bool
 }
 
 func DefaultSettings() Settings {
@@ -65,6 +68,14 @@ type Player struct {
 	Score int
 }
 
+// AI judge status values for a turn.
+const (
+	AIStatusPending = "pending"
+	AIStatusDone    = "done"
+	AIStatusSkipped = "skipped"
+	AIStatusFailed  = "failed"
+)
+
 type Turn struct {
 	PlayerID      string
 	PlayerName    string
@@ -78,13 +89,19 @@ type Turn struct {
 	Eliminated    bool
 	Score         int
 	Scored        bool
+
+	// AI judge results ("" means the judge was not involved).
+	AIStatus    string
+	AIRelevance *float64
+	AIFeedback  string
 }
 
 func (t Turn) ScoreParts() []ScorePart {
 	return ScoreParts(ScoreInput{
-		DurationSeconds: t.Duration,
-		SpokenSeconds:   t.SpokenSeconds,
-		Completed:       t.Completed,
+		DurationSeconds:  t.Duration,
+		SpokenSeconds:    t.SpokenSeconds,
+		Completed:        t.Completed,
+		AIRelevanceScore: t.AIRelevance,
 	})
 }
 
@@ -357,6 +374,45 @@ func (s *Session) SubmitTurn(spokenSeconds int, completed bool, eliminated bool)
 	s.ActiveTurn = nil
 	s.advance()
 	return turn, nil
+}
+
+// MarkTurnAIPending flags the most recent completed turn as awaiting an AI
+// verdict and returns its index, or -1 if there is no turn to grade.
+func (s *Session) MarkTurnAIPending() int {
+	if len(s.CompletedTurns) == 0 {
+		return -1
+	}
+	index := len(s.CompletedTurns) - 1
+	s.CompletedTurns[index].AIStatus = AIStatusPending
+	return index
+}
+
+// ResolveTurnAI records the judge's outcome for a previously submitted turn
+// and applies the bonus to the player's score. The playerID and topic guard
+// against the roster or game changing while the judge was thinking.
+func (s *Session) ResolveTurnAI(index int, playerID, topic string, relevance *float64, feedback string, status string) bool {
+	if index < 0 || index >= len(s.CompletedTurns) {
+		return false
+	}
+	turn := &s.CompletedTurns[index]
+	if turn.PlayerID != playerID || turn.Topic != topic {
+		return false
+	}
+	turn.AIStatus = status
+	turn.AIFeedback = feedback
+	if relevance == nil || status != AIStatusDone {
+		return true
+	}
+	turn.AIRelevance = relevance
+	bonus := int(*relevance * 20)
+	turn.Score += bonus
+	for i := range s.Players {
+		if s.Players[i].ID == playerID {
+			s.Players[i].Score += bonus
+			break
+		}
+	}
+	return true
 }
 
 func (s *Session) OverrideScore(playerID string, delta int) {

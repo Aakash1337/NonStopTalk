@@ -2,7 +2,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Don't Stop Talking</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=7">
+  <link rel="stylesheet" href="/static/css/app.css?v=8">
   <script src="/static/js/htmx.min.js?v=3" defer></script>
   <script src="/static/js/setup.js?v=2" defer></script>
   <script src="/static/js/room.js?v=1" defer></script>
@@ -225,6 +225,11 @@
     </select>
   </label>
   <p class="pack-note">{{.Selected.Description}}{{if .Selected.Difficulty}} Difficulty: {{.Selected.Difficulty}}.{{end}}</p>
+  <label class="toggle-row">
+    <input type="checkbox" name="aiJudge" value="on" {{if .Session.Settings.AIJudgeEnabled}}checked{{end}}>
+    <span>AI judge (optional relevance bonus)</span>
+  </label>
+  <p class="pack-note consent-note">When on, the current speaker's browser transcribes their words and sends only that text to an AI judge for a bonus of up to 20 points with a short explanation. Audio never leaves the device, transcripts are used only to score the turn, and the host can always adjust scores.</p>
   <button class="button secondary" type="submit">Apply Settings</button>
 </form>
 {{else}}
@@ -233,6 +238,10 @@
   <div><dt>Silence limit</dt><dd>{{.Session.Settings.SilenceTimeoutSeconds}}s</dd></div>
   <div><dt>Rounds</dt><dd>{{.Session.Settings.Rounds}}</dd></div>
   <div><dt>Topics</dt><dd>{{.Selected.Name}} ({{len .Session.Topics}})</dd></div>
+  <div><dt>AI judge</dt><dd>{{if .Session.Settings.AIJudgeEnabled}}On{{else}}Off{{end}}</dd></div>
 </dl>
+{{if .Session.Settings.AIJudgeEnabled}}
+<p class="pack-note consent-note">The AI judge is on: while you speak, your browser transcribes your words and sends only that text to be graded for a relevance bonus. Audio never leaves your device.</p>
+{{end}}
 {{end}}
 {{end}}

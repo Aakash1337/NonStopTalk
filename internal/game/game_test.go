@@ -228,6 +228,76 @@ func TestInputLimits(t *testing.T) {
 	}
 }
 
+func TestResolveTurnAIAppliesBonus(t *testing.T) {
+	session := NewSession("test")
+	avery := session.AddPlayer("Avery")
+	session.AddPlayer("Blair")
+	session.SetTopics([]string{"Topic one"})
+
+	if _, err := session.StartTurn(); err != nil {
+		t.Fatal(err)
+	}
+	turn, err := session.SubmitTurn(30, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := session.MarkTurnAIPending()
+	if index != 0 || session.CompletedTurns[0].AIStatus != AIStatusPending {
+		t.Fatalf("expected pending AI status on turn 0, got %d %q", index, session.CompletedTurns[0].AIStatus)
+	}
+
+	relevance := 0.8
+	if !session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, &relevance, "Nice focus.", AIStatusDone) {
+		t.Fatal("expected verdict to apply")
+	}
+	graded := session.CompletedTurns[0]
+	if graded.Score != 30+16 {
+		t.Fatalf("expected 46 points after bonus, got %d", graded.Score)
+	}
+	if session.Players[0].ID != avery.ID || session.Players[0].Score != 46 {
+		t.Fatalf("expected player score 46, got %d", session.Players[0].Score)
+	}
+	if graded.AIFeedback != "Nice focus." || graded.AIStatus != AIStatusDone {
+		t.Fatalf("unexpected AI fields: %+v", graded)
+	}
+
+	parts := graded.ScoreParts()
+	foundAI := false
+	for _, part := range parts {
+		if part.Label == "AI relevance" && part.Points == 16 {
+			foundAI = true
+		}
+	}
+	if !foundAI {
+		t.Fatalf("expected AI relevance part, got %+v", parts)
+	}
+}
+
+func TestResolveTurnAIRejectsStaleVerdicts(t *testing.T) {
+	session := NewSession("test")
+	session.AddPlayer("Avery")
+	session.AddPlayer("Blair")
+	session.SetTopics([]string{"Topic one"})
+
+	if _, err := session.StartTurn(); err != nil {
+		t.Fatal(err)
+	}
+	turn, err := session.SubmitTurn(10, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := session.MarkTurnAIPending()
+
+	relevance := 1.0
+	if session.ResolveTurnAI(index, "someone-else", turn.Topic, &relevance, "x", AIStatusDone) {
+		t.Fatal("expected mismatched player to be rejected")
+	}
+	session.ResetForNewGame()
+	if session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, &relevance, "x", AIStatusDone) {
+		t.Fatal("expected verdict after reset to be rejected")
+	}
+}
+
 func TestRedrawActiveTurnAdvancesTopic(t *testing.T) {
 	session := NewSession("test")
 	session.AddPlayer("Avery")

@@ -279,6 +279,50 @@ textarea {
   font-weight: 700;
 }
 
+.toggle-row {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+}
+
+.toggle-row input {
+  inline-size: 18px;
+  block-size: 18px;
+  accent-color: var(--color-accent);
+}
+
+.consent-note {
+  font-weight: 500;
+}
+
+.ai-banner {
+  margin-block-start: 14px;
+  border: 1px solid var(--color-info);
+  border-radius: 8px;
+  color: var(--color-text);
+  background: var(--color-surface);
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 10px 12px;
+}
+
+.ai-verdict {
+  max-inline-size: 640px;
+  margin-block-start: 10px;
+  border-inline-start: 3px solid var(--color-info);
+  color: var(--color-text);
+  font-size: 0.95rem;
+  font-weight: 600;
+  padding-inline-start: 12px;
+}
+
+.ai-verdict.pending {
+  color: var(--color-muted);
+  font-style: italic;
+}
+
 .next-turn {
   margin-block-start: 18px;
 }

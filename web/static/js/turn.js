@@ -3,6 +3,7 @@
   if (!stage) return;
 
   const base = stage.dataset.base || "";
+  const aiJudgeEnabled = stage.dataset.ai === "1";
   const duration = Number(stage.dataset.duration || 60);
   const silenceLimit = Number(stage.dataset.silence || 2);
   const timer = stage.querySelector("[data-timer]");
@@ -24,6 +25,7 @@
   const spokenInput = stage.querySelector("[data-spoken]");
   const completedInput = stage.querySelector("[data-completed]");
   const eliminatedInput = stage.querySelector("[data-eliminated]");
+  const transcriptInput = stage.querySelector("[data-transcript]");
   const soundToggle = stage.querySelector("[data-sound-toggle]");
 
   const autoMicValue = "auto";
@@ -175,6 +177,60 @@
     window.__dstTurnRunning = value;
     if (!value) {
       document.dispatchEvent(new CustomEvent("dst:turn-idle"));
+    }
+  };
+
+  // With the AI judge on, the speaker's own browser transcribes the turn via
+  // the Web Speech API. Only the resulting text is submitted with the turn;
+  // audio never leaves the device. Everything here is best-effort: without
+  // speech support the turn simply gets no relevance bonus.
+  let recognition = null;
+  let transcriptParts = [];
+
+  const startTranscription = () => {
+    if (!aiJudgeEnabled || !transcriptInput) return;
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Recognition) return;
+    try {
+      recognition = new Recognition();
+      recognition.continuous = true;
+      recognition.interimResults = false;
+      recognition.onresult = (event) => {
+        for (let i = event.resultIndex; i < event.results.length; i += 1) {
+          const result = event.results[i];
+          if (result.isFinal && result[0]) {
+            transcriptParts.push(result[0].transcript);
+          }
+        }
+      };
+      // Restart if the browser ends recognition early while still speaking.
+      recognition.onend = () => {
+        if (running && mode === "mic" && recognition) {
+          try {
+            recognition.start();
+          } catch {
+            // Recognition is best-effort.
+          }
+        }
+      };
+      recognition.start();
+    } catch {
+      recognition = null;
+    }
+  };
+
+  const stopTranscription = () => {
+    const active = recognition;
+    recognition = null;
+    if (active) {
+      try {
+        active.stop();
+      } catch {
+        // Recognition is best-effort.
+      }
+    }
+    if (transcriptInput) {
+      transcriptInput.value = transcriptParts.join(" ").trim().slice(0, 8000);
     }
   };
 
@@ -551,6 +607,7 @@
     setTurnRunningFlag(false);
     mode = "idle";
     cancelAnimationFrame(raf);
+    stopTranscription();
     stopPreview();
     stopMic();
     if (cueContext) {
@@ -654,6 +711,8 @@
       running = true;
       setTurnRunningFlag(true);
       notifyTurnBegin();
+      transcriptParts = [];
+      startTranscription();
       startedAt = performance.now();
       lastVoiceAt = startedAt;
       lastTickSecond = -1;
@@ -729,6 +788,7 @@
     setTurnRunningFlag(false);
     mode = "idle";
     cancelAnimationFrame(raf);
+    stopTranscription();
     stopPreview();
     stopMic();
   });

@@ -18,11 +18,16 @@
     data-turn
     data-base="{{.Base}}"
     data-duration="{{.CurrentTurn.Duration}}"
-    data-silence="{{.CurrentTurn.SilenceLimit}}">
+    data-silence="{{.CurrentTurn.SilenceLimit}}"
+    {{if .Session.Settings.AIJudgeEnabled}}data-ai="1"{{end}}>
     <div class="turn-meta">
       <span>Round {{.CurrentTurn.Round}} of {{.Session.Settings.Rounds}}</span>
       <span>{{.CurrentTurn.PlayerName}}{{if .IsActor}} (you){{end}}</span>
     </div>
+
+    {{if .Session.Settings.AIJudgeEnabled}}
+    <p class="ai-banner">AI judge is on: while you talk, your browser transcribes your words and sends only that text to be graded for a bonus. Audio never leaves this device.</p>
+    {{end}}
 
     <div class="topic-block">
       <p class="eyebrow">Topic</p>
@@ -60,6 +65,7 @@
       <input type="hidden" name="spokenSeconds" data-spoken value="0">
       <input type="hidden" name="completed" data-completed value="false">
       <input type="hidden" name="eliminated" data-eliminated value="false">
+      <input type="hidden" name="transcript" data-transcript value="">
       <div class="host-bar">
         <button class="button primary large" type="button" data-start-turn>Start Talking</button>
         {{if .IsHost}}
@@ -123,7 +129,7 @@
     {{template "standings" .}}
   </aside>
   {{if or .IsActor (and .IsHost (not .ActorIsRemote))}}
-  <script src="/static/js/turn.js?v=7" defer></script>
+  <script src="/static/js/turn.js?v=8" defer></script>
   {{end}}
 </main>
 {{end}}
@@ -148,6 +154,11 @@
       <p class="eyebrow">Turn scored</p>
       <h1>{{.LastTurn.PlayerName}} earned {{.LastTurn.Score}} points.</h1>
       <p>{{.LastTurn.SpokenSeconds}} of {{.LastTurn.Duration}} seconds spoken{{if .LastTurn.Completed}}, full-time bonus included{{end}}.</p>
+      {{if eq .LastTurn.AIStatus "pending"}}
+      <p class="ai-verdict pending">The AI judge is reviewing this turn…</p>
+      {{else if .LastTurn.AIFeedback}}
+      <p class="ai-verdict">{{.LastTurn.AIFeedback}}</p>
+      {{end}}
       {{if or .IsHost .IsNextUp}}
       <form class="next-turn" hx-post="{{.Base}}/turn/start" hx-target="#app" hx-swap="outerHTML">
         <button class="button primary large" type="submit">Next Turn</button>

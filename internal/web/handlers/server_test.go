@@ -1,13 +1,16 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
+	"dontstoptalking/internal/judge"
 	"dontstoptalking/internal/room"
 )
 
@@ -329,6 +332,121 @@ func TestJoinRateLimit(t *testing.T) {
 	}
 	if !limited {
 		t.Fatal("expected join attempts to be rate limited")
+	}
+}
+
+type stubJudge struct{}
+
+func (stubJudge) Name() string { return "stub judge" }
+
+func (stubJudge) Grade(context.Context, string, string) (judge.Verdict, error) {
+	return judge.Verdict{Relevance: 0.5, Feedback: "Stub: solid effort on the topic."}, nil
+}
+
+func TestAIJudgeGradesTurnAsynchronously(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.SetJudge(stubJudge{})
+	router := server.Routes()
+
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	host.do(http.MethodPost, base+"/players", url.Values{"name": {"Blair"}})
+	host.do(http.MethodPost, base+"/settings", url.Values{
+		"duration": {"10"}, "silence": {"1"}, "rounds": {"1"},
+		"topicPack": {"everyday"}, "aiJudge": {"on"},
+	})
+	host.do(http.MethodPost, base+"/game/start", nil)
+
+	res := host.do(http.MethodPost, base+"/turn/submit", url.Values{
+		"spokenSeconds": {"10"}, "completed": {"true"}, "eliminated": {"false"},
+		"transcript":    {"I truly believe pancakes are the best breakfast food ever made"},
+	})
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", res.Code, res.Body.String())
+	}
+
+	// The verdict is applied off the request path; poll until it lands.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		body := host.do(http.MethodGet, base+"/partial", nil).Body.String()
+		if strings.Contains(body, "Stub: solid effort on the topic.") {
+			for _, expected := range []string{"AI relevance", "45 points"} {
+				if !strings.Contains(body, expected) {
+					t.Fatalf("expected %q with AI verdict, got %s", expected, body)
+				}
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("AI verdict never applied, last body: %s", body)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestAIJudgeSkippedWithoutTranscript(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.SetJudge(stubJudge{})
+	router := server.Routes()
+
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	host.do(http.MethodPost, base+"/players", url.Values{"name": {"Blair"}})
+	host.do(http.MethodPost, base+"/settings", url.Values{
+		"duration": {"10"}, "silence": {"1"}, "rounds": {"1"},
+		"topicPack": {"everyday"}, "aiJudge": {"on"},
+	})
+	host.do(http.MethodPost, base+"/game/start", nil)
+
+	res := host.do(http.MethodPost, base+"/turn/submit", url.Values{
+		"spokenSeconds": {"10"}, "completed": {"true"}, "eliminated": {"false"},
+	})
+	body := res.Body.String()
+	if !strings.Contains(body, "No transcript was captured") {
+		t.Fatalf("expected skipped-verdict note, got %s", body)
+	}
+	if strings.Contains(body, "AI relevance") {
+		t.Fatal("expected no AI bonus without a transcript")
+	}
+}
+
+func TestNoAIVerdictWhenDisabled(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.SetJudge(stubJudge{})
+	router := server.Routes()
+
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	host.do(http.MethodPost, base+"/players", url.Values{"name": {"Blair"}})
+	host.do(http.MethodPost, base+"/settings", url.Values{
+		"duration": {"10"}, "silence": {"1"}, "rounds": {"1"}, "topicPack": {"everyday"},
+	})
+	host.do(http.MethodPost, base+"/game/start", nil)
+
+	res := host.do(http.MethodPost, base+"/turn/submit", url.Values{
+		"spokenSeconds": {"10"}, "completed": {"true"}, "eliminated": {"false"},
+		"transcript":    {"words that should be ignored"},
+	})
+	body := res.Body.String()
+	if strings.Contains(body, "AI") && strings.Contains(body, "reviewing") {
+		t.Fatalf("expected no AI activity when disabled, got %s", body)
+	}
+	time.Sleep(50 * time.Millisecond)
+	after := host.do(http.MethodGet, base+"/partial", nil).Body.String()
+	if strings.Contains(after, "Stub:") {
+		t.Fatal("expected judge to stay uninvoked when disabled")
 	}
 }
 

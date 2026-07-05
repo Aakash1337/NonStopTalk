@@ -2,15 +2,18 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"html/template"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"dontstoptalking/internal/game"
+	"dontstoptalking/internal/judge"
 	"dontstoptalking/internal/room"
 	"dontstoptalking/internal/topics"
 )
@@ -22,6 +25,11 @@ const (
 	// completionGraceSeconds forgives clock skew between the browser timer
 	// and the server turn clock when awarding the completion bonus.
 	completionGraceSeconds = 2
+
+	// maxTranscriptBytes caps the browser-supplied transcript sent to the
+	// judge; a 5-minute turn is well under this.
+	maxTranscriptBytes = 8 << 10
+	judgeTimeout       = 30 * time.Second
 )
 
 type Server struct {
@@ -29,6 +37,12 @@ type Server struct {
 	packs    []topics.Pack
 	template *template.Template
 	limiter  *rateLimiter
+	judge    judge.Provider
+}
+
+// SetJudge swaps the relevance judge (used by tests).
+func (s *Server) SetJudge(provider judge.Provider) {
+	s.judge = provider
 }
 
 type ViewData struct {
@@ -61,11 +75,18 @@ func NewServer(templatePattern string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The Claude judge is used when credentials are configured; otherwise a
+	// transparent offline heuristic keeps AI mode playable and testable.
+	var relevanceJudge judge.Provider = judge.Heuristic{}
+	if os.Getenv("ANTHROPIC_API_KEY") != "" {
+		relevanceJudge = judge.NewAnthropic()
+	}
 	return &Server{
 		rooms:    room.NewManager(),
 		packs:    topics.PresetPacks(),
 		template: tmpl,
 		limiter:  newRateLimiter(),
+		judge:    relevanceJudge,
 	}, nil
 }
 
@@ -408,6 +429,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, rr roomR
 			SilenceTimeoutSeconds:   parseInt(r.FormValue("silence"), session.Settings.SilenceTimeoutSeconds),
 			Rounds:                  parseInt(r.FormValue("rounds"), session.Settings.Rounds),
 			TopicPackID:             r.FormValue("topicPack"),
+			AIJudgeEnabled:          r.FormValue("aiJudge") == "on",
 		}
 		session.UpdateSettings(settings)
 		if pack, ok := topics.FindPack(settings.TopicPackID); ok {
@@ -542,8 +564,14 @@ func (s *Server) handleSubmitTurn(w http.ResponseWriter, r *http.Request, rr roo
 	}
 	claimedCompleted := r.FormValue("completed") == "true"
 	eliminated := r.FormValue("eliminated") == "true"
+	transcript := strings.TrimSpace(r.FormValue("transcript"))
+	if len(transcript) > maxTranscriptBytes {
+		transcript = transcript[:maxTranscriptBytes]
+	}
 
 	var submitErr error
+	gradeIndex := -1
+	var gradedTurn game.Turn
 	rr.room.Do(func() {
 		session := rr.room.Session
 		spoken := claimedSpoken
@@ -563,13 +591,45 @@ func (s *Server) handleSubmitTurn(w http.ResponseWriter, r *http.Request, rr roo
 				completed = false
 			}
 		}
-		_, submitErr = session.SubmitTurn(spoken, completed, eliminated)
+		var turn game.Turn
+		turn, submitErr = session.SubmitTurn(spoken, completed, eliminated)
+		if submitErr != nil || !session.Settings.AIJudgeEnabled {
+			return
+		}
+		index := session.MarkTurnAIPending()
+		if transcript == "" {
+			session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, nil,
+				"No transcript was captured, so there is no relevance bonus.", game.AIStatusSkipped)
+			return
+		}
+		gradeIndex = index
+		gradedTurn = turn
 	})
 	if submitErr != nil {
 		s.renderRoomState(w, rr, submitErr.Error(), false)
 		return
 	}
+	if gradeIndex >= 0 {
+		go s.gradeTurn(rr.room, gradeIndex, gradedTurn, transcript)
+	}
 	s.renderRoomState(w, rr, "", false)
+}
+
+// gradeTurn asks the judge for a verdict off the request path; the result is
+// applied under the room lock and broadcast to every connected screen.
+func (s *Server) gradeTurn(rm *room.Room, index int, turn game.Turn, transcript string) {
+	ctx, cancel := context.WithTimeout(context.Background(), judgeTimeout)
+	defer cancel()
+	verdict, err := s.judge.Grade(ctx, turn.Topic, transcript)
+	rm.Do(func() {
+		if err != nil {
+			rm.Session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, nil,
+				"The judge could not review this turn, so scoring stays classic.", game.AIStatusFailed)
+			return
+		}
+		relevance := verdict.Relevance
+		rm.Session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, &relevance, verdict.Feedback, game.AIStatusDone)
+	})
 }
 
 func (s *Server) handleScoreOverride(w http.ResponseWriter, r *http.Request, rr roomRequest) {

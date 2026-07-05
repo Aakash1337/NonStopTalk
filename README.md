@@ -37,6 +37,23 @@ Every game runs in a room with a six-character join code:
 
 Protections: same-origin checks on all state changes, per-IP rate limits on room create/join, capped request bodies, name/topic length limits, room and seat caps, and idle-room cleanup.
 
+## AI Judge Mode (optional)
+
+The host can enable an AI judge in game settings. When on:
+
+- The current speaker's browser transcribes their words with the Web Speech API. Audio never leaves the device; only the transcript of the current turn is submitted with the turn.
+- The server asks Claude (model `claude-opus-4-8`) how relevant the speech was to the topic and applies a bonus of up to 20 points, with a short explanation shown on the score screen.
+- Grading is asynchronous and best-effort: classic scoring always lands first, and a judge failure just means no bonus. The host can override any score.
+- Without an `ANTHROPIC_API_KEY`, a transparent offline keyword-overlap judge is used instead, so the mode stays playable and testable everywhere.
+
+Run with the AI judge backed by Claude:
+
+```text
+ANTHROPIC_API_KEY=sk-ant-... go run ./cmd/web
+```
+
+See [AI and Privacy](docs/AI_AND_PRIVACY.md) for the consent and data-handling rules this implements.
+
 ## Preferred Web Stack
 
 The preferred implementation path is a Go web application using HTMX for server-rendered interactions.
