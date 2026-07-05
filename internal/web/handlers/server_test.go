@@ -249,6 +249,41 @@ func TestRedrawTurnRendersNewTopic(t *testing.T) {
 	}
 }
 
+func TestDuplicateSubmitShowsCurrentStateWithError(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	router := server.Routes()
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/game/start", nil))
+	submitTurn(router, 60, true)
+
+	// A second submit (double click or second browser) must not nest a full
+	// document into the htmx swap; it should re-render the score screen.
+	res := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/turn/submit", formBody(url.Values{
+		"spokenSeconds": {"60"},
+		"completed":     {"true"},
+		"eliminated":    {"false"},
+	}))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	router.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", res.Code, res.Body.String())
+	}
+	body := res.Body.String()
+	if strings.Contains(body, "<!doctype html>") {
+		t.Fatal("expected a partial, got a full document")
+	}
+	for _, expected := range []string{"no active turn", "Turn scored"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q in duplicate submit response, got %s", expected, body)
+		}
+	}
+}
+
 func formBody(values url.Values) *strings.Reader {
 	return strings.NewReader(values.Encode())
 }

@@ -17,6 +17,7 @@
 
 {{define "play"}}
 <main class="shell play-shell" id="app">
+  {{if .Error}}<div class="notice danger">{{.Error}}</div>{{end}}
   <section class="turn-stage"
     data-turn
     data-duration="{{.CurrentTurn.Duration}}"
@@ -99,6 +100,7 @@
 
 {{define "score"}}
 <main class="shell" id="app">
+  {{if .Error}}<div class="notice danger">{{.Error}}</div>{{end}}
   <section class="result-band">
     <p class="eyebrow">Turn scored</p>
     <h1>{{.LastTurn.PlayerName}} earned {{.LastTurn.Score}} points.</h1>
@@ -142,6 +144,7 @@
 
 {{define "winner"}}
 <main class="shell" id="app">
+  {{if .Error}}<div class="notice danger">{{.Error}}</div>{{end}}
   <section class="winner-band">
     <p class="eyebrow">Winner</p>
     {{with .Session.Winner}}

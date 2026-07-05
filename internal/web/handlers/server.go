@@ -187,12 +187,12 @@ func (s *Server) handleStartGame(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.session.Start(); err != nil {
-		s.render(w, "home", s.view(err.Error()))
+		s.renderState(w, err.Error())
 		return
 	}
 	turn, err := s.session.StartTurn()
 	if err != nil {
-		s.render(w, "home", s.view(err.Error()))
+		s.renderState(w, err.Error())
 		return
 	}
 	data := s.view("")
@@ -209,7 +209,7 @@ func (s *Server) handleStartTurn(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	turn, err := s.session.StartTurn()
 	if err != nil {
-		s.render(w, "home", s.view(err.Error()))
+		s.renderState(w, err.Error())
 		return
 	}
 	data := s.view("")
@@ -226,7 +226,7 @@ func (s *Server) handleRedrawTurn(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	turn, err := s.session.RedrawActiveTurn()
 	if err != nil {
-		s.render(w, "home", s.view(err.Error()))
+		s.renderState(w, err.Error())
 		return
 	}
 	data := s.view("")
@@ -246,7 +246,7 @@ func (s *Server) handleSubmitTurn(w http.ResponseWriter, r *http.Request) {
 	eliminated := r.FormValue("eliminated") == "true"
 	turn, err := s.session.SubmitTurn(spoken, completed, eliminated)
 	if err != nil {
-		s.render(w, "home", s.view(err.Error()))
+		s.renderState(w, err.Error())
 		return
 	}
 	data := s.view("")
@@ -292,6 +292,25 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 		s.session.SetTopics(s.packs[0].Topics)
 	}
 	s.render(w, "setup", s.view(""))
+}
+
+// renderState renders the partial that matches the session's current state,
+// so error responses land on the screen the game is actually on instead of
+// nesting the full home document inside an htmx swap.
+func (s *Server) renderState(w http.ResponseWriter, message string) {
+	data := s.view(message)
+	switch {
+	case s.session.ActiveTurn != nil:
+		data.CurrentTurn = s.session.ActiveTurn
+		s.render(w, "play", data)
+	case s.session.Finished:
+		s.render(w, "winner", data)
+	case s.session.Started && len(s.session.CompletedTurns) > 0:
+		data.LastTurn = lastTurn(s.session)
+		s.render(w, "score", data)
+	default:
+		s.render(w, "setup", data)
+	}
 }
 
 func (s *Server) view(message string) ViewData {

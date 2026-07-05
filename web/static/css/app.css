@@ -330,6 +330,11 @@ label span {
   gap: 20px;
 }
 
+.play-shell > .notice {
+  grid-column: 1 / -1;
+  margin-block-end: 0;
+}
+
 .turn-stage {
   min-block-size: calc(100vh - 64px);
   border: 1px solid var(--color-border);

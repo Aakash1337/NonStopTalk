@@ -125,14 +125,24 @@ func (s *Session) AddPlayer(name string) Player {
 }
 
 func (s *Session) RemovePlayer(id string) {
-	filtered := s.Players[:0]
-	for _, player := range s.Players {
-		if player.ID != id {
-			filtered = append(filtered, player)
+	index := -1
+	for i, player := range s.Players {
+		if player.ID == id {
+			index = i
+			break
 		}
 	}
-	s.Players = filtered
-	if s.CurrentPlayer >= len(s.Players) {
+	if index == -1 {
+		return
+	}
+	s.Players = append(s.Players[:index], s.Players[index+1:]...)
+	if s.ActiveTurn != nil && s.ActiveTurn.PlayerID == id {
+		s.ActiveTurn = nil
+	}
+	if index < s.CurrentPlayer {
+		s.CurrentPlayer--
+	}
+	if len(s.Players) == 0 || s.CurrentPlayer >= len(s.Players) {
 		s.CurrentPlayer = 0
 	}
 }
@@ -246,6 +256,9 @@ func (s *Session) StartTurn() (*Turn, error) {
 	}
 	if s.Finished {
 		return nil, errors.New("game is finished")
+	}
+	if s.ActiveTurn != nil {
+		return s.ActiveTurn, nil
 	}
 	if len(s.Players) == 0 || len(s.Topics) == 0 {
 		return nil, errors.New("game is not ready")

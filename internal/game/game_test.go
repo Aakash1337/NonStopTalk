@@ -92,6 +92,85 @@ func TestRenameAndMovePlayer(t *testing.T) {
 	}
 }
 
+func TestRemovePlayerKeepsTurnOrder(t *testing.T) {
+	session := NewSession("test")
+	avery := session.AddPlayer("Avery")
+	blair := session.AddPlayer("Blair")
+	casey := session.AddPlayer("Casey")
+	session.SetTopics([]string{"Topic one"})
+
+	if _, err := session.StartTurn(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.SubmitTurn(5, false, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Blair is up next. Removing Avery (earlier in the list) must not skip Blair.
+	session.RemovePlayer(avery.ID)
+	turn, err := session.StartTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if turn.PlayerID != blair.ID {
+		t.Fatalf("expected %s to keep the next turn, got %s", blair.ID, turn.PlayerID)
+	}
+	if _, err := session.SubmitTurn(5, false, true); err != nil {
+		t.Fatal(err)
+	}
+	turn, err = session.StartTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if turn.PlayerID != casey.ID {
+		t.Fatalf("expected %s after Blair, got %s", casey.ID, turn.PlayerID)
+	}
+}
+
+func TestRemoveActivePlayerClearsTurn(t *testing.T) {
+	session := NewSession("test")
+	avery := session.AddPlayer("Avery")
+	blair := session.AddPlayer("Blair")
+	session.SetTopics([]string{"Topic one"})
+
+	if _, err := session.StartTurn(); err != nil {
+		t.Fatal(err)
+	}
+	session.RemovePlayer(avery.ID)
+	if session.ActiveTurn != nil {
+		t.Fatal("expected active turn to be cleared when its player is removed")
+	}
+	turn, err := session.StartTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if turn.PlayerID != blair.ID {
+		t.Fatalf("expected %s to take over, got %s", blair.ID, turn.PlayerID)
+	}
+}
+
+func TestStartTurnReturnsExistingActiveTurn(t *testing.T) {
+	session := NewSession("test")
+	session.AddPlayer("Avery")
+	session.AddPlayer("Blair")
+	session.SetTopics([]string{"Topic one", "Topic two"})
+
+	first, err := session.StartTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := session.StartTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Fatal("expected duplicate start to return the existing turn")
+	}
+	if session.TopicCursor != 1 {
+		t.Fatalf("expected topic cursor to advance once, got %d", session.TopicCursor)
+	}
+}
+
 func TestRedrawActiveTurnAdvancesTopic(t *testing.T) {
 	session := NewSession("test")
 	session.AddPlayer("Avery")
