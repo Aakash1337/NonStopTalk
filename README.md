@@ -97,3 +97,9 @@ npm.cmd run smoke
 ```
 
 The smoke test starts its own Go server on a temporary port, drives a full local game in a browser, verifies the mic-denied manual timer fallback, and checks the winner screen.
+
+If the Playwright-managed browser is not installed, point the smoke test at an existing Chromium binary:
+
+```text
+SMOKE_CHROMIUM=/path/to/chromium npm run smoke
+```
