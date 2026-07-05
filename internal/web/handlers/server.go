@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"html/template"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -39,6 +40,23 @@ type Server struct {
 	limiter   *rateLimiter
 	judge     judge.Provider
 	generator judge.TopicGenerator
+	// hostClaimGrace is how long the host must be gone before another member
+	// can claim the room.
+	hostClaimGrace time.Duration
+}
+
+// SetHostClaimGrace overrides the claim grace period (used by tests).
+func (s *Server) SetHostClaimGrace(grace time.Duration) {
+	s.hostClaimGrace = grace
+}
+
+// EnablePersistence loads previously saved rooms and starts autosaving them,
+// so games survive server restarts. Failures are logged and non-fatal.
+func (s *Server) EnablePersistence(path string) {
+	if err := s.rooms.LoadFrom(path); err != nil {
+		log.Printf("could not restore rooms from %s: %v", path, err)
+	}
+	s.rooms.StartAutosave(path, 10*time.Second)
 }
 
 // SetJudge swaps the relevance judge (used by tests).
@@ -62,9 +80,17 @@ type ViewData struct {
 	// from another browser, so the host spectates instead of running the mic.
 	ActorIsRemote bool
 	IsNextUp      bool
-	TurnRunning bool
-	Remaining   int
-	Online      map[string]bool
+	TurnRunning   bool
+	Remaining     int
+	Online        map[string]bool
+	// Bound marks players driven from their own browser (eligible to host).
+	Bound map[string]bool
+	// HostPlayerID is the seat bound to the host, "" if the host only runs
+	// the screen.
+	HostPlayerID string
+	// CanClaimHost is true for seated members when the host has been gone
+	// past the grace period.
+	CanClaimHost bool
 
 	// Game state
 	Session     *game.Session
@@ -94,12 +120,13 @@ func NewServer(templatePattern string) (*Server, error) {
 		generator = claude
 	}
 	return &Server{
-		rooms:     room.NewManager(),
-		packs:     topics.PresetPacks(),
-		template:  tmpl,
-		limiter:   newRateLimiter(),
-		judge:     relevanceJudge,
-		generator: generator,
+		rooms:          room.NewManager(),
+		packs:          topics.PresetPacks(),
+		template:       tmpl,
+		limiter:        newRateLimiter(),
+		judge:          relevanceJudge,
+		generator:      generator,
+		hostClaimGrace: 30 * time.Second,
 	}, nil
 }
 
@@ -127,6 +154,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /room/{code}/turn/redraw", s.roomHandler(s.handleRedrawTurn))
 	mux.HandleFunc("POST /room/{code}/turn/submit", s.roomHandler(s.handleSubmitTurn))
 	mux.HandleFunc("POST /room/{code}/score/override", s.roomHandler(s.handleScoreOverride))
+	mux.HandleFunc("POST /room/{code}/host/transfer", s.roomHandler(s.handleTransferHost))
+	mux.HandleFunc("POST /room/{code}/host/claim", s.roomHandler(s.handleClaimHost))
 
 	fileServer := http.FileServer(http.Dir("web/static"))
 	mux.Handle("/static/", http.StripPrefix("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -192,7 +221,7 @@ type roomRequest struct {
 }
 
 func (rr roomRequest) isHost() bool {
-	return rr.token != "" && rr.token == rr.room.HostToken
+	return rr.room.IsHost(rr.token)
 }
 
 func (rr roomRequest) playerID() string {
@@ -209,6 +238,9 @@ func (s *Server) roomHandler(fn func(http.ResponseWriter, *http.Request, roomReq
 			return
 		}
 		token := s.ensureToken(w, r)
+		// Any authenticated host request counts as presence for the
+		// claim-host grace period.
+		rm.HostSeen(token)
 		fn(w, r, roomRequest{room: rm, token: token})
 	}
 }
@@ -288,7 +320,7 @@ func (s *Server) handleJoinRoom(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Reconnect: already seated in this room.
-	if _, ok := rm.MemberPlayerID(token); ok || token == rm.HostToken {
+	if _, ok := rm.MemberPlayerID(token); ok || rm.IsHost(token) {
 		http.Redirect(w, r, "/room/"+rm.Code, http.StatusSeeOther)
 		return
 	}
@@ -429,6 +461,43 @@ func (s *Server) handleLeave(w http.ResponseWriter, r *http.Request, rr roomRequ
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+// --- Host migration ---
+
+// handleTransferHost lets the current host hand control to a remote player.
+func (s *Server) handleTransferHost(w http.ResponseWriter, r *http.Request, rr roomRequest) {
+	if !rr.isHost() {
+		s.renderRoomState(w, rr, "Only the host can transfer hosting.", false)
+		return
+	}
+	playerID := r.FormValue("playerID")
+	token, ok := rr.room.TokenForPlayer(playerID)
+	if !ok {
+		s.renderRoomState(w, rr, "That player is not connected from their own device.", false)
+		return
+	}
+	rr.room.TransferHostTo(token)
+	s.renderRoomState(w, rr, "", false)
+}
+
+// handleClaimHost lets any seated member take over a room whose host has
+// been gone past the grace period.
+func (s *Server) handleClaimHost(w http.ResponseWriter, r *http.Request, rr roomRequest) {
+	if rr.isHost() {
+		s.renderRoomState(w, rr, "", false)
+		return
+	}
+	if rr.playerID() == "" {
+		s.renderRoomState(w, rr, "Join the room before claiming host.", false)
+		return
+	}
+	if rr.room.HostOfflineFor() < s.hostClaimGrace {
+		s.renderRoomState(w, rr, "The host is still here — ask them to hand over hosting instead.", false)
+		return
+	}
+	rr.room.TransferHostTo(rr.token)
+	s.renderRoomState(w, rr, "", false)
+}
+
 // --- Setup ---
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, rr roomRequest) {
@@ -543,11 +612,12 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request, rr roomRequ
 
 func (s *Server) handleStartTurn(w http.ResponseWriter, r *http.Request, rr roomRequest) {
 	playerID := rr.playerID()
+	isHost := rr.isHost()
 	var turnErr error
 	allowed := true
 	rr.room.Do(func() {
 		session := rr.room.Session
-		if !rr.isHost() {
+		if !isHost {
 			next := ""
 			if session.CurrentPlayer >= 0 && session.CurrentPlayer < len(session.Players) {
 				next = session.Players[session.CurrentPlayer].ID
@@ -623,11 +693,12 @@ func (s *Server) handleSubmitTurn(w http.ResponseWriter, r *http.Request, rr roo
 	var submitErr error
 	gradeIndex := -1
 	var gradedTurn game.Turn
+	isHost := rr.isHost()
 	rr.room.Do(func() {
 		session := rr.room.Session
 		spoken := claimedSpoken
 		completed := claimedCompleted
-		if !rr.isHost() {
+		if !isHost {
 			// Server-authoritative: remote speakers cannot claim more time
 			// than the server clock observed.
 			observed := 0
@@ -726,23 +797,30 @@ func (s *Server) renderRoomState(w http.ResponseWriter, rr roomRequest, message 
 	turnRunning := rr.room.TurnRunning()
 	elapsed := rr.room.TurnElapsedSeconds()
 	playerID := rr.playerID()
+	hostPlayerID := rr.room.HostPlayerID()
+	isHost := rr.isHost()
+	canClaimHost := !isHost && playerID != "" &&
+		rr.room.HostOfflineFor() >= s.hostClaimGrace
 
 	var buf bytes.Buffer
 	var renderErr error
 	rr.room.View(func() {
 		session := rr.room.Session
 		data := ViewData{
-			Code:        rr.room.Code,
-			Base:        "/room/" + rr.room.Code,
-			IsHost:      rr.isHost(),
-			YouID:       playerID,
-			TurnRunning: turnRunning,
-			Online:      online,
-			Session:     session,
-			Packs:       s.packs,
-			Selected:    selectedPack(session),
-			Error:       message,
-			Standings:   session.Standings(),
+			Code:         rr.room.Code,
+			Base:         "/room/" + rr.room.Code,
+			IsHost:       isHost,
+			YouID:        playerID,
+			TurnRunning:  turnRunning,
+			Online:       online,
+			Bound:        bound,
+			HostPlayerID: hostPlayerID,
+			CanClaimHost: canClaimHost,
+			Session:      session,
+			Packs:        s.packs,
+			Selected:     selectedPack(session),
+			Error:        message,
+			Standings:    session.Standings(),
 		}
 
 		state := "setup"

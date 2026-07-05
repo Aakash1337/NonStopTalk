@@ -132,6 +132,119 @@ func TestTurnClock(t *testing.T) {
 	}
 }
 
+func TestPersistenceRoundTrip(t *testing.T) {
+	manager := NewManager()
+	created, err := manager.Create("host-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created.Do(func() {
+		created.Session.AddPlayer("Avery")
+		created.Session.AddPlayer("Blair")
+		created.Session.SetTopics([]string{"Topic one"})
+		created.BindMemberLocked("guest-token", "p2")
+	})
+	if _, err := created.Session.StartTurn(); err != nil {
+		t.Fatal(err)
+	}
+
+	path := t.TempDir() + "/rooms.json"
+	if err := manager.SaveTo(path); err != nil {
+		t.Fatal(err)
+	}
+
+	restored := NewManager()
+	if err := restored.LoadFrom(path); err != nil {
+		t.Fatal(err)
+	}
+	r, err := restored.Get(created.Code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.IsHost("host-token") {
+		t.Fatal("expected host token restored")
+	}
+	if id, ok := r.MemberPlayerID("guest-token"); !ok || id != "p2" {
+		t.Fatalf("expected member binding restored, got %q %v", id, ok)
+	}
+	if len(r.Session.Players) != 2 || r.Session.ActiveTurn == nil {
+		t.Fatalf("expected session state restored, got %+v", r.Session)
+	}
+	// New players after a restore must not reuse old IDs.
+	player := r.Session.AddPlayer("Casey")
+	if player.ID == "p1" || player.ID == "p2" {
+		t.Fatalf("expected fresh player ID, got %s", player.ID)
+	}
+
+	// Loading a missing file is not an error.
+	if err := NewManager().LoadFrom(path + ".missing"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadSkipsExpiredRooms(t *testing.T) {
+	manager := NewManager()
+	stale, err := manager.Create("host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.mu.Lock()
+	stale.lastActive = time.Now().Add(-idleTTL - time.Hour)
+	stale.mu.Unlock()
+
+	path := t.TempDir() + "/rooms.json"
+	if err := manager.SaveTo(path); err != nil {
+		t.Fatal(err)
+	}
+	restored := NewManager()
+	if err := restored.LoadFrom(path); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Count() != 0 {
+		t.Fatalf("expected expired room skipped, got %d rooms", restored.Count())
+	}
+}
+
+func TestHostTransferAndPresence(t *testing.T) {
+	manager := NewManager()
+	r, err := manager.Create("host-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.HostOfflineFor() != 0 && r.HostOfflineFor() > time.Second {
+		t.Fatalf("expected freshly created host to look present, offline for %v", r.HostOfflineFor())
+	}
+
+	r.BindMember("guest-token", "p2")
+	if token, ok := r.TokenForPlayer("p2"); !ok || token != "guest-token" {
+		t.Fatalf("expected token lookup, got %q %v", token, ok)
+	}
+
+	r.TransferHostTo("guest-token")
+	if !r.IsHost("guest-token") || r.IsHost("host-token") {
+		t.Fatal("expected host transfer")
+	}
+	if r.HostPlayerID() != "p2" {
+		t.Fatalf("expected host seat p2, got %q", r.HostPlayerID())
+	}
+
+	// A live connection keeps the host "present" regardless of timestamps.
+	_, unsubscribe := r.Subscribe("guest-token")
+	r.mu.Lock()
+	r.hostLastSeen = time.Now().Add(-time.Hour)
+	r.mu.Unlock()
+	if r.HostOfflineFor() != 0 {
+		t.Fatalf("expected connected host to be present, offline for %v", r.HostOfflineFor())
+	}
+	unsubscribe()
+	r.mu.Lock()
+	r.hostLastSeen = time.Now().Add(-time.Hour)
+	r.mu.Unlock()
+	if r.HostOfflineFor() < time.Hour {
+		t.Fatalf("expected host offline for an hour, got %v", r.HostOfflineFor())
+	}
+}
+
 func TestNewTokenAndCodeAreRandom(t *testing.T) {
 	tokenA, err := NewToken()
 	if err != nil {

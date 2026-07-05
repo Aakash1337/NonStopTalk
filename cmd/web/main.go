@@ -15,6 +15,17 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Rooms survive restarts via periodic JSON snapshots. Set DST_DATA_FILE
+	// to change the location, or to "off" to keep everything in memory.
+	dataFile := os.Getenv("DST_DATA_FILE")
+	if dataFile == "" {
+		dataFile = "data/rooms.json"
+	}
+	if dataFile != "off" {
+		server.EnablePersistence(dataFile)
+		log.Printf("room persistence enabled at %s", dataFile)
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"

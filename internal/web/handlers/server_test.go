@@ -512,6 +512,111 @@ func TestGenerateTopicsIsHostOnly(t *testing.T) {
 	}
 }
 
+func TestHostTransferHandsOverControls(t *testing.T) {
+	router := newTestRouter(t)
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+
+	guest := newClient(t, router)
+	guest.join(code, "Blair")
+
+	// A guest cannot transfer hosting.
+	res := guest.do(http.MethodPost, base+"/host/transfer", url.Values{"playerID": {"p2"}})
+	if !strings.Contains(res.Body.String(), "Only the host can transfer hosting.") {
+		t.Fatalf("expected host-only message, got %s", res.Body.String())
+	}
+
+	// The host hands over to the remote player.
+	res = host.do(http.MethodPost, base+"/host/transfer", url.Values{"playerID": {"p2"}})
+	if strings.Contains(res.Body.String(), "Start Game") {
+		t.Fatal("expected old host to lose host controls")
+	}
+	guestPage := guest.do(http.MethodGet, base, nil).Body.String()
+	for _, expected := range []string{"Start Game", "Add local player"} {
+		if !strings.Contains(guestPage, expected) {
+			t.Fatalf("expected new host to gain %q, got %s", expected, guestPage)
+		}
+	}
+
+	// Transferring to a pass-and-play seat (no browser) is rejected.
+	host2 := guest
+	host2.do(http.MethodPost, base+"/players", url.Values{"name": {"Local"}})
+	res = host2.do(http.MethodPost, base+"/host/transfer", url.Values{"playerID": {"p3"}})
+	if !strings.Contains(res.Body.String(), "not connected from their own device") {
+		t.Fatalf("expected unbound-seat rejection, got %s", res.Body.String())
+	}
+}
+
+func TestClaimHostRequiresAbsentHost(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := server.Routes()
+
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	guest := newClient(t, router)
+	guest.join(code, "Blair")
+
+	// Host was just active: claim refused under the default grace.
+	res := guest.do(http.MethodPost, base+"/host/claim", nil)
+	if !strings.Contains(res.Body.String(), "The host is still here") {
+		t.Fatalf("expected claim refusal, got %s", res.Body.String())
+	}
+
+	// With no grace, an offline host can be replaced.
+	server.SetHostClaimGrace(0)
+	res = guest.do(http.MethodPost, base+"/host/claim", nil)
+	if !strings.Contains(res.Body.String(), "Start Game") {
+		t.Fatalf("expected claimer to become host, got %s", res.Body.String())
+	}
+	hostPage := host.do(http.MethodGet, base, nil).Body.String()
+	if strings.Contains(hostPage, "Add local player") {
+		t.Fatal("expected old host to lose controls after claim")
+	}
+}
+
+func TestRoomsSurviveRestartViaPersistence(t *testing.T) {
+	path := t.TempDir() + "/rooms.json"
+
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.EnablePersistence(path)
+	router := server.Routes()
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	host.do(http.MethodPost, "/room/"+code+"/players", url.Values{"name": {"Blair"}})
+	if err := server.rooms.SaveTo(path); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh server (simulated restart) restores the room; the same browser
+	// cookie is still the host.
+	restarted, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.EnablePersistence(path)
+	router2 := restarted.Routes()
+	host.router = router2
+
+	page := host.do(http.MethodGet, "/room/"+code, nil)
+	if page.Code != http.StatusOK {
+		t.Fatalf("expected restored room, got %d", page.Code)
+	}
+	body := page.Body.String()
+	for _, expected := range []string{"Avery", "Blair", "Start Game"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q after restart, got %s", expected, body)
+		}
+	}
+}
+
 func TestMissingRoomRedirects(t *testing.T) {
 	router := newTestRouter(t)
 	c := newClient(t, router)

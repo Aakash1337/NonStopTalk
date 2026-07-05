@@ -36,17 +36,19 @@ var (
 // so concurrent clients stay consistent; the other exported methods take the
 // lock themselves and must not be called from inside a Do/View callback.
 type Room struct {
-	Code      string
-	HostToken string
-	Session   *game.Session
+	Code    string
+	Session *game.Session
 
-	mu          sync.Mutex
-	members     map[string]string // browser token -> player ID
-	subscribers map[chan struct{}]string
-	online      map[string]int // player ID -> live connection count
-	version     int64
-	lastActive  time.Time
-	turnStarted time.Time
+	mu           sync.Mutex
+	hostToken    string
+	hostLastSeen time.Time
+	members      map[string]string // browser token -> player ID
+	subscribers  map[chan struct{}]string
+	online       map[string]int // player ID -> live connection count
+	tokenConns   map[string]int // browser token -> live connection count
+	version      int64
+	lastActive   time.Time
+	turnStarted  time.Time
 }
 
 func (r *Room) touch() {
@@ -85,6 +87,63 @@ func (r *Room) Version() int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.version
+}
+
+// --- Host identity ---
+
+// IsHost reports whether the token currently controls the room.
+func (r *Room) IsHost(token string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return token != "" && token == r.hostToken
+}
+
+// HostSeen records host activity: any HTTP request or live connection from
+// the host token counts as presence for the claim grace period.
+func (r *Room) HostSeen(token string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if token != "" && token == r.hostToken {
+		r.hostLastSeen = time.Now()
+	}
+}
+
+// HostOfflineFor returns how long the host has been away: zero while any of
+// the host's connections is live.
+func (r *Room) HostOfflineFor() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.tokenConns[r.hostToken] > 0 {
+		return 0
+	}
+	return time.Since(r.hostLastSeen)
+}
+
+// TransferHostTo hands room control to another token and notifies everyone.
+func (r *Room) TransferHostTo(token string) {
+	r.Do(func() {
+		r.hostToken = token
+		r.hostLastSeen = time.Now()
+	})
+}
+
+// HostPlayerID returns the player seat bound to the host token, if any.
+func (r *Room) HostPlayerID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.members[r.hostToken]
+}
+
+// TokenForPlayer returns the browser token bound to a player ID.
+func (r *Room) TokenForPlayer(playerID string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for token, id := range r.members {
+		if id == playerID {
+			return token, true
+		}
+	}
+	return "", false
 }
 
 // BindMember associates a browser token with a player ID.
@@ -145,6 +204,10 @@ func (r *Room) Subscribe(token string) (<-chan struct{}, func()) {
 	ch := make(chan struct{}, 1)
 	r.mu.Lock()
 	r.subscribers[ch] = token
+	r.tokenConns[token]++
+	if token == r.hostToken {
+		r.hostLastSeen = time.Now()
+	}
 	if playerID, ok := r.members[token]; ok {
 		r.online[playerID]++
 	}
@@ -155,6 +218,14 @@ func (r *Room) Subscribe(token string) (<-chan struct{}, func()) {
 	return ch, func() {
 		r.mu.Lock()
 		delete(r.subscribers, ch)
+		if r.tokenConns[token] > 1 {
+			r.tokenConns[token]--
+		} else {
+			delete(r.tokenConns, token)
+		}
+		if token == r.hostToken {
+			r.hostLastSeen = time.Now()
+		}
 		if playerID, ok := r.members[token]; ok {
 			if r.online[playerID] > 1 {
 				r.online[playerID]--
@@ -266,13 +337,15 @@ func (m *Manager) Create(hostToken string) (*Room, error) {
 		return nil, err
 	}
 	room := &Room{
-		Code:        code,
-		HostToken:   hostToken,
-		Session:     game.NewSession(code),
-		members:     map[string]string{},
-		subscribers: map[chan struct{}]string{},
-		online:      map[string]int{},
-		lastActive:  time.Now(),
+		Code:         code,
+		Session:      game.NewSession(code),
+		hostToken:    hostToken,
+		hostLastSeen: time.Now(),
+		members:      map[string]string{},
+		subscribers:  map[chan struct{}]string{},
+		online:       map[string]int{},
+		tokenConns:   map[string]int{},
+		lastActive:   time.Now(),
 	}
 	m.rooms[code] = room
 	return room, nil

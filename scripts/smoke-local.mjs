@@ -465,8 +465,9 @@ async function runRemoteRoomScenario(browser, baseURL) {
 async function main() {
   const port = process.env.SMOKE_PORT || String(await getFreePort());
   const baseURL = `http://127.0.0.1:${port}`;
-  // Force the offline judge so the AI scenario is deterministic and free.
-  const env = { ...process.env, PORT: port };
+  // Force the offline judge so the AI scenario is deterministic and free,
+  // and keep rooms in memory so runs stay hermetic.
+  const env = { ...process.env, PORT: port, DST_DATA_FILE: "off" };
   delete env.ANTHROPIC_API_KEY;
   const server = spawn("go", ["run", "./cmd/web"], {
     cwd: root,
