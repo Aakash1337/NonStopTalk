@@ -33,16 +33,22 @@ const (
 )
 
 type Server struct {
-	rooms    *room.Manager
-	packs    []topics.Pack
-	template *template.Template
-	limiter  *rateLimiter
-	judge    judge.Provider
+	rooms     *room.Manager
+	packs     []topics.Pack
+	template  *template.Template
+	limiter   *rateLimiter
+	judge     judge.Provider
+	generator judge.TopicGenerator
 }
 
 // SetJudge swaps the relevance judge (used by tests).
 func (s *Server) SetJudge(provider judge.Provider) {
 	s.judge = provider
+}
+
+// SetTopicGenerator swaps the topic generator (used by tests).
+func (s *Server) SetTopicGenerator(generator judge.TopicGenerator) {
+	s.generator = generator
 }
 
 type ViewData struct {
@@ -71,22 +77,29 @@ type ViewData struct {
 }
 
 func NewServer(templatePattern string) (*Server, error) {
-	tmpl, err := template.ParseGlob(templatePattern)
+	tmpl, err := template.New("app").Funcs(template.FuncMap{
+		"joinLines": func(lines []string) string { return strings.Join(lines, "\n") },
+	}).ParseGlob(templatePattern)
 	if err != nil {
 		return nil, err
 	}
-	// The Claude judge is used when credentials are configured; otherwise a
-	// transparent offline heuristic keeps AI mode playable and testable.
+	// The Claude judge and topic generator are used when credentials are
+	// configured; otherwise transparent offline fallbacks keep both features
+	// playable and testable.
 	var relevanceJudge judge.Provider = judge.Heuristic{}
+	var generator judge.TopicGenerator = judge.Heuristic{}
 	if os.Getenv("ANTHROPIC_API_KEY") != "" {
-		relevanceJudge = judge.NewAnthropic()
+		claude := judge.NewAnthropic()
+		relevanceJudge = claude
+		generator = claude
 	}
 	return &Server{
-		rooms:    room.NewManager(),
-		packs:    topics.PresetPacks(),
-		template: tmpl,
-		limiter:  newRateLimiter(),
-		judge:    relevanceJudge,
+		rooms:     room.NewManager(),
+		packs:     topics.PresetPacks(),
+		template:  tmpl,
+		limiter:   newRateLimiter(),
+		judge:     relevanceJudge,
+		generator: generator,
 	}, nil
 }
 
@@ -106,6 +119,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /room/{code}/leave", s.roomHandler(s.handleLeave))
 	mux.HandleFunc("POST /room/{code}/settings", s.roomHandler(s.handleSettings))
 	mux.HandleFunc("POST /room/{code}/topics/custom", s.roomHandler(s.handleCustomTopics))
+	mux.HandleFunc("POST /room/{code}/topics/generate", s.roomHandler(s.handleGenerateTopics))
 	mux.HandleFunc("POST /room/{code}/game/start", s.roomHandler(s.handleStartGame))
 	mux.HandleFunc("POST /room/{code}/game/reset", s.roomHandler(s.handleReset))
 	mux.HandleFunc("POST /room/{code}/turn/start", s.roomHandler(s.handleStartTurn))
@@ -449,6 +463,43 @@ func (s *Server) handleCustomTopics(w http.ResponseWriter, r *http.Request, rr r
 	rr.room.Do(func() {
 		session := rr.room.Session
 		session.SetTopics(lines)
+		settings := session.Settings
+		settings.TopicPackID = "custom"
+		session.UpdateSettings(settings)
+	})
+	s.renderRoomState(w, rr, "", false)
+}
+
+// handleGenerateTopics builds a topic list from a host-supplied theme. Only
+// the theme text reaches the AI provider.
+func (s *Server) handleGenerateTopics(w http.ResponseWriter, r *http.Request, rr roomRequest) {
+	if !rr.isHost() {
+		s.renderRoomState(w, rr, "Only the host can generate topics.", false)
+		return
+	}
+	if !s.limiter.allow("topics:"+clientKey(r), 6, time.Minute) {
+		s.renderRoomState(w, rr, "Slow down a little before generating more topics.", false)
+		return
+	}
+	theme := strings.TrimSpace(r.FormValue("theme"))
+	if runes := []rune(theme); len(runes) > 100 {
+		theme = string(runes[:100])
+	}
+	if theme == "" {
+		s.renderRoomState(w, rr, "Describe a theme to generate topics.", false)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), judgeTimeout)
+	defer cancel()
+	generated, err := s.generator.GenerateTopics(ctx, theme)
+	if err != nil {
+		s.renderRoomState(w, rr, "Could not generate topics right now — try again or write your own.", false)
+		return
+	}
+	rr.room.Do(func() {
+		session := rr.room.Session
+		session.SetTopics(generated)
 		settings := session.Settings
 		settings.TopicPackID = "custom"
 		session.UpdateSettings(settings)

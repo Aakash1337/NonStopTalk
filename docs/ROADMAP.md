@@ -75,7 +75,7 @@ Exit criteria:
 
 Goal: Add optional relevance grading without making AI mandatory.
 
-Status: core delivered — host-toggled AI judge with explicit consent copy, browser-side transcription (Web Speech API, no audio upload), Claude-backed relevance grading applied asynchronously as a capped bonus with plain-language feedback, an offline heuristic fallback when no API key is configured, and host score override. Remaining: repetition detection, confidence display, and AI topic-pack generation.
+Status: core delivered — host-toggled AI judge with explicit consent copy, browser-side transcription (Web Speech API, no audio upload), Claude-backed relevance grading applied asynchronously as a capped bonus with plain-language feedback, an offline heuristic fallback when no API key is configured, host score override, and AI topic-pack generation from a host-supplied theme (offline template fallback included). Remaining: repetition detection and confidence display.
 
 Deliverables:
 

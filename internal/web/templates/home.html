@@ -2,10 +2,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Don't Stop Talking</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=8">
+  <link rel="stylesheet" href="/static/css/app.css?v=9">
   <script src="/static/js/htmx.min.js?v=3" defer></script>
   <script src="/static/js/setup.js?v=2" defer></script>
-  <script src="/static/js/room.js?v=1" defer></script>
+  <script src="/static/js/room.js?v=2" defer></script>
 {{end}}
 
 {{define "landingPage"}}
@@ -135,8 +135,13 @@
           <h2>Custom Topics</h2>
           <span id="topic-summary">{{len .Session.Topics}} topics loaded</span>
         </div>
+        <form class="inline-form generate-form" hx-post="{{.Base}}/topics/generate" hx-target="#app" hx-swap="outerHTML">
+          <input name="theme" type="text" maxlength="100" placeholder="Theme, e.g. road trips with dragons" aria-label="Topic theme">
+          <button class="button secondary" type="submit">Generate Topics</button>
+        </form>
+        <p class="hint">Generates a themed topic list. Only the theme text is sent to the AI provider; without one, simple offline templates are used. Edit the result below.</p>
         <form hx-post="{{.Base}}/topics/custom" hx-target="#app" hx-swap="outerHTML">
-          <textarea name="topics" rows="5" maxlength="20000" placeholder="One topic per line"></textarea>
+          <textarea name="topics" rows="5" maxlength="20000" placeholder="One topic per line">{{if eq .Session.Settings.TopicPackID "custom"}}{{joinLines .Session.Topics}}{{end}}</textarea>
           <button class="button secondary" type="submit">Use Custom List</button>
           <p class="hint">Your custom list is saved on this device.</p>
         </form>

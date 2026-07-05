@@ -8,8 +8,10 @@
   let lastVersion = null;
 
   const refresh = () => {
-    if (window.__dstTurnRunning) {
-      // Never re-render under an in-progress local turn; catch up after.
+    const dialogOpen = document.querySelector("[data-mic-dialog]:not([hidden])");
+    if (window.__dstTurnRunning || dialogOpen) {
+      // Never re-render under an in-progress local turn or an open dialog;
+      // catch up as soon as it is safe.
       refreshQueued = true;
       return;
     }

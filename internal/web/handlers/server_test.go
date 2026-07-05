@@ -450,6 +450,68 @@ func TestNoAIVerdictWhenDisabled(t *testing.T) {
 	}
 }
 
+type stubGenerator struct{}
+
+func (stubGenerator) GenerateTopics(_ context.Context, theme string) ([]string, error) {
+	return []string{"Stub topic one about " + theme, "Stub topic two about " + theme}, nil
+}
+
+func TestGenerateTopicsFillsCustomList(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.SetTopicGenerator(stubGenerator{})
+	router := server.Routes()
+
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+
+	res := host.do(http.MethodPost, base+"/topics/generate", url.Values{"theme": {"pirates"}})
+	body := res.Body.String()
+	for _, expected := range []string{"2 topics loaded", "Stub topic one about pirates", "Stub topic two about pirates"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q after generation, got %s", expected, body)
+		}
+	}
+
+	// The generated list is editable custom topics: it should be in the
+	// textarea and selected as the Custom pack.
+	if !strings.Contains(body, "Custom") {
+		t.Fatal("expected custom pack selected after generation")
+	}
+
+	// Empty theme is rejected with a message.
+	res = host.do(http.MethodPost, base+"/topics/generate", url.Values{"theme": {"  "}})
+	if !strings.Contains(res.Body.String(), "Describe a theme") {
+		t.Fatalf("expected theme-required message, got %s", res.Body.String())
+	}
+}
+
+func TestGenerateTopicsIsHostOnly(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.SetTopicGenerator(stubGenerator{})
+	router := server.Routes()
+
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	guest := newClient(t, router)
+	guest.join(code, "Blair")
+
+	res := guest.do(http.MethodPost, "/room/"+code+"/topics/generate", url.Values{"theme": {"pirates"}})
+	if !strings.Contains(res.Body.String(), "Only the host can generate topics.") {
+		t.Fatalf("expected host-only message, got %s", res.Body.String())
+	}
+	page := host.do(http.MethodGet, "/room/"+code, nil).Body.String()
+	if strings.Contains(page, "Stub topic") {
+		t.Fatal("expected guest generation attempt to change nothing")
+	}
+}
+
 func TestMissingRoomRedirects(t *testing.T) {
 	router := newTestRouter(t)
 	c := newClient(t, router)

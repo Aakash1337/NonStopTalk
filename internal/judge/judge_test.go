@@ -2,6 +2,7 @@ package judge
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -40,6 +41,46 @@ func TestHeuristicHandlesEmptyTranscript(t *testing.T) {
 	}
 	if verdict.Relevance != 0 {
 		t.Fatalf("expected zero relevance for empty transcript, got %v", verdict.Relevance)
+	}
+}
+
+func TestHeuristicGeneratesThemedTopics(t *testing.T) {
+	topics, err := Heuristic{}.GenerateTopics(context.Background(), "space travel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(topics) != GeneratedTopicCount {
+		t.Fatalf("expected %d topics, got %d", GeneratedTopicCount, len(topics))
+	}
+	seen := map[string]bool{}
+	for _, topic := range topics {
+		if !strings.Contains(topic, "space travel") {
+			t.Fatalf("expected theme in topic %q", topic)
+		}
+		if seen[topic] {
+			t.Fatalf("duplicate topic %q", topic)
+		}
+		seen[topic] = true
+	}
+
+	if _, err := (Heuristic{}).GenerateTopics(context.Background(), "   "); err == nil {
+		t.Fatal("expected error for empty theme")
+	}
+}
+
+func TestParseTopicList(t *testing.T) {
+	topics, err := parseTopicList(`Here you go: ["One", " Two ", ""] done`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(topics) != 2 || topics[0] != "One" || topics[1] != "Two" {
+		t.Fatalf("unexpected topics: %#v", topics)
+	}
+	if _, err := parseTopicList("no list"); err == nil {
+		t.Fatal("expected error for missing list")
+	}
+	if _, err := parseTopicList("[]"); err == nil {
+		t.Fatal("expected error for empty list")
 	}
 }
 

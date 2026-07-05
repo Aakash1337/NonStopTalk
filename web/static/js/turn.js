@@ -562,6 +562,8 @@
     if (restoreFocus && openMicButton) {
       openMicButton.focus();
     }
+    // Let any live update deferred while the dialog was open land now.
+    document.dispatchEvent(new CustomEvent("dst:turn-idle"));
   };
 
   const setStatus = (label, level, warning = false) => {
