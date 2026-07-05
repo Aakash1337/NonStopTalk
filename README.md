@@ -25,6 +25,18 @@ The first playable version should be a web app focused on local multiplayer:
 - Score every turn
 - Show round standings and final winner
 
+## Online Rooms
+
+Every game runs in a room with a six-character join code:
+
+- The host creates a room, optionally taking a seat, and controls settings, topics, pacing, and score overrides.
+- Remote players join with the code, get their own seat bound to their browser, and see the game update live over Server-Sent Events.
+- Pass-and-play still works: local seats the host adds run from the host's screen.
+- The current speaker runs the mic on their own device; the server keeps its own turn clock, so remote players cannot claim more speaking time than the server observed.
+- Reconnecting is automatic: rejoin with the same browser and you keep your seat.
+
+Protections: same-origin checks on all state changes, per-IP rate limits on room create/join, capped request bodies, name/topic length limits, room and seat caps, and idle-room cleanup.
+
 ## Preferred Web Stack
 
 The preferred implementation path is a Go web application using HTMX for server-rendered interactions.
@@ -96,7 +108,7 @@ npm.cmd install
 npm.cmd run smoke
 ```
 
-The smoke test starts its own Go server on a temporary port, drives a full local game in a browser, verifies the mic-denied manual timer fallback, and checks the winner screen.
+The smoke test starts its own Go server on a temporary port and drives three full games in a browser: a pass-and-play game with the mic-denied manual timer fallback, an automatic-ending game with a mocked microphone, and a two-browser remote room game joined by code and synced over Server-Sent Events.
 
 If the Playwright-managed browser is not installed, point the smoke test at an existing Chromium binary:
 

@@ -1,6 +1,9 @@
 package game
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestClassicScoreAwardsCompletionBonus(t *testing.T) {
 	score := Score(ScoreInput{
@@ -168,6 +171,60 @@ func TestStartTurnReturnsExistingActiveTurn(t *testing.T) {
 	}
 	if session.TopicCursor != 1 {
 		t.Fatalf("expected topic cursor to advance once, got %d", session.TopicCursor)
+	}
+}
+
+func TestResetForNewGameKeepsRoster(t *testing.T) {
+	session := NewSession("test")
+	avery := session.AddPlayer("Avery")
+	session.AddPlayer("Blair")
+	session.SetTopics([]string{"Topic one"})
+
+	if _, err := session.StartTurn(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.SubmitTurn(5, false, true); err != nil {
+		t.Fatal(err)
+	}
+
+	session.ResetForNewGame()
+	if session.Started || session.Finished {
+		t.Fatal("expected fresh game state")
+	}
+	if len(session.Players) != 2 || session.Players[0].ID != avery.ID {
+		t.Fatalf("expected roster preserved, got %#v", session.Players)
+	}
+	if session.Players[0].Score != 0 {
+		t.Fatalf("expected scores cleared, got %d", session.Players[0].Score)
+	}
+	if len(session.CompletedTurns) != 0 || session.ActiveTurn != nil {
+		t.Fatal("expected turns cleared")
+	}
+	if len(session.Topics) != 1 {
+		t.Fatalf("expected topics preserved, got %d", len(session.Topics))
+	}
+}
+
+func TestInputLimits(t *testing.T) {
+	session := NewSession("test")
+	long := strings.Repeat("x", MaxPlayerNameLength+20)
+	player := session.AddPlayer(long)
+	if len([]rune(player.Name)) > MaxPlayerNameLength {
+		t.Fatalf("expected player name capped, got %d runes", len([]rune(player.Name)))
+	}
+
+	topics := make([]string, MaxTopics+50)
+	for i := range topics {
+		topics[i] = "Topic " + itoa(i) + " " + strings.Repeat("y", MaxTopicLength)
+	}
+	session.SetTopics(topics)
+	if len(session.Topics) != MaxTopics {
+		t.Fatalf("expected topic count capped at %d, got %d", MaxTopics, len(session.Topics))
+	}
+	for _, topic := range session.Topics {
+		if len([]rune(topic)) > MaxTopicLength {
+			t.Fatalf("expected topic capped at %d runes, got %d", MaxTopicLength, len([]rune(topic)))
+		}
 	}
 }
 

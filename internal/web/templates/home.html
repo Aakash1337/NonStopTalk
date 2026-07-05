@@ -1,13 +1,74 @@
-{{define "home"}}
-<!doctype html>
-<html lang="en">
-<head>
+{{define "head"}}
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Don't Stop Talking</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=6">
-  <script src="/static/js/htmx.min.js?v=2" defer></script>
-  <script src="/static/js/setup.js?v=1" defer></script>
+  <link rel="stylesheet" href="/static/css/app.css?v=7">
+  <script src="/static/js/htmx.min.js?v=3" defer></script>
+  <script src="/static/js/setup.js?v=2" defer></script>
+  <script src="/static/js/room.js?v=1" defer></script>
+{{end}}
+
+{{define "landingPage"}}
+<!doctype html>
+<html lang="en">
+<head>
+{{template "head" .}}
+</head>
+<body>
+  <main class="shell landing" id="app">
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">Party speaking game</p>
+        <h1>Don't Stop Talking</h1>
+      </div>
+    </header>
+
+    {{if .Error}}<div class="notice danger">{{.Error}}</div>{{end}}
+
+    <section class="setup-grid">
+      <div class="panel">
+        <div class="section-title">
+          <h2>Host a Game</h2>
+          <span>You control setup and pacing</span>
+        </div>
+        <form class="stack-form" method="post" action="/rooms">
+          <label>
+            <span>Your player name (optional, if you are playing too)</span>
+            <input name="name" type="text" maxlength="40" placeholder="Host name">
+          </label>
+          <button class="button primary large" type="submit">Create Room</button>
+        </form>
+        <p class="hint">You get a room code to share. Everyone in the same room can also play pass-and-play on one screen.</p>
+      </div>
+
+      <div class="panel">
+        <div class="section-title">
+          <h2>Join a Game</h2>
+          <span>Get the code from your host</span>
+        </div>
+        <form class="stack-form" method="post" action="/rooms/join">
+          <label>
+            <span>Room code</span>
+            <input name="code" type="text" maxlength="6" autocapitalize="characters" autocomplete="off" placeholder="ABC123" required>
+          </label>
+          <label>
+            <span>Your player name</span>
+            <input name="name" type="text" maxlength="40" placeholder="Player name">
+          </label>
+          <button class="button secondary large" type="submit">Join Room</button>
+        </form>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
+{{end}}
+
+{{define "setupPage"}}
+<!doctype html>
+<html lang="en">
+<head>
+{{template "head" .}}
 </head>
 <body>
   {{template "setup" .}}
@@ -16,16 +77,32 @@
 {{end}}
 
 {{define "setup"}}
-  <main class="shell" id="app">
+  <main class="shell" id="app" data-room-base="{{.Base}}">
     <header class="app-header">
       <div>
-        <p class="eyebrow">Local desktop game</p>
+        <p class="eyebrow">Room {{.Code}}</p>
         <h1>Don't Stop Talking</h1>
       </div>
-      <form hx-post="/game/reset" hx-target="#app" hx-swap="outerHTML">
-        <button class="button ghost" type="submit">Reset</button>
-      </form>
+      <div class="header-tools">
+        {{if .IsHost}}
+        <form hx-post="{{.Base}}/game/reset" hx-target="#app" hx-swap="outerHTML">
+          <button class="button ghost" type="submit">Reset</button>
+        </form>
+        {{else}}
+        <form method="post" action="{{.Base}}/leave">
+          <button class="button ghost" type="submit">Leave Room</button>
+        </form>
+        {{end}}
+      </div>
     </header>
+
+    <section class="share-band">
+      <div>
+        <p class="eyebrow">Invite players</p>
+        <h2>Room code: <strong class="room-code">{{.Code}}</strong></h2>
+      </div>
+      <p>Friends open this site, choose Join a Game, and enter the code. Their names appear in the player list live.</p>
+    </section>
 
     {{if .Error}}<div class="notice danger">{{.Error}}</div>{{end}}
 
@@ -36,10 +113,12 @@
           <span>{{len .Session.Players}} ready</span>
         </div>
         {{template "players" .}}
-        <form class="inline-form" hx-post="/players" hx-target="#players" hx-swap="outerHTML">
-          <input name="name" type="text" placeholder="Add player" aria-label="Player name">
+        {{if .IsHost}}
+        <form class="inline-form" hx-post="{{.Base}}/players" hx-target="#app" hx-swap="outerHTML">
+          <input name="name" type="text" maxlength="40" placeholder="Add local player" aria-label="Player name">
           <button class="button" type="submit">Add</button>
         </form>
+        {{end}}
       </div>
 
       <div class="panel">
@@ -50,17 +129,19 @@
         {{template "settings" .}}
       </div>
 
+      {{if .IsHost}}
       <div class="panel wide">
         <div class="section-title">
           <h2>Custom Topics</h2>
           <span id="topic-summary">{{len .Session.Topics}} topics loaded</span>
         </div>
-        <form hx-post="/topics/custom" hx-target="#app" hx-swap="outerHTML">
-          <textarea name="topics" rows="5" placeholder="One topic per line"></textarea>
+        <form hx-post="{{.Base}}/topics/custom" hx-target="#app" hx-swap="outerHTML">
+          <textarea name="topics" rows="5" maxlength="20000" placeholder="One topic per line"></textarea>
           <button class="button secondary" type="submit">Use Custom List</button>
           <p class="hint">Your custom list is saved on this device.</p>
         </form>
       </div>
+      {{end}}
     </section>
 
     <section class="start-band">
@@ -68,9 +149,13 @@
         <p class="eyebrow">Classic mode</p>
         <h2>{{.Session.Settings.SpeakingDurationSeconds}}s to survive, {{.Session.Settings.SilenceTimeoutSeconds}}s silence limit.</h2>
       </div>
-      <form hx-post="/game/start" hx-target="#app" hx-swap="outerHTML">
+      {{if .IsHost}}
+      <form hx-post="{{.Base}}/game/start" hx-target="#app" hx-swap="outerHTML">
         <button class="button primary large" type="submit">Start Game</button>
       </form>
+      {{else}}
+      <p class="waiting">Waiting for the host to start the game…</p>
+      {{end}}
     </section>
   </main>
 {{end}}
@@ -79,35 +164,46 @@
 <div class="player-list" id="players">
   {{range .Session.Players}}
   <div class="player-row">
-    <form class="player-name-form" hx-post="/players/rename" hx-target="#players" hx-swap="outerHTML">
+    {{if or $.IsHost (eq .ID $.YouID)}}
+    <form class="player-name-form" hx-post="{{$.Base}}/players/rename" hx-target="#app" hx-swap="outerHTML">
       <input type="hidden" name="id" value="{{.ID}}">
-      <input name="name" type="text" value="{{.Name}}" aria-label="Rename {{.Name}}">
+      <input name="name" type="text" maxlength="40" value="{{.Name}}" aria-label="Rename {{.Name}}">
       <button class="icon-button" type="submit" aria-label="Save {{.Name}}">OK</button>
     </form>
-    <span>{{.Score}} pts</span>
+    {{else}}
+    <span class="player-name">{{.Name}}</span>
+    {{end}}
+    <span class="player-meta">
+      {{if index $.Online .ID}}<span class="presence" title="Connected">●</span>{{end}}
+      {{if eq .ID $.YouID}}<span class="you-tag">you</span>{{end}}
+      {{.Score}} pts
+    </span>
+    {{if $.IsHost}}
     <div class="player-tools">
-      <form hx-post="/players/move" hx-target="#players" hx-swap="outerHTML">
+      <form hx-post="{{$.Base}}/players/move" hx-target="#app" hx-swap="outerHTML">
         <input type="hidden" name="id" value="{{.ID}}">
         <input type="hidden" name="offset" value="-1">
         <button class="icon-button" type="submit" aria-label="Move {{.Name}} up">Up</button>
       </form>
-      <form hx-post="/players/move" hx-target="#players" hx-swap="outerHTML">
+      <form hx-post="{{$.Base}}/players/move" hx-target="#app" hx-swap="outerHTML">
         <input type="hidden" name="id" value="{{.ID}}">
         <input type="hidden" name="offset" value="1">
         <button class="icon-button" type="submit" aria-label="Move {{.Name}} down">Down</button>
       </form>
     </div>
-    <form hx-post="/players/remove" hx-target="#players" hx-swap="outerHTML">
+    <form hx-post="{{$.Base}}/players/remove" hx-target="#app" hx-swap="outerHTML">
       <input type="hidden" name="id" value="{{.ID}}">
       <button class="icon-button" type="submit" aria-label="Remove {{.Name}}">×</button>
     </form>
+    {{end}}
   </div>
   {{end}}
 </div>
 {{end}}
 
 {{define "settings"}}
-<form class="settings-grid" id="settings" hx-post="/settings" hx-target="#app" hx-swap="outerHTML">
+{{if .IsHost}}
+<form class="settings-grid" id="settings" hx-post="{{.Base}}/settings" hx-target="#app" hx-swap="outerHTML">
   <label>
     <span>Talk time</span>
     <input name="duration" type="number" min="10" max="300" value="{{.Session.Settings.SpeakingDurationSeconds}}">
@@ -131,8 +227,12 @@
   <p class="pack-note">{{.Selected.Description}}{{if .Selected.Difficulty}} Difficulty: {{.Selected.Difficulty}}.{{end}}</p>
   <button class="button secondary" type="submit">Apply Settings</button>
 </form>
+{{else}}
+<dl class="settings-summary">
+  <div><dt>Talk time</dt><dd>{{.Session.Settings.SpeakingDurationSeconds}}s</dd></div>
+  <div><dt>Silence limit</dt><dd>{{.Session.Settings.SilenceTimeoutSeconds}}s</dd></div>
+  <div><dt>Rounds</dt><dd>{{.Session.Settings.Rounds}}</dd></div>
+  <div><dt>Topics</dt><dd>{{.Selected.Name}} ({{len .Session.Topics}})</dd></div>
+</dl>
 {{end}}
-
-{{define "topicSummary"}}
-<span id="topic-summary">{{len .Session.Topics}} custom topics loaded</span>
 {{end}}

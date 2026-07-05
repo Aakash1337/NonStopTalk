@@ -2,6 +2,7 @@
   const stage = document.querySelector("[data-turn]");
   if (!stage) return;
 
+  const base = stage.dataset.base || "";
   const duration = Number(stage.dataset.duration || 60);
   const silenceLimit = Number(stage.dataset.silence || 2);
   const timer = stage.querySelector("[data-timer]");
@@ -156,6 +157,25 @@
     if (!soundToggle) return;
     soundToggle.textContent = soundEnabled ? "Sound On" : "Sound Off";
     soundToggle.setAttribute("aria-pressed", soundEnabled ? "true" : "false");
+  };
+
+  // The server keeps its own turn clock for authoritative scoring; tell it
+  // the moment speaking starts. Fire-and-forget: local play continues even
+  // if the notification is lost, the server just scores conservatively.
+  const notifyTurnBegin = () => {
+    if (!base) return;
+    try {
+      fetch(`${base}/turn/begin`, { method: "POST", keepalive: true });
+    } catch {
+      // Best-effort only.
+    }
+  };
+
+  const setTurnRunningFlag = (value) => {
+    window.__dstTurnRunning = value;
+    if (!value) {
+      document.dispatchEvent(new CustomEvent("dst:turn-idle"));
+    }
   };
 
   const stopStream = (activeStream) => {
@@ -528,6 +548,7 @@
 
   const submitResult = (spokenSeconds, completed, eliminated) => {
     running = false;
+    setTurnRunningFlag(false);
     mode = "idle";
     cancelAnimationFrame(raf);
     stopPreview();
@@ -631,6 +652,8 @@
       data = new Uint8Array(analyser.fftSize);
       source.connect(analyser);
       running = true;
+      setTurnRunningFlag(true);
+      notifyTurnBegin();
       startedAt = performance.now();
       lastVoiceAt = startedAt;
       lastTickSecond = -1;
@@ -653,6 +676,8 @@
     stopPreview();
     mode = "manual";
     running = true;
+    setTurnRunningFlag(true);
+    notifyTurnBegin();
     startedAt = performance.now();
     lastTickSecond = -1;
     cues.start();
@@ -693,12 +718,15 @@
   if (navigator.mediaDevices?.addEventListener) {
     navigator.mediaDevices.addEventListener("devicechange", () => populateMics({ startTest: true }));
   }
-  completeButton.addEventListener("click", () => finish(true, false, { fullDuration: true }));
+  if (completeButton) {
+    completeButton.addEventListener("click", () => finish(true, false, { fullDuration: true }));
+  }
   form.addEventListener("submit", () => {
     if (running) {
       spokenInput.value = String(elapsedSeconds());
     }
     running = false;
+    setTurnRunningFlag(false);
     mode = "idle";
     cancelAnimationFrame(raf);
     stopPreview();

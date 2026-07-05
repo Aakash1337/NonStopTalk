@@ -53,6 +53,8 @@ Exit criteria:
 
 Goal: Support remote players through rooms.
 
+Status: core delivered — rooms with join codes, host-gated controls, join/leave/reconnect, SSE-synced state, a server-side turn clock capping remote score claims, and abuse protections (origin checks, rate limits, input and capacity caps, idle-room cleanup). Remaining: host migration if the host disappears, and persistence across server restarts.
+
 Deliverables:
 
 - Room codes

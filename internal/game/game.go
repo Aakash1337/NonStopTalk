@@ -12,6 +12,10 @@ const (
 	DefaultSilenceTimeout   = 2 * time.Second
 	DefaultRounds           = 1
 	CompletionBonus         = 25
+
+	MaxPlayerNameLength = 40
+	MaxTopicLength      = 200
+	MaxTopics           = 500
 )
 
 type Settings struct {
@@ -111,7 +115,7 @@ func NewSession(id string) *Session {
 }
 
 func (s *Session) AddPlayer(name string) Player {
-	name = strings.TrimSpace(name)
+	name = cleanName(name)
 	if name == "" {
 		name = "Player " + itoa(s.nextPlayerNumber)
 	}
@@ -148,7 +152,7 @@ func (s *Session) RemovePlayer(id string) {
 }
 
 func (s *Session) RenamePlayer(id string, name string) bool {
-	name = strings.TrimSpace(name)
+	name = cleanName(name)
 	if name == "" {
 		return false
 	}
@@ -214,15 +218,34 @@ func (s *Session) SetTopics(topics []string) {
 		if topic == "" {
 			continue
 		}
+		topic = truncate(topic, MaxTopicLength)
 		key := strings.ToLower(topic)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
 		cleaned = append(cleaned, topic)
+		if len(cleaned) >= MaxTopics {
+			break
+		}
 	}
 	s.Topics = cleaned
 	s.TopicCursor = 0
+}
+
+// ResetForNewGame clears play state while keeping the roster, settings, and
+// topics so remote players stay bound to their seats across games.
+func (s *Session) ResetForNewGame() {
+	s.Started = false
+	s.Finished = false
+	s.CurrentPlayer = 0
+	s.CurrentRound = 1
+	s.ActiveTurn = nil
+	s.CompletedTurns = nil
+	s.TopicCursor = 0
+	for i := range s.Players {
+		s.Players[i].Score = 0
+	}
 }
 
 func (s *Session) CanStart() bool {
@@ -373,6 +396,18 @@ func (s *Session) advance() {
 	if s.CurrentRound > s.Settings.Rounds {
 		s.Finished = true
 	}
+}
+
+func cleanName(name string) string {
+	return truncate(strings.TrimSpace(name), MaxPlayerNameLength)
+}
+
+func truncate(value string, max int) string {
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return strings.TrimSpace(string(runes[:max]))
 }
 
 func itoa(v int) string {

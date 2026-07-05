@@ -179,6 +179,115 @@ textarea {
   gap: 14px;
 }
 
+.stack-form {
+  display: grid;
+  gap: 14px;
+}
+
+.share-band {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-block-end: 18px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-surface);
+  padding: 16px 20px;
+}
+
+.share-band h2 {
+  font-size: 1.25rem;
+}
+
+.share-band p {
+  max-inline-size: 420px;
+  color: var(--color-muted);
+  font-size: 0.92rem;
+  font-weight: 600;
+}
+
+.room-code {
+  padding: 2px 10px;
+  border: 1px solid var(--color-accent);
+  border-radius: 8px;
+  background: var(--color-bg);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.14em;
+}
+
+.player-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.player-name {
+  overflow: hidden;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.presence {
+  color: var(--color-success);
+  font-size: 0.8rem;
+}
+
+.you-tag {
+  border: 1px solid var(--color-info);
+  border-radius: 999px;
+  color: var(--color-info);
+  font-size: 0.72rem;
+  font-weight: 800;
+  padding: 1px 8px;
+  text-transform: uppercase;
+}
+
+.settings-summary {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+
+.settings-summary div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg);
+  padding: 10px 12px;
+}
+
+.settings-summary dt {
+  color: var(--color-muted);
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.settings-summary dd {
+  margin: 0;
+  font-weight: 800;
+}
+
+.waiting {
+  color: var(--color-muted);
+  font-weight: 700;
+}
+
+.next-turn {
+  margin-block-start: 18px;
+}
+
+.header-tools {
+  display: flex;
+  gap: 10px;
+}
+
 .pack-note,
 .hint {
   grid-column: 1 / -1;
