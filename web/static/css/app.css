@@ -279,6 +279,15 @@ textarea {
   font-weight: 700;
 }
 
+.generate-form {
+  margin-block-end: 10px;
+}
+
+.generate-form input {
+  flex: 1;
+  min-inline-size: 220px;
+}
+
 .toggle-row {
   display: flex;
   grid-column: 1 / -1;

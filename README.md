@@ -46,6 +46,8 @@ The host can enable an AI judge in game settings. When on:
 - Grading is asynchronous and best-effort: classic scoring always lands first, and a judge failure just means no bonus. The host can override any score.
 - Without an `ANTHROPIC_API_KEY`, a transparent offline keyword-overlap judge is used instead, so the mode stays playable and testable everywhere.
 
+The host can also generate a themed topic pack: type a theme (for example "road trips with dragons") and Claude writes ten speaking prompts into the editable custom list. Only the theme text is sent to the provider; without an API key, simple offline templates are used instead.
+
 Run with the AI judge backed by Claude:
 
 ```text

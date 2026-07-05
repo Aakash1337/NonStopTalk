@@ -363,6 +363,13 @@ async function runAIJudgeScenario(browser, baseURL) {
   await page.getByRole("button", { name: "Apply Settings" }).click();
   await expectText(page, ".start-band", "10s to survive, 1s silence limit");
 
+  // Generate a themed pack (offline template generator in this environment),
+  // then override with a deterministic topic for the grading assertion.
+  await page.getByLabel("Topic theme").fill("space travel");
+  await page.getByRole("button", { name: "Generate Topics" }).click();
+  await expectText(page, "#topic-summary", "10 topics loaded");
+  await expectText(page, "textarea[name='topics']", "space travel");
+
   await page.getByPlaceholder("One topic per line").fill("Talk about pancakes and breakfast food");
   await page.getByRole("button", { name: "Use Custom List" }).click();
   await expectText(page, "#topic-summary", "1 topics loaded");
