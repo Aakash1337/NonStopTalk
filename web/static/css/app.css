@@ -11,6 +11,8 @@
   --color-warning: oklch(0.72 0.15 78);
   --color-danger: oklch(0.58 0.18 24);
   --color-info: oklch(0.56 0.12 230);
+  --color-mic: oklch(0.62 0.17 315);
+  --color-mic-soft: oklch(0.97 0.018 315);
   --shadow: 0 24px 60px oklch(0.25 0.02 72 / 14%);
 }
 
@@ -229,6 +231,11 @@ label span {
   padding-inline: 22px;
 }
 
+.button.compact {
+  min-block-size: 42px;
+  padding-inline: 12px;
+}
+
 .icon-button {
   min-inline-size: 38px;
   padding-inline: 8px;
@@ -370,6 +377,185 @@ label span {
   font-weight: 900;
 }
 
+.mic-status {
+  color: var(--color-muted);
+  font-size: 0.92rem;
+  font-weight: 800;
+}
+
+.mic-status.is-warning {
+  color: var(--color-danger);
+}
+
+.mic-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-panel);
+  padding: 14px;
+}
+
+.mic-summary-copy {
+  display: grid;
+  gap: 6px;
+  min-inline-size: 0;
+}
+
+.mic-summary-copy span {
+  color: var(--color-muted);
+  font-size: 0.88rem;
+  font-weight: 800;
+}
+
+.mic-summary-copy strong {
+  overflow: hidden;
+  font-size: 1.08rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mic-dialog-backdrop[hidden] {
+  display: none;
+}
+
+.mic-dialog-backdrop {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: oklch(0.2 0.018 72 / 42%);
+  padding: 14px;
+}
+
+.mic-dialog {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 24px;
+  inline-size: min(720px, 100%);
+  max-block-size: min(760px, calc(100vh - 28px));
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-surface);
+  padding: 24px;
+  box-shadow: 0 34px 80px oklch(0.2 0.018 72 / 28%);
+}
+
+.mic-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.mic-dialog-head h2 {
+  font-size: 1.5rem;
+}
+
+.mic-dialog-close {
+  min-inline-size: 44px;
+  border-color: transparent;
+  background: transparent;
+  font-size: 1.8rem;
+  line-height: 1;
+}
+
+.mic-list {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  overflow: auto;
+  padding-inline-end: 6px;
+}
+
+.mic-list::-webkit-scrollbar {
+  inline-size: 12px;
+}
+
+.mic-list::-webkit-scrollbar-track {
+  background: var(--color-panel);
+  border-radius: 999px;
+}
+
+.mic-list::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: oklch(0.62 0.006 72);
+}
+
+.mic-option {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-block-size: 92px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-panel);
+  color: var(--color-text);
+  padding: 20px 22px;
+  text-align: start;
+}
+
+.mic-option:hover {
+  border-color: var(--color-accent);
+}
+
+.mic-option.is-selected {
+  border-width: 2px;
+  border-color: var(--color-mic);
+  background: var(--color-mic-soft);
+}
+
+.mic-option-copy {
+  display: grid;
+  gap: 5px;
+  min-inline-size: 0;
+}
+
+.mic-option-copy strong,
+.mic-option-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mic-option-copy span {
+  color: var(--color-muted);
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.mic-option-copy span:empty {
+  display: none;
+}
+
+.mic-level {
+  display: grid;
+  gap: 3px;
+  inline-size: 28px;
+}
+
+.mic-summary-level {
+  inline-size: 26px;
+}
+
+.mic-level span {
+  block-size: 5px;
+  border-radius: 999px;
+  background: var(--color-border);
+}
+
+.mic-level span.is-active {
+  background: var(--color-mic);
+}
+
+.mic-option.is-hearing .mic-level span.is-active {
+  background: var(--color-mic);
+}
+
 .meter {
   overflow: hidden;
   block-size: 22px;
@@ -443,7 +629,8 @@ label span {
 @media (max-width: 840px) {
   .setup-grid,
   .play-shell,
-  .timer-row {
+  .timer-row,
+  .mic-summary {
     grid-template-columns: 1fr;
   }
 

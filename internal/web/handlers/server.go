@@ -61,7 +61,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/turn/submit", s.handleSubmitTurn)
 	mux.HandleFunc("/score/override", s.handleScoreOverride)
 	mux.HandleFunc("/game/reset", s.handleReset)
-	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
+	fileServer := http.FileServer(http.Dir("web/static"))
+	mux.Handle("/static/", http.StripPrefix("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		fileServer.ServeHTTP(w, r)
+	})))
 	return mux
 }
 

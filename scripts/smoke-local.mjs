@@ -205,13 +205,22 @@ async function runManualFallbackScenario(browser, baseURL) {
 async function runAutomaticEndingScenario(browser, baseURL) {
   const page = await browser.newPage();
   await page.addInitScript(() => {
+    window.__audioRequests = [];
     Object.defineProperty(navigator, "mediaDevices", {
       configurable: true,
       value: {
-        getUserMedia: () =>
-          Promise.resolve({
+        enumerateDevices: () =>
+          Promise.resolve([
+            { kind: "audioinput", deviceId: "mic-alpha", label: "Table Mic" },
+            { kind: "audioinput", deviceId: "mic-beta", label: "Room Mic" },
+          ]),
+        addEventListener() {},
+        getUserMedia: (constraints) => {
+          window.__audioRequests.push(constraints);
+          return Promise.resolve({
             getTracks: () => [{ stop() {} }],
-          }),
+          });
+        },
       },
     });
     class FakeAudioContext {
@@ -241,6 +250,14 @@ async function runAutomaticEndingScenario(browser, baseURL) {
 
   await page.getByRole("button", { name: "Start Game" }).click();
   await page.waitForSelector("[data-turn]");
+  await page.getByRole("button", { name: "Change" }).click();
+  await page.waitForSelector('[data-mic-option][data-device-id="mic-beta"]');
+  await page.locator('[data-mic-option][data-device-id="mic-beta"]').click();
+  await expectText(page, "[data-mic-selected-label]", "Room Mic");
+  await page.waitForFunction(() =>
+    document.querySelector('[data-mic-option][data-device-id="mic-beta"]')?.getAttribute("aria-selected") === "true",
+  );
+  await page.getByLabel("Close microphone picker").click();
   await page.getByRole("button", { name: "Manual Timer" }).click();
   await page.waitForSelector(".result-band", { timeout: 15000 });
   await expectText(page, ".result-band h1", "Player 1 earned 35 points.");
@@ -248,7 +265,15 @@ async function runAutomaticEndingScenario(browser, baseURL) {
 
   await page.getByRole("button", { name: "Next Turn" }).click();
   await page.waitForSelector("[data-turn]");
+  await page.waitForFunction(() =>
+    document.querySelector('[data-mic-option][data-device-id="mic-beta"]')?.getAttribute("aria-selected") === "true",
+  );
   await page.getByRole("button", { name: "Start Talking" }).click();
+  const audioRequests = await page.evaluate(() => window.__audioRequests);
+  assert(
+    audioRequests.some((request) => request.audio?.deviceId?.exact === "mic-beta"),
+    `Expected selected microphone to be requested, got ${JSON.stringify(audioRequests)}`,
+  );
   await expectText(page, "[data-voice-label]", "Silence");
   await page.waitForSelector(".winner-band", { timeout: 5000 });
   await expectText(page, ".winner-band", "Player 1");

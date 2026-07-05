@@ -48,6 +48,9 @@ func TestStartGameRendersTurn(t *testing.T) {
 	if !strings.Contains(res.Body.String(), "Manual Timer") {
 		t.Fatalf("expected manual timer control in response")
 	}
+	if !strings.Contains(res.Body.String(), "Auto-detect") {
+		t.Fatalf("expected automatic microphone option in response")
+	}
 }
 
 func TestSettingsUpdateRendersFreshSetupSummary(t *testing.T) {

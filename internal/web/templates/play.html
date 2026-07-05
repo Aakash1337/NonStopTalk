@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Don't Stop Talking</title>
-  <link rel="stylesheet" href="/static/css/app.css">
+  <link rel="stylesheet" href="/static/css/app.css?v=5">
   <script src="/static/js/htmx.min.js?v=2" defer></script>
 </head>
 <body>
@@ -34,6 +34,24 @@
       <div class="timer" data-timer>{{.CurrentTurn.Duration}}</div>
       <div class="voice-panel">
         <div class="voice-label" data-voice-label>Mic ready</div>
+        <div class="mic-summary" data-mic-summary>
+          <div class="mic-summary-copy">
+            <span>Microphone</span>
+            <strong data-mic-selected-label>Auto-detect</strong>
+          </div>
+          <span class="mic-level mic-summary-level" data-mic-summary-level aria-hidden="true"></span>
+          <button class="button secondary compact" type="button" data-open-mic-picker>Change</button>
+        </div>
+        <div class="mic-dialog-backdrop" data-mic-dialog hidden>
+          <section class="mic-dialog" role="dialog" aria-modal="true" aria-labelledby="mic-dialog-title">
+            <div class="mic-dialog-head">
+              <h2 id="mic-dialog-title">Microphone</h2>
+              <button class="icon-button mic-dialog-close" type="button" data-close-mic-picker aria-label="Close microphone picker">&times;</button>
+            </div>
+            <div class="mic-list" data-mic-list role="listbox" aria-label="Microphone"></div>
+          </section>
+        </div>
+        <div class="mic-status" data-mic-status>Auto-detect</div>
         <div class="meter"><span data-meter></span></div>
         <div class="silence" data-silence-label>Silence limit: {{.CurrentTurn.SilenceLimit}}s</div>
       </div>
@@ -56,7 +74,7 @@
   <aside class="standings-panel">
     {{template "standings" .}}
   </aside>
-  <script src="/static/js/turn.js?v=3" defer></script>
+  <script src="/static/js/turn.js?v=5" defer></script>
 </main>
 {{end}}
 
@@ -67,7 +85,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Don't Stop Talking</title>
-  <link rel="stylesheet" href="/static/css/app.css">
+  <link rel="stylesheet" href="/static/css/app.css?v=5">
   <script src="/static/js/htmx.min.js?v=2" defer></script>
 </head>
 <body>
@@ -109,7 +127,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Don't Stop Talking</title>
-  <link rel="stylesheet" href="/static/css/app.css">
+  <link rel="stylesheet" href="/static/css/app.css?v=5">
   <script src="/static/js/htmx.min.js?v=2" defer></script>
 </head>
 <body>
