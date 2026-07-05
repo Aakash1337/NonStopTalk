@@ -1,6 +1,6 @@
 (() => {
   const storageKey = "dont-stop-talking.custom-topics";
-  const formSelector = 'form[hx-post="/topics/custom"]';
+  const formSelector = 'form[hx-post$="/topics/custom"]';
 
   const readSavedTopics = () => {
     try {

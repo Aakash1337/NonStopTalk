@@ -12,6 +12,10 @@ const (
 	DefaultSilenceTimeout   = 2 * time.Second
 	DefaultRounds           = 1
 	CompletionBonus         = 25
+
+	MaxPlayerNameLength = 40
+	MaxTopicLength      = 200
+	MaxTopics           = 500
 )
 
 type Settings struct {
@@ -19,6 +23,9 @@ type Settings struct {
 	SilenceTimeoutSeconds   int
 	Rounds                  int
 	TopicPackID             string
+	// AIJudgeEnabled turns on the optional relevance bonus. Off by default:
+	// AI is an optional judge, never the core game.
+	AIJudgeEnabled bool
 }
 
 func DefaultSettings() Settings {
@@ -61,6 +68,14 @@ type Player struct {
 	Score int
 }
 
+// AI judge status values for a turn.
+const (
+	AIStatusPending = "pending"
+	AIStatusDone    = "done"
+	AIStatusSkipped = "skipped"
+	AIStatusFailed  = "failed"
+)
+
 type Turn struct {
 	PlayerID      string
 	PlayerName    string
@@ -74,13 +89,19 @@ type Turn struct {
 	Eliminated    bool
 	Score         int
 	Scored        bool
+
+	// AI judge results ("" means the judge was not involved).
+	AIStatus    string
+	AIRelevance *float64
+	AIFeedback  string
 }
 
 func (t Turn) ScoreParts() []ScorePart {
 	return ScoreParts(ScoreInput{
-		DurationSeconds: t.Duration,
-		SpokenSeconds:   t.SpokenSeconds,
-		Completed:       t.Completed,
+		DurationSeconds:  t.Duration,
+		SpokenSeconds:    t.SpokenSeconds,
+		Completed:        t.Completed,
+		AIRelevanceScore: t.AIRelevance,
 	})
 }
 
@@ -111,7 +132,7 @@ func NewSession(id string) *Session {
 }
 
 func (s *Session) AddPlayer(name string) Player {
-	name = strings.TrimSpace(name)
+	name = cleanName(name)
 	if name == "" {
 		name = "Player " + itoa(s.nextPlayerNumber)
 	}
@@ -125,20 +146,30 @@ func (s *Session) AddPlayer(name string) Player {
 }
 
 func (s *Session) RemovePlayer(id string) {
-	filtered := s.Players[:0]
-	for _, player := range s.Players {
-		if player.ID != id {
-			filtered = append(filtered, player)
+	index := -1
+	for i, player := range s.Players {
+		if player.ID == id {
+			index = i
+			break
 		}
 	}
-	s.Players = filtered
-	if s.CurrentPlayer >= len(s.Players) {
+	if index == -1 {
+		return
+	}
+	s.Players = append(s.Players[:index], s.Players[index+1:]...)
+	if s.ActiveTurn != nil && s.ActiveTurn.PlayerID == id {
+		s.ActiveTurn = nil
+	}
+	if index < s.CurrentPlayer {
+		s.CurrentPlayer--
+	}
+	if len(s.Players) == 0 || s.CurrentPlayer >= len(s.Players) {
 		s.CurrentPlayer = 0
 	}
 }
 
 func (s *Session) RenamePlayer(id string, name string) bool {
-	name = strings.TrimSpace(name)
+	name = cleanName(name)
 	if name == "" {
 		return false
 	}
@@ -204,15 +235,34 @@ func (s *Session) SetTopics(topics []string) {
 		if topic == "" {
 			continue
 		}
+		topic = truncate(topic, MaxTopicLength)
 		key := strings.ToLower(topic)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
 		cleaned = append(cleaned, topic)
+		if len(cleaned) >= MaxTopics {
+			break
+		}
 	}
 	s.Topics = cleaned
 	s.TopicCursor = 0
+}
+
+// ResetForNewGame clears play state while keeping the roster, settings, and
+// topics so remote players stay bound to their seats across games.
+func (s *Session) ResetForNewGame() {
+	s.Started = false
+	s.Finished = false
+	s.CurrentPlayer = 0
+	s.CurrentRound = 1
+	s.ActiveTurn = nil
+	s.CompletedTurns = nil
+	s.TopicCursor = 0
+	for i := range s.Players {
+		s.Players[i].Score = 0
+	}
 }
 
 func (s *Session) CanStart() bool {
@@ -246,6 +296,9 @@ func (s *Session) StartTurn() (*Turn, error) {
 	}
 	if s.Finished {
 		return nil, errors.New("game is finished")
+	}
+	if s.ActiveTurn != nil {
+		return s.ActiveTurn, nil
 	}
 	if len(s.Players) == 0 || len(s.Topics) == 0 {
 		return nil, errors.New("game is not ready")
@@ -323,6 +376,45 @@ func (s *Session) SubmitTurn(spokenSeconds int, completed bool, eliminated bool)
 	return turn, nil
 }
 
+// MarkTurnAIPending flags the most recent completed turn as awaiting an AI
+// verdict and returns its index, or -1 if there is no turn to grade.
+func (s *Session) MarkTurnAIPending() int {
+	if len(s.CompletedTurns) == 0 {
+		return -1
+	}
+	index := len(s.CompletedTurns) - 1
+	s.CompletedTurns[index].AIStatus = AIStatusPending
+	return index
+}
+
+// ResolveTurnAI records the judge's outcome for a previously submitted turn
+// and applies the bonus to the player's score. The playerID and topic guard
+// against the roster or game changing while the judge was thinking.
+func (s *Session) ResolveTurnAI(index int, playerID, topic string, relevance *float64, feedback string, status string) bool {
+	if index < 0 || index >= len(s.CompletedTurns) {
+		return false
+	}
+	turn := &s.CompletedTurns[index]
+	if turn.PlayerID != playerID || turn.Topic != topic {
+		return false
+	}
+	turn.AIStatus = status
+	turn.AIFeedback = feedback
+	if relevance == nil || status != AIStatusDone {
+		return true
+	}
+	turn.AIRelevance = relevance
+	bonus := int(*relevance * 20)
+	turn.Score += bonus
+	for i := range s.Players {
+		if s.Players[i].ID == playerID {
+			s.Players[i].Score += bonus
+			break
+		}
+	}
+	return true
+}
+
 func (s *Session) OverrideScore(playerID string, delta int) {
 	for i := range s.Players {
 		if s.Players[i].ID == playerID {
@@ -360,6 +452,18 @@ func (s *Session) advance() {
 	if s.CurrentRound > s.Settings.Rounds {
 		s.Finished = true
 	}
+}
+
+func cleanName(name string) string {
+	return truncate(strings.TrimSpace(name), MaxPlayerNameLength)
+}
+
+func truncate(value string, max int) string {
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return strings.TrimSpace(string(runes[:max]))
 }
 
 func itoa(v int) string {

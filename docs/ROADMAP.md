@@ -53,6 +53,8 @@ Exit criteria:
 
 Goal: Support remote players through rooms.
 
+Status: core delivered — rooms with join codes, host-gated controls, join/leave/reconnect, SSE-synced state, a server-side turn clock capping remote score claims, and abuse protections (origin checks, rate limits, input and capacity caps, idle-room cleanup). Remaining: host migration if the host disappears, and persistence across server restarts.
+
 Deliverables:
 
 - Room codes
@@ -72,6 +74,8 @@ Exit criteria:
 ## Phase 4: AI Judge Mode
 
 Goal: Add optional relevance grading without making AI mandatory.
+
+Status: core delivered — host-toggled AI judge with explicit consent copy, browser-side transcription (Web Speech API, no audio upload), Claude-backed relevance grading applied asynchronously as a capped bonus with plain-language feedback, an offline heuristic fallback when no API key is configured, and host score override. Remaining: repetition detection, confidence display, and AI topic-pack generation.
 
 Deliverables:
 

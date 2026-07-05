@@ -1,6 +1,9 @@
 package game
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestClassicScoreAwardsCompletionBonus(t *testing.T) {
 	score := Score(ScoreInput{
@@ -89,6 +92,209 @@ func TestRenameAndMovePlayer(t *testing.T) {
 
 	if session.MovePlayer(avery.ID, -1) {
 		t.Fatal("expected first player to stay in place")
+	}
+}
+
+func TestRemovePlayerKeepsTurnOrder(t *testing.T) {
+	session := NewSession("test")
+	avery := session.AddPlayer("Avery")
+	blair := session.AddPlayer("Blair")
+	casey := session.AddPlayer("Casey")
+	session.SetTopics([]string{"Topic one"})
+
+	if _, err := session.StartTurn(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.SubmitTurn(5, false, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Blair is up next. Removing Avery (earlier in the list) must not skip Blair.
+	session.RemovePlayer(avery.ID)
+	turn, err := session.StartTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if turn.PlayerID != blair.ID {
+		t.Fatalf("expected %s to keep the next turn, got %s", blair.ID, turn.PlayerID)
+	}
+	if _, err := session.SubmitTurn(5, false, true); err != nil {
+		t.Fatal(err)
+	}
+	turn, err = session.StartTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if turn.PlayerID != casey.ID {
+		t.Fatalf("expected %s after Blair, got %s", casey.ID, turn.PlayerID)
+	}
+}
+
+func TestRemoveActivePlayerClearsTurn(t *testing.T) {
+	session := NewSession("test")
+	avery := session.AddPlayer("Avery")
+	blair := session.AddPlayer("Blair")
+	session.SetTopics([]string{"Topic one"})
+
+	if _, err := session.StartTurn(); err != nil {
+		t.Fatal(err)
+	}
+	session.RemovePlayer(avery.ID)
+	if session.ActiveTurn != nil {
+		t.Fatal("expected active turn to be cleared when its player is removed")
+	}
+	turn, err := session.StartTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if turn.PlayerID != blair.ID {
+		t.Fatalf("expected %s to take over, got %s", blair.ID, turn.PlayerID)
+	}
+}
+
+func TestStartTurnReturnsExistingActiveTurn(t *testing.T) {
+	session := NewSession("test")
+	session.AddPlayer("Avery")
+	session.AddPlayer("Blair")
+	session.SetTopics([]string{"Topic one", "Topic two"})
+
+	first, err := session.StartTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := session.StartTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Fatal("expected duplicate start to return the existing turn")
+	}
+	if session.TopicCursor != 1 {
+		t.Fatalf("expected topic cursor to advance once, got %d", session.TopicCursor)
+	}
+}
+
+func TestResetForNewGameKeepsRoster(t *testing.T) {
+	session := NewSession("test")
+	avery := session.AddPlayer("Avery")
+	session.AddPlayer("Blair")
+	session.SetTopics([]string{"Topic one"})
+
+	if _, err := session.StartTurn(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.SubmitTurn(5, false, true); err != nil {
+		t.Fatal(err)
+	}
+
+	session.ResetForNewGame()
+	if session.Started || session.Finished {
+		t.Fatal("expected fresh game state")
+	}
+	if len(session.Players) != 2 || session.Players[0].ID != avery.ID {
+		t.Fatalf("expected roster preserved, got %#v", session.Players)
+	}
+	if session.Players[0].Score != 0 {
+		t.Fatalf("expected scores cleared, got %d", session.Players[0].Score)
+	}
+	if len(session.CompletedTurns) != 0 || session.ActiveTurn != nil {
+		t.Fatal("expected turns cleared")
+	}
+	if len(session.Topics) != 1 {
+		t.Fatalf("expected topics preserved, got %d", len(session.Topics))
+	}
+}
+
+func TestInputLimits(t *testing.T) {
+	session := NewSession("test")
+	long := strings.Repeat("x", MaxPlayerNameLength+20)
+	player := session.AddPlayer(long)
+	if len([]rune(player.Name)) > MaxPlayerNameLength {
+		t.Fatalf("expected player name capped, got %d runes", len([]rune(player.Name)))
+	}
+
+	topics := make([]string, MaxTopics+50)
+	for i := range topics {
+		topics[i] = "Topic " + itoa(i) + " " + strings.Repeat("y", MaxTopicLength)
+	}
+	session.SetTopics(topics)
+	if len(session.Topics) != MaxTopics {
+		t.Fatalf("expected topic count capped at %d, got %d", MaxTopics, len(session.Topics))
+	}
+	for _, topic := range session.Topics {
+		if len([]rune(topic)) > MaxTopicLength {
+			t.Fatalf("expected topic capped at %d runes, got %d", MaxTopicLength, len([]rune(topic)))
+		}
+	}
+}
+
+func TestResolveTurnAIAppliesBonus(t *testing.T) {
+	session := NewSession("test")
+	avery := session.AddPlayer("Avery")
+	session.AddPlayer("Blair")
+	session.SetTopics([]string{"Topic one"})
+
+	if _, err := session.StartTurn(); err != nil {
+		t.Fatal(err)
+	}
+	turn, err := session.SubmitTurn(30, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := session.MarkTurnAIPending()
+	if index != 0 || session.CompletedTurns[0].AIStatus != AIStatusPending {
+		t.Fatalf("expected pending AI status on turn 0, got %d %q", index, session.CompletedTurns[0].AIStatus)
+	}
+
+	relevance := 0.8
+	if !session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, &relevance, "Nice focus.", AIStatusDone) {
+		t.Fatal("expected verdict to apply")
+	}
+	graded := session.CompletedTurns[0]
+	if graded.Score != 30+16 {
+		t.Fatalf("expected 46 points after bonus, got %d", graded.Score)
+	}
+	if session.Players[0].ID != avery.ID || session.Players[0].Score != 46 {
+		t.Fatalf("expected player score 46, got %d", session.Players[0].Score)
+	}
+	if graded.AIFeedback != "Nice focus." || graded.AIStatus != AIStatusDone {
+		t.Fatalf("unexpected AI fields: %+v", graded)
+	}
+
+	parts := graded.ScoreParts()
+	foundAI := false
+	for _, part := range parts {
+		if part.Label == "AI relevance" && part.Points == 16 {
+			foundAI = true
+		}
+	}
+	if !foundAI {
+		t.Fatalf("expected AI relevance part, got %+v", parts)
+	}
+}
+
+func TestResolveTurnAIRejectsStaleVerdicts(t *testing.T) {
+	session := NewSession("test")
+	session.AddPlayer("Avery")
+	session.AddPlayer("Blair")
+	session.SetTopics([]string{"Topic one"})
+
+	if _, err := session.StartTurn(); err != nil {
+		t.Fatal(err)
+	}
+	turn, err := session.SubmitTurn(10, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := session.MarkTurnAIPending()
+
+	relevance := 1.0
+	if session.ResolveTurnAI(index, "someone-else", turn.Topic, &relevance, "x", AIStatusDone) {
+		t.Fatal("expected mismatched player to be rejected")
+	}
+	session.ResetForNewGame()
+	if session.ResolveTurnAI(index, turn.PlayerID, turn.Topic, &relevance, "x", AIStatusDone) {
+		t.Fatal("expected verdict after reset to be rejected")
 	}
 }
 

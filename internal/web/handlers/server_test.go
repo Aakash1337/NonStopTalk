@@ -1,265 +1,469 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strconv"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
+
+	"dontstoptalking/internal/judge"
+	"dontstoptalking/internal/room"
 )
 
-func TestHomeRenders(t *testing.T) {
+// client is a fake browser: it keeps its identity cookie across requests.
+type client struct {
+	t      *testing.T
+	router http.Handler
+	cookie string
+}
+
+func newTestRouter(t *testing.T) http.Handler {
+	t.Helper()
 	server, err := NewServer("../templates/*.html")
 	if err != nil {
 		t.Fatal(err)
 	}
+	return server.Routes()
+}
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	res := httptest.NewRecorder()
+func newClient(t *testing.T, router http.Handler) *client {
+	return &client{t: t, router: router}
+}
 
-	server.Routes().ServeHTTP(res, req)
-
-	if res.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", res.Code, res.Body.String())
+func (c *client) do(method, path string, form url.Values) *httptest.ResponseRecorder {
+	c.t.Helper()
+	var req *http.Request
+	if form != nil {
+		req = httptest.NewRequest(method, path, strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	} else {
+		req = httptest.NewRequest(method, path, nil)
 	}
-	if !strings.Contains(res.Body.String(), "Don't Stop Talking") {
-		t.Fatalf("expected app title in response")
+	if c.cookie != "" {
+		req.Header.Set("Cookie", c.cookie)
+	}
+	res := httptest.NewRecorder()
+	c.router.ServeHTTP(res, req)
+	for _, sc := range res.Result().Cookies() {
+		if sc.Name == "dst_token" {
+			c.cookie = "dst_token=" + sc.Value
+		}
+	}
+	return res
+}
+
+var roomPathPattern = regexp.MustCompile(`^/room/([A-Z2-9]+)$`)
+
+// createRoom creates a room as this client (becoming host) and returns its code.
+func (c *client) createRoom(name string) string {
+	c.t.Helper()
+	res := c.do(http.MethodPost, "/rooms", url.Values{"name": {name}})
+	if res.Code != http.StatusSeeOther {
+		c.t.Fatalf("expected redirect after create, got %d: %s", res.Code, res.Body.String())
+	}
+	match := roomPathPattern.FindStringSubmatch(res.Header().Get("Location"))
+	if match == nil {
+		c.t.Fatalf("expected room redirect, got %q", res.Header().Get("Location"))
+	}
+	return match[1]
+}
+
+func (c *client) join(code, name string) *httptest.ResponseRecorder {
+	c.t.Helper()
+	return c.do(http.MethodPost, "/rooms/join", url.Values{"code": {code}, "name": {name}})
+}
+
+func TestLandingRenders(t *testing.T) {
+	router := newTestRouter(t)
+	res := newClient(t, router).do(http.MethodGet, "/", nil)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.Code)
+	}
+	body := res.Body.String()
+	for _, expected := range []string{"Host a Game", "Join a Game", "Room code"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q on landing page", expected)
+		}
 	}
 }
 
-func TestStartGameRendersTurn(t *testing.T) {
-	server, err := NewServer("../templates/*.html")
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestCreateRoomAndRenderSetup(t *testing.T) {
+	router := newTestRouter(t)
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
 
-	req := httptest.NewRequest(http.MethodPost, "/game/start", nil)
-	res := httptest.NewRecorder()
-
-	server.Routes().ServeHTTP(res, req)
-
+	res := host.do(http.MethodGet, "/room/"+code, nil)
 	if res.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", res.Code, res.Body.String())
+		t.Fatalf("expected 200, got %d: %s", res.Code, res.Body.String())
 	}
+	body := res.Body.String()
+	for _, expected := range []string{"Room " + code, "Avery", "Start Game", "Add local player"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q on setup page, got %s", expected, body)
+		}
+	}
+}
+
+func TestJoinRoomAddsPlayerAndReconnects(t *testing.T) {
+	router := newTestRouter(t)
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+
+	guest := newClient(t, router)
+	res := guest.join(code, "Blair")
+	if res.Code != http.StatusSeeOther || res.Header().Get("Location") != "/room/"+code {
+		t.Fatalf("expected join redirect to room, got %d %q", res.Code, res.Header().Get("Location"))
+	}
+
+	// Guest sees themselves, but no host-only controls.
+	page := guest.do(http.MethodGet, "/room/"+code, nil).Body.String()
+	for _, expected := range []string{"Blair", "you", "Leave Room", "Waiting for the host"} {
+		if !strings.Contains(page, expected) {
+			t.Fatalf("expected %q on guest setup page", expected)
+		}
+	}
+	if strings.Contains(page, "Start Game") || strings.Contains(page, "Add local player") {
+		t.Fatal("guest page must not include host controls")
+	}
+
+	// Joining again with the same browser reconnects instead of adding a seat.
+	guest.join(code, "Blair again")
+	hostPage := host.do(http.MethodGet, "/room/"+code, nil).Body.String()
+	if strings.Count(hostPage, `value="Blair"`) != 1 || strings.Contains(hostPage, "Blair again") {
+		t.Fatalf("expected a single Blair seat after rejoin, got %s", hostPage)
+	}
+
+	if res := guest.join("ZZZZZZ", "Nobody"); res.Header().Get("Location") != "/?err=notfound" {
+		t.Fatalf("expected notfound redirect, got %q", res.Header().Get("Location"))
+	}
+}
+
+func TestGuestCannotUseHostControls(t *testing.T) {
+	router := newTestRouter(t)
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+
+	guest := newClient(t, router)
+	guest.join(code, "Blair")
+
+	res := guest.do(http.MethodPost, base+"/game/start", nil)
+	if !strings.Contains(res.Body.String(), "Only the host can start the game.") {
+		t.Fatalf("expected host-only message, got %s", res.Body.String())
+	}
+
+	guest.do(http.MethodPost, base+"/settings", url.Values{"duration": {"10"}})
+	page := host.do(http.MethodGet, base, nil).Body.String()
+	if !strings.Contains(page, `value="60"`) {
+		t.Fatal("expected settings unchanged after guest attempt")
+	}
+
+	res = guest.do(http.MethodPost, base+"/score/override", url.Values{"playerID": {"p1"}, "delta": {"50"}})
+	if !strings.Contains(res.Body.String(), "Only the host can adjust scores.") {
+		t.Fatalf("expected host-only message, got %s", res.Body.String())
+	}
+}
+
+func TestHostRunsFullGame(t *testing.T) {
+	router := newTestRouter(t)
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+
+	host.do(http.MethodPost, base+"/players", url.Values{"name": {"Blair"}})
+	host.do(http.MethodPost, base+"/settings", url.Values{
+		"duration": {"10"}, "silence": {"1"}, "rounds": {"1"}, "topicPack": {"everyday"},
+	})
+
+	res := host.do(http.MethodPost, base+"/game/start", nil)
 	if !strings.Contains(res.Body.String(), "Start Talking") {
-		t.Fatalf("expected turn controls in response")
+		t.Fatalf("expected play screen, got %s", res.Body.String())
 	}
-	if !strings.Contains(res.Body.String(), "Manual Timer") {
-		t.Fatalf("expected manual timer control in response")
+
+	// Host submissions are trusted (host override authority).
+	res = host.do(http.MethodPost, base+"/turn/submit", url.Values{
+		"spokenSeconds": {"10"}, "completed": {"true"}, "eliminated": {"false"},
+	})
+	body := res.Body.String()
+	for _, expected := range []string{"Turn scored", "35 points", "Completion bonus"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q after host submit, got %s", expected, body)
+		}
 	}
-	if !strings.Contains(res.Body.String(), "Auto-detect") {
-		t.Fatalf("expected automatic microphone option in response")
+
+	host.do(http.MethodPost, base+"/turn/start", nil)
+	res = host.do(http.MethodPost, base+"/turn/submit", url.Values{
+		"spokenSeconds": {"4"}, "completed": {"false"}, "eliminated": {"true"},
+	})
+	if !strings.Contains(res.Body.String(), "Winner") {
+		t.Fatalf("expected winner screen, got %s", res.Body.String())
+	}
+
+	// Reset keeps the roster for the next game.
+	res = host.do(http.MethodPost, base+"/game/reset", nil)
+	body = res.Body.String()
+	if !strings.Contains(body, "Avery") || !strings.Contains(body, "Blair") {
+		t.Fatalf("expected roster preserved after reset, got %s", body)
 	}
 }
 
-func TestSettingsUpdateRendersFreshSetupSummary(t *testing.T) {
-	server, err := NewServer("../templates/*.html")
-	if err != nil {
-		t.Fatal(err)
+func TestRemoteSpeakerScoresAreServerAuthoritative(t *testing.T) {
+	router := newTestRouter(t)
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+
+	guest := newClient(t, router)
+	guest.join(code, "Blair")
+
+	host.do(http.MethodPost, base+"/settings", url.Values{
+		"duration": {"60"}, "silence": {"2"}, "rounds": {"1"}, "topicPack": {"everyday"},
+	})
+	host.do(http.MethodPost, base+"/game/start", nil)
+	// Avery (host seat) goes first; host ends their turn honestly.
+	host.do(http.MethodPost, base+"/turn/submit", url.Values{
+		"spokenSeconds": {"30"}, "completed": {"false"}, "eliminated": {"false"},
+	})
+
+	// Blair is next and can start their own turn.
+	res := guest.do(http.MethodPost, base+"/turn/start", nil)
+	if !strings.Contains(res.Body.String(), "Start Talking") {
+		t.Fatalf("expected guest to start own turn, got %s", res.Body.String())
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/settings", formBody(url.Values{
-		"duration":  {"10"},
-		"silence":   {"1"},
-		"rounds":    {"2"},
-		"topicPack": {"absurd"},
-	}))
+	// Blair begins speaking, then immediately claims a full completed turn.
+	guest.do(http.MethodPost, base+"/turn/begin", nil)
+	res = guest.do(http.MethodPost, base+"/turn/submit", url.Values{
+		"spokenSeconds": {"60"}, "completed": {"true"}, "eliminated": {"false"},
+	})
+	body := res.Body.String()
+	if !strings.Contains(body, "Winner") {
+		t.Fatalf("expected winner screen after last turn, got %s", body)
+	}
+	if strings.Contains(body, "Completion bonus") {
+		t.Fatal("expected no completion bonus for an instant claimed turn")
+	}
+	// The server clock observed ~0-1 seconds, so 60 claimed seconds cannot stand.
+	if strings.Contains(body, "60 of 60") {
+		t.Fatal("expected claimed speaking time to be capped by the server clock")
+	}
+}
+
+func TestGuestCannotDriveSomeoneElsesTurn(t *testing.T) {
+	router := newTestRouter(t)
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+
+	guest := newClient(t, router)
+	guest.join(code, "Blair")
+	host.do(http.MethodPost, base+"/game/start", nil)
+
+	// Avery's turn is active; Blair cannot end or redraw it.
+	res := guest.do(http.MethodPost, base+"/turn/submit", url.Values{"spokenSeconds": {"60"}, "completed": {"true"}})
+	if !strings.Contains(res.Body.String(), "Only the host or the current speaker") {
+		t.Fatalf("expected permission message, got %s", res.Body.String())
+	}
+	res = guest.do(http.MethodPost, base+"/turn/redraw", nil)
+	if !strings.Contains(res.Body.String(), "Only the host or the current speaker") {
+		t.Fatalf("expected permission message, got %s", res.Body.String())
+	}
+}
+
+func TestLeaveRemovesSeat(t *testing.T) {
+	router := newTestRouter(t)
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+
+	guest := newClient(t, router)
+	guest.join(code, "Blair")
+	res := guest.do(http.MethodPost, base+"/leave", nil)
+	if res.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect after leave, got %d", res.Code)
+	}
+	page := host.do(http.MethodGet, base, nil).Body.String()
+	if strings.Contains(page, "Blair") {
+		t.Fatal("expected Blair removed after leaving")
+	}
+}
+
+func TestRoomFullRejectsJoin(t *testing.T) {
+	router := newTestRouter(t)
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	for i := 1; i < room.MaxPlayersPerRoom; i++ {
+		host.do(http.MethodPost, base+"/players", url.Values{"name": {"Local"}})
+	}
+
+	guest := newClient(t, router)
+	if res := guest.join(code, "Overflow"); res.Header().Get("Location") != "/?err=full" {
+		t.Fatalf("expected full redirect, got %q", res.Header().Get("Location"))
+	}
+}
+
+func TestCrossOriginPostRejected(t *testing.T) {
+	router := newTestRouter(t)
+	req := httptest.NewRequest(http.MethodPost, "/rooms", strings.NewReader("name=Evil"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://evil.example")
 	res := httptest.NewRecorder()
-
-	server.Routes().ServeHTTP(res, req)
-
-	if res.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", res.Code, res.Body.String())
-	}
-	body := res.Body.String()
-	for _, expected := range []string{"Absurd Arguments", "10s to survive, 1s silence limit", `value="2"`} {
-		if !strings.Contains(body, expected) {
-			t.Fatalf("expected %q in settings response", expected)
-		}
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-origin post, got %d", res.Code)
 	}
 }
 
-func TestCustomTopicsUpdateSetupSummary(t *testing.T) {
+func TestJoinRateLimit(t *testing.T) {
+	router := newTestRouter(t)
+	guest := newClient(t, router)
+	limited := false
+	for i := 0; i < 25; i++ {
+		res := guest.join("XXXXXX", "Spammer")
+		if res.Header().Get("Location") == "/?err=rate" {
+			limited = true
+			break
+		}
+	}
+	if !limited {
+		t.Fatal("expected join attempts to be rate limited")
+	}
+}
+
+type stubJudge struct{}
+
+func (stubJudge) Name() string { return "stub judge" }
+
+func (stubJudge) Grade(context.Context, string, string) (judge.Verdict, error) {
+	return judge.Verdict{Relevance: 0.5, Feedback: "Stub: solid effort on the topic."}, nil
+}
+
+func TestAIJudgeGradesTurnAsynchronously(t *testing.T) {
 	server, err := NewServer("../templates/*.html")
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	req := httptest.NewRequest(http.MethodPost, "/topics/custom", formBody(url.Values{
-		"topics": {"First custom topic\nSecond custom topic\nFirst custom topic"},
-	}))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	res := httptest.NewRecorder()
-
-	server.Routes().ServeHTTP(res, req)
-
-	if res.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", res.Code, res.Body.String())
-	}
-	body := res.Body.String()
-	for _, expected := range []string{"Custom", "2 topics loaded"} {
-		if !strings.Contains(body, expected) {
-			t.Fatalf("expected %q in custom topic response", expected)
-		}
-	}
-}
-
-func TestHomeResumesActiveTurn(t *testing.T) {
-	server, err := NewServer("../templates/*.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	start := httptest.NewRequest(http.MethodPost, "/game/start", nil)
-	server.Routes().ServeHTTP(httptest.NewRecorder(), start)
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	res := httptest.NewRecorder()
-	server.Routes().ServeHTTP(res, req)
-
-	if res.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", res.Code, res.Body.String())
-	}
-	body := res.Body.String()
-	for _, expected := range []string{"<!doctype html>", "Start Talking", "/static/css/app.css"} {
-		if !strings.Contains(body, expected) {
-			t.Fatalf("expected %q in resumed active turn", expected)
-		}
-	}
-}
-
-func TestHomeResumesScoreAndWinnerScreens(t *testing.T) {
-	server, err := NewServer("../templates/*.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	server.SetJudge(stubJudge{})
 	router := server.Routes()
-	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/game/start", nil))
-	submitTurn(router, 60, true)
 
-	scoreRes := httptest.NewRecorder()
-	router.ServeHTTP(scoreRes, httptest.NewRequest(http.MethodGet, "/", nil))
-	if !strings.Contains(scoreRes.Body.String(), "Turn scored") {
-		t.Fatalf("expected score screen on refresh, got %s", scoreRes.Body.String())
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	host.do(http.MethodPost, base+"/players", url.Values{"name": {"Blair"}})
+	host.do(http.MethodPost, base+"/settings", url.Values{
+		"duration": {"10"}, "silence": {"1"}, "rounds": {"1"},
+		"topicPack": {"everyday"}, "aiJudge": {"on"},
+	})
+	host.do(http.MethodPost, base+"/game/start", nil)
+
+	res := host.do(http.MethodPost, base+"/turn/submit", url.Values{
+		"spokenSeconds": {"10"}, "completed": {"true"}, "eliminated": {"false"},
+		"transcript":    {"I truly believe pancakes are the best breakfast food ever made"},
+	})
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", res.Code, res.Body.String())
 	}
 
-	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/turn/start", nil))
-	submitTurn(router, 1, false)
-
-	winnerRes := httptest.NewRecorder()
-	router.ServeHTTP(winnerRes, httptest.NewRequest(http.MethodGet, "/", nil))
-	if !strings.Contains(winnerRes.Body.String(), "Winner") {
-		t.Fatalf("expected winner screen on refresh, got %s", winnerRes.Body.String())
-	}
-}
-
-func TestSubmitTurnRendersScoreBreakdown(t *testing.T) {
-	server, err := NewServer("../templates/*.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	start := httptest.NewRequest(http.MethodPost, "/game/start", nil)
-	startRes := httptest.NewRecorder()
-	server.Routes().ServeHTTP(startRes, start)
-
-	submit := httptest.NewRequest(http.MethodPost, "/turn/submit", formBody(url.Values{
-		"spokenSeconds": {"60"},
-		"completed":     {"true"},
-		"eliminated":    {"false"},
-	}))
-	submit.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	submitRes := httptest.NewRecorder()
-	server.Routes().ServeHTTP(submitRes, submit)
-
-	if submitRes.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", submitRes.Code, submitRes.Body.String())
-	}
-	body := submitRes.Body.String()
-	for _, expected := range []string{"Speaking time", "Completion bonus", "Total", "85"} {
-		if !strings.Contains(body, expected) {
-			t.Fatalf("expected %q in score response", expected)
+	// The verdict is applied off the request path; poll until it lands.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		body := host.do(http.MethodGet, base+"/partial", nil).Body.String()
+		if strings.Contains(body, "Stub: solid effort on the topic.") {
+			for _, expected := range []string{"AI relevance", "45 points"} {
+				if !strings.Contains(body, expected) {
+					t.Fatalf("expected %q with AI verdict, got %s", expected, body)
+				}
+			}
+			break
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("AI verdict never applied, last body: %s", body)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
-func TestRenameAndMovePlayers(t *testing.T) {
+func TestAIJudgeSkippedWithoutTranscript(t *testing.T) {
 	server, err := NewServer("../templates/*.html")
 	if err != nil {
 		t.Fatal(err)
 	}
+	server.SetJudge(stubJudge{})
+	router := server.Routes()
 
-	rename := httptest.NewRequest(http.MethodPost, "/players/rename", formBody(url.Values{
-		"id":   {"p1"},
-		"name": {"Avery"},
-	}))
-	rename.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	renameRes := httptest.NewRecorder()
-	server.Routes().ServeHTTP(renameRes, rename)
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	host.do(http.MethodPost, base+"/players", url.Values{"name": {"Blair"}})
+	host.do(http.MethodPost, base+"/settings", url.Values{
+		"duration": {"10"}, "silence": {"1"}, "rounds": {"1"},
+		"topicPack": {"everyday"}, "aiJudge": {"on"},
+	})
+	host.do(http.MethodPost, base+"/game/start", nil)
 
-	if renameRes.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", renameRes.Code, renameRes.Body.String())
+	res := host.do(http.MethodPost, base+"/turn/submit", url.Values{
+		"spokenSeconds": {"10"}, "completed": {"true"}, "eliminated": {"false"},
+	})
+	body := res.Body.String()
+	if !strings.Contains(body, "No transcript was captured") {
+		t.Fatalf("expected skipped-verdict note, got %s", body)
 	}
-	if !strings.Contains(renameRes.Body.String(), `value="Avery"`) {
-		t.Fatalf("expected renamed player in response")
-	}
-
-	move := httptest.NewRequest(http.MethodPost, "/players/move", formBody(url.Values{
-		"id":     {"p2"},
-		"offset": {"-1"},
-	}))
-	move.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	moveRes := httptest.NewRecorder()
-	server.Routes().ServeHTTP(moveRes, move)
-
-	if moveRes.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", moveRes.Code, moveRes.Body.String())
-	}
-	body := moveRes.Body.String()
-	if strings.Index(body, `value="Player 2"`) > strings.Index(body, `value="Avery"`) {
-		t.Fatalf("expected Player 2 before Avery after move")
+	if strings.Contains(body, "AI relevance") {
+		t.Fatal("expected no AI bonus without a transcript")
 	}
 }
 
-func TestRedrawTurnRendersNewTopic(t *testing.T) {
+func TestNoAIVerdictWhenDisabled(t *testing.T) {
 	server, err := NewServer("../templates/*.html")
 	if err != nil {
 		t.Fatal(err)
 	}
+	server.SetJudge(stubJudge{})
+	router := server.Routes()
 
-	start := httptest.NewRequest(http.MethodPost, "/game/start", nil)
-	startRes := httptest.NewRecorder()
-	server.Routes().ServeHTTP(startRes, start)
-	if !strings.Contains(startRes.Body.String(), "The best breakfast food") {
-		t.Fatalf("expected first topic in start response")
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	host.do(http.MethodPost, base+"/players", url.Values{"name": {"Blair"}})
+	host.do(http.MethodPost, base+"/settings", url.Values{
+		"duration": {"10"}, "silence": {"1"}, "rounds": {"1"}, "topicPack": {"everyday"},
+	})
+	host.do(http.MethodPost, base+"/game/start", nil)
+
+	res := host.do(http.MethodPost, base+"/turn/submit", url.Values{
+		"spokenSeconds": {"10"}, "completed": {"true"}, "eliminated": {"false"},
+		"transcript":    {"words that should be ignored"},
+	})
+	body := res.Body.String()
+	if strings.Contains(body, "AI") && strings.Contains(body, "reviewing") {
+		t.Fatalf("expected no AI activity when disabled, got %s", body)
 	}
-
-	redraw := httptest.NewRequest(http.MethodPost, "/turn/redraw", nil)
-	redrawRes := httptest.NewRecorder()
-	server.Routes().ServeHTTP(redrawRes, redraw)
-
-	if redrawRes.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", redrawRes.Code, redrawRes.Body.String())
-	}
-	if !strings.Contains(redrawRes.Body.String(), "A tiny convenience") {
-		t.Fatalf("expected redrawn topic in response")
+	time.Sleep(50 * time.Millisecond)
+	after := host.do(http.MethodGet, base+"/partial", nil).Body.String()
+	if strings.Contains(after, "Stub:") {
+		t.Fatal("expected judge to stay uninvoked when disabled")
 	}
 }
 
-func formBody(values url.Values) *strings.Reader {
-	return strings.NewReader(values.Encode())
-}
+func TestMissingRoomRedirects(t *testing.T) {
+	router := newTestRouter(t)
+	c := newClient(t, router)
 
-func submitTurn(router http.Handler, spokenSeconds int, completed bool) {
-	values := url.Values{
-		"spokenSeconds": {strconv.Itoa(spokenSeconds)},
-		"completed":     {strconv.FormatBool(completed)},
-		"eliminated":    {strconv.FormatBool(!completed)},
+	res := c.do(http.MethodGet, "/room/XXXXXX", nil)
+	if res.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect for missing room, got %d", res.Code)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/turn/submit", formBody(values))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	router.ServeHTTP(httptest.NewRecorder(), req)
+
+	req := httptest.NewRequest(http.MethodGet, "/room/XXXXXX/partial", nil)
+	req.Header.Set("HX-Request", "true")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Header().Get("HX-Redirect") != "/?err=gone" {
+		t.Fatalf("expected HX-Redirect for htmx request, got %q", rec.Header().Get("HX-Redirect"))
+	}
 }
