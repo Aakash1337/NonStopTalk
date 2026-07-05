@@ -50,6 +50,14 @@ The host can enable an AI judge in game settings. When on:
 
 The host can also generate a themed topic pack: type a theme (for example "road trips with dragons") and Claude writes ten speaking prompts into the editable custom list. Only the theme text is sent to the provider; without an API key, simple offline templates are used instead.
 
+The judge reports its confidence with every verdict (noisy transcripts and ambiguous topics lower it), shown next to the feedback, and it is told to call out heavy repetition.
+
+## Presets, Sharing, and History
+
+- **Presets**: the host can save the current settings and custom topics under a name (stored on their device) and re-apply everything with one click.
+- **Topic pack sharing**: export the custom topic list as a plain text file and import one someone shared with you.
+- **Game history**: each room remembers its last 20 finished games (winner, standings, turn count) — shown on the setup screen and persisted with the room.
+
 Run with the AI judge backed by Claude:
 
 ```text

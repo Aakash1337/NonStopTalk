@@ -13,6 +13,9 @@ import (
 type Verdict struct {
 	// Relevance is 0..1; the game converts it to bonus points.
 	Relevance float64
+	// Confidence is 0..1: how sure the judge is about its own grade
+	// (noisy transcripts and ambiguous topics lower it).
+	Confidence float64
 	// Feedback is one or two short sentences addressed to the player.
 	Feedback string
 }
@@ -62,6 +65,9 @@ func (Heuristic) Grade(_ context.Context, topic, transcript string) (Verdict, er
 	}
 	relevance := clampRelevance(0.7*overlap + 0.3*length)
 
+	// Keyword overlap is a rough measure; never claim high confidence.
+	confidence := 0.3
+
 	feedback := "Offline judge: you touched on the topic's key words."
 	switch {
 	case matched == 0:
@@ -69,7 +75,7 @@ func (Heuristic) Grade(_ context.Context, topic, transcript string) (Verdict, er
 	case overlap < 0.5:
 		feedback = "Offline judge: you hit some of the topic's key words, but wandered."
 	}
-	return Verdict{Relevance: relevance, Feedback: feedback}, nil
+	return Verdict{Relevance: relevance, Confidence: confidence, Feedback: feedback}, nil
 }
 
 var stopwords = map[string]bool{

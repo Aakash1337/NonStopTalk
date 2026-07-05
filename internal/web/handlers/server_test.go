@@ -617,6 +617,63 @@ func TestRoomsSurviveRestartViaPersistence(t *testing.T) {
 	}
 }
 
+func TestApplyPresetInstallsSettingsAndTopics(t *testing.T) {
+	router := newTestRouter(t)
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+
+	res := host.do(http.MethodPost, base+"/presets/apply", url.Values{
+		"duration": {"45"}, "silence": {"3"}, "rounds": {"2"},
+		"topicPack": {"custom"}, "aiJudge": {"on"},
+		"topics": {"Preset topic one\nPreset topic two"},
+	})
+	body := res.Body.String()
+	for _, expected := range []string{`value="45"`, `value="3"`, `value="2"`, "2 topics loaded", "Preset topic one"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q after preset apply, got %s", expected, body)
+		}
+	}
+	if !strings.Contains(body, `name="aiJudge" value="on" checked`) {
+		t.Fatalf("expected AI judge enabled, got %s", body)
+	}
+
+	// A preset naming a preset pack installs that pack's topics.
+	res = host.do(http.MethodPost, base+"/presets/apply", url.Values{
+		"duration": {"60"}, "silence": {"2"}, "rounds": {"1"}, "topicPack": {"absurd"},
+	})
+	if !strings.Contains(res.Body.String(), "Absurd Arguments") {
+		t.Fatalf("expected absurd pack selected, got %s", res.Body.String())
+	}
+
+	guest := newClient(t, router)
+	guest.join(code, "Blair")
+	res = guest.do(http.MethodPost, base+"/presets/apply", url.Values{"duration": {"10"}})
+	if !strings.Contains(res.Body.String(), "Only the host can apply presets.") {
+		t.Fatalf("expected host-only message, got %s", res.Body.String())
+	}
+}
+
+func TestGameHistoryShowsAfterPlayAgain(t *testing.T) {
+	router := newTestRouter(t)
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	host.do(http.MethodPost, base+"/players", url.Values{"name": {"Blair"}})
+	host.do(http.MethodPost, base+"/game/start", nil)
+	host.do(http.MethodPost, base+"/turn/submit", url.Values{"spokenSeconds": {"60"}, "completed": {"true"}})
+	host.do(http.MethodPost, base+"/turn/start", nil)
+	host.do(http.MethodPost, base+"/turn/submit", url.Values{"spokenSeconds": {"5"}, "eliminated": {"true"}})
+
+	res := host.do(http.MethodPost, base+"/game/reset", nil)
+	body := res.Body.String()
+	for _, expected := range []string{"Game History", "Avery won", "2 turns"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q on setup after reset, got %s", expected, body)
+		}
+	}
+}
+
 func TestMissingRoomRedirects(t *testing.T) {
 	router := newTestRouter(t)
 	c := newClient(t, router)

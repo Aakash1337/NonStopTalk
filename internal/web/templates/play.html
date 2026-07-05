@@ -159,7 +159,7 @@
       {{if eq .LastTurn.AIStatus "pending"}}
       <p class="ai-verdict pending">The AI judge is reviewing this turn…</p>
       {{else if .LastTurn.AIFeedback}}
-      <p class="ai-verdict">{{.LastTurn.AIFeedback}}</p>
+      <p class="ai-verdict">{{.LastTurn.AIFeedback}}{{with .LastTurn.AIConfidenceLabel}} <span class="you-tag confidence-tag">{{.}}</span>{{end}}</p>
       {{end}}
       {{if or .IsHost .IsNextUp}}
       <form class="next-turn" hx-post="{{.Base}}/turn/start" hx-target="#app" hx-swap="outerHTML">
