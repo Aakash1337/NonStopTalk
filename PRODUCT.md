@@ -4,44 +4,96 @@
 
 product
 
-## Users
+## Direction
 
-NonStopTalk is for groups who want a quick social game that works both in the same room and online. Primary users are friends, families, classrooms, streamers, and party hosts. They need a game that is easy to start, easy to explain, and funny because of what players say under pressure.
+NonStopTalk is expanding from a speaking-endurance party game into a broader voice and speech-practice product. The original multiplayer game remains a first-class mode; the new coaching path adds private, deliberate practice rather than replacing social play.
 
-The host manages setup, settings, and judgment calls. Players need to understand whose turn it is, what the topic is, how much time remains, and whether they are still successfully speaking.
+```text
+NonStopTalk
+├── Practice — rehearse, inspect evidence, and choose one improvement
+├── Play     — the original local and online speaking game
+└── Progress — review origin-local browser summaries over time
+```
 
-## Product Purpose
+The product thesis is:
 
-The product creates a lightweight speaking challenge: keep talking about the topic without pausing too long. The app should make the rules visible, handle timing and scoring, and reduce host bookkeeping.
+> Practice speaking under pressure, get one useful signal, and try again.
 
-Success means a group can start a game in under two minutes, play a complete local or online session without instructions outside the screen, and understand why each player earned their score.
+## Users and jobs
 
-## Brand Personality
+The initial coaching audience is students and early-career professionals rehearsing interview answers, presentation openings, and impromptu responses. Their job is not to earn a universal voice grade. It is to notice one behavior, receive a concrete next action, and make a better unassisted attempt.
 
-The personality is tense, playful, and sharp. The game should feel like a fast party table with enough structure to avoid arguments. The tone should be direct and lively, but not childish.
+The game remains for friends, families, classrooms, streamers, and party hosts who want a quick social challenge in the same room or online. The host manages setup and judgment calls; players need to see the current speaker, topic, timer, voice state, and score.
 
-UI copy should be short and game-like. It should avoid long explanations, marketing language, and anything that makes the game feel like a productivity app.
+Potential later audiences include educators, human coaches, and teams running facilitated practice. Accounts, assignments, shared reports, and teacher dashboards are not part of the current prototype.
+
+## Product purpose
+
+Practice should create a deliberate-practice loop:
+
+```text
+choose one goal
+  → make an uncoached attempt
+  → inspect explainable evidence
+  → receive one highest-value next action
+  → retry without live help
+  → compare with the baseline
+```
+
+The first prototype implements standalone practice attempts, analysis/advice, and origin-scoped IndexedDB summaries in the current browser profile. Consented transcript analysis retains derived filler/repetition patterns in the summary but discards the full transcript by default. A separate, unchecked choice can retain the attempt recording and available full transcript locally for individual download; summary export omits those full artifacts, and deleting local history clears them. Its small local RAG pattern ranks curated in-app coaching cards; the top card supplies the intact base drill, deterministic template assembly appends a metric-specific comparison sentence, and separate rules select the strength and focus while the source remains visible. Explicit baseline/retry pairing and validated learning outcomes are still work in progress.
+
+Play creates a lightweight speaking challenge: keep talking about a topic without exceeding the silence limit. It makes rules visible, handles timing and scoring, and reduces host bookkeeping.
+
+These modes must keep different success models. A pause can be a failure condition in the game while being an intentional delivery technique in coaching. Game points must never be presented as a speech-development score.
+
+## Product success
+
+The primary future coaching outcomes are:
+
+1. People complete a deliberate-practice loop: baseline, evidence/advice review, and unassisted retry.
+2. The unassisted retry improves the one goal the person selected, measured as a paired goal-specific change rather than one opaque score.
+
+Drivers and guardrails include usable microphone sessions, strict local-transcription availability, false-tip rate, reported distraction, local-retrieval grounding quality, privacy network violations, and subgroup fairness. There is not enough pilot evidence to claim baselines or numeric targets yet. See [Coaching Presentation Guide](docs/COACHING_PRESENTATION_GUIDE.md#4-measurement).
+
+For the game, success still means a group can start quickly, complete a local or online session from on-screen guidance, and understand why each player earned their score. Formal time-to-start testing has not yet been run.
+
+## Brand personality
+
+The shared personality is focused, direct, energetic, and humane.
+
+- Practice should feel like a calm rehearsal room: evidence-forward, encouraging, and never clinical or judgmental.
+- Play should feel tense, social, and sharp without becoming chaotic or childish.
+- Progress should emphasize change against the user's own attempts, not comparison with a population.
+
+Copy should be short while someone is speaking. Detailed explanations belong in setup and review, where each recommendation can name its evidence, limitation, and next action.
 
 ## Anti-references
 
-The app should not feel like a generic SaaS dashboard, a trivia quiz clone, or a dark neon streamer overlay. It should avoid decorative complexity that competes with the current turn. The interface should not bury host controls or make players read paragraphs during a turn.
+NonStopTalk should not feel like:
 
-Avoid:
+- A dense SaaS analytics dashboard
+- A generic “AI score” with no inspectable evidence
+- A medical speech assessment or automated diagnosis
+- A system that equates an accent, dialect, vocal pitch, or loudness with professionalism
+- A dark neon streamer overlay or an overly cute party-game clone
+- A live coach that interrupts with several warnings at once
 
-- Dense admin-style screens
-- Overly cute party-game visuals
-- Unclear microphone states
-- AI grading that feels like a hidden black box
-- Timers or scoring that require host interpretation
+## Design principles
 
-## Design Principles
+1. The current speaking task is always the center of attention.
+2. Show one live coaching cue at a time; move deeper analysis to the review.
+3. Connect every recommendation to an observable measurement and a concrete retry.
+4. Show which product-authored curated card supplied the retry drill; require expert/source review before calling a future curriculum authoritative.
+5. State uncertainty and unavailable signals instead of manufacturing a score.
+6. Keep attempt-recording and full-transcript retention off by default, explain that derived word patterns remain in the compact summary when transcript analysis is enabled, and separate every additional consent boundary.
+7. Treat accents and dialects as language variation, not defects.
+8. Preserve complete, explainable game scoring independently from coaching progress.
+9. Keep local play complete while the online and coaching editions evolve.
 
-1. The current turn is always the center of attention.
-2. Host controls are powerful but quiet.
-3. Scoring must be explainable at a glance.
-4. AI features are optional judges, not the core game.
-5. Local play must remain complete as online play evolves.
+## Safety, accessibility, and inclusion
 
-## Accessibility & Inclusion
+NonStopTalk is a general communication-practice product, not speech therapy and not a medical device. It must not infer confidence, anxiety, emotion, honesty, personality, age, identity, or health from a person's voice.
 
-The app should target WCAG 2.1 AA for contrast, focus states, keyboard navigation, and readable text. It should support reduced motion, clear microphone permission states, color-blind-safe status indicators, and manual scoring controls for noisy rooms or players who cannot use voice detection reliably.
+Users should be compared primarily with their own baselines. Any fairness study must use voluntarily supplied, appropriately protected group information; group identity must not be inferred from audio. ASHA's [accent guidance](https://www.asha.org/Practice-Portal/Professional-Issues/Accent-Modification/) describes accents as natural language variations rather than communication disorders.
+
+The interface should target WCAG 2.1 AA for contrast, focus, keyboard navigation, and readable text; support reduced motion; communicate microphone and transcription availability in text; and preserve non-microphone fallbacks for the game. Formal conformance and broad assistive-technology testing remain backlog.

@@ -1,11 +1,16 @@
 # NonStopTalk
 
-NonStopTalk is a work-in-progress multiplayer party game about speaking on a surprise topic without pausing for too long. It supports pass-and-play on one device and online rooms for players on separate devices.
+NonStopTalk is a work-in-progress speaking-practice product and multiplayer party game. The native Cloudflare app now includes a private speech-coaching prototype for individual rehearsal, while the original game still supports pass-and-play and online rooms for players on separate devices.
 
-The playable core exists today. The project is still being hardened, and the [roadmap](docs/ROADMAP.md) separates implemented features from future ideas.
+The playable game and a demonstrable coaching prototype exist today. The project is still being validated and hardened; the [roadmap](docs/ROADMAP.md) separates implemented work, prototype claims, and future ideas.
 
 ## Implemented now
 
+- A Cloudflare-SPA coaching prototype at `/practice`: 30–90 second interview, presentation, or impromptu attempts; microphone calibration; browser-side audio measurements; sparse deterministic live tips; and evidence-based review
+- A small local RAG layer: goal/evidence queries lexically retrieve curated in-app coaching cards; the top card supplies an intact base drill, deterministic template assembly appends a metric-specific comparison sentence, and separate rules select strength/focus—with visible provenance and no LLM, free-form model prose, embeddings, vector database, or network call
+- Optional pace and word-pattern estimates only when the user consents and the browser supports strict on-device speech recognition; the summary retains derived filler/repetition patterns, while the full transcript is discarded by default
+- Origin-local coaching summaries, JSON export, and deletion at `/progress` through IndexedDB in the current browser profile
+- A separate, off-by-default retention choice that can keep the attempt recording and, when local transcription succeeds, its full transcript in the same origin-local IndexedDB database; Progress downloads those artifacts individually, JSON export excludes them, and deletion clears both stores
 - Six-character rooms with a host, remote seats, browser-based reconnect, live updates (SSE in the local Go app and hibernatable WebSockets online), host transfer, and takeover after a short absence grace period
 - Local pass-and-play and remote turns in the same room
 - Player add, rename, remove, and reorder controls
@@ -18,9 +23,9 @@ The playable core exists today. The project is still being hardened, and the [ro
 
 ## Privacy and AI
 
-Classic play does not require an account, an API key, transcription, or audio upload. The browser uses its microphone locally for voice-activity detection. NonStopTalk does not upload or persist microphone audio.
+Classic play does not require an account, an API key, transcription, or audio upload. The browser uses its microphone locally for voice-activity detection. The coaching prototype similarly processes microphone frames in the browser and makes no coaching API call. It does not upload coaching audio or transcripts. Attempt-recording/full-transcript retention is a separate, off-by-default local-storage option; without it, audio is reduced to measurements and the full transcript is discarded.
 
-The free Cloudflare edition is classic-only: it does not transcribe speech or call an AI provider. The following optional AI behavior belongs to the local Go edition.
+The free Cloudflare multiplayer game remains classic-only and calls no AI provider. Its separate coaching path may create a transcript only after explicit consent and only when the browser supports mandatory on-device recognition. Derived filler/repetition patterns are saved with its compact summary. By default the full transcript is discarded; if the user separately enables full-session retention, the recording and available full transcript are stored only for that site origin and browser profile. Coaching-card retrieval and deterministic review assembly also stay in the browser. The following AI-judge behavior belongs to the local Go game edition.
 
 The AI judge is opt-in at two levels: the host enables it for the room, then the current speaker chooses whether to use transcription for that turn. Transcription starts only when the browser exposes `SpeechRecognition` with `processLocally` support and accepts the selected live microphone track. If any of those checks fail, the turn continues with classic scoring or the manual timer.
 
@@ -73,7 +78,7 @@ npx wrangler login
 npm run deploy
 ```
 
-No Docker engine, Container subscription, or static build-output setting is required. The public routes are `/` and `/room/ABC123`; the Durable Object binding is internal and has no separate public URL. See [Cloudflare Deployment](docs/CLOUDFLARE_DEPLOYMENT.md) for the free-tier limits, dashboard settings, local Worker development, and custom-domain routing.
+No Docker engine, Container subscription, or static build-output setting is required. The public routes include `/`, `/practice`, `/progress`, and `/room/ABC123`; the Durable Object binding is internal and has no separate public URL. Coaching pages are static SPA routes and never put coaching summaries, recordings, or transcripts into the room object. See [Cloudflare Deployment](docs/CLOUDFLARE_DEPLOYMENT.md) for the free-tier limits, dashboard settings, local Worker development, and custom-domain routing.
 
 ## Configuration
 
@@ -134,9 +139,14 @@ Set `HEADED=1` to watch the browser run.
 Validate the native Cloudflare game rules and deploy bundle:
 
 ```sh
+npm run typecheck:cloudflare
 npm run test:cloudflare
+npm run test:coach
 npm run check:cloudflare
+npm run smoke:coach
 ```
+
+`test:coach` runs 20 deterministic measurement, continuity, transcript-analysis, retrieval, and advice tests without a microphone. `smoke:coach` drives the Cloudflare SPA with synthetic media; it proves a default-off attempt never constructs `MediaRecorder` or creates an artifact, exercises a v1→v2 storage upgrade, verifies opted-in recording/transcript and real downloads, checks JSON artifact exclusion and two-store deletion, renders a voice/quiet timeline, moves focus after SPA navigation, cleans up canceled permission/worklet work, handles active/calibration stalls, and makes no application `/api/*` request.
 
 ## Architecture
 
@@ -148,6 +158,8 @@ npm run check:cloudflare
 - Anthropic Go SDK behind a small judge/topic-generator interface
 - Native TypeScript Worker, Workers Static Assets, and one SQLite-backed Durable Object per online room
 - Hibernatable WebSockets for cost-efficient online synchronization
+- Browser `AudioWorklet` (with an `AnalyserNode` compatibility fallback) for coaching signal reduction, plus deterministic analysis and local lexical coaching-card retrieval
+- Origin-scoped IndexedDB v2 for compact coaching summaries and a separate, explicitly opted-in full-artifact store; exports exclude full recordings/transcripts and local deletion clears both stores
 - Playwright browser smoke coverage plus Go unit and handler tests
 
 There is no frontend build step for local play.
@@ -163,7 +175,10 @@ These ideas are not presented as current features:
 - User profiles
 - Family/content filters
 - Post-turn AI summaries
-- Full feature parity between the local Go and free Cloudflare editions (AI judge, saved presets, import/export, microphone picker, and sound cues)
+- Full multiplayer-game feature parity between the local Go and free Cloudflare editions (AI judge, saved presets, import/export, microphone picker, and sound cues)
+- Validated baseline-to-unassisted-retry coaching comparisons
+- Coaching accuracy, usability, accessibility, and accent/language fairness validation across browsers and microphones
+- Guided programs, accounts, cross-device progress, educator tools, and optional semantic coaching
 
 ## Documents
 
@@ -177,3 +192,5 @@ These ideas are not presented as current features:
 - [Roadmap](docs/ROADMAP.md)
 - [AI and Privacy](docs/AI_AND_PRIVACY.md)
 - [Cloudflare Deployment](docs/CLOUDFLARE_DEPLOYMENT.md)
+- [Speech Coaching Prototype](docs/SPEECH_COACHING_PROTOTYPE.md)
+- [Coaching Presentation Guide](docs/COACHING_PRESENTATION_GUIDE.md)

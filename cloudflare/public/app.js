@@ -14,10 +14,29 @@ let clockTimer = 0;
 let controller = null;
 let busy = false;
 let routeGeneration = 0;
+let coachingRun = null;
+let pendingCoachingToken = null;
+let coachEnginePromise = null;
+let routeFocusRequested = false;
+let practice = freshPracticeState();
+
+const PRACTICE_SCENARIOS = [
+  { id: "interview", name: "Interview answer", prompt: "Tell me about a time you solved a difficult problem." },
+  { id: "presentation", name: "Presentation opening", prompt: "Open a presentation and make the audience care about your idea." },
+  { id: "impromptu", name: "Impromptu response", prompt: "What is one everyday habit that deserves a redesign?" },
+];
+const PRACTICE_GOALS = [
+  { id: "pace", name: "Intentional pace", detail: "Use complete thoughts and give important ideas room to land." },
+  { id: "pauses", name: "Purposeful pauses", detail: "Replace rushed transitions with short, deliberate pauses." },
+  { id: "energy", name: "Steady delivery", detail: "Keep your vocal level consistent without clipping." },
+];
 
 document.addEventListener("click", handleClick);
 document.addEventListener("submit", handleSubmit);
-window.addEventListener("popstate", loadRoute);
+window.addEventListener("popstate", () => {
+  routeFocusRequested = true;
+  loadRoute();
+});
 window.addEventListener("pagehide", shutdown);
 
 loadRoute();
@@ -25,12 +44,31 @@ loadRoute();
 async function loadRoute() {
   const generation = ++routeGeneration;
   stopRoomLifecycle();
+  const finishingIntoProgress = practice.phase === "finishing" && /^\/progress\/?$/i.test(location.pathname);
+  if (!finishingIntoProgress) stopCoachingLifecycle();
   room = null;
+  updatePrimaryNavigation();
+  if (/^\/practice\/?$/i.test(location.pathname)) {
+    roomCode = "";
+    document.title = "Practice · NonStopTalk";
+    practice = freshPracticeState(practice.setup);
+    renderPractice();
+    focusRouteHeading();
+    return;
+  }
+  if (/^\/progress\/?$/i.test(location.pathname)) {
+    roomCode = "";
+    document.title = "Progress · NonStopTalk";
+    await renderProgress(generation);
+    focusRouteHeading();
+    return;
+  }
   const match = location.pathname.match(/^\/room\/([A-Z2-9]{6})\/?$/i);
   if (!match) {
     roomCode = "";
     document.title = "NonStopTalk";
     renderLanding();
+    focusRouteHeading();
     return;
   }
   roomCode = match[1].toUpperCase();
@@ -40,9 +78,11 @@ async function loadRoute() {
     const payload = await api(`/api/rooms/${roomCode}/state`);
     if (generation !== routeGeneration) return;
     acceptRoom(payload.room);
+    focusRouteHeading();
   } catch (error) {
     if (generation !== routeGeneration) return;
     renderLanding(error.message === "Room not found." ? "That room does not exist." : error.message);
+    focusRouteHeading();
   }
 }
 
@@ -51,9 +91,10 @@ function renderLanding(message = "") {
     ${message ? notice(message, true) : ""}
     <section class="hero">
       <div class="hero-copy">
-        <p class="eyebrow">Keep talking</p>
-        <h1>No pauses. No escape.</h1>
-        <p class="lede">Draw a topic, survive the silence limit, and collect points for every second you keep the words moving.</p>
+        <p class="eyebrow">Play + practice</p>
+        <h1>Find your voice.</h1>
+        <p class="lede">Build speaking confidence with private, on-device coaching—or draw a topic and keep the words moving with friends.</p>
+        <div class="action-row hero-buttons"><a class="button primary" href="/practice" data-route>Start practicing</a><a class="button ghost" href="/progress" data-route>View progress</a></div>
         <p class="hint">The online edition stores each room in its own Cloudflare Durable Object. The local Go edition still works independently.</p>
       </div>
       <div class="landing-actions">
@@ -70,6 +111,1065 @@ function renderLanding(message = "") {
         </form>
       </div>
     </section>`;
+}
+
+function freshPracticeState(setup = {}) {
+  return {
+    phase: "setup",
+    setup: {
+      scenario: setup.scenario || "interview",
+      goal: setup.goal || "pauses",
+      duration: Number(setup.duration) || 45,
+      transcriptConsent: Boolean(setup.transcriptConsent),
+      retainArtifacts: Boolean(setup.retainArtifacts),
+    },
+    error: "",
+    report: null,
+    advice: null,
+    saved: false,
+    transcriptUsed: false,
+    live: null,
+  };
+}
+
+function renderPractice() {
+  if (practice.phase === "calibrating" || practice.phase === "permission") {
+    renderPracticeCalibration();
+    return;
+  }
+  if (practice.phase === "active" || practice.phase === "finishing") {
+    renderPracticeLive();
+    return;
+  }
+  if (practice.phase === "review") {
+    renderPracticeReview();
+    return;
+  }
+  renderPracticeSetup();
+}
+
+function renderPracticeSetup() {
+  const speech = localSpeechCapability();
+  const hasMicrophone = Boolean(navigator.mediaDevices?.getUserMedia);
+  const canRecord = typeof window.MediaRecorder === "function";
+  app.innerHTML = `
+    <section class="coach-hero">
+      <div>
+        <p class="eyebrow">Private speaking lab</p>
+        <h1>Practice with a signal, not a score.</h1>
+        <p class="lede">Choose one delivery goal. NonStopTalk listens for timing and vocal-level patterns, gives one useful live cue, then helps you retry.</p>
+      </div>
+      <div class="privacy-card">
+        <span class="device-badge"><span aria-hidden="true">●</span> On device</span>
+        <h2>Your voice stays here.</h2>
+        <p>Audio is analyzed live in this tab and never uploaded. Recording is off by default; the optional full-session setting below stores it only for this site in this browser profile.</p>
+        <ul class="check-list"><li>AudioWorklet live analysis</li><li>No coaching API calls</li><li>Delete all local coaching data anytime</li></ul>
+      </div>
+    </section>
+    ${practice.error ? notice(practice.error, true) : ""}
+    <form class="coach-setup panel stack" data-coach-setup>
+      <div class="section-head"><div><p class="eyebrow">Set your session</p><h2>One goal. One attempt.</h2></div><span class="step-mark">01 / 03</span></div>
+      <div class="coach-fields">
+        <label>Speaking scenario
+          <select name="scenario">${PRACTICE_SCENARIOS.map((item) => `<option value="${item.id}" ${practice.setup.scenario === item.id ? "selected" : ""}>${escapeHTML(item.name)}</option>`).join("")}</select>
+        </label>
+        <label>Coaching goal
+          <select name="goal">${PRACTICE_GOALS.map((item) => `<option value="${item.id}" ${practice.setup.goal === item.id ? "selected" : ""}>${escapeHTML(item.name)}</option>`).join("")}</select>
+        </label>
+        <label>Attempt length
+          <select name="duration">${[30, 45, 60, 90].map((seconds) => `<option value="${seconds}" ${practice.setup.duration === seconds ? "selected" : ""}>${seconds} seconds</option>`).join("")}</select>
+        </label>
+      </div>
+      <fieldset class="consent-card" aria-label="Optional transcript analysis" ${speech.supported ? "" : "disabled"}>
+        <legend>Optional transcript analysis</legend>
+        <label class="choice-row">
+          <input type="checkbox" name="transcriptConsent" ${practice.setup.transcriptConsent && speech.supported ? "checked" : ""}>
+          <span><strong>Use experimental on-device transcription</strong><small>${speech.supported ? "Adds pace and word-pattern evidence. Derived counts and filler/repetition patterns are saved; the full captured transcript is discarded unless you also select full-session retention below." : escapeHTML(speech.reason)}</small></span>
+        </label>
+      </fieldset>
+      <fieldset class="consent-card" aria-label="Optional full session retention" ${canRecord ? "" : "disabled"}>
+        <legend>Optional full session retention</legend>
+        <label class="choice-row">
+          <input type="checkbox" name="retainArtifacts" ${practice.setup.retainArtifacts && canRecord ? "checked" : ""}>
+          <span><strong>Keep the recording and captured transcript when available</strong><small>${canRecord ? "Stores the browser-encoded attempt recording and, when local transcription is enabled and succeeds, its captured transcript for this site in this browser profile. Nothing is uploaded. There is no automatic expiry; Progress downloads them or deletes all local coaching data. Downloaded copies are yours to manage." : "This browser cannot create a local audio recording. Compact coaching summaries still work."}</small></span>
+        </label>
+      </fieldset>
+      <div class="coach-start-row">
+        <div><p class="hint">Next: a four-second quiet + speaking calibration. Browser microphone permission is required.</p>${hasMicrophone ? "" : `<p class="notice error" role="alert">This browser does not expose microphone input.</p>`}</div>
+        <button class="button primary coach-start" type="submit" data-coach-start ${hasMicrophone ? "" : "disabled"}>Calibrate microphone <span aria-hidden="true">→</span></button>
+      </div>
+    </form>`;
+}
+
+function renderPracticeCalibration() {
+  const waiting = practice.phase === "permission";
+  const stage = practice.calibrationStage || "quiet";
+  const quiet = stage === "quiet";
+  app.innerHTML = `
+    <section class="coach-stage" data-coach-calibration aria-labelledby="calibration-title">
+      <div class="stage-top"><span class="device-badge"><span aria-hidden="true">●</span> On device</span><span class="step-mark">02 / 03</span></div>
+      <p class="eyebrow">Microphone calibration</p>
+      <h1 id="calibration-title">${waiting ? "Allow microphone access." : quiet ? "Stay quiet for a moment." : "Now speak normally."}</h1>
+      <p class="lede">${waiting ? practice.setup.retainArtifacts ? "Your browser will ask for permission. Your selected recording begins only after calibration and stays in this browser profile." : "Your browser will ask for permission. Audio is analyzed locally and is not recorded or uploaded." : quiet ? "We are learning the sound of your room so pauses are measured fairly. Calibration audio is not retained." : "Say: “I am ready to practice my speaking.” Calibration audio is not retained."}</p>
+      <div class="calibration-track" aria-hidden="true"><span data-coach-calibration-bar style="width:${waiting ? 0 : quiet ? 30 : 70}%"></span></div>
+      <p class="calibration-status" role="status" data-coach-calibration-status>${waiting ? "Waiting for permission…" : quiet ? "Measuring room level…" : "Measuring your speaking level…"}</p>
+      <button class="button ghost" type="button" data-command="coach-cancel">Cancel</button>
+    </section>`;
+}
+
+function renderPracticeLive() {
+  const scenario = scenarioById(practice.setup.scenario);
+  const goal = goalById(practice.setup.goal);
+  const live = practice.live || {};
+  const remaining = Math.max(0, practice.setup.duration - Math.floor((live.elapsedMs || 0) / 1000));
+  app.innerHTML = `
+    <section class="practice-live" data-coach-live>
+      <div class="stage-top"><span class="device-badge" title="${practice.analysisMode === "Analyser fallback" ? "Compatibility analysis uses an AnalyserNode on this device." : "Audio is measured off the main browser thread."}"><span aria-hidden="true">●</span> On device · ${practice.analysisMode === "Analyser fallback" ? "compatibility mode" : "AudioWorklet"}</span><span class="step-mark">03 / 03</span></div>
+      <div class="practice-grid">
+        <div class="prompt-stage">
+          <p class="eyebrow">${escapeHTML(scenario.name)}</p>
+          <h1>${escapeHTML(scenario.prompt)}</h1>
+          <p class="goal-line"><strong>Focus:</strong> ${escapeHTML(goal.detail)}</p>
+          <div class="coach-timer" data-coach-timer aria-label="${remaining} seconds remaining">${remaining}</div>
+          <div class="coach-meter" aria-label="Live microphone level"><span data-coach-meter style="width:${Math.round((live.level || 0) * 100)}%"></span><i data-coach-threshold></i></div>
+          <div class="live-stats" aria-label="Current measurements">
+            <div><span data-coach-speaking>${formatPercent(live.speakingRatio)}</span><small>speaking</small></div>
+            <div><span data-coach-pauses>${live.pauseCount ?? 0}</span><small>pauses</small></div>
+            <div><span data-coach-level>${levelLabel(live.level)}</span><small>input</small></div>
+          </div>
+          <button class="button ghost" type="button" data-command="coach-stop" data-coach-stop>${practice.phase === "finishing" ? "Building review…" : "Finish attempt"}</button>
+        </div>
+        <aside class="coach-sidebar">
+          <div class="coach-tip ${live.tip ? "is-visible" : ""}" data-coach-tip role="status" aria-live="polite">
+            <p class="eyebrow">Live cue</p>
+            <h2 data-coach-tip-text>${escapeHTML(live.tip?.text || "Listening for a useful pattern…")}</h2>
+            <p data-coach-tip-evidence>${escapeHTML(live.tip?.evidence || "Tips appear only when the signal is consistent.")}</p>
+          </div>
+          <div class="privacy-card compact"><h3>Private by design</h3><p>${practice.setup.retainArtifacts ? "You chose to keep full session artifacts for this site in this browser profile. Nothing is uploaded." : `Audio is reduced to measurements in memory. ${practice.setup.transcriptConsent ? "The full local transcript is discarded after derived word-pattern analysis." : "Transcription is off."}`}</p></div>
+        </aside>
+      </div>
+    </section>`;
+}
+
+function renderPracticeReview() {
+  const report = practice.report || {};
+  const advice = normalizedAdvice(practice.advice, report);
+  const transcript = report.transcriptMetrics;
+  const grounding = practice.advice?.grounding;
+  const retainedCopy = retainedArtifactCopy(practice.savedArtifacts);
+  app.innerHTML = `
+    <section class="coach-review" data-coach-review>
+      ${practice.artifactWarning ? notice(practice.artifactWarning, true) : ""}
+      <div class="review-head">
+        <div><p class="eyebrow">Attempt review</p><h1>Keep this. Change one thing.</h1></div>
+        <span class="device-badge"><span aria-hidden="true">●</span> Analysis complete</span>
+      </div>
+      <div class="advice-grid">
+        <article class="advice-card strength"><span>01 · Strength</span><h2>${escapeHTML(advice.strength)}</h2><p>${escapeHTML(advice.strengthEvidence)}</p></article>
+        <article class="advice-card focus"><span>02 · Focus next</span><h2>${escapeHTML(advice.focus)}</h2><p>${escapeHTML(advice.focusEvidence)}</p></article>
+        <article class="advice-card drill"><span>03 · Drill</span><h2>${escapeHTML(advice.drill)}</h2><p>${escapeHTML(advice.drillDetail)}</p></article>
+      </div>
+      <section class="panel evidence-panel">
+        <div class="section-head"><div><p class="eyebrow">Evidence</p><h2>What the browser measured</h2></div><span>${escapeHTML(confidenceLabel(report.audioConfidence))}</span></div>
+        <div class="metric-grid">
+          ${reviewMetric(formatDuration(report.durationMs), "analyzed")}
+          ${reviewMetric(formatPercent(report.speakingRatio), "speaking ratio")}
+          ${reviewMetric(String(report.pauseCount ?? 0), "measured pauses")}
+          ${reviewMetric(formatDuration(report.medianPauseMs), "median pause")}
+          ${reviewMetric(formatDuration(report.longestSpeakingRunMs), "longest run")}
+          ${reviewMetric(formatOptionalPercentage(report.levelConsistencyPct), "level consistency")}
+          ${reviewMetric(formatOptionalPercentage(report.clippingPct), "clipping frames")}
+          ${report.unknownMs > 0 ? reviewMetric(formatDuration(report.unknownMs), "unobserved audio") : ""}
+        </div>
+        ${renderCoachTimeline(report)}
+        ${transcript ? `<div class="transcript-evidence"><div><span class="device-badge">On-device transcript</span><strong>${transcript.wordCount ?? 0} words · ${formatNumber(transcript.wordsPerMinute)} wpm</strong></div><p>${escapeHTML(formatTranscriptPatternSummary(transcript))} ${practice.savedArtifacts?.transcriptStored ? "You opted to retain the full captured transcript locally." : "The full captured transcript has been discarded; these derived patterns are retained locally for analysis."}</p></div>` : `<p class="hint privacy-note">No transcript metrics were used or stored.${practice.savedArtifacts?.transcriptStored ? " A captured transcript artifact was retained locally at your request." : ""}</p>`}
+        ${renderCoachGrounding(grounding)}
+      </section>
+      <div class="review-actions">
+        <div><strong>${practice.saved ? practice.artifactSaved ? "Summary and available selected artifacts saved locally" : "Saved for this site in this browser profile" : "Review ready"}</strong><p class="hint">${practice.artifactSaved ? retainedCopy : "Metrics, advice, and consented derived word patterns are kept locally—no full recording or captured transcript."}</p></div>
+        <div class="action-row"><a class="button ghost" href="/progress" data-route>View progress</a><button class="button primary" type="button" data-command="coach-again">Try again <span aria-hidden="true">↻</span></button></div>
+      </div>
+    </section>`;
+}
+
+function retainedArtifactCopy(artifacts = {}) {
+  if (artifacts.audioStored && artifacts.transcriptStored) {
+    return "The browser-encoded recording and captured transcript are stored only for this site in this browser profile.";
+  }
+  if (artifacts.audioStored) return "The browser-encoded recording is stored only for this site in this browser profile; no captured transcript was saved.";
+  if (artifacts.transcriptStored) return "The captured transcript is stored only for this site in this browser profile; no recording was saved.";
+  return "No full-session artifact was available to save.";
+}
+
+function renderCoachGrounding(grounding = {}) {
+  const card = Array.isArray(grounding.retrieved) ? grounding.retrieved[0] : null;
+  if (!card) return "";
+  const terms = Array.isArray(card.matchedTerms) ? card.matchedTerms.slice(0, 5).join(", ") : "";
+  return `<aside class="grounding-evidence" data-coach-grounding aria-label="Local RAG advice grounding">
+    <div><span class="device-badge">Local RAG · retrieved</span><h3>${escapeHTML(card.title || "Curated coaching guidance")}</h3><small>${escapeHTML(card.source || "NonStopTalk Coaching Library")}</small></div>
+    <div><p>${escapeHTML(card.excerpt || "")}</p><p class="hint">This card shaped the retry drill through deterministic generation.${terms ? ` Matched locally: ${escapeHTML(terms)}.` : ""} No model or network call was used.</p></div>
+  </aside>`;
+}
+
+function renderCoachTimeline(report) {
+  const duration = Math.max(1, Number(report.durationMs) || 1);
+  const segments = Array.isArray(report.segments) ? report.segments : [];
+  const normalized = segments.map((segment) => {
+    const start = Math.max(0, Number(segment.startMs ?? segment.start ?? 0));
+    const end = Math.min(duration, Number(segment.endMs ?? segment.end ?? start));
+    const kind = segment.kind === "unknown"
+      ? "unknown"
+      : segment.type === "pause" || segment.kind === "pause" || segment.kind === "silence" || segment.voiced === false
+        ? "pause"
+        : "voice";
+    return { start, end, kind };
+  });
+  const voiceCount = normalized.filter((segment) => segment.kind === "voice").length;
+  const quietCount = normalized.filter((segment) => segment.kind === "pause").length;
+  const unknownCount = normalized.filter((segment) => segment.kind === "unknown").length;
+  const summary = `${voiceCount} voice ${voiceCount === 1 ? "region" : "regions"}, ${quietCount} quiet ${quietCount === 1 ? "region" : "regions"}, and ${unknownCount} unobserved ${unknownCount === 1 ? "region" : "regions"} across ${formatDuration(duration)}.`;
+  return `<div class="timeline-wrap" data-coach-timeline><div class="timeline-label"><span>Delivery timeline</span><span>voice <i class="voice-key"></i> quiet <i class="pause-key"></i> unobserved <i class="unknown-key"></i></span></div><p class="sr-only" id="coach-timeline-summary">${escapeHTML(summary)}</p><div class="speech-timeline" aria-label="Timeline of voice, quiet, and unobserved regions" aria-describedby="coach-timeline-summary">${normalized.map((segment) => {
+    const label = `${segment.kind === "voice" ? "Voice" : segment.kind === "pause" ? "Quiet" : "Audio unobserved"}, ${formatDuration(segment.end - segment.start)}`;
+    return `<span class="${segment.kind}" role="img" aria-label="${escapeHTML(label)}" style="left:${(segment.start / duration) * 100}%;width:${Math.max(.35, ((segment.end - segment.start) / duration) * 100)}%" title="${escapeHTML(label)}"></span>`;
+  }).join("")}</div></div>`;
+}
+
+function reviewMetric(value, label) {
+  return `<div class="review-metric"><strong>${escapeHTML(value)}</strong><span>${escapeHTML(label)}</span></div>`;
+}
+
+async function beginCoachingSession(values) {
+  const generation = routeGeneration;
+  const speech = localSpeechCapability();
+  practice = freshPracticeState({
+    scenario: String(values.scenario || "interview"),
+    goal: String(values.goal || "pauses"),
+    duration: clamp(Number(values.duration) || 45, 15, 180),
+    transcriptConsent: values.transcriptConsent === "on" && speech.supported,
+    retainArtifacts: values.retainArtifacts === "on" && typeof window.MediaRecorder === "function",
+  });
+  practice.phase = "permission";
+  renderPractice();
+  const token = Symbol("coaching-run");
+  pendingCoachingToken = token;
+  let stream;
+  let context;
+  try {
+    const engine = await loadCoachEngine();
+    if (pendingCoachingToken !== token || generation !== routeGeneration || !isPracticeRoute()) return;
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+      video: false,
+    });
+    if (pendingCoachingToken !== token || generation !== routeGeneration || !isPracticeRoute()) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) throw new Error("This browser cannot analyze microphone audio.");
+    context = new AudioContext();
+    await context.resume();
+    if (pendingCoachingToken !== token || generation !== routeGeneration || !isPracticeRoute()) {
+      stream.getTracks().forEach((track) => track.stop());
+      await context.close().catch(() => {});
+      return;
+    }
+    const source = context.createMediaStreamSource(stream);
+    const run = coachingRun = {
+      token,
+      generation,
+      engine,
+      stream,
+      context,
+      source,
+      quietSamples: [],
+      voiceSamples: [],
+      calibrationStartedAt: performance.now(),
+      analyzer: null,
+      tipPolicy: null,
+      startedAt: 0,
+      lastTipAt: -Infinity,
+      tipUntil: 0,
+      transcript: "",
+      recognition: null,
+      recorder: null,
+      recordedChunks: [],
+      discardRecording: false,
+      updateTimer: 0,
+      fallbackTimer: 0,
+      calibrationTimer: 0,
+      attemptTimer: 0,
+      inputTrack: null,
+      inputEndedHandler: null,
+    };
+    run.inputTrack = stream.getAudioTracks()[0] || null;
+    run.inputEndedHandler = () => handleCoachingInputEnded(run);
+    run.inputTrack?.addEventListener?.("ended", run.inputEndedHandler, { once: true });
+    const attached = await attachCoachingMeter(run);
+    if (!attached || !isPendingCoachingRun(run)) {
+      stopCoachingHardware(run);
+      if (coachingRun === run) coachingRun = null;
+      return;
+    }
+    pendingCoachingToken = null;
+    practice.analysisMode = run.analysisMode;
+    run.calibrationStartedAt = performance.now();
+    practice.phase = "calibrating";
+    practice.calibrationStage = "quiet";
+    practice.live = { elapsedMs: 0, level: 0, pauseCount: 0, speakingRatio: 0 };
+    renderPractice();
+    run.updateTimer = window.setInterval(updateCoachingUI, 100);
+    run.calibrationTimer = window.setTimeout(() => {
+      if (run !== coachingRun || practice.phase !== "calibrating") return;
+      failCoachingRun(run, "Microphone analysis stopped during calibration. Check the input and try again.");
+    }, 7_000);
+  } catch (error) {
+    stream?.getTracks().forEach((track) => track.stop());
+    if (context?.state !== "closed") await context?.close().catch(() => {});
+    if (pendingCoachingToken !== token || generation !== routeGeneration || !isPracticeRoute()) return;
+    pendingCoachingToken = null;
+    stopCoachingLifecycle();
+    practice.phase = "setup";
+    practice.error = microphoneErrorMessage(error);
+    renderPractice();
+    announce(practice.error);
+  }
+}
+
+async function attachCoachingMeter(run) {
+  if (!isPendingCoachingRun(run)) return false;
+  if (run.context.audioWorklet && window.AudioWorkletNode) {
+    try {
+      await run.context.audioWorklet.addModule("/coach-audio-worklet.js");
+      if (!isPendingCoachingRun(run)) return false;
+      const node = new AudioWorkletNode(run.context, "coaching-meter");
+      const silent = run.context.createGain();
+      silent.gain.value = 0;
+      node.port.onmessage = (event) => ingestCoachingFrame(event.data);
+      run.source.connect(node).connect(silent).connect(run.context.destination);
+      run.meterNode = node;
+      run.silentNode = silent;
+      run.analysisMode = "AudioWorklet";
+      return true;
+    } catch {
+      // Use the same on-device analysis through an AnalyserNode on older browsers.
+    }
+  }
+  if (!isPendingCoachingRun(run)) return false;
+  const analyser = run.context.createAnalyser();
+  analyser.fftSize = 2048;
+  const samples = new Float32Array(analyser.fftSize);
+  run.source.connect(analyser);
+  run.analyser = analyser;
+  run.analysisMode = "Analyser fallback";
+  run.fallbackTimer = window.setInterval(() => {
+    analyser.getFloatTimeDomainData(samples);
+    let energy = 0;
+    let peak = 0;
+    for (const sample of samples) {
+      energy += sample * sample;
+      peak = Math.max(peak, Math.abs(sample));
+    }
+    ingestCoachingFrame({ rms: Math.sqrt(energy / samples.length), peak });
+  }, 100);
+  return true;
+}
+
+function isPendingCoachingRun(run) {
+  return coachingRun === run
+    && pendingCoachingToken === run.token
+    && routeGeneration === run.generation
+    && isPracticeRoute()
+    && run.context?.state !== "closed";
+}
+
+function ingestCoachingFrame(frame) {
+  const run = coachingRun;
+  if (!run || !Number.isFinite(frame?.rms) || !Number.isFinite(frame?.peak)) return;
+  const now = performance.now();
+  if (practice.phase === "calibrating") {
+    const elapsed = now - run.calibrationStartedAt;
+    const sample = { rms: frame.rms, peak: frame.peak };
+    if (elapsed < 2_000) run.quietSamples.push(sample);
+    else run.voiceSamples.push(sample);
+    practice.live.level = Math.min(1, frame.rms * 8);
+    if (elapsed >= 2_000 && practice.calibrationStage !== "voice") {
+      practice.calibrationStage = "voice";
+      renderPractice();
+    }
+    if (elapsed >= 4_000 && !run.activating) activateCoachingAttempt(run);
+    return;
+  }
+  if (practice.phase !== "active" || !run.analyzer) return;
+  const elapsedMs = now - run.startedAt;
+  run.analyzer.ingest({ atMs: elapsedMs, rms: frame.rms, peak: frame.peak });
+  const snapshot = run.analyzer.snapshot(elapsedMs);
+  const level = normalizedCoachLevel(frame.rms, run.calibration);
+  const live = snapshotToLive(snapshot, elapsedMs, level, practice.live?.tip);
+  if (elapsedMs >= 5_000 && now >= run.tipUntil && now - run.lastTipAt >= 10_000) {
+    const candidate = normalizeTip(run.tipPolicy.evaluate(snapshot, elapsedMs), snapshot);
+    if (candidate) {
+      live.tip = candidate;
+      run.lastTipAt = now;
+      run.tipUntil = now + 5_000;
+    }
+  } else if (now >= run.tipUntil) {
+    live.tip = null;
+  }
+  practice.live = live;
+  if (elapsedMs >= practice.setup.duration * 1000) finishCoachingSession("timer").catch((error) => showToast(error.message));
+}
+
+async function activateCoachingAttempt(run) {
+  if (run !== coachingRun || run.activating) return;
+  run.activating = true;
+  clearTimeout(run.calibrationTimer);
+  try {
+    run.calibration = run.engine.deriveCalibration({ quietSamples: run.quietSamples, voiceSamples: run.voiceSamples });
+    run.analyzer = new run.engine.CoachingAnalyzer({
+      calibration: run.calibration,
+      goal: practice.setup.goal,
+      targetDurationMs: practice.setup.duration * 1000,
+    });
+    run.tipPolicy = new run.engine.CoachingTipPolicy({ cooldownMs: 10_000 });
+    run.startedAt = performance.now();
+    run.attemptTimer = window.setTimeout(() => {
+      if (run !== coachingRun || practice.phase !== "active") return;
+      finishCoachingSession("timer").catch((error) => showToast(error.message));
+    }, practice.setup.duration * 1_000);
+    practice.phase = "active";
+    practice.live = snapshotToLive(run.analyzer.snapshot(0), 0, 0, null);
+    if (practice.setup.retainArtifacts) startArtifactRecorder(run);
+    if (practice.setup.transcriptConsent) startLocalRecognition(run);
+    renderPractice();
+    announce("Calibration complete. Your practice attempt has started.");
+  } catch (error) {
+    stopCoachingLifecycle();
+    practice.phase = "setup";
+    practice.error = error?.message || "Calibration could not find a clear speaking level. Try again closer to the microphone.";
+    renderPractice();
+  }
+}
+
+function startLocalRecognition(run) {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Recognition) return;
+  try {
+    const recognition = new Recognition();
+    if (!("processLocally" in recognition)) return;
+    recognition.processLocally = true;
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = document.documentElement.lang || "en-US";
+    recognition.onresult = (event) => {
+      if (run !== coachingRun) return;
+      let text = "";
+      for (let index = 0; index < event.results.length; index += 1) text += `${event.results[index][0]?.transcript || ""} `;
+      run.transcript = text.trim().slice(0, 20_000);
+    };
+    recognition.onerror = () => {
+      if (run === coachingRun) practice.transcriptUnavailable = true;
+    };
+    const track = run.stream.getAudioTracks()[0];
+    recognition.start(track);
+    run.recognition = recognition;
+  } catch {
+    practice.transcriptUnavailable = true;
+  }
+}
+
+function startArtifactRecorder(run) {
+  try {
+    const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"];
+    const mimeType = candidates.find((value) => window.MediaRecorder.isTypeSupported?.(value));
+    const recorder = new MediaRecorder(run.stream, mimeType ? { mimeType } : undefined);
+    run.recordedChunks = [];
+    run.discardRecording = false;
+    recorder.ondataavailable = (event) => {
+      if (!run.discardRecording && event.data?.size) run.recordedChunks.push(event.data);
+    };
+    recorder.onerror = () => {
+      if (run === coachingRun) practice.artifactWarning = "The browser could not retain this recording.";
+    };
+    recorder.start(1_000);
+    run.recorder = recorder;
+  } catch {
+    run.recorder = null;
+    practice.artifactWarning = "The browser could not retain this recording.";
+  }
+}
+
+function stopArtifactRecorder(run) {
+  const recorder = run.recorder;
+  if (!recorder) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      const chunks = run.recordedChunks.splice(0);
+      const type = recorder.mimeType || chunks[0]?.type || "audio/webm";
+      run.discardRecording = true;
+      recorder.ondataavailable = null;
+      recorder.onerror = null;
+      recorder.removeEventListener("stop", finish);
+      recorder.removeEventListener("error", finish);
+      run.recorder = null;
+      resolve(chunks.length ? new Blob(chunks, { type }) : null);
+    };
+    const timeout = setTimeout(finish, 2_000);
+    recorder.addEventListener("stop", finish, { once: true });
+    recorder.addEventListener("error", finish, { once: true });
+    try {
+      if (recorder.state === "inactive") finish();
+      else recorder.stop();
+    } catch {
+      finish();
+    }
+  });
+}
+
+function finishLocalRecognition(run) {
+  const recognition = run.recognition;
+  if (!recognition) return Promise.resolve(run.transcript);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(run.transcript);
+    };
+    const priorOnEnd = recognition.onend;
+    recognition.onend = (event) => {
+      priorOnEnd?.call(recognition, event);
+      finish();
+    };
+    const timeout = setTimeout(finish, 350);
+    try { recognition.stop(); } catch { finish(); }
+  });
+}
+
+async function finishCoachingSession(reason = "manual") {
+  const run = coachingRun;
+  if (!run || practice.phase !== "active") return;
+  practice.phase = "finishing";
+  updateCoachingUI();
+  const endedAt = Math.min(performance.now() - run.startedAt, practice.setup.duration * 1000);
+  const [capturedTranscript, audioBlob] = await Promise.all([
+    finishLocalRecognition(run),
+    practice.setup.retainArtifacts ? stopArtifactRecorder(run) : Promise.resolve(null),
+  ]);
+  const transcriptText = practice.transcriptUnavailable ? "" : capturedTranscript;
+  let report;
+  let advice;
+  try {
+    report = run.analyzer.finish(endedAt, transcriptText);
+    if (transcriptText && !report.transcriptMetrics && run.engine.analyzeTranscript) {
+      report = { ...report, transcriptMetrics: run.engine.analyzeTranscript(transcriptText, endedAt) };
+    }
+    report = { ...report, stopReason: reason };
+    advice = run.engine.buildAdvice(report);
+  } catch (error) {
+    run.transcript = "";
+    stopCoachingHardware(run);
+    coachingRun = null;
+    practice = freshPracticeState(practice.setup);
+    practice.error = "This attempt could not be analyzed. Please calibrate and try again.";
+    if (isPracticeRoute()) renderPractice();
+    throw error;
+  }
+  practice.report = report;
+  practice.advice = advice;
+  practice.transcriptUsed = Boolean(report.transcriptMetrics);
+  run.transcript = "";
+  stopCoachingHardware(run);
+  coachingRun = null;
+  try {
+    const summary = buildCoachingSummary(report, advice);
+    const artifact = practice.setup.retainArtifacts
+      ? buildCoachingArtifact(summary.id, summary.createdAt, audioBlob, transcriptText)
+      : null;
+    if (practice.setup.retainArtifacts && !artifact) {
+      practice.artifactWarning ||= "No full recording or transcript artifact was available to save for this attempt.";
+    }
+    summary.artifacts = artifactMetadata(artifact);
+    await saveCoachingSession(summary, artifact);
+    practice.saved = true;
+    practice.artifactSaved = Boolean(artifact);
+    practice.savedArtifacts = summary.artifacts;
+  } catch {
+    practice.saved = false;
+    practice.artifactSaved = false;
+    practice.savedArtifacts = null;
+    practice.artifactWarning ||= "This browser could not save the local coaching record.";
+  }
+  if (/^\/progress\/?$/i.test(location.pathname)) {
+    await renderProgress(routeGeneration);
+    return;
+  }
+  if (!isPracticeRoute()) return;
+  practice.phase = "review";
+  renderPractice();
+  announce("Your attempt review is ready.");
+}
+
+function stopCoachingLifecycle() {
+  pendingCoachingToken = null;
+  const run = coachingRun;
+  if (run) stopCoachingHardware(run);
+  coachingRun = null;
+  if (practice.phase === "permission" || practice.phase === "calibrating" || practice.phase === "active" || practice.phase === "finishing") {
+    practice = freshPracticeState(practice.setup);
+  }
+}
+
+function handleCoachingInputEnded(run) {
+  if (run !== coachingRun) return;
+  if (practice.phase === "active") {
+    practice.artifactWarning ||= "Microphone input ended before the selected duration.";
+    finishCoachingSession("input-ended").catch((error) => showToast(error.message));
+    return;
+  }
+  if (practice.phase === "permission" || practice.phase === "calibrating") {
+    failCoachingRun(run, "Microphone input ended before calibration completed. Check the input and try again.");
+  }
+}
+
+function failCoachingRun(run, message) {
+  if (run !== coachingRun) return;
+  stopCoachingLifecycle();
+  practice.phase = "setup";
+  practice.error = message;
+  if (isPracticeRoute()) renderPractice();
+  announce(message);
+}
+
+function stopCoachingHardware(run) {
+  clearInterval(run.updateTimer);
+  clearInterval(run.fallbackTimer);
+  clearTimeout(run.calibrationTimer);
+  clearTimeout(run.attemptTimer);
+  run.inputTrack?.removeEventListener?.("ended", run.inputEndedHandler);
+  run.recognition?.abort?.();
+  if (run.recorder) {
+    run.discardRecording = true;
+    run.recordedChunks?.splice(0);
+    run.recorder.ondataavailable = null;
+    try { if (run.recorder.state !== "inactive") run.recorder.stop(); } catch { /* The recorder is already stopping. */ }
+    run.recorder = null;
+  }
+  run.meterNode?.port?.close?.();
+  run.stream?.getTracks().forEach((track) => track.stop());
+  if (run.context?.state !== "closed") run.context?.close().catch(() => {});
+}
+
+function updateCoachingUI() {
+  const run = coachingRun;
+  if (!run) return;
+  if (practice.phase === "calibrating") {
+    const elapsed = performance.now() - run.calibrationStartedAt;
+    const bar = document.querySelector("[data-coach-calibration-bar]");
+    if (bar) bar.style.width = `${Math.min(100, elapsed / 40)}%`;
+    return;
+  }
+  if (practice.phase !== "active" && practice.phase !== "finishing") return;
+  const elapsed = Math.min(practice.setup.duration * 1000, Math.max(0, performance.now() - run.startedAt));
+  if (practice.live) practice.live.elapsedMs = elapsed;
+  const remaining = Math.max(0, practice.setup.duration - Math.floor(elapsed / 1000));
+  setText("[data-coach-timer]", remaining);
+  const timer = document.querySelector("[data-coach-timer]");
+  if (timer) timer.setAttribute("aria-label", `${remaining} seconds remaining`);
+  setText("[data-coach-speaking]", formatPercent(practice.live?.speakingRatio));
+  setText("[data-coach-pauses]", practice.live?.pauseCount ?? 0);
+  setText("[data-coach-level]", levelLabel(practice.live?.level));
+  const meter = document.querySelector("[data-coach-meter]");
+  if (meter) meter.style.width = `${Math.round((practice.live?.level || 0) * 100)}%`;
+  const tip = document.querySelector("[data-coach-tip]");
+  tip?.classList.toggle("is-visible", Boolean(practice.live?.tip));
+  setText("[data-coach-tip-text]", practice.live?.tip?.text || "Listening for a useful pattern…");
+  setText("[data-coach-tip-evidence]", practice.live?.tip?.evidence || "Tips appear only when the signal is consistent.");
+}
+
+function loadCoachEngine() {
+  coachEnginePromise ||= import("./coach-engine.js");
+  return coachEnginePromise;
+}
+
+function snapshotToLive(snapshot = {}, elapsedMs = 0, level = 0, tip = null) {
+  return {
+    elapsedMs,
+    level,
+    speakingRatio: Number(snapshot.speakingRatio) || 0,
+    pauseCount: Number(snapshot.pauseCount) || 0,
+    tip,
+  };
+}
+
+function normalizeTip(candidate, snapshot) {
+  if (!candidate) return null;
+  if (typeof candidate === "string") return { text: candidate, evidence: tipEvidence(snapshot) };
+  const text = candidate.text || candidate.message || candidate.tip;
+  if (!text) return null;
+  return { text: String(text), evidence: String(candidate.evidence || tipEvidence(snapshot)) };
+}
+
+function tipEvidence(snapshot = {}) {
+  if (Number.isFinite(snapshot.longestSpeakingRunMs) && snapshot.longestSpeakingRunMs > 8_000) return `${formatDuration(snapshot.longestSpeakingRunMs)} without a reset pause.`;
+  if (Number.isFinite(snapshot.clippingPct) && snapshot.clippingPct > 0) return `${formatNumber(snapshot.clippingPct)}% of frames reached the clipping range.`;
+  return `Based on ${formatDuration(snapshot.durationMs || snapshot.elapsedMs || 0)} of stable signal.`;
+}
+
+function normalizedCoachLevel(rms, calibration = {}) {
+  const quiet = Number(calibration.quietRms ?? calibration.noiseFloor ?? 0.01);
+  const voice = Number(calibration.voiceRms ?? calibration.speechLevel ?? Math.max(.05, quiet * 4));
+  return clamp((rms - quiet) / Math.max(.015, voice - quiet), 0, 1);
+}
+
+function normalizedAdvice(value = {}, report = {}) {
+  const strength = Array.isArray(value.strengths) ? value.strengths[0] : value.strength;
+  const priority = Array.isArray(value.priorities) ? value.priorities[0] : value.focus;
+  const drill = value.nextAttempt || priority?.drill || value.drill;
+  return {
+    strength: strength?.title || (typeof strength === "string" ? strength : "") || "You completed a focused attempt.",
+    strengthEvidence: strength?.evidence || strength?.message || value.strengthEvidence || `${formatPercent(report.speakingRatio)} of the attempt contained speech.`,
+    focus: priority?.title || (typeof priority === "string" ? priority : "") || "Make the next attempt more deliberate.",
+    focusEvidence: priority?.evidence || priority?.message || value.focusEvidence || `${report.pauseCount ?? 0} pauses were measured in this attempt.`,
+    drill: drill?.title || "Retry with one change.",
+    drillDetail: drill?.detail || drill?.message || drill?.instruction || (typeof drill === "string" ? drill : "") || value.drillDetail || "Repeat the same prompt and place one full breath between your main ideas.",
+  };
+}
+
+function buildCoachingSummary(report, advice) {
+  const normalized = normalizedAdvice(advice, report);
+  return {
+    analysisSchemaVersion: 2,
+    id: crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    createdAt: new Date().toISOString(),
+    scenario: practice.setup.scenario,
+    goal: practice.setup.goal,
+    targetDurationMs: practice.setup.duration * 1000,
+    metrics: {
+      durationMs: finiteNumber(report.durationMs), voicedMs: finiteNumber(report.voicedMs),
+      speakingRatio: finiteNumber(report.speakingRatio), pauseCount: finiteNumber(report.pauseCount),
+      observedDurationMs: finiteNumber(report.observedDurationMs), unknownMs: finiteNumber(report.unknownMs),
+      coverageRatio: finiteNumber(report.coverageRatio), maxSampleGapMs: finiteNumber(report.continuity?.maxSampleGapMs),
+      medianPauseMs: finiteNumber(report.medianPauseMs), longestPauseMs: finiteNumber(report.longestPauseMs),
+      longestSpeakingRunMs: finiteNumber(report.longestSpeakingRunMs), levelConsistencyPct: finiteNumberOrNull(report.levelConsistencyPct),
+      clippingPct: finiteNumber(report.clippingPct), audioConfidence: String(report.audioConfidence || "unknown"),
+      transcriptMetrics: sanitizeTranscriptMetrics(report.transcriptMetrics),
+    },
+    advice: normalized,
+  };
+}
+
+function buildCoachingArtifact(id, createdAt, audioBlob, transcriptText) {
+  const transcript = typeof transcriptText === "string" ? transcriptText.trim() : "";
+  if (!(audioBlob instanceof Blob) && !transcript) return null;
+  return {
+    id,
+    createdAt,
+    audioBlob: audioBlob instanceof Blob ? audioBlob : null,
+    audioMimeType: audioBlob instanceof Blob ? audioBlob.type || "audio/webm" : "",
+    transcript,
+  };
+}
+
+function artifactMetadata(artifact) {
+  return {
+    audioStored: Boolean(artifact?.audioBlob),
+    audioBytes: finiteNumber(artifact?.audioBlob?.size),
+    audioMimeType: String(artifact?.audioMimeType || ""),
+    transcriptStored: Boolean(artifact?.transcript),
+  };
+}
+
+function sanitizeTranscriptMetrics(metrics) {
+  if (!metrics) return null;
+  return {
+    wordCount: finiteNumber(metrics.wordCount), wordsPerMinute: finiteNumber(metrics.wordsPerMinute),
+    fillerCount: finiteNumber(metrics.fillerCount), repeatedWordCount: finiteNumber(metrics.repeatedWordCount),
+    fillerRatePer100Words: finiteNumber(metrics.fillerRatePer100Words),
+    repetitionRatePer100Words: finiteNumber(metrics.repetitionRatePer100Words),
+    fillerOccurrences: sanitizeWordPatterns(metrics.fillerOccurrences, "phrase"),
+    repeatedWords: sanitizeWordPatterns(metrics.repeatedWords, "word"),
+  };
+}
+
+function sanitizeWordPatterns(items, key) {
+  if (!Array.isArray(items)) return [];
+  return items.slice(0, 50).flatMap((item) => {
+    const label = typeof item?.[key] === "string" ? item[key].trim().slice(0, 64) : "";
+    return label ? [{ [key]: label, count: finiteNumber(item.count) }] : [];
+  });
+}
+
+function finiteNumber(value) {
+  return Number.isFinite(Number(value)) ? Number(value) : 0;
+}
+
+function finiteNumberOrNull(value) {
+  return value === null || value === undefined || !Number.isFinite(Number(value)) ? null : Number(value);
+}
+
+function localSpeechCapability() {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Recognition) return { supported: false, reason: "On-device transcription is unavailable here; acoustic coaching still works." };
+  try {
+    const probe = new Recognition();
+    const supported = "processLocally" in probe;
+    probe.abort?.();
+    return supported
+      ? { supported: true, reason: "Available" }
+      : { supported: false, reason: "This browser cannot guarantee local-only transcription; it remains off." };
+  } catch {
+    return { supported: false, reason: "On-device transcription could not be initialized; acoustic coaching still works." };
+  }
+}
+
+function scenarioById(id) { return PRACTICE_SCENARIOS.find((item) => item.id === id) || PRACTICE_SCENARIOS[0]; }
+function goalById(id) { return PRACTICE_GOALS.find((item) => item.id === id) || PRACTICE_GOALS[0]; }
+function isPracticeRoute() { return /^\/practice\/?$/i.test(location.pathname); }
+function setText(selector, value) { const element = document.querySelector(selector); if (element) element.textContent = String(value); }
+function clamp(value, min, max) { return Math.min(max, Math.max(min, value)); }
+function formatPercent(value) { return `${Math.round(clamp(Number(value) || 0, 0, 1) * 100)}%`; }
+function formatNumber(value) { return Number.isFinite(Number(value)) ? String(Math.round(Number(value))) : "0"; }
+function formatOptionalPercentage(value) { return value === null || value === undefined || !Number.isFinite(Number(value)) ? "—" : `${Math.round(Number(value))}%`; }
+function formatTranscriptPatternSummary(metrics = {}) {
+  const fillerCount = finiteNumber(metrics.fillerCount);
+  const repeatedCount = finiteNumber(metrics.repeatedWordCount);
+  const patterns = [
+    ...(Array.isArray(metrics.fillerOccurrences) ? metrics.fillerOccurrences.map((item) => item?.phrase) : []),
+    ...(Array.isArray(metrics.repeatedWords) ? metrics.repeatedWords.map((item) => item?.word) : []),
+  ].filter((value) => typeof value === "string" && value.trim()).slice(0, 3);
+  const counts = `${fillerCount} possible filler ${fillerCount === 1 ? "marker" : "markers"} and ${repeatedCount} immediate ${repeatedCount === 1 ? "repetition" : "repetitions"}.`;
+  return patterns.length ? `${counts} Retained patterns: ${patterns.join(", ")}.` : counts;
+}
+function formatDuration(milliseconds) { return `${(Math.max(0, Number(milliseconds) || 0) / 1000).toFixed(milliseconds >= 10_000 ? 0 : 1)}s`; }
+function levelLabel(value) { return value > .92 ? "High" : value > .35 ? "Clear" : "Low"; }
+function confidenceLabel(value) { const text = String(value || "unknown"); return `${text.charAt(0).toUpperCase()}${text.slice(1)} signal confidence`; }
+function microphoneErrorMessage(error) {
+  if (error?.name === "NotAllowedError") return "Microphone permission was denied. Allow access in your browser settings, then try again.";
+  if (error?.name === "NotFoundError") return "No microphone was found. Connect one and try again.";
+  return error?.message || "The microphone could not be started.";
+}
+
+async function renderProgress(generation = routeGeneration) {
+  app.innerHTML = `<section class="loading-card" role="status">Loading private progress…</section>`;
+  let summaries = [];
+  let storageError = "";
+  try {
+    summaries = await readCoachingSummariesWithRetry();
+  } catch {
+    storageError = "Local progress storage is unavailable in this browser.";
+  }
+  if (generation !== routeGeneration || !/^\/progress\/?$/i.test(location.pathname)) return;
+  summaries.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  const averageRatio = summaries.length
+    ? summaries.reduce((total, item) => total + finiteNumber(item.metrics?.speakingRatio), 0) / summaries.length
+    : 0;
+  const latest = summaries[0];
+  const earlier = summaries[1];
+  const change = latest && earlier ? latest.metrics.speakingRatio - earlier.metrics.speakingRatio : null;
+  app.innerHTML = `
+    <section class="progress-page" data-coach-progress>
+      <div class="progress-hero">
+        <div><p class="eyebrow">Private progress</p><h1>Your baseline, not a leaderboard.</h1><p class="lede">Track patterns against your own previous attempts. These compact summaries stay with this site in this browser profile.</p></div>
+        <a class="button primary" href="/practice" data-route>New practice</a>
+      </div>
+      ${storageError ? notice(storageError, true) : ""}
+      <div class="progress-metrics">
+        ${reviewMetric(String(summaries.length), `${summaries.length === 1 ? "attempt" : "attempts"} for this site`)}
+        ${reviewMetric(formatPercent(averageRatio), "average speaking ratio")}
+        ${reviewMetric(change === null ? "—" : `${change >= 0 ? "+" : ""}${Math.round(change * 100)} pts`, "latest ratio shift")}
+      </div>
+      <section class="panel progress-history">
+        <div class="section-head"><div><p class="eyebrow">Attempt history</p><h2>Evidence you can explain</h2></div><span>${summaries.length}</span></div>
+        ${summaries.length ? `<div class="attempt-list">${summaries.map(renderProgressItem).join("")}</div>` : `<div class="empty-progress"><h2>No attempts yet.</h2><p>Complete a practice session and its metric summary will appear here.</p><a class="button" href="/practice" data-route>Build a baseline</a></div>`}
+      </section>
+      <section class="storage-controls">
+        <div><h2>Your data, your controls.</h2><p class="hint">JSON exports contain metrics, advice, and derived word patterns. Opted-in recordings and full transcripts stay in a separate local artifact store and download individually.</p></div>
+        <div class="action-row"><button class="button ghost" type="button" data-command="coach-export" ${summaries.length ? "" : "disabled"}>Export JSON</button><button class="button danger ghost" type="button" data-command="coach-delete" ${summaries.length ? "" : "disabled"}>Delete local history</button></div>
+      </section>
+    </section>`;
+}
+
+function renderProgressItem(item) {
+  const scenario = scenarioById(item.scenario);
+  const goal = goalById(item.goal);
+  const metrics = item.metrics || {};
+  return `<article class="attempt-row">
+    <div><time datetime="${escapeHTML(item.createdAt)}">${escapeHTML(formatAttemptDate(item.createdAt))}</time><h3>${escapeHTML(scenario.name)}</h3><p>${escapeHTML(goal.name)}</p></div>
+    <div class="attempt-numbers"><span><strong>${formatPercent(metrics.speakingRatio)}</strong> speaking</span><span><strong>${metrics.pauseCount ?? 0}</strong> pauses</span><span><strong>${formatDuration(metrics.durationMs)}</strong> analyzed</span></div>
+    <div class="attempt-focus"><span>Next focus</span><p>${escapeHTML(item.advice?.focus || "Repeat and compare your delivery.")}</p>${renderArtifactActions(item)}</div>
+  </article>`;
+}
+
+function renderArtifactActions(item) {
+  const artifacts = item.artifacts || {};
+  if (!artifacts.audioStored && !artifacts.transcriptStored) return "";
+  const id = escapeHTML(item.id);
+  return `<div class="artifact-actions" aria-label="Saved full session artifacts">
+    ${artifacts.audioStored ? `<button class="button ghost small" type="button" data-command="coach-download-audio" data-session-id="${id}">Download recording</button>` : ""}
+    ${artifacts.transcriptStored ? `<button class="button ghost small" type="button" data-command="coach-download-transcript" data-session-id="${id}">Download transcript</button>` : ""}
+  </div>`;
+}
+
+function formatAttemptDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return "Unknown date";
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
+}
+
+const COACH_DB_NAME = "nonstoptalk-coaching";
+const COACH_STORE = "session-summaries";
+const COACH_ARTIFACT_STORE = "session-artifacts";
+const COACH_DB_VERSION = 2;
+
+function openCoachDatabase() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) {
+      reject(new Error("IndexedDB unavailable"));
+      return;
+    }
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    const request = indexedDB.open(COACH_DB_NAME, COACH_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(COACH_STORE)) {
+        const store = database.createObjectStore(COACH_STORE, { keyPath: "id" });
+        store.createIndex("createdAt", "createdAt");
+      }
+      if (!database.objectStoreNames.contains(COACH_ARTIFACT_STORE)) {
+        const store = database.createObjectStore(COACH_ARTIFACT_STORE, { keyPath: "id" });
+        store.createIndex("createdAt", "createdAt");
+      }
+    };
+    request.onsuccess = () => {
+      if (settled) {
+        request.result.close();
+        return;
+      }
+      settled = true;
+      resolve(request.result);
+    };
+    request.onerror = () => fail(request.error || new Error("Could not open coaching history"));
+    request.onblocked = () => fail(new Error("A previous NonStopTalk tab is blocking the coaching storage upgrade."));
+  });
+}
+
+async function withCoachTransaction(storeNames, mode, callback) {
+  const database = await openCoachDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = database.transaction(storeNames, mode);
+      let result;
+      try { result = callback(transaction); } catch (error) { reject(error); return; }
+      transaction.oncomplete = () => resolve(result?.result ?? result);
+      transaction.onerror = () => reject(transaction.error || new Error("Coaching history operation failed"));
+      transaction.onabort = () => reject(transaction.error || new Error("Coaching history operation was cancelled"));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+function withCoachStore(storeName, mode, callback) {
+  return withCoachTransaction([storeName], mode, (transaction) => callback(transaction.objectStore(storeName)));
+}
+
+function saveCoachingSession(summary, artifact) {
+  const stores = artifact ? [COACH_STORE, COACH_ARTIFACT_STORE] : [COACH_STORE];
+  return withCoachTransaction(stores, "readwrite", (transaction) => {
+    transaction.objectStore(COACH_STORE).put(summary);
+    if (artifact) transaction.objectStore(COACH_ARTIFACT_STORE).put(artifact);
+  });
+}
+
+function readCoachingSummaries() {
+  return withCoachStore(COACH_STORE, "readonly", (store) => store.getAll());
+}
+
+function readCoachingArtifact(id) {
+  return withCoachStore(COACH_ARTIFACT_STORE, "readonly", (store) => store.get(id));
+}
+
+async function readCoachingSummariesWithRetry() {
+  try {
+    return await readCoachingSummaries();
+  } catch {
+    // A document reload can briefly abort an IndexedDB open while the prior
+    // page's connection is closing. One bounded retry preserves local history
+    // without hiding a persistent storage error.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return readCoachingSummaries();
+  }
+}
+
+function clearCoachingSummaries() {
+  return withCoachTransaction([COACH_STORE, COACH_ARTIFACT_STORE], "readwrite", (transaction) => {
+    transaction.objectStore(COACH_STORE).clear();
+    transaction.objectStore(COACH_ARTIFACT_STORE).clear();
+  });
+}
+
+async function exportCoachingSummaries() {
+  const sessions = await readCoachingSummaries();
+  const payload = JSON.stringify({
+    product: "NonStopTalk",
+    schemaVersion: 2,
+    exportedAt: new Date().toISOString(),
+    privacy: "Local coaching metrics, advice, and consented derived word patterns; no audio or full transcript.",
+    sessions,
+  }, null, 2);
+  const url = URL.createObjectURL(new Blob([payload], { type: "application/json" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `nonstoptalk-progress-${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+  showToast(`${sessions.length} coaching ${sessions.length === 1 ? "summary" : "summaries"} exported.`);
+}
+
+async function downloadCoachingArtifact(id, kind) {
+  const artifact = await readCoachingArtifact(String(id || ""));
+  if (!artifact) throw new Error("That saved session artifact is unavailable.");
+  let blob;
+  let extension;
+  if (kind === "audio") {
+    if (!(artifact.audioBlob instanceof Blob)) throw new Error("This session has no saved recording.");
+    blob = artifact.audioBlob;
+    extension = audioFileExtension(artifact.audioMimeType || artifact.audioBlob.type);
+  } else {
+    if (!artifact.transcript) throw new Error("This session has no saved full transcript.");
+    blob = new Blob([artifact.transcript], { type: "text/plain;charset=utf-8" });
+    extension = "txt";
+  }
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `nonstoptalk-${kind}-${String(artifact.createdAt || "session").slice(0, 10)}-${String(artifact.id).slice(0, 8)}.${extension}`;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+  showToast(`${kind === "audio" ? "Recording" : "Transcript"} download started.`);
+}
+
+function audioFileExtension(mimeType = "") {
+  const value = String(mimeType).toLowerCase();
+  if (value.includes("ogg")) return "ogg";
+  if (value.includes("mp4") || value.includes("aac")) return "m4a";
+  if (value.includes("wav")) return "wav";
+  return "webm";
 }
 
 function renderRoom() {
@@ -285,7 +1385,9 @@ async function handleSubmit(event) {
   const values = Object.fromEntries(new FormData(form));
   try {
     setBusy(true);
-    if (form.matches("[data-create-room]")) {
+    if (form.matches("[data-coach-setup]")) {
+      beginCoachingSession(values).catch((error) => showToast(error.message));
+    } else if (form.matches("[data-create-room]")) {
       const payload = await api("/api/rooms", { name: values.name }, "POST");
       navigate(`/room/${payload.room.code}`);
     } else if (form.matches("[data-join-room]")) {
@@ -307,6 +1409,12 @@ async function handleSubmit(event) {
 }
 
 async function handleClick(event) {
+  const routeLink = event.target.closest("[data-route]");
+  if (routeLink) {
+    event.preventDefault();
+    navigate(new URL(routeLink.href, location.href).pathname);
+    return;
+  }
   const home = event.target.closest("[data-home]");
   if (home) {
     event.preventDefault();
@@ -345,6 +1453,28 @@ async function handleClick(event) {
       await doAction({ type: "reset" });
     } else if (command === "claim-host") {
       await doAction({ type: "claim-host" });
+    } else if (command === "coach-cancel") {
+      stopCoachingLifecycle();
+      practice = freshPracticeState(practice.setup);
+      renderPractice();
+    } else if (command === "coach-stop") {
+      await finishCoachingSession("manual");
+    } else if (command === "coach-again") {
+      practice = freshPracticeState(practice.setup);
+      renderPractice();
+      document.querySelector("[data-coach-setup]")?.scrollIntoView({ block: "start" });
+    } else if (command === "coach-export") {
+      await exportCoachingSummaries();
+    } else if (command === "coach-download-audio") {
+      await downloadCoachingArtifact(button.dataset.sessionId, "audio");
+    } else if (command === "coach-download-transcript") {
+      await downloadCoachingArtifact(button.dataset.sessionId, "transcript");
+    } else if (command === "coach-delete") {
+      if (window.confirm("Delete every coaching summary, recording, and transcript artifact stored for this NonStopTalk site in this browser profile?")) {
+        await clearCoachingSummaries();
+        await renderProgress(routeGeneration);
+        showToast("Local coaching history deleted.");
+      }
     }
   } catch (error) {
     showToast(error.message);
@@ -615,7 +1745,30 @@ async function api(path, body, method = "GET") {
 
 function navigate(path) {
   history.pushState({}, "", path);
+  routeFocusRequested = true;
   loadRoute();
+}
+
+function focusRouteHeading() {
+  if (!routeFocusRequested) return;
+  routeFocusRequested = false;
+  const heading = app.querySelector("h1");
+  if (!heading) return;
+  heading.tabIndex = -1;
+  heading.focus({ preventScroll: false });
+  announce(`${heading.textContent.trim()} page.`);
+}
+
+function updatePrimaryNavigation() {
+  for (const link of document.querySelectorAll("[data-nav]")) {
+    const href = new URL(link.href, location.href).pathname;
+    const active = href === "/"
+      ? location.pathname === "/" || /^\/room\//i.test(location.pathname)
+      : location.pathname === href || location.pathname === `${href}/`;
+    link.classList.toggle("active", active);
+    if (active) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
 }
 
 function setBusy(value) {
@@ -741,4 +1894,5 @@ function escapeHTML(value) {
 
 function shutdown() {
   stopRoomLifecycle();
+  stopCoachingLifecycle();
 }

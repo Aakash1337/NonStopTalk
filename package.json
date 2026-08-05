@@ -7,11 +7,13 @@
   },
   "scripts": {
     "check:cloudflare": "wrangler deploy --dry-run",
+    "test:coach": "node --test cloudflare/public/coach-engine.test.js",
     "test:cloudflare": "tsx --test cloudflare/*.test.ts",
     "typecheck:cloudflare": "tsc -p cloudflare/tsconfig.json",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "smoke": "node scripts/smoke-local.mjs"
+    "smoke": "node scripts/smoke-local.mjs",
+    "smoke:coach": "node scripts/smoke-coach.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20260804.1",

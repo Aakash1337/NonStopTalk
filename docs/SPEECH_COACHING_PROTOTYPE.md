@@ -1,0 +1,698 @@
+# Speech coaching prototype
+
+This document explains the prototype as both a product walkthrough and a technical tour. It is written for someone who needs to demonstrate the feature, understand the code, and explain its limitations honestly.
+
+> **Current boundary:** Practice and Progress are implemented only in the native Cloudflare SPA at `/practice` and `/progress`. The local Go game at port 8080 is unchanged. The multiplayer game is preserved. This is a work-in-progress rehearsal tool, not a clinical assessment, speech therapy product, or validated measure of speaking ability.
+
+## What the prototype proves
+
+The prototype demonstrates that NonStopTalk can add useful individual coaching without requiring a paid speech service or sending a person's voice to the application server.
+
+It currently supports:
+
+- Interview-answer, presentation-opening, and impromptu prompts
+- One focus per attempt: intentional pace, purposeful pauses, or steady delivery
+- 30, 45, 60, or 90 second attempts
+- A four-second, session-specific microphone calibration
+- Browser-side acoustic analysis through `AudioWorklet`, with an `AnalyserNode` compatibility path
+- Sparse deterministic live cues
+- A post-attempt strength, highest-value focus, evidence, and retry drill
+- Optional transcript-derived pace/filler/repetition evidence through strict on-device browser recognition; consented derived word patterns remain in the compact summary
+- Aggregate session summaries in IndexedDB, plus JSON export
+- Separate, off-by-default local retention of the attempt recording and available full transcript, with per-attempt downloads and confirmed two-store deletion
+
+It does not prove that the current thresholds work equally well across microphones, rooms, languages, accents, disabilities, or browsers. It does not yet pair a baseline with an unassisted retry or establish a learning outcome.
+
+## Try it locally
+
+The coaching prototype is part of the Worker-with-Assets edition:
+
+```sh
+npm ci
+npm run test:coach
+npm run dev
+```
+
+Open:
+
+```text
+http://127.0.0.1:8787/practice
+```
+
+Wrangler may print a different port if 8787 is already occupied; use the URL it prints. Loopback development and deployed HTTPS are secure contexts, which browsers require for microphone access and `AudioWorklet` module loading.
+
+The local Go command serves the game, not this prototype:
+
+```sh
+go run ./cmd/web
+# game at http://localhost:8080
+```
+
+## User flow
+
+### 1. Set one goal
+
+The setup asks for:
+
+- **Scenario:** Interview answer, Presentation opening, or Impromptu response
+- **Goal:** Intentional pace, Purposeful pauses, or Steady delivery
+- **Length:** 30, 45, 60, or 90 seconds
+- **Optional transcript:** A separate checkbox that is enabled only when the browser exposes mandatory local-processing support
+- **Optional full-session retention:** An independent, unchecked checkbox that is enabled only when the browser exposes `MediaRecorder`
+
+Choosing one goal limits the amount of advice and makes a later retry interpretable. The three prompts are fixed prototype content, not a curriculum or generated AI content.
+
+The two optional data choices do different jobs. Transcript analysis adds pace/count/pattern evidence and, when it succeeds, stores bounded derived filler/repetition patterns in the compact summary. Full-session retention records the active attempt and can keep the full transcript only if transcript analysis was also enabled and successful. Neither checkbox silently enables the other.
+
+### 2. Consent and calibrate
+
+The page explains the browser-local boundary and any selected retention before calling `getUserMedia`. The browser remains responsible for displaying and enforcing microphone permission.
+
+Calibration lasts four seconds:
+
+1. Approximately two seconds of quiet room sound estimate the local noise floor.
+2. Approximately two seconds of normal speech estimate a useful speaking level.
+
+The analyzer derives a threshold between those observations. This is more resilient than one global amplitude cutoff, but it is still sensitive to sudden noise, distance changes, automatic device processing, and a user who speaks during the quiet phase.
+
+### 3. Speak with sparse live feedback
+
+The live page keeps the prompt and selected focus dominant. It shows:
+
+- Seconds remaining
+- Normalized microphone level
+- Estimated speaking ratio
+- Detected pause count
+- A simple Low/Clear/High input label
+- At most one live cue
+
+Tips are deliberately gated. No tip is considered during the first five seconds. A displayed cue stays visible for five seconds, and at least ten seconds must pass between displayed cues. Deeper advice waits for review.
+
+### 4. Review evidence and one next action
+
+The review contains:
+
+- One measured strength
+- One next focus with evidence
+- One short retry drill
+- Analyzed duration
+- Speaking ratio
+- Pause count and median pause
+- Longest uninterrupted speaking run
+- Input-level consistency
+- A voice/quiet/unobserved timeline for the current review
+- Unobserved duration when audio-level callbacks were missing
+- Optional word count, words per minute, filler/repetition counts, and derived pattern labels when local transcript analysis succeeded
+
+The timeline exists only in the in-memory review. It is intentionally excluded from the stored summary.
+
+### 5. Retry or review local progress
+
+**Try again** returns to setup with the same selections. The prototype does not yet link two attempts as a baseline/retry pair or claim that the second attempt improved.
+
+`/progress` reads summaries for the current site origin in the current browser profile. It shows attempt count, average speaking ratio, the latest raw speaking-ratio change, and individual attempt summaries. The latest change is descriptive, not a quality judgment: a higher speaking ratio is not always better, especially when the selected goal is purposeful pauses.
+
+The user can export summary JSON. When a completed attempt has separately retained artifacts, Progress shows individual **Download recording** and/or **Download transcript** controls. JSON export never includes those full artifacts. **Delete local history** clears both coaching stores for that origin after confirmation. Another domain, scheme, port, or browser profile has separate IndexedDB storage; for example, `127.0.0.1:8787` and a different Wrangler port do not share history.
+
+## Architecture and data flow
+
+```text
+Workers Static Assets
+  └─ index.html + app.css + browser modules
+       │
+       ├─ /room/ABC123 ── JSON/WebSocket ──> Worker ──> room Durable Object
+       │                                         (multiplayer game only)
+       │
+       └─ /practice
+            │
+            ├─ getUserMedia microphone track
+            │    └─ AudioContext
+            │         ├─ AudioWorklet preferred
+            │         │    raw samples → ~100 ms RMS + peak frames
+            │         └─ AnalyserNode compatibility path
+            │              time-domain frames → RMS + peak
+            │
+            ├─ CoachingAnalyzer
+            │    calibration → speech/pause segments → aggregate metrics
+            │
+            ├─ CoachingTipPolicy
+            │    snapshots → deterministic sparse cue
+            │
+            ├─ optional SpeechRecognition(processLocally = true)
+            │    text → aggregate counts + bounded derived word patterns
+            │
+            ├─ optional MediaRecorder (separate consent)
+            │    active attempt → encoded audio Blob
+            │
+            ├─ goal + evidence query
+            │    → lexical retrieval over bundled coaching cards
+            │    → top card's prewritten drill + source
+            │
+            └─ rule-selected strength/focus
+                 + retrieved drill + fixed comparison sentence → review
+                  └─ IndexedDB v2 → /progress
+                       ├─ session-summaries (every saved attempt)
+                       └─ session-artifacts (only after separate opt-in)
+
+No coaching fetch/API path
+No audio or transcript upload
+No Durable Object or external model in the coaching path
+```
+
+Cloudflare's [SPA asset routing](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/) serves `index.html` for `/practice` and `/progress`. The same browser module reads the path and renders the appropriate surface. The Worker and Durable Object remain responsible for `/api/*` multiplayer state, not coaching media.
+
+## Audio signal processing
+
+### Why `AudioWorklet`
+
+The Web Audio model separates page/control work from audio rendering work. `AudioWorkletProcessor.process()` receives small blocks of channel samples on the audio rendering thread. That provides a regular source of samples without running a per-sample loop inside DOM rendering or input handlers. See the [Web Audio specification](https://www.w3.org/TR/webaudio-1.1/) and MDN's [`AudioWorkletNode` reference](https://developer.mozilla.org/en-US/docs/Web/API/AudioWorkletNode).
+
+The processor does not recognize words. Its job is deliberately small: mix channels and reduce samples to two objective values.
+
+### Channel mix
+
+For each frame index, the worklet averages the available input channels:
+
+```text
+x[i] = (channel₁[i] + channel₂[i] + … + channelₘ[i]) / m
+```
+
+This produces one scalar sample `x[i]` per frame even when the microphone stream is multi-channel.
+
+### Root-mean-square level
+
+For `N` mixed samples:
+
+```text
+RMS = sqrt((x[1]² + x[2]² + … + x[N]²) / N)
+```
+
+RMS is an energy-like amplitude measurement. Digital audio samples normally lie between -1 and 1, so RMS is also in that range. It is not a sound-pressure-level measurement in decibels and cannot compare physical loudness across uncalibrated devices.
+
+### Peak level
+
+```text
+peak = max(|x[1]|, |x[2]|, …, |x[N]|)
+```
+
+Peak helps detect samples close to the digital limit. It does not prove that the analog microphone never distorted before digitization.
+
+### Frame interval
+
+The worklet accumulates approximately `sampleRate / 10` samples before posting a message. At 48 kHz that is about 4,800 samples, or one message every 100 ms. It posts:
+
+```js
+{ atMs, rms, peak }
+```
+
+The application consumes the relative timing and levels. It does not retain the underlying samples.
+
+### Compatibility path
+
+If the worklet module or `AudioWorkletNode` cannot start, the page connects an `AnalyserNode`, reads 2,048 floating-point time-domain samples every 100 ms, and calculates the same RMS/peak shape on the page thread. This remains on-device but has less regular timing and more page-thread involvement.
+
+## Calibration and speech classification
+
+Calibration receives quiet and normal-speaking RMS/peak frames. It derives a noise estimate, speaking-level estimate, and speech thresholds for the current attempt; the analyzer carries a fixed digital clipping boundary of `0.98`.
+
+The core idea is:
+
+```text
+quiet observations ─┐
+                    ├─> session threshold ─> classify each ~100 ms frame
+speech observations ┘                         as voice, silence, or unknown
+```
+
+### Calibration statistics
+
+The engine sorts the RMS observations and uses quantiles so one unusually loud frame has less influence than it would have on a simple maximum:
+
+```text
+quiet median  = Q50(quiet RMS)
+quiet ceiling = Q90(quiet RMS)
+voice floor   = Q20(voice RMS)
+voice median  = Q50(voice RMS)
+voice upper   = Q80(voice RMS)
+separation    = voice floor − quiet ceiling
+```
+
+When usable separation is at least `0.002`, the on/off boundaries are placed inside that gap:
+
+```text
+speech-on  = quiet ceiling + 0.45 × separation
+speech-off = quiet ceiling + 0.20 × separation
+```
+
+When the two calibration phases do not separate, conservative fallbacks derive boundaries from the quiet ceiling and voice median and mark confidence low. Final thresholds are clamped to valid digital-amplitude ranges.
+
+The engine also derives a target voiced-RMS band from the speech-on threshold and the 20th/50th/80th voice quantiles. That band is relative to this microphone session; it is not a physical decibel target.
+
+### Hysteresis and segments
+
+Hysteresis means a silent frame must rise to `speech-on` to enter voice, while an existing voice segment stays active until it falls below the lower `speech-off` boundary. The two boundaries reduce rapid voice/silence flicker around one value.
+
+After classification:
+
+- An interior segment shorter than `120 ms` is merged when both neighbors have the opposite, matching label. This removes a brief classification glitch.
+- A **pause** is an interior silence of at least `400 ms` with voice before and after it. Leading and trailing quiet are not counted as pauses.
+- A speaking run bridges an interior quiet gap of at most `250 ms`, so a tiny dip does not split the run.
+- One level frame describes at most the next `250 ms`. If another callback arrives later, the remainder is labeled **unknown**, not projected as voice, silence, or clipping.
+- Unknown segments are never glitch-merged into speech, never counted as a pause, and always break a speaking run.
+
+These values live in `COACHING_THRESHOLDS` and have deterministic boundary tests. They are engineering defaults, not universal definitions of speech quality.
+
+If an active analyzer receives zero level callbacks, the whole elapsed attempt is one unknown segment: observed duration and coverage are `0`, confidence is `0`, and the first priority is to restore stable input rather than change delivery.
+
+### Calibration confidence
+
+Calibration confidence combines sample evidence and relative quiet/voice separation:
+
+```text
+sample evidence      = clamp(min(quiet count, voice count) / 12, 0, 1)
+relative separation  = clamp(separation / max(voice median, quiet ceiling + 0.01), 0, 1)
+calibration score    = 0.45 × sample evidence
+                     + 0.55 × clamp(relative separation / 0.45, 0, 1)
+```
+
+Scores at least `0.75` are labeled high; scores at least `0.50` are medium; the rest are low. The label describes available signal evidence, never the speaker.
+
+## Metrics and what they mean
+
+| Metric | Calculation shape | What it can support | Important limitation |
+| --- | --- | --- | --- |
+| Attempt duration | End time minus attempt start, capped by target duration | Wall-clock attempt/progress timing | It can exceed the duration with reliable audio frames |
+| Observed duration | Voice duration plus silence duration | Amount of time backed by held level frames | Each frame is held for at most 250 ms; missing callbacks reduce it |
+| Unobserved duration | Attempt duration minus observed duration | Discloses missing level evidence instead of inventing delivery behavior | It does not explain why callbacks stopped |
+| Signal coverage | `observed duration / attempt duration` | Caps confidence and protects advice when input is unstable | It is an availability measure, not speaking quality |
+| Voiced time | Sum of frames/segments classified as speech | Speaking ratio and speech-run lengths | Music, echo, and noise can be classified as voice |
+| Speaking ratio | `voiced duration / observed duration` | Describing talk/silence balance only where frames exist | Higher is not inherently better; unknown time is deliberately excluded |
+| Pause count | Count of qualifying unvoiced segments between speech | Identifying delivery breaks | It is not a linguistic sentence-boundary detector |
+| Median pause | Median duration of qualifying pause segments | A robust description of typical measured pauses | A short attempt may have too few pauses to be meaningful |
+| Longest pause | Maximum qualifying pause duration | Finding a possible loss-of-flow moment | Silence at the edge of an attempt must be interpreted differently from mid-speech silence |
+| Longest speaking run | Longest voiced run after bridging interior quiet gaps of at most `250 ms` | Detecting a long run without a reset | Noise can merge runs; a long run is not automatically bad |
+| Level consistency | `0.7 × in-calibrated-band ratio + 0.3 × stability`, where `stability = clamp(1 − coefficient of variation / 0.75)` | Input/delivery stability for this setup | It mixes voice behavior with distance, gain, compression, and mic handling |
+| Clipping percentage | Frames with `peak ≥ 0.98` divided by analyzed frames | Warning about possible digital overload | This is a sample-frame ratio, not a physical loudness value; analog distortion and browser processing can occur below that point |
+| Audio confidence | Heuristic label based on calibration separation and usable evidence | Communicating uncertainty | It is not a statistical confidence interval |
+
+Metrics are evidence for a chosen practice goal, not components of one hidden score. A user should primarily compare like-for-like attempts on the same goal, device, and environment.
+
+Level consistency is withheld until at least eight voiced frames and one second of measured speech are available. A consistency of at least `0.75` is labeled consistent, at least `0.50` mixed, and lower values variable.
+
+Attempt-level measurement confidence combines five pieces of evidence:
+
+```text
+score = 0.25 × calibration confidence
+      + 0.20 × sample density
+      + 0.25 × observed-duration evidence (full at 15 seconds)
+      + 0.25 × voice evidence (full at 5 seconds)
+      + 0.05 × callback continuity
+
+final score = min(weighted score, signal coverage)
+```
+
+Sample density compares observed frames with a conservative minimum of `max(8, observed duration / 250 ms)`. Signal coverage is the observed/attempt-duration ratio and acts as a hard confidence ceiling: missing frames are not evidence. The same high/medium/low label boundaries apply. This is a transparent heuristic, not a probability that the advice is correct.
+
+## Optional transcript measurements
+
+The prototype does not send audio to a transcription service. When the user checks the option and the browser exposes mandatory local processing, it creates `SpeechRecognition`, sets `processLocally = true`, supplies the active microphone track, and keeps interim text in memory up to 20,000 characters.
+
+At finish, the deterministic transcript analyzer computes:
+
+- Word count
+- Words per minute as `word count / (analyzed milliseconds / 60,000)`
+- Filler count and rate per 100 words from the explicit prototype list: `you know`, `I mean`, `kind of`, `sort of`, `um`, `uh`, `erm`, `er`, and `hmm`
+- Adjacent repeated-word count and rate per 100 words
+
+Words are Unicode letter/number tokens with internal apostrophes; matching is case-normalized. Multiword filler matches reserve their token positions so the same words are not double-counted by another filler pattern. “Very very” counts one immediate repetition; separated repetitions do not.
+
+The compact summary retains numeric aggregates plus bounded derived pattern arrays: each array keeps at most 50 filler/repeated-word entries, and each label is trimmed to at most 64 characters. These labels are not the full transcript, but they can still contain sensitive lexical content—for example, an immediately repeated name. The full transcript is then cleared by default. Filler markers and repetitions can be intentional, and a summary without the full transcript cannot support later context review. Recognition errors, punctuation, language mismatch, or an unavailable local language pack can also make these estimates wrong. The prototype does not attempt a remote fallback, semantic relevance, structure, sentiment, emotion, or accent scoring.
+
+The Web Speech on-device APIs are experimental and browser-dependent. MDN documents [`processLocally`, availability checks, and language packs](https://developer.mozilla.org/en-US/docs/Web/API/Web_Speech_API/Using_the_Web_Speech_API#on-device_speech_recognition). The current prototype detects the mandatory-local property and fails back to acoustic analysis if recognition cannot start; it does not manage language-pack installation.
+
+## Optional full-session artifacts
+
+Attempt-recording/full-transcript retention is independent from transcript analysis and starts unchecked on a fresh page load. **Try again** preserves the visible setup selections so the user can review or uncheck them before the next attempt. If `MediaRecorder` is unavailable, the setup disables this option and compact summaries still work.
+
+When selected:
+
+1. `MediaRecorder` attaches to the same microphone stream after calibration, so the four-second calibration is not part of the recording.
+2. It prefers Opus WebM, then WebM, then Opus Ogg when the browser reports support; otherwise it lets the browser choose a default.
+3. Approximately one-second encoded chunks remain in page memory while the attempt runs.
+4. Finishing stops the recorder and combines non-empty chunks into an audio `Blob`.
+5. The application saves that encoded `Blob` and any captured transcript to `session-artifacts`, linked to the summary by ID.
+
+Recording retention does not enable transcription. If transcript analysis was off or failed, the artifact may contain audio only. If the recorder failed but a full transcript exists, a transcript-only artifact can be saved. Canceling or navigating away stops the recorder, clears pending chunks, and saves no unfinished artifact.
+
+## Small local RAG, deterministic tips, and advice
+
+The prototype uses a small retrieval-augmented generation pattern entirely inside `coach-engine.js`:
+
+```text
+selected goal + measured evidence
+  → lexical query
+  → ranked match from curated in-app coaching cards
+  → top card's prewritten drill kept intact
+  → fixed comparison sentence selected from the top measurement priority
+  → separate rules select strength/focus and assemble the review
+  → review names the grounding source
+```
+
+It is labeled **retrieval-augmented deterministic generation**, where “generation” is bounded template assembly. The engine does not rewrite the retrieved drill or synthesize open-ended prose: it appends one prewritten, metric-specific comparison sentence. This is not the common production RAG stack: there is no LLM, embedding model, vector database, remote corpus, or network request.
+
+“Deterministic” means the same measurements and goal lead to the same live-tip, strength/focus, retrieved-card, and comparison-template decisions. Retrieval makes the base drill traceable to curated product material without introducing a variable model response.
+
+This design was chosen for the presentation prototype because it is:
+
+- **Private:** the query and card library stay in the browser.
+- **No-cost:** there is no inference, embedding, or database service.
+- **Low-latency:** the card library is already loaded with the application.
+- **Auditable:** a reviewer can inspect every card, ranking rule, and source label.
+- **Testable:** controlled evidence can assert the exact retrieved card and advice.
+
+A future LLM-backed RAG layer could retrieve richer curriculum passages and generate more contextual explanations. It would also add provider/model behavior, embeddings or another semantic index, latency, cost, consent and retention boundaries, source/version governance, prompt-injection defenses, and a much larger relevance, safety, and fairness evaluation.
+
+### Curated corpus and ranking
+
+Version 1 freezes six product-owned cards:
+
+| Card ID | Coaching idea | Source label |
+| --- | --- | --- |
+| `idea-boundary-pause` | Use a pause to separate complete ideas | NonStopTalk Coaching Library · Delivery foundations v1 |
+| `recover-after-gap` | Recover from a long gap with one landing sentence | NonStopTalk Coaching Library · Delivery foundations v1 |
+| `protect-input-level` | Stabilize gain and microphone distance | NonStopTalk Coaching Library · Recording basics v1 |
+| `pace-with-breaths` | Shape pace at sentence boundaries | NonStopTalk Coaching Library · Delivery foundations v1 |
+| `replace-fillers-with-silence` | Replace one filler/repetition pattern with a quiet beat | NonStopTalk Coaching Library · Delivery foundations v1 |
+| `repeat-and-compare` | Build a longer, comparable practice baseline | NonStopTalk Coaching Library · Practice method v1 |
+
+The retrieval query contains only the selected goal and aggregate evidence flags, such as unstable signal coverage, clipping, variable level, long run/gap, estimated fast pace, filler count, or a short attempt. Raw or recognized transcript text is never inserted into the retrieval query.
+
+The lexical ranker:
+
+1. Lowercases Unicode letter/number tokens.
+2. Removes a small English stop-word list and normalizes a simple trailing plural `s` on longer tokens.
+3. Gives each query match `4` points in card tags, `2` in its title, `1` in its excerpt, and `0.5` in its drill.
+4. Sorts by descending score and uses frozen corpus order as the deterministic tie-break.
+5. Treats a score below `4` as too weak to claim grounding, returns at most two qualifying cards in the current advice call, and otherwise returns `repeat-and-compare` as a score-zero fallback.
+
+The grounding record exposes retrieval mode, generation mode `deterministic-template`, library version, used card ID, source label, score, and matched terms. This is why the presenter can show not just advice, but where its local context came from. The numeric retrieval score is a ranking aid, not a probability or coaching-quality score.
+
+The live policy evaluates acoustic conditions for pauses/long speech runs, level consistency, and clipping. Choosing the pace or pauses goal lowers the acoustic long-run threshold; transcript-derived WPM, fillers, and local card retrieval happen only after the attempt for review advice, not live tips. The surrounding UI adds three anti-distraction controls:
+
+1. Five seconds of attempt evidence before any cue is considered.
+2. Only one visible cue at a time, shown for five seconds.
+3. A minimum ten-second interval between displayed cues.
+
+The main engineering defaults are:
+
+| Decision | Current qualifying evidence |
+| --- | --- |
+| Live clipping cue | At least 20 analyzed frames over at least 3 seconds, with at least 3 clipping frames and at least 2% of frames clipping |
+| Live resume cue | Current silence at least 2.5 seconds after at least 1.5 seconds of measured speech |
+| Live intentional-pause cue | Current bridged speaking run at least 18 seconds for a pace/pauses goal, or 28 seconds otherwise |
+| Live steady-distance cue | Variable input status after at least 8 seconds of speech and 20 voiced frames |
+| Review: restore stable input | Attempt at least 3 seconds and either at least 1 second unknown or signal coverage below 75%; this priority outranks delivery advice |
+| Review: protect recording | At least 20 frames, at least 3 clipping frames, and at least 2% clipping |
+| Review: create idea boundary | Longest bridged speaking run at least 25 seconds and no completed pause of at least 400 ms |
+| Review: plan next landing point | At least one pause and longest pause at least 3 seconds |
+| Transcript review eligibility | Attempt at least 15 seconds and at least 25 recognized words |
+| Review: reduce pace | Eligible transcript estimate above 180 words per minute |
+| Review: replace filler | At least 3 filler markers and at least 4 per 100 recognized words |
+| Review: immediate repetition | At least 2 adjacent repeats and at least 2 per 100 recognized words |
+| Review: collect longer baseline | Attempt shorter than 8 seconds |
+
+Transcript word count, WPM, fillers, and repetitions never drive live cues. They are calculated after the attempt and can influence only review advice. When signal coverage is unstable, the engine prioritizes restoring input, avoids calling level consistency a strength, and suppresses the long-run/long-pause delivery priorities that missing frames could fabricate. These thresholds make the prototype behavior easy to reproduce; they have not been validated as universal coaching norms.
+
+The post-attempt builder assembles this structure:
+
+```text
+strength
+  ├─ title
+  └─ measured evidence
+
+focus next
+  ├─ title
+  └─ measured evidence
+
+drill
+  ├─ title
+  └─ top retrieved card's intact retry instruction
+       + one fixed comparison sentence selected by the top priority
+
+grounding
+  ├─ curated coaching-card identity/source
+  └─ lexical score and matched terms for this goal/evidence
+```
+
+Advice wording is intentionally behavioral. It may say to insert a reset pause, move closer to the microphone, or reduce clipping; it must not say the speaker is anxious, dishonest, unprofessional, or medically impaired.
+
+The fixed comparison suffix makes the retry measurable:
+
+| Top priority | Appended comparison |
+| --- | --- |
+| Restore a stable input signal | Confirm stable signal coverage before comparing delivery measurements |
+| Protect the recording | Compare clipping-frame percentage |
+| Keep microphone distance steady | Compare level consistency |
+| Create an idea boundary | Compare longest speaking run and measured pause count |
+| Plan the next landing point | Compare longest measured pause |
+| Leave more room between phrases | Compare estimated WPM and repeat its transcript-dependent caveat |
+| Replace one filler pattern | Compare possible filler markers per 100 words |
+| Finish the word, then continue | Compare immediate repetitions per 100 words |
+| Collect a longer baseline | Use the longer attempt as the baseline for one comparable retry |
+| No priority | Compare the same selected measurement with this attempt |
+
+## IndexedDB v2 storage schema
+
+Database and stores:
+
+```text
+database: nonstoptalk-coaching (version 2)
+stores:   session-summaries
+          session-artifacts
+key:      id in both stores
+index:    createdAt in both stores
+```
+
+Opening version 2 upgrades an existing version-1 database by preserving `session-summaries` and adding the missing `session-artifacts` store. The browser smoke test exercises that upgrade path.
+
+Conceptual summary record:
+
+```js
+{
+  analysisSchemaVersion: 2,
+  id,
+  createdAt,
+  scenario,
+  goal,
+  targetDurationMs,
+  metrics: {
+    durationMs,
+    observedDurationMs,
+    unknownMs,
+    coverageRatio,
+    maxSampleGapMs,
+    voicedMs,
+    speakingRatio,
+    pauseCount,
+    medianPauseMs,
+    longestPauseMs,
+    longestSpeakingRunMs,
+    levelConsistencyPct,
+    clippingPct,
+    audioConfidence,
+    transcriptMetrics: null | {
+      wordCount,
+      wordsPerMinute,
+      fillerCount,
+      fillerRatePer100Words,
+      repeatedWordCount,
+      repetitionRatePer100Words,
+      fillerOccurrences: [{ phrase, count }],
+      repeatedWords: [{ word, count }]
+    }
+  },
+  advice: {
+    strength,
+    strengthEvidence,
+    focus,
+    focusEvidence,
+    drill,
+    drillDetail
+  },
+  artifacts: {
+    audioStored,
+    audioBytes,
+    audioMimeType,
+    transcriptStored
+  }
+}
+```
+
+Conceptual full-artifact record, created only after the separate retention choice:
+
+```js
+{
+  id,            // same ID as its summary
+  createdAt,
+  audioBlob,     // Blob | null
+  audioMimeType,
+  transcript     // full string, possibly empty
+}
+```
+
+The full in-memory review also contains speech/pause segments and local-retrieval grounding (card/source/score/matched terms). `buildCoachingSummary` deliberately excludes segments, grounding metadata, raw frames, raw audio, and full transcript text, while retaining the allowlisted aggregate metrics, derived word patterns, advice, and artifact-presence metadata. If an artifact exists, the summary and artifact are written in one IndexedDB transaction.
+
+JSON export reads only `session-summaries` and adds product/export schema metadata. It therefore includes consented derived pattern labels and artifact-presence metadata but never the audio `Blob` or full transcript. The visible card source remains available only in the immediate review, not historical `/progress` records. Artifact download buttons read one `session-artifacts` record at a time; recording extensions follow its MIME type, and transcripts download as UTF-8 `.txt` files.
+
+## Privacy and consent checklist
+
+| Boundary | Prototype behavior |
+| --- | --- |
+| Opening Practice | Does not open the microphone |
+| Microphone | Browser permission requested after an explanation |
+| Default audio path | Reduced in the audio graph; not recorded, persisted, or uploaded |
+| Live measurement frames | Kept in page memory for the active attempt |
+| Transcript analysis | Separate opt-in; mandatory local processing; derived counts/patterns enter the summary; full text cleared by default |
+| Full-session retention | Independent, unchecked opt-in; stores attempt audio and any available full transcript in `session-artifacts` |
+| Stored summary | Aggregate metrics, consented derived patterns, normalized advice, and artifact-presence metadata in origin-scoped IndexedDB |
+| Export | Summary store only; excludes audio `Blob` and full transcript |
+| Individual download | Reads the opted-in artifact and creates a recording file or UTF-8 transcript file |
+| Delete | Clears `session-summaries` and `session-artifacts` after confirmation; previously downloaded files are outside its scope |
+| Navigation/cancel | Stops recognition/recorder, discards unsaved chunks, stops microphone tracks/worklet/intervals/context, and rejects delayed permission/worklet activation |
+| Cloudflare Durable Object | Multiplayer room state only; receives no coaching data |
+| External model | None in the coaching prototype |
+
+See [AI and Privacy](AI_AND_PRIVACY.md) for how this differs from the local Go game's optional AI judge.
+
+## File tour
+
+Read the implementation in this order:
+
+1. **`cloudflare/public/index.html`** — the persistent document shell and primary navigation.
+2. **`cloudflare/public/app.js`** — start at `freshPracticeState`, then follow `renderPractice`, `beginCoachingSession`, `ingestCoachingFrame`, `startArtifactRecorder`, `finishCoachingSession`, the two IndexedDB stores/download helpers, and `renderProgress`.
+3. **`cloudflare/public/coach-audio-worklet.js`** — the small sample-to-RMS/peak processor.
+4. **`cloudflare/public/coach-engine.js`** — calibration, segmentation, metrics, transcript counts, curated coaching cards, lexical retrieval, live-tip policy, grounding, and final advice.
+5. **`cloudflare/public/coach-engine.test.js`** — executable examples of expected formulas, retrieval/ranking, grounding, and boundary behavior.
+6. **`cloudflare/public/app.css`** — Practice, live attempt, review, timeline, and Progress layouts in the shared graphite/acid-lime system.
+7. **`scripts/smoke-coach.mjs`** — browser-level proof using synthetic media, two IndexedDB stores, accessibility focus, lifecycle-race, and network assertions.
+8. **`wrangler.jsonc`** — Static Assets SPA fallback plus Worker/Durable Object bindings for the separate multiplayer API.
+
+## How to explain the implementation
+
+Use this sequence instead of starting with file names:
+
+1. **Capture:** `getUserMedia` provides a live track after permission.
+2. **Reduce:** AudioWorklet turns thousands of samples into about ten RMS/peak frames per second.
+3. **Calibrate:** Quiet and speaking examples adapt the threshold to this attempt.
+4. **Classify:** The analyzer turns frames into voiced/unvoiced segments with timing stability.
+5. **Measure:** Segment durations and voiced levels produce inspectable aggregate metrics.
+6. **Retrieve:** The selected goal and measured evidence rank curated local coaching cards.
+7. **Assemble advice:** The top retrieved card supplies the intact base drill; deterministic rules append one metric-specific comparison sentence and select strength/focus.
+8. **Store by consent:** The default path clears live media/full text and writes an allowlisted summary; the separate retention choice additionally writes a linked audio/transcript artifact.
+
+This makes the privacy boundary and the coaching mechanism understandable without calling every calculation “AI.”
+
+## Verification
+
+Run the focused checks:
+
+```sh
+npm ci
+npm run test:coach
+npm run smoke:coach
+npm run typecheck:cloudflare
+npm run check:cloudflare
+```
+
+Run the complete repository baseline before release:
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+npm run smoke
+npm run typecheck:cloudflare
+npm run test:cloudflare
+```
+
+What each coaching check demonstrates:
+
+- `test:coach` runs 20 tests that feed controlled frames/transcripts into the pure engine and check calibration, segmentation (including zero callbacks → zero coverage), observed/unknown time, continuity confidence, metrics, tips, retrieval, deterministic drill assembly, and advice.
+- `smoke:coach` drives `/practice` with synthetic audio/transcription. It proves a default-off attempt constructs no recorder/artifact, upgrades a synthetic v1 database to both v2 stores, verifies an opted-in non-empty recording `Blob` and transcript, reads real recording/transcript downloads, parses JSON export and confirms full-artifact exclusion, checks Progress reload and route-heading focus, clears both stores, handles canceled permission/worklet loading and active/calibration stalls without leaked intervals/tracks, and makes no application `/api/*` request.
+- `check:cloudflare` confirms that the Worker and all Static Assets, including the coaching modules, form a valid deploy bundle.
+
+These tests do not replace real-device, accessibility, security, or fairness validation.
+
+## Known limitations and explicit work in progress
+
+- Audio thresholds and advice rules are prototype defaults, not validated norms.
+- Calibration is short and can be contaminated by noise or incorrect user behavior.
+- Browser-requested echo cancellation/noise suppression changes the signal; actual device behavior varies.
+- The AudioWorklet fallback has different timing characteristics.
+- Strict on-device speech recognition is experimental and uneven across browsers/languages.
+- Transcript analysis uses simple English token/rule matching, not semantic understanding.
+- Fixed prompts, fixed goals, and English UI are prototype content.
+- Progress compares standalone summaries and does not yet pair a baseline with an unassisted retry.
+- Speaking ratio change is descriptive; it is not a universal improvement direction.
+- The local coaching-card library is intentionally small; retrieval is lexical rather than semantic and still requires relevance/fairness evaluation.
+- Derived filler/repetition labels may contain sensitive words even though they are not a full transcript.
+- Retained artifacts have no automatic expiration, per-attempt deletion, quota dashboard, or app-level encryption; anyone with access to the unlocked browser profile may reach them.
+- No accounts, sync, retention policy across devices, educator view, or shared report exists.
+- No formal WCAG, security, privacy, microphone/device, learning-outcome, or subgroup-fairness study has been completed.
+- The coaching feature is absent from the local Go edition.
+- The tool does not diagnose or treat a communication disorder.
+
+## Next measurement plan
+
+The first pilot should collect enough evidence to decide whether to refine or expand the coach:
+
+- Completed baseline → review → unassisted retry loops
+- Paired goal-specific changes, reported as distributions
+- Human/user-rated false-tip rate
+- Reported distraction and tip frequency
+- Microphone/calibration and strict-local-transcription availability by device/browser/language
+- Automated network privacy violations
+- Measurement repeatability under the same setup
+- Availability and false-tip differences across voluntary, sufficiently sized language/accent groups
+
+Do not set adoption or improvement targets until the event definitions, measurement noise, and pilot population are known. See [Coaching Presentation Guide](COACHING_PRESENTATION_GUIDE.md#4-measurement) for operational definitions and guardrails.
+
+## Glossary
+
+| Term | Plain-language meaning |
+| --- | --- |
+| Acoustic measurement | A number calculated from the sound signal, such as energy, peak level, or timing; it does not imply that words were understood. |
+| `getUserMedia` | The browser API that asks permission for a live microphone/camera stream. NonStopTalk requests audio only. |
+| `AudioContext` | The browser object that owns a Web Audio processing graph. |
+| `AudioWorklet` | A small custom audio processor that runs with the browser's audio rendering work and receives blocks of samples. |
+| RMS | Root mean square: an energy-like average amplitude for a block of samples. |
+| Peak | The largest absolute sample amplitude in a block. |
+| Voice-activity detection | Estimating whether a time region contains speech-like signal. This is not word recognition. |
+| Calibration | Observing the current quiet room and speaking level to derive session-specific thresholds. |
+| Threshold | A boundary used to classify a measurement, such as speech versus non-speech. It is an engineering rule, not a human diagnosis. |
+| Hysteresis | Using different enter/exit boundaries or timing so classifications do not flicker when a signal sits near one threshold. |
+| Segment | A contiguous measured interval labeled voice or pause. |
+| Deterministic | Given the same inputs and configuration, the rule produces the same output. |
+| `SpeechRecognition` | An experimental browser API that can turn speech into text. NonStopTalk uses it only when mandatory on-device processing is exposed and chosen. |
+| `MediaRecorder` | A browser API that encodes a live media stream. NonStopTalk uses it only after the separate full-session-retention choice. |
+| Artifact | An explicitly retained encoded attempt recording and/or captured transcript stored separately from the compact summary. |
+| WPM | Words per minute: transcript word count divided by analyzed minutes. It inherits transcription errors. |
+| IndexedDB | Best-effort structured browser storage scoped to one site origin and browser profile. It is not a server database or automatic cloud backup, and storage pressure may remove it. |
+| SPA | Single-page application: one HTML shell changes the visible page in JavaScript as the URL changes. |
+| Worker | Cloudflare's server-side JavaScript runtime. It handles multiplayer `/api/*` requests but does not receive coaching audio/transcripts. |
+| Durable Object | A Cloudflare object that coordinates and stores one multiplayer room. It is not used for coaching analysis/history. |
+| RAG | Retrieval-augmented generation: retrieve relevant context, then use it to shape an output. This prototype uses lexical retrieval plus deterministic templates locally—no LLM, embeddings, vector database, or network. |
+| Baseline | A first, unassisted attempt used as the comparison point for a specific goal. |
+| Unassisted retry | A comparable second attempt made without depending on live coaching prompts; the intended evidence of learned change. |
+| Driver metric | A measurable step that helps explain whether users can reach the desired outcome. |
+| Guardrail metric | A measurement that detects harm or a tradeoff while optimizing the main outcome. |
+
+## Sources
+
+- [Web Audio API 1.1 specification](https://www.w3.org/TR/webaudio-1.1/)
+- [MDN: AudioWorkletNode](https://developer.mozilla.org/en-US/docs/Web/API/AudioWorkletNode)
+- [MDN: on-device speech recognition](https://developer.mozilla.org/en-US/docs/Web/API/Web_Speech_API/Using_the_Web_Speech_API#on-device_speech_recognition)
+- [Lewis et al.: Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks](https://papers.nips.cc/paper_files/paper/2020/hash/6b493230205f780e1bc26945df7481e5-Abstract.html) — origin of the RAG framing; this prototype uses a much smaller deterministic local adaptation, not that paper's neural architecture
+- [Cloudflare: Single Page Application routing](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/)
+- [Cloudflare: Durable Objects](https://developers.cloudflare.com/durable-objects/)
+- [Liang et al., A Survey of Automated Presentation Coaching](https://aclanthology.org/2026.bea-1.4/)
+- [ASHA: Accent Modification](https://www.asha.org/Practice-Portal/Professional-Issues/Accent-Modification/)

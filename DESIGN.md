@@ -2,108 +2,169 @@
 
 ## Intent
 
-NonStopTalk is a product UI for a live group game. The interface should feel immediate, legible, and pressure-filled without becoming visually chaotic. During turns, the screen should behave like a game table centerpiece: topic, timer, voice status, and score are visible from a few feet away.
+NonStopTalk now has three interface jobs:
 
-Physical scene: a group is gathered around a laptop or TV in a living room or classroom, with mixed lighting, background noise, and players glancing at the screen while speaking.
+- **Practice** creates a calm, focused space for one person to rehearse and understand evidence.
+- **Play** remains a legible, pressure-filled group game that can be read from several feet away.
+- **Progress** helps a person compare their own attempts without turning speech into a universal grade.
 
-## Visual Direction
+All three should feel like the same product: high contrast, decisive typography, compact controls, and an acid-lime signal color on a graphite field. The current native Cloudflare SPA at `127.0.0.1:8787` is the canonical visual direction.
 
-Use a restrained product interface with a confident game accent. The product should not look like a corporate dashboard. Use strong contrast, large turn-state elements, and compact setup screens.
+## Visual direction
 
 Preferred qualities:
 
-- Focused
-- Fast
-- Social
-- Slightly tense
-- Easy to scan at distance
+- Focused and editorial
+- Dark graphite, not neon arcade black
+- Energetic but controlled
+- Technical enough to make evidence credible
+- Human enough that advice does not feel clinical
+- Easy to scan on a phone, laptop, or shared display
 
 Avoid:
 
-- Neon-on-black arcade styling
 - Generic purple-blue gradients
-- Beige social app warmth
-- Heavy card grids
-- Decorative illustrations that do not support play
+- Dense analytics grids during an attempt
+- Cards nested inside cards
+- Decorative charts without a decision attached
+- Red-as-shame scoring for normal speech variation
+- Ambient motion that competes with speaking
+- A single oversized “AI score”
 
-## Color System
+## Current color system
 
-Use OKLCH tokens in implementation.
-
-Suggested starter palette:
+The Cloudflare SPA implements these core tokens:
 
 ```css
 :root {
-  --color-bg: oklch(0.965 0.008 82);
-  --color-surface: oklch(0.985 0.006 82);
-  --color-panel: oklch(0.925 0.012 82);
-  --color-text: oklch(0.205 0.018 72);
-  --color-muted: oklch(0.47 0.018 72);
-  --color-border: oklch(0.82 0.014 82);
-
-  --color-accent: oklch(0.64 0.18 33);
-  --color-accent-strong: oklch(0.54 0.2 33);
-  --color-success: oklch(0.58 0.14 150);
-  --color-warning: oklch(0.72 0.15 78);
-  --color-danger: oklch(0.58 0.18 24);
-  --color-info: oklch(0.56 0.12 230);
+  --ink: #f5f2e9;
+  --muted: #aaa99e;
+  --surface: #191a17;
+  --surface-2: #22231f;
+  --line: #35362f;
+  --acid: #d5ff4f;
+  --acid-ink: #151a07;
+  --danger: #ff826e;
+  --blue: #7ec8ff;
 }
 ```
 
-The accent should mark primary actions, active turns, and timer pressure. It should not be used as decoration everywhere.
+The page background begins at `#10110f` with a restrained olive radial glow. Acid lime marks the primary action, active state, speech signal, and useful positive evidence. It must not become a decorative border around every panel. Warm off-white text prevents the interface from feeling like a developer console.
+
+`--danger` is reserved for destructive actions, failures, and genuine hardware problems. It should not label an ordinary pause, filler word, accent, or slower pace as a personal failure.
 
 ## Typography
 
-Use a system UI font stack or Inter if the project later adds a font package.
+Use the current system-first stack:
 
 ```css
 font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 ```
 
-Text scale should stay fixed by component role rather than scaling with viewport width.
+Large, tightly tracked headlines provide the visual identity. Monospaced/tabular numerals support timers and room codes. Component roles determine scale:
 
-- Turn topic: large and readable from distance
-- Timer: largest element during active play
-- Setup labels: compact and clear
-- Scoreboard numbers: tabular lining numbers
+- Practice prompt: large enough to hold attention without looking like a form label
+- Live metric: readable at a glance, with its unit always visible
+- Current tip: one short sentence, visually secondary to the speaking task
+- Turn topic and timer: readable from across a room
+- Review evidence: normal reading size with plain-language definitions
+- Progress comparison: paired values and direction, never unexplained decoration
 
-## Layout
+## Information hierarchy
 
-The game needs three major interface shapes:
+### Practice
 
-1. Setup screens: efficient forms and lists for players, settings, and topics.
-2. Turn screen: one focused play surface with topic, timer, voice state, and host controls.
-3. Scoreboard screens: standings, round results, and winner state.
+The speaker should see, in order:
 
-Use cards only for repeated list items, player rows, topic packs, and small panels. Do not put cards inside cards. The turn screen should not feel like a form inside a card.
+1. The prompt and chosen goal
+2. The local-processing disclosure and two independent choices before the attempt: transcript analysis and full-session artifact retention
+3. The current attempt state and remaining time
+4. One live cue at most
+5. A clear stop action
 
-## Components
+Do not show the full post-session dashboard while the person is speaking. Analysis belongs in review, where each recommendation follows this shape:
 
-Core components:
+```text
+observation → evidence → curated drill source → limitation → next action
+```
 
-- Player list row
-- Topic pack selector
-- Custom topic editor
-- Game settings panel
-- Turn timer
-- Voice activity meter
-- Silence countdown
-- Host control bar
-- Scoreboard table
-- Winner summary
-- Permission and device status banners
+### Play
 
-Every interactive component needs default, hover, focus, active, disabled, and loading states.
+The active topic, timer, voice status, and score remain the centerpiece. Host controls are powerful but quiet. Setup forms can be compact; the live turn cannot feel like a form inside a card.
 
-## Motion
+### Progress
 
-Motion should communicate state:
+Lead with recent attempts and goal-specific trends. Compare the user with their own history. Do not rank people, infer demographic traits, or collapse pause, pace, filler, and input-level measurements into an opaque universal quality score. When an attempt has opted-in artifacts, expose separate recording/transcript download actions beside that attempt; JSON export must remain visibly distinct because it contains summaries and derived word patterns, not the full artifacts. The delete action must say that it clears both stores for this site.
 
-- Countdown start
-- Timer pressure
-- Speech detected
-- Silence warning
-- Turn ended
-- Score applied
+## Core components
 
-Keep transitions around 150 to 250 ms. Support reduced motion.
+Shared:
+
+- Primary navigation for Practice, Play/Home, and Progress
+- Permission, privacy, compatibility, and error notices
+- Buttons with default, hover, focus, active, disabled, and loading states
+- Screen-reader announcements for meaningful state changes, not every timer tick
+
+Practice and Progress:
+
+- Scenario and focus-goal selector
+- Prompt surface
+- Microphone readiness/privacy disclosure
+- Separate, unchecked controls for optional on-device transcript analysis and optional attempt-recording/full-transcript retention
+- Live level indicator, with a sparse clipping cue when the measured condition qualifies
+- Single-tip coaching surface
+- Evidence row with value, unit, and explanation
+- Compact source label for the retrieved coaching card that supplied the retry drill
+- Actionable review card
+- Device-local attempt history and empty state
+- Per-attempt download controls only when the relevant full artifact exists, plus one confirmed action that clears summaries and artifacts
+
+Play:
+
+- Player row, topic selector/editor, settings panel
+- Turn timer, voice meter, silence state, and host controls
+- Scoreboard, score explanation, winner, and history
+
+## Coaching language
+
+Copy should describe what the system observed, not what it imagines about a person.
+
+Prefer:
+
+- “Your longest measured pause was 2.8 seconds.”
+- “Try finishing the thought, then pause once before the next point.”
+- “Pace is unavailable because strict on-device transcription is not supported here.”
+
+Avoid:
+
+- “You sounded nervous.”
+- “Your voice lacks confidence.”
+- “Your accent reduced your score.”
+- “AI says you are 82% professional.”
+
+## Motion and live feedback
+
+Motion communicates state: microphone ready, speech detected, clipping, a sustained coaching condition, turn completion, and saved review. Keep normal transitions around 150–250 ms and honor `prefers-reduced-motion`.
+
+Live feedback must be sparse:
+
+- One visible cue at a time
+- A sustained condition before a cue appears
+- A cooldown before another cue
+- Automatic recovery when the condition clears
+- No rapid flashing or timer announcements to assistive technology
+
+Exact prototype timing and thresholds are documented in [Speech Coaching Prototype](docs/SPEECH_COACHING_PROTOTYPE.md). They are engineering defaults awaiting user and fairness validation, not universal truths about good speech.
+
+## Accessibility and input resilience
+
+- Maintain visible keyboard focus and native semantic controls.
+- Do not use color as the only state signal.
+- Give charts or meter-like visuals a text equivalent.
+- Explain why microphone permission is requested before requesting it.
+- Keep transcript analysis and full-artifact retention visibly optional and do not imply that one grants the other.
+- State that transcript analysis keeps derived filler/repetition patterns in the summary, while full audio/transcript retention is a separate off-by-default choice.
+- Preserve a usable analysis when transcription is unavailable.
+- Stop microphone tracks and audio work when leaving Practice.
+- Move keyboard focus to the new route heading after client-side navigation.
+- Test reduced motion, zoom, narrow layouts, keyboard-only operation, and common screen readers before claiming conformance.

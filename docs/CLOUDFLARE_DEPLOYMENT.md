@@ -4,15 +4,19 @@ NonStopTalk has a native Cloudflare edition designed for the Workers Free plan. 
 
 The deployment consists of:
 
-- Workers Static Assets serving `cloudflare/public`
+- Workers Static Assets serving the Play, Practice, and Progress SPA in `cloudflare/public`
 - a TypeScript Worker handling `/api/*`
 - one SQLite-backed Durable Object per six-character room code
 - hibernatable WebSockets for live room updates
+
+The multiplayer game uses the Worker and Durable Objects. The speech-coaching prototype at `/practice` and its origin-local browser history at `/progress` run entirely in the browser after the static assets load. Coaching summaries, recordings, and transcript text are not sent to the Worker, a Durable Object, or an external model. A separate unchecked option can retain a recording and available full transcript in that origin's IndexedDB; it does not consume Durable Object storage.
 
 The Durable Object binding is internal. Players use the normal public Worker URL:
 
 ```text
 https://nonstoptalk.<account-subdomain>.workers.dev/
+https://nonstoptalk.<account-subdomain>.workers.dev/practice
+https://nonstoptalk.<account-subdomain>.workers.dev/progress
 https://nonstoptalk.<account-subdomain>.workers.dev/room/ABC123
 ```
 
@@ -24,7 +28,7 @@ This small party game is designed to stay inside those allocations: inactive obj
 
 The Worker also uses Cloudflare's built-in [Rate Limiting binding][rate-limit-binding] to allow at most ten room creations per source connection per minute in each Cloudflare location. This guard is intentionally generous for normal play and reduces trivial Free-plan quota abuse; Cloudflare documents these counters as permissive and eventually consistent, so it is not an accounting boundary or a defense against a distributed attack.
 
-The optional Anthropic integration belongs to the local Go edition. The supplied Cloudflare edition uses classic scoring and does not require or accept an AI-provider secret.
+The optional Anthropic integration belongs to the local Go game edition. The supplied Cloudflare multiplayer game uses classic scoring and does not require or accept an AI-provider secret. The Cloudflare coaching prototype uses bundled coaching cards, local lexical retrieval, deterministic template assembly, and optional strict on-device recognition; it also requires no provider secret, embedding service, or vector database.
 
 ## Requirements
 
@@ -40,7 +44,9 @@ From the repository root:
 
 ```sh
 npm clean-install
+npm run typecheck:cloudflare
 npm run test:cloudflare
+npm run test:coach
 npm run check:cloudflare
 npx wrangler login
 npm run deploy
@@ -59,7 +65,7 @@ For the repository-connected flow in the Cloudflare dashboard:
 1. Create or connect a **Worker** project, not a Pages-only static project.
 2. Use the repository root (`/`) as the root directory.
 3. Use Node.js 22 or newer (Node.js 24 is also supported).
-4. Use `npm run test:cloudflare` as the optional build command.
+4. Use `npm run typecheck:cloudflare && npm run test:cloudflare && npm run test:coach` as the build command.
 5. Use `npm run deploy` as the deploy command.
 6. Keep the Worker name aligned with `name` in `wrangler.jsonc` (`nonstoptalk` by default).
 
@@ -73,6 +79,8 @@ npm run dev
 ```
 
 Wrangler starts the Worker, local Durable Object storage, and static assets. Its local state lives under `.wrangler`, which is ignored by Git.
+
+Open `http://127.0.0.1:8787/practice` for the coaching prototype or `/progress` for summaries and separately opted-in artifacts scoped to that origin and browser profile. Wrangler prints the actual URL if it selects a different port; a different port is a different origin and has separate IndexedDB history. These routes do not create a Durable Object. They use the SPA asset fallback documented by Cloudflare; microphone processing, summary storage, and optional recording/full-transcript storage stay in the browser. `MediaRecorder` support is required only for the full-session-retention option.
 
 The original Go edition is still the richer local app and remains available independently:
 
@@ -88,7 +96,9 @@ Each online room owns one Durable Object selected by its room code. The object s
 
 A room is deleted after 30 days without a state change. The alarm closes any remaining sockets and clears the object's storage. Browser identity is an unguessable, HTTP-only cookie; clearing that cookie loses the corresponding seat/host identity.
 
-The free online edition currently mirrors the core room, setup, topic, microphone/manual timer, classic scoring, score override, standings, history, host transfer, and host-claim flows. It does not yet include the Go edition's AI judge, generated topics, saved presets, text import/export, microphone picker, or sound cues.
+The free online multiplayer game currently mirrors the core room, setup, topic, microphone/manual timer, classic scoring, score override, standings, history, host transfer, and host-claim flows. It does not yet include the Go game's AI judge, generated topics, saved presets, text import/export, microphone picker, or sound cues.
+
+The browser-only coaching prototype is a separate path, not game-feature parity. It provides acoustic analysis, optional on-device transcript-derived counts/patterns, deterministic retrieval-plus-template advice, and local IndexedDB v2 storage. Compact summaries are saved for Progress. Full recordings and available transcripts are retained only after a second, off-by-default choice, are stored in a separate object store, and download individually; summary JSON export excludes them and confirmed deletion clears both stores. No coaching data enters room SQLite state or synchronizes across devices.
 
 ## Custom domain
 
@@ -113,7 +123,7 @@ The earlier repository had neither a Wrangler entry point nor a declared static 
 Could not detect a directory containing static files
 ```
 
-`wrangler.jsonc` now supplies all three stateful pieces Wrangler needs: the Worker entry point, the `cloudflare/public` asset directory, and the SQLite-backed Durable Object binding/migration. It is a Worker-with-Assets deployment rather than a Pages-only site.
+`wrangler.jsonc` now supplies all three stateful pieces Wrangler needs: the Worker entry point, the `cloudflare/public` asset directory with SPA fallback, and the SQLite-backed Durable Object binding/migration. It is a Worker-with-Assets deployment rather than a Pages-only site. `/practice` and `/progress` are handled by that static SPA fallback, so no separate output directory or Pages project is required.
 
 ## Durable Object migrations
 
