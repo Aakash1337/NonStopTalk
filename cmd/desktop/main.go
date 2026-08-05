@@ -9,11 +9,12 @@ import (
 	"runtime"
 	"time"
 
-	"dontstoptalking/internal/web/handlers"
+	nonstoptalk "github.com/Aakash1337/NonStopTalk"
+	"github.com/Aakash1337/NonStopTalk/internal/web/handlers"
 )
 
 func main() {
-	server, err := handlers.NewServer("internal/web/templates/*.html")
+	server, err := handlers.NewServerFromFS(nonstoptalk.EmbeddedAssets())
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -23,9 +24,14 @@ func main() {
 		log.Fatal(err)
 	}
 	url := fmt.Sprintf("http://%s", listener.Addr().String())
+	httpServer := &http.Server{
+		Handler:           server.Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
 
 	go func() {
-		if err := http.Serve(listener, server.Routes()); err != nil && err != http.ErrServerClosed {
+		if err := httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 			log.Fatal(err)
 		}
 	}()
@@ -34,7 +40,7 @@ func main() {
 	if err := openBrowser(url); err != nil {
 		log.Printf("Open %s in your browser. Launcher could not open it automatically: %v", url, err)
 	} else {
-		log.Printf("Don't Stop Talking desktop session running at %s", url)
+		log.Printf("NonStopTalk desktop session running at %s", url)
 	}
 
 	select {}

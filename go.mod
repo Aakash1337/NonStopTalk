@@ -1,4 +1,4 @@
-module dontstoptalking
+module github.com/Aakash1337/NonStopTalk
 
 go 1.26
 

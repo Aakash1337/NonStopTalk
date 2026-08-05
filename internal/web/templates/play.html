@@ -11,7 +11,7 @@
 {{end}}
 
 {{define "play"}}
-<main class="shell play-shell" id="app" data-room-base="{{.Base}}">
+<main class="shell play-shell" id="app" data-room-base="{{.Base}}"{{if .HostClaimWaitMS}} data-host-claim-wait-ms="{{.HostClaimWaitMS}}"{{end}}>
   {{if .Error}}<div class="notice danger">{{.Error}}</div>{{end}}
   {{template "claimHost" .}}
   {{if or .IsActor (and .IsHost (not .ActorIsRemote))}}
@@ -20,6 +20,9 @@
     data-base="{{.Base}}"
     data-duration="{{.CurrentTurn.Duration}}"
     data-silence="{{.CurrentTurn.SilenceLimit}}"
+    data-remaining="{{.Remaining}}"
+    data-turn-running="{{if .TurnRunning}}1{{else}}0{{end}}"
+    data-turn-id="{{.CurrentTurn.ID}}"
     {{if .Session.Settings.AIJudgeEnabled}}data-ai="1"{{end}}>
     <div class="turn-meta">
       <span>Round {{.CurrentTurn.Round}} of {{.Session.Settings.Rounds}}</span>
@@ -27,7 +30,19 @@
     </div>
 
     {{if .Session.Settings.AIJudgeEnabled}}
-    <p class="ai-banner">AI judge is on: while you talk, your browser transcribes your words and sends only that text to be graded for a bonus. Audio never leaves this device.</p>
+      <div class="ai-banner" data-ai-consent>
+        <p><strong>AI judge choice for this turn</strong></p>
+        <p>Choose supported on-device transcription, which sends only the resulting text to the judge, or play this turn without transcription or an AI bonus. NonStopTalk never uploads microphone audio.</p>
+        <label class="toggle-row">
+          <input type="radio" name="ai-turn-choice" value="local" data-ai-consent-local>
+          <span>Use on-device transcription for this turn</span>
+        </label>
+        <label class="toggle-row">
+          <input type="radio" name="ai-turn-choice" value="classic" data-ai-consent-classic>
+          <span>Play without AI transcription</span>
+        </label>
+        <p class="hint" data-ai-consent-status role="status">Choose how to play this turn.</p>
+      </div>
     {{end}}
 
     <div class="topic-block">
@@ -36,7 +51,7 @@
     </div>
 
       <div class="timer-row">
-      <div class="timer" data-timer>{{.CurrentTurn.Duration}}</div>
+      <div class="timer" data-timer>{{.Remaining}}</div>
       <div class="voice-panel">
         <div class="voice-label" data-voice-label>Mic ready</div>
         <div class="mic-summary" data-mic-summary>
@@ -62,24 +77,28 @@
       </div>
     </div>
 
-    <form class="turn-result" data-result-form hx-post="{{.Base}}/turn/submit" hx-target="#app" hx-swap="outerHTML">
-      <input type="hidden" name="spokenSeconds" data-spoken value="0">
-      <input type="hidden" name="completed" data-completed value="false">
-      <input type="hidden" name="eliminated" data-eliminated value="false">
-      <input type="hidden" name="transcript" data-transcript value="">
+    <div class="turn-result">
+      <form id="turn-result-form" data-result-form hx-post="{{.Base}}/turn/submit" hx-target="#app" hx-swap="outerHTML">
+        <input type="hidden" name="turnID" value="{{.CurrentTurn.ID}}">
+        <input type="hidden" name="spokenSeconds" data-spoken value="0">
+        <input type="hidden" name="completed" data-completed value="false">
+        <input type="hidden" name="eliminated" data-eliminated value="false">
+        <input type="hidden" name="transcript" data-transcript value="">
+      </form>
       <div class="host-bar">
         <button class="button primary large" type="button" data-start-turn>Start Talking</button>
-        {{if .IsHost}}
         <button class="button secondary" type="button" data-start-manual>Manual Timer</button>
-        {{end}}
-        <button class="button secondary" type="button" data-redraw-topic hx-post="{{.Base}}/turn/redraw" hx-target="#app" hx-swap="outerHTML">Redraw Topic</button>
+        {{if not .TurnRunning}}<form hx-post="{{.Base}}/turn/redraw" hx-target="#app" hx-swap="outerHTML">
+          <input type="hidden" name="turnID" value="{{.CurrentTurn.ID}}">
+          <button class="button secondary" type="submit" data-redraw-topic>Redraw Topic</button>
+        </form>{{end}}
         {{if .IsHost}}
         <button class="button secondary" type="button" data-manual-complete>Mark Complete</button>
         {{end}}
         <button class="button ghost" type="button" data-sound-toggle aria-pressed="true">Sound On</button>
-        <button class="button ghost" type="submit">End Turn</button>
+        <button class="button ghost" type="submit" form="turn-result-form">End Turn</button>
       </div>
-    </form>
+    </div>
   </section>
   {{else}}
   <section class="turn-stage spectate">
@@ -109,13 +128,18 @@
     {{if .IsHost}}
     <div class="host-bar host-override">
       <form hx-post="{{.Base}}/turn/submit" hx-target="#app" hx-swap="outerHTML">
+        <input type="hidden" name="turnID" value="{{.CurrentTurn.ID}}">
         <input type="hidden" name="spokenSeconds" value="{{.CurrentTurn.Duration}}">
         <input type="hidden" name="completed" value="true">
         <input type="hidden" name="eliminated" value="false">
         <button class="button secondary" type="submit">Mark Complete</button>
       </form>
-      <button class="button secondary" type="button" hx-post="{{.Base}}/turn/redraw" hx-target="#app" hx-swap="outerHTML">Redraw Topic</button>
+      {{if not .TurnRunning}}<form hx-post="{{.Base}}/turn/redraw" hx-target="#app" hx-swap="outerHTML">
+        <input type="hidden" name="turnID" value="{{.CurrentTurn.ID}}">
+        <button class="button secondary" type="submit">Redraw Topic</button>
+      </form>{{end}}
       <form hx-post="{{.Base}}/turn/submit" hx-target="#app" hx-swap="outerHTML">
+        <input type="hidden" name="turnID" value="{{.CurrentTurn.ID}}">
         <input type="hidden" name="spokenSeconds" value="-1">
         <input type="hidden" name="completed" value="false">
         <input type="hidden" name="eliminated" value="false">
@@ -130,7 +154,7 @@
     {{template "standings" .}}
   </aside>
   {{if or .IsActor (and .IsHost (not .ActorIsRemote))}}
-  <script src="/static/js/turn.js?v=9" defer></script>
+    <script src="/static/js/turn.js?v=10" defer></script>
   {{end}}
 </main>
 {{end}}
@@ -148,7 +172,7 @@
 {{end}}
 
 {{define "score"}}
-<main class="shell" id="app" data-room-base="{{.Base}}">
+<main class="shell" id="app" data-room-base="{{.Base}}"{{if .HostClaimWaitMS}} data-host-claim-wait-ms="{{.HostClaimWaitMS}}"{{end}}>
   {{if .Error}}<div class="notice danger">{{.Error}}</div>{{end}}
   {{template "claimHost" .}}
   <section class="result-band">
@@ -163,6 +187,7 @@
       {{end}}
       {{if or .IsHost .IsNextUp}}
       <form class="next-turn" hx-post="{{.Base}}/turn/start" hx-target="#app" hx-swap="outerHTML">
+        <input type="hidden" name="afterTurnID" value="{{.LastTurn.ID}}">
         <button class="button primary large" type="submit">Next Turn</button>
       </form>
       {{else}}
@@ -199,7 +224,7 @@
 {{end}}
 
 {{define "winner"}}
-<main class="shell" id="app" data-room-base="{{.Base}}">
+<main class="shell" id="app" data-room-base="{{.Base}}"{{if .HostClaimWaitMS}} data-host-claim-wait-ms="{{.HostClaimWaitMS}}"{{end}}>
   {{if .Error}}<div class="notice danger">{{.Error}}</div>{{end}}
   {{template "claimHost" .}}
   <section class="winner-band">

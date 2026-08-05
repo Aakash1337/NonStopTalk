@@ -1,120 +1,95 @@
-# Web Version Plan
+# Web Version Plan — Historical
 
-## Direction
+> Historical planning record. The original Go + HTMX web milestone has been implemented and expanded. This file explains the initial direction and the important differences in the current build; [Technical Architecture](TECHNICAL_ARCHITECTURE.md) is the canonical description.
 
-Build the first version as a Go and HTMX web app. This fits the product because most screens are form, list, and state-transition driven: player setup, topic selection, game settings, host actions, scoreboards, and round summaries.
+## Original direction
 
-Use minimal vanilla JavaScript only where the browser requires it:
+The first plan chose a Go and HTMX web application because most product actions are forms and state transitions:
 
-- Microphone permission
-- Web Audio voice activity detection
-- High-frequency timer display
-- Local event dispatch during active turns
+- Player setup
+- Topic and settings selection
+- Host actions
+- Turn submission
+- Scoreboards and winner view
 
-## Why Go and HTMX Fit
+Vanilla JavaScript was reserved for capabilities that server-rendered HTML cannot provide:
 
-Go is a good fit for the game engine, topic system, scoring, room state, and future online multiplayer. HTMX keeps setup and host workflows simple by letting the server return HTML partials instead of building a large client app.
+- Microphone permission and device selection
+- Web Audio voice-activity analysis
+- Precise timer display
+- Optional browser speech recognition
+- Browser-local presets
 
-The result should be:
+That boundary remains in the implementation. The browser is not a full SPA.
 
-- Simple to run locally
-- Easy to test server-side game rules
-- Fast enough for party use
-- Ready for online rooms later
-- Less client state than a full SPA
+## Original milestones and outcome
 
-## What HTMX Should Handle
+| Milestone | Outcome |
+| --- | --- |
+| Go server and templates | Implemented with `net/http` and embedded `html/template` assets |
+| Static UI shell | Implemented with token-based CSS and responsive/reduced-motion rules |
+| Game engine and scoring | Implemented in `internal/game` |
+| HTMX setup flow | Implemented with official HTMX 2.0.10 |
+| Topic packs | Implemented with five packs, custom lists, randomized deck, import/export, and generation |
+| Turn screen | Implemented |
+| Microphone and timer JavaScript | Implemented with device selection, Web Audio, sound cues, and manual fallback |
+| Result submission | Implemented with server clock caps and stable turn identity |
+| Scoreboard and winner | Implemented, plus score corrections and room history |
+| Browser smoke test | Implemented with five Playwright flows |
 
-- Add player
-- Remove player
-- Rename player
-- Reorder player later
-- Select topic pack
-- Create custom topic list
-- Update game settings
-- Start game
-- Start turn
-- Submit turn result
-- Apply score override
-- Move to next player
-- Show scoreboard
-- Restart game
+## Expansion beyond the original local plan
 
-## What JavaScript Must Handle
+The first plan treated online play, AI judging, and persistence as later upgrades. They now exist:
 
-HTMX cannot directly handle microphone access or precise audio analysis. A small client module should handle:
+- Six-character rooms with remote seats
+- Server-Sent Events synchronization
+- Host transfer and claim after absence
+- Browser-token reconnect
+- Optional JSON snapshots
+- Optional on-device transcription and relevance judging
+- Offline and Anthropic-backed topic generation
+- Native Workers Static Assets + SQLite-backed Durable Object deployment path
 
-- Request microphone permission
-- Create an `AudioContext`
-- Measure input volume
-- Smooth voice activity levels
-- Detect speech and silence
-- Track silence timeout
-- Drive the visible active-turn timer
-- Submit final turn results to the server
+## Current request shape
 
-The JavaScript should stay isolated to `web/static/js/turn.js` or similar. It should not become a full client-side app.
-
-## Suggested Request Flow
-
-### Setup
+The exact route set has evolved from the early sketch. Current endpoints are room-oriented:
 
 ```text
-GET  /                    -> setup screen
-POST /players             -> adds player, returns player list partial
-POST /settings            -> updates settings, returns settings partial
-POST /topics/custom       -> saves custom topics, returns topic summary
-POST /games               -> creates game, redirects to first turn
+GET  /                              landing page
+POST /rooms                         create room
+POST /rooms/join                    join room
+
+GET  /room/{code}                   full current state
+GET  /room/{code}/partial           current state partial
+GET  /room/{code}/events            SSE update stream
+
+POST /room/{code}/players...        roster actions
+POST /room/{code}/settings          game settings
+POST /room/{code}/topics...         custom or generated topics
+POST /room/{code}/game...           start/reset
+POST /room/{code}/turn...           start/begin/redraw/submit
+POST /room/{code}/score/override    host correction
+POST /room/{code}/host...           transfer/claim
+POST /room/{code}/presets/apply     apply browser-local preset data
 ```
 
-### Turn
+Most POSTs return a newly rendered `#app` fragment for HTMX. Full-page form navigation and redirects remain available for entry flows.
 
-```text
-GET  /games/{id}/turn     -> active turn screen
-POST /games/{id}/turns    -> receives result, returns score summary
-POST /games/{id}/next     -> advances turn, returns next turn screen
-```
+## Decisions that changed
 
-### Scoreboard
+- **Real-time transport:** the Go edition uses SSE; the native Cloudflare edition uses hibernatable WebSockets.
+- **Storage:** local persistence uses an atomic JSON snapshot; Cloudflare rooms use private Durable Object SQLite databases.
+- **Assets:** templates and static files are embedded in Go binaries.
+- **Online hosting:** the free online edition is a Worker-with-Assets app backed by Durable Objects. It is separate from the Go runtime and is not a Pages-only static site.
+- **Transcription privacy:** the app requires browser-reported on-device recognition and fails closed instead of accepting cloud-backed browser recognition.
+- **Topics:** prompt order is randomized in persisted non-repeating cycles.
 
-```text
-GET  /games/{id}/scores   -> scoreboard screen or partial
-POST /games/{id}/scores   -> host score override
-GET  /games/{id}/winner   -> final winner screen
-```
+## Work that remains outside this completed plan
 
-## Server State
-
-For MVP, in-memory state is acceptable:
-
-```text
-map[GameID]*GameSession
-```
-
-This keeps the first version simple. Add SQLite once saved games, custom packs, or online rooms need persistence.
-
-## Real-time Online Upgrade
-
-For online multiplayer, keep Go as the room authority.
-
-Use:
-
-- HTMX for setup and host actions
-- Server-Sent Events for broadcasting room state
-- WebSocket if active turns need bidirectional low-latency updates
-
-Do not make every interaction real time immediately. Local play and host-led online play can stay mostly request/response.
-
-## Implementation Milestones
-
-1. Scaffold Go server and template layout.
-2. Add static CSS and base UI shell.
-3. Implement game engine and scoring in Go.
-4. Implement setup flow with HTMX.
-5. Implement topic packs.
-6. Implement turn screen.
-7. Add microphone and timer JavaScript.
-8. Submit turn results to Go.
-9. Render scoreboard and winner screen.
-10. Add Playwright smoke test for a full local game.
-
+- Party voting
+- Named Lightning and Strict modes
+- Pause, skip-player, and restart-current-turn controls
+- Native desktop wrapper
+- Profiles and family/content filters
+- Post-turn AI summaries
+- Full feature parity and stronger cross-edition rule tests

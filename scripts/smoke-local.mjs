@@ -134,8 +134,18 @@ const fakeMicInit = () => {
       addEventListener() {},
       getUserMedia: (constraints) => {
         window.__audioRequests.push(constraints);
+        const deviceId = constraints.audio?.deviceId?.exact || "auto";
+        const track = {
+          kind: "audio",
+          readyState: "live",
+          getSettings: () => ({ deviceId }),
+          stop() {
+            this.readyState = "ended";
+          },
+        };
         return Promise.resolve({
-          getTracks: () => [{ stop() {} }],
+          getTracks: () => [track],
+          getAudioTracks: () => [track],
         });
       },
     },
@@ -160,8 +170,16 @@ const fakeMicInit = () => {
 };
 
 const fakeSpeechInit = () => {
+  window.__speechTrackDeviceIDs = [];
   class FakeSpeechRecognition {
-    start() {
+    constructor() {
+      this.processLocally = false;
+    }
+    start(track) {
+      if (!this.processLocally || track?.kind !== "audio" || track?.readyState !== "live") {
+        throw new DOMException("Local audio track required", "NotSupportedError");
+      }
+      window.__speechTrackDeviceIDs.push(track.getSettings?.().deviceId || "unknown");
       setTimeout(() => {
         const result = Object.assign(
       [{ transcript: "pancakes are the best breakfast food and I eat pancakes with syrup for breakfast every single morning" }],
@@ -179,6 +197,34 @@ const fakeSpeechInit = () => {
     configurable: true,
     value: FakeSpeechRecognition,
   });
+};
+
+const unsupportedSpeechInit = () => {
+  class RemoteOnlySpeechRecognition {
+    start() {
+      window.__remoteRecognitionStarted = true;
+    }
+    stop() {}
+  }
+  Object.defineProperty(window, "SpeechRecognition", {
+    configurable: true,
+    value: RemoteOnlySpeechRecognition,
+  });
+  Object.defineProperty(window, "webkitSpeechRecognition", {
+    configurable: true,
+    value: undefined,
+  });
+};
+
+const legacyStorageInit = () => {
+  if (window.sessionStorage.getItem("nonstoptalk-smoke-legacy-seeded")) return;
+  window.sessionStorage.setItem("nonstoptalk-smoke-legacy-seeded", "1");
+  window.localStorage.setItem("dont-stop-talking.custom-topics", "Legacy migration topic");
+  window.localStorage.setItem("dont-stop-talking.presets", JSON.stringify({ Legacy: {
+    duration: "10", silence: "1", rounds: "1", topicPack: "custom", aiJudge: "", topics: "Legacy migration topic",
+  } }));
+  window.localStorage.setItem("dont-stop-talking.mic-id", "mic-beta");
+  window.localStorage.setItem("dont-stop-talking.sound", "off");
 };
 
 async function createRoom(page, baseURL, hostName) {
@@ -236,27 +282,65 @@ async function runManualFallbackScenario(browser, baseURL) {
   const context = await browser.newContext();
   const page = await context.newPage();
   await page.addInitScript(deniedMicInit);
+  await page.addInitScript(legacyStorageInit);
 
   await setupFastCustomGame(page, baseURL);
 
+  const setupStorage = await page.evaluate(() => ({
+    topics: window.localStorage.getItem("nonstoptalk.custom-topics"),
+    presets: window.localStorage.getItem("nonstoptalk.presets"),
+    legacyTopics: window.localStorage.getItem("dont-stop-talking.custom-topics"),
+    legacyPresets: window.localStorage.getItem("dont-stop-talking.presets"),
+  }));
+  assert(setupStorage.topics, `Expected migrated topics, got ${JSON.stringify(setupStorage)}`);
+  assert(setupStorage.presets, `Expected migrated presets, got ${JSON.stringify(setupStorage)}`);
+  assert(!setupStorage.legacyTopics && !setupStorage.legacyPresets, `Expected legacy setup keys removed, got ${JSON.stringify(setupStorage)}`);
+
   await page.getByRole("button", { name: "Start Game" }).click();
   await page.waitForSelector("[data-turn]");
-  await expectText(page, ".topic-block h1", "Topic Alpha");
+  const firstTopic = (await page.locator(".topic-block h1").textContent())?.trim();
+  assert(
+    firstTopic === "Topic Alpha" || firstTopic === "Topic Beta",
+    `Expected one of the custom topics, got ${JSON.stringify(firstTopic)}`,
+  );
+  const redrawnTopic = firstTopic === "Topic Alpha" ? "Topic Beta" : "Topic Alpha";
+  await expectText(page, "[data-sound-toggle]", "Sound Off");
+  const turnStorage = await page.evaluate(() => ({
+    mic: window.localStorage.getItem("nonstoptalk.mic-id"),
+    sound: window.localStorage.getItem("nonstoptalk.sound"),
+    legacyMic: window.localStorage.getItem("dont-stop-talking.mic-id"),
+    legacySound: window.localStorage.getItem("dont-stop-talking.sound"),
+  }));
+  assert(turnStorage.mic === "mic-beta" && turnStorage.sound === "off", `Expected migrated turn settings, got ${JSON.stringify(turnStorage)}`);
+  assert(!turnStorage.legacyMic && !turnStorage.legacySound, `Expected legacy turn keys removed, got ${JSON.stringify(turnStorage)}`);
 
   await page.getByRole("button", { name: "Start Talking" }).click();
   await expectText(page, "[data-voice-label]", "Mic blocked");
   await expectText(page, "[data-silence-label]", "Manual mode ready");
 
   await page.getByRole("button", { name: "Redraw Topic" }).click();
-  await expectText(page, ".topic-block h1", "Topic Beta");
+  await expectText(page, ".topic-block h1", redrawnTopic);
 
   await page.reload();
   await page.waitForSelector("[data-turn]");
-  await expectText(page, ".topic-block h1", "Topic Beta");
+  await expectText(page, ".topic-block h1", redrawnTopic);
 
   await page.getByRole("button", { name: "Manual Timer" }).click();
+  await page.waitForFunction(() => Number(document.querySelector("[data-timer]")?.textContent) <= 9);
+  await page.reload();
+  await page.waitForSelector("[data-turn][data-turn-running='1']");
+  await expectText(page, "[data-start-turn]", "Resume Talking");
+  const resumedRemaining = Number(await page.locator("[data-timer]").textContent());
+  assert(resumedRemaining >= 0 && resumedRemaining < 10, `Expected resumed server time, got ${resumedRemaining}`);
+  await page.getByRole("button", { name: "Resume Talking" }).click();
+  await expectText(page, "[data-voice-label]", "Mic blocked");
+  await page.waitForFunction(
+    (previous) => Number(document.querySelector("[data-timer]")?.textContent) < previous,
+    resumedRemaining,
+  );
+  await page.getByRole("button", { name: "Resume Manual Timer" }).click();
   await expectText(page, "[data-voice-label]", "Manual timing");
-  await expectText(page, "[data-silence-label]", "Host controlled");
+  await expectText(page, "[data-silence-label]", "Speaker controlled");
 
   await page.getByRole("button", { name: "Mark Complete" }).click();
   await page.waitForSelector(".result-band");
@@ -391,14 +475,81 @@ async function runAIJudgeScenario(browser, baseURL) {
 
   await page.getByRole("button", { name: "Start Game" }).click();
   await page.waitForSelector("[data-turn][data-ai='1']");
-  await expectText(page, ".ai-banner", "Audio never leaves this device");
+  await expectText(page, ".ai-banner", "NonStopTalk never uploads microphone audio");
+
+  const startButton = page.getByRole("button", { name: "Start Talking" });
+  assert(await startButton.isDisabled(), "Expected AI consent to gate Start Talking");
+
+  await page.getByRole("button", { name: "Change" }).click();
+  await page.waitForSelector('[data-mic-option][data-device-id="mic-beta"]');
+  await page.locator('[data-mic-option][data-device-id="mic-beta"]').click();
+  await page.getByLabel("Close microphone picker").click();
+  await page.getByLabel("Use on-device transcription for this turn").check();
+  assert(!(await startButton.isDisabled()), "Expected explicit local-transcription consent to enable Start Talking");
+
+  const turnIdentity = await page.locator("[data-turn]").evaluate((element) => ({
+    stage: element.dataset.turnId,
+    form: element.querySelector('input[name="turnID"]')?.value,
+  }));
+  assert(turnIdentity.stage && turnIdentity.stage === turnIdentity.form, `Expected one turn ID across actor requests, got ${JSON.stringify(turnIdentity)}`);
 
   // Speak with the fake mic: the mocked recognizer emits an on-topic
   // transcript, then the silent mic eliminates the player after ~1s.
-  await page.getByRole("button", { name: "Start Talking" }).click();
+  await startButton.click();
+  await page.waitForFunction(() => window.__speechTrackDeviceIDs?.includes("mic-beta"));
+  const selectedAudio = await page.evaluate(() => ({
+    requests: window.__audioRequests,
+    speechTracks: window.__speechTrackDeviceIDs,
+  }));
+  assert(
+    selectedAudio.requests.some((request) => request.audio?.deviceId?.exact === "mic-beta"),
+    `Expected VAD to use mic-beta, got ${JSON.stringify(selectedAudio)}`,
+  );
+  assert(
+    selectedAudio.speechTracks.includes("mic-beta"),
+    `Expected local recognition to use the VAD track, got ${JSON.stringify(selectedAudio)}`,
+  );
   await page.waitForSelector(".result-band", { timeout: 15000 });
   await expectText(page, ".ai-verdict", "Offline judge");
   await expectText(page, ".score-breakdown", "AI relevance");
+
+  await context.close();
+}
+
+// Browsers that cannot guarantee on-device recognition must never fall back
+// to a remote/default SpeechRecognition service. The speaker can still choose
+// a classic microphone turn with no transcript or AI bonus.
+async function runAIClassicFallbackScenario(browser, baseURL) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  await page.addInitScript(fakeMicInit);
+  await page.addInitScript(unsupportedSpeechInit);
+
+  await createRoom(page, baseURL, "Avery");
+  await page.getByLabel("Player name").fill("Blair");
+  await page.getByRole("button", { name: "Add" }).click();
+  await page.getByLabel("Talk time").fill("10");
+  await page.getByLabel("Silence limit").fill("1");
+  await page.getByLabel("AI judge (optional relevance bonus)").check();
+  await page.getByRole("button", { name: "Apply Settings" }).click();
+  await page.getByRole("button", { name: "Start Game" }).click();
+  await page.waitForSelector("[data-turn][data-ai='1']");
+
+  const localChoice = page.getByLabel("Use on-device transcription for this turn");
+  const startButton = page.getByRole("button", { name: "Start Talking" });
+  const manualButton = page.getByRole("button", { name: "Manual Timer" });
+  assert(await localChoice.isDisabled(), "Expected remote-only recognition to be rejected");
+  assert(await startButton.isDisabled(), "Expected consent choice before starting");
+  assert(!(await manualButton.isDisabled()), "Manual Timer must remain an available classic fallback");
+  await expectText(page, "[data-ai-consent-status]", "On-device speech recognition is unavailable");
+
+  await page.getByLabel("Play without AI transcription").check();
+  await startButton.click();
+  await page.waitForSelector(".result-band", { timeout: 15000 });
+  await expectText(page, ".ai-verdict", "No transcript was captured");
+  const remoteRecognitionStarted = await page.evaluate(() => window.__remoteRecognitionStarted === true);
+  assert(!remoteRecognitionStarted, "Remote-only SpeechRecognition must never start");
+  assert((await page.locator(".score-breakdown").textContent()).includes("AI relevance") === false, "Classic fallback must not receive an AI bonus");
 
   await context.close();
 }
@@ -452,6 +603,7 @@ async function runRemoteRoomScenario(browser, baseURL) {
   await guest.getByRole("button", { name: "Next Turn" }).click();
   await guest.waitForSelector("[data-turn]");
   await expectText(guest, ".turn-meta", "Remy (you)");
+  assert(await guest.getByRole("button", { name: "Manual Timer" }).isVisible(), "Expected the active remote speaker to have Manual Timer fallback");
 
   // Host spectates the remote turn.
   await host.waitForSelector(".turn-stage.spectate", { timeout: 10000 });
@@ -482,7 +634,8 @@ async function main() {
   const baseURL = `http://127.0.0.1:${port}`;
   // Force the offline judge so the AI scenario is deterministic and free,
   // and keep rooms in memory so runs stay hermetic.
-  const env = { ...process.env, PORT: port, DST_DATA_FILE: "off" };
+  const env = { ...process.env, PORT: port, NONSTOPTALK_DATA_FILE: "off" };
+  delete env.DST_DATA_FILE;
   delete env.ANTHROPIC_API_KEY;
   const server = spawn("go", ["run", "./cmd/web"], {
     cwd: root,
@@ -502,7 +655,8 @@ async function main() {
     await runAutomaticEndingScenario(browser, baseURL);
     await runRemoteRoomScenario(browser, baseURL);
     await runAIJudgeScenario(browser, baseURL);
-    console.log("Smoke test passed (local, automatic ending, remote room, AI judge)");
+    await runAIClassicFallbackScenario(browser, baseURL);
+    console.log("Smoke test passed (local resume, automatic ending, remote room, on-device AI, classic AI fallback)");
   } catch (error) {
     console.error("Smoke test failed");
     console.error(error);

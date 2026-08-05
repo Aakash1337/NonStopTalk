@@ -1,5 +1,7 @@
 package game
 
+import "math"
+
 type ScoreInput struct {
 	DurationSeconds  int
 	SpokenSeconds    int
@@ -19,7 +21,7 @@ func Score(input ScoreInput) int {
 		score += CompletionBonus
 	}
 	if input.AIRelevanceScore != nil {
-		score += int((*input.AIRelevanceScore) * 20)
+		score += aiRelevanceBonus(*input.AIRelevanceScore)
 	}
 	score += input.VoteBonus
 	if score < 0 {
@@ -36,10 +38,14 @@ func ScoreParts(input ScoreInput) []ScorePart {
 		parts = append(parts, ScorePart{Label: "Completion bonus", Points: CompletionBonus})
 	}
 	if input.AIRelevanceScore != nil {
-		parts = append(parts, ScorePart{Label: "AI relevance", Points: int((*input.AIRelevanceScore) * 20)})
+		parts = append(parts, ScorePart{Label: "AI relevance", Points: aiRelevanceBonus(*input.AIRelevanceScore)})
 	}
 	if input.VoteBonus != 0 {
 		parts = append(parts, ScorePart{Label: "Vote bonus", Points: input.VoteBonus})
 	}
 	return parts
+}
+
+func aiRelevanceBonus(relevance float64) int {
+	return int(math.Round(relevance * 20))
 }

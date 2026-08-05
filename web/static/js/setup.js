@@ -1,10 +1,33 @@
 (() => {
-  const storageKey = "dont-stop-talking.custom-topics";
+  const storageKey = "nonstoptalk.custom-topics";
+  const legacyStorageKey = "dont-stop-talking.custom-topics";
   const formSelector = 'form[hx-post$="/topics/custom"]';
+
+  const readMigratedValue = (key, legacyKey) => {
+    const current = window.localStorage.getItem(key);
+    if (current !== null) {
+      try {
+        window.localStorage.removeItem(legacyKey);
+      } catch {
+        // Keep using the current value when legacy cleanup is blocked.
+      }
+      return current;
+    }
+    const legacy = window.localStorage.getItem(legacyKey);
+    if (legacy !== null) {
+      try {
+        window.localStorage.setItem(key, legacy);
+        window.localStorage.removeItem(legacyKey);
+      } catch {
+        // Read through the legacy value when migration cannot be persisted.
+      }
+    }
+    return legacy;
+  };
 
   const readSavedTopics = () => {
     try {
-      return window.localStorage.getItem(storageKey) || "";
+      return readMigratedValue(storageKey, legacyStorageKey) || "";
     } catch {
       return "";
     }
@@ -17,6 +40,7 @@
       } else {
         window.localStorage.removeItem(storageKey);
       }
+      window.localStorage.removeItem(legacyStorageKey);
     } catch {
       // Persistence is best-effort.
     }
@@ -40,11 +64,12 @@
 
   // --- Saved presets (settings + custom topics, stored on this device) ---
 
-  const presetsKey = "dont-stop-talking.presets";
+  const presetsKey = "nonstoptalk.presets";
+  const legacyPresetsKey = "dont-stop-talking.presets";
 
   const readPresets = () => {
     try {
-      return JSON.parse(window.localStorage.getItem(presetsKey)) || {};
+      return JSON.parse(readMigratedValue(presetsKey, legacyPresetsKey)) || {};
     } catch {
       return {};
     }
@@ -53,6 +78,7 @@
   const savePresets = (presets) => {
     try {
       window.localStorage.setItem(presetsKey, JSON.stringify(presets));
+      window.localStorage.removeItem(legacyPresetsKey);
     } catch {
       // Persistence is best-effort.
     }
@@ -103,7 +129,7 @@
     const blob = new Blob([content + "\n"], { type: "text/plain" });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = "dont-stop-talking-topics.txt";
+    link.download = "nonstoptalk-topics.txt";
     link.click();
     URL.revokeObjectURL(link.href);
   };

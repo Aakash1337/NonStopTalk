@@ -19,7 +19,7 @@ type TopicGenerator interface {
 	GenerateTopics(ctx context.Context, theme string) ([]string, error)
 }
 
-const topicSystemPrompt = `You write speaking prompts for "Don't Stop Talking", a party game where a player
+const topicSystemPrompt = `You write speaking prompts for "NonStopTalk", a party game where a player
 must talk about a topic non-stop for about a minute.
 
 Given a theme, write engaging prompts a player can improvise on out loud: opinions

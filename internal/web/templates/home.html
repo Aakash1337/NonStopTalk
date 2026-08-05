@@ -1,11 +1,11 @@
 {{define "head"}}
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Don't Stop Talking</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=11">
+  <title>NonStopTalk</title>
+  <link rel="stylesheet" href="/static/css/app.css?v=12">
   <script src="/static/js/htmx.min.js?v=3" defer></script>
-  <script src="/static/js/setup.js?v=3" defer></script>
-  <script src="/static/js/room.js?v=2" defer></script>
+  <script src="/static/js/setup.js?v=4" defer></script>
+  <script src="/static/js/room.js?v=4" defer></script>
 {{end}}
 
 {{define "landingPage"}}
@@ -19,7 +19,7 @@
     <header class="app-header">
       <div>
         <p class="eyebrow">Party speaking game</p>
-        <h1>Don't Stop Talking</h1>
+        <h1>NonStopTalk</h1>
       </div>
     </header>
 
@@ -88,11 +88,11 @@
 {{end}}
 
 {{define "setup"}}
-  <main class="shell" id="app" data-room-base="{{.Base}}">
+  <main class="shell" id="app" data-room-base="{{.Base}}"{{if .HostClaimWaitMS}} data-host-claim-wait-ms="{{.HostClaimWaitMS}}"{{end}}>
     <header class="app-header">
       <div>
         <p class="eyebrow">Room {{.Code}}</p>
-        <h1>Don't Stop Talking</h1>
+        <h1>NonStopTalk</h1>
       </div>
       <div class="header-tools">
         {{if .IsHost}}
@@ -296,7 +296,7 @@
     <input type="checkbox" name="aiJudge" value="on" {{if .Session.Settings.AIJudgeEnabled}}checked{{end}}>
     <span>AI judge (optional relevance bonus)</span>
   </label>
-  <p class="pack-note consent-note">When on, the current speaker's browser transcribes their words and sends only that text to an AI judge for a bonus of up to 20 points with a short explanation. Audio never leaves the device, transcripts are used only to score the turn, and the host can always adjust scores.</p>
+  <p class="pack-note consent-note">When on, each speaker chooses for every turn whether to use supported on-device speech recognition and send the resulting transcript to the judge. Choosing classic or manual play sends no transcript. NonStopTalk never uploads microphone audio, and the host can always adjust scores.</p>
   <button class="button secondary" type="submit">Apply Settings</button>
 </form>
 {{else}}
@@ -308,7 +308,7 @@
   <div><dt>AI judge</dt><dd>{{if .Session.Settings.AIJudgeEnabled}}On{{else}}Off{{end}}</dd></div>
 </dl>
 {{if .Session.Settings.AIJudgeEnabled}}
-<p class="pack-note consent-note">The AI judge is on: while you speak, your browser transcribes your words and sends only that text to be graded for a relevance bonus. Audio never leaves your device.</p>
+<p class="pack-note consent-note">The AI judge is available. On each turn, the speaker can consent to supported on-device transcription or play without transcription and an AI bonus. NonStopTalk never uploads microphone audio.</p>
 {{end}}
 {{end}}
 {{end}}

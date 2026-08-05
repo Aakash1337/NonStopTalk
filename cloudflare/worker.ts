@@ -1,0 +1,448 @@
+import { DurableObject } from "cloudflare:workers";
+
+import {
+	GameError,
+	applyAction,
+	createRoomState,
+	joinRoom,
+	publicRoomState,
+	setHostOnline,
+	type Action,
+	type RoomState,
+} from "./game";
+import { parseRoomRoute } from "./routes";
+
+const TOKEN_COOKIE = "nonstoptalk_token";
+const LEGACY_TOKEN_COOKIE = "dst_token";
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const MAX_ROOM_SOCKETS = 64;
+const MAX_SOCKETS_PER_TOKEN = 4;
+const ROOM_IDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+interface AssetsBinding {
+	fetch(request: Request): Promise<Response>;
+}
+
+interface RoomStub {
+	fetch(request: Request): Promise<Response>;
+}
+
+interface RoomNamespace {
+	idFromName(name: string): unknown;
+	get(id: unknown): RoomStub;
+}
+
+interface RateLimitBinding {
+	limit(options: { key: string }): Promise<{ success: boolean }>;
+}
+
+interface Env {
+	ROOMS: RoomNamespace;
+	ASSETS: AssetsBinding;
+	ROOM_CREATION_RATE_LIMITER: RateLimitBinding;
+}
+
+interface SocketAttachment {
+	token: string;
+}
+
+interface TokenIdentity {
+	token: string;
+	created: boolean;
+}
+
+export class RoomDurableObject extends DurableObject<Env> {
+	constructor(ctx: DurableObjectState, env: Env) {
+		super(ctx, env);
+	}
+
+	private initializeSchema(): void {
+		this.ctx.storage.sql.exec(`
+			CREATE TABLE IF NOT EXISTS room_state (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				json TEXT NOT NULL
+			)
+		`);
+	}
+
+	async fetch(request: Request): Promise<Response> {
+		try {
+			const url = new URL(request.url);
+			const token = request.headers.get("X-NonStopTalk-Token") ?? "";
+			const room = this.load();
+
+			if (request.method === "POST" && url.pathname === "/create") {
+				if (room) return json({ error: "Room code collision." }, 409);
+				const body = await readJson(request);
+				this.initializeSchema();
+				const created = createRoomState(text(body.code), token, text(body.name));
+				this.save(created);
+				return json({ room: publicRoomState(created, token, this.onlineTokens()) }, 201);
+			}
+
+			if (!room) return json({ error: "Room not found." }, 404);
+
+			if (request.method === "GET" && url.pathname === "/state") {
+				if (token === room.hostToken && !this.hasOpenSocket(token)) {
+					room.hostDisconnectedAt = Date.now();
+					room.version += 1;
+					room.updatedAt = Date.now();
+					this.save(room);
+				}
+				return json({ room: publicRoomState(room, token, this.onlineTokens()) });
+			}
+
+			if (request.method === "POST" && url.pathname === "/join") {
+				const body = await readJson(request);
+				joinRoom(room, token, text(body.name));
+				this.save(room);
+				this.broadcast(room);
+				return json({ room: publicRoomState(room, token, this.onlineTokens()) });
+			}
+
+			if (request.method === "POST" && url.pathname === "/action") {
+				const action = (await readJson(request)) as Action;
+				applyAction(room, token, action, Date.now(), this.onlineTokens());
+				this.save(room);
+				this.broadcast(room);
+				return json({ room: publicRoomState(room, token, this.onlineTokens()) });
+			}
+
+			if (request.method === "GET" && url.pathname === "/socket") {
+				if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+					return json({ error: "Expected a WebSocket upgrade." }, 426);
+				}
+				if (room.hostToken !== token && !room.members[token]) {
+					return json({ error: "Join the room before connecting." }, 403);
+				}
+				if (this.ctx.getWebSockets().length >= MAX_ROOM_SOCKETS) {
+					return json({ error: "This room has too many live connections." }, 503);
+				}
+				if (this.socketCount(token) >= MAX_SOCKETS_PER_TOKEN) {
+					return json({ error: "Close an extra tab before reconnecting to this room." }, 503);
+				}
+
+				const pair = new WebSocketPair();
+				const [client, server] = Object.values(pair);
+				server.serializeAttachment({ token } satisfies SocketAttachment);
+				this.ctx.acceptWebSocket(server);
+				if (token === room.hostToken && setHostOnline(room, true)) this.save(room);
+				this.broadcast(room);
+				return new Response(null, { status: 101, webSocket: client } as ResponseInit);
+			}
+
+			return json({ error: "Not found." }, 404);
+		} catch (error) {
+			if (error instanceof GameError) return json({ error: error.message }, error.status);
+			console.error("room request failed", error);
+			return json({ error: "The room could not process that request." }, 500);
+		}
+	}
+
+	webSocketMessage(socket: WebSocket, message: ArrayBuffer | string): void {
+		if (typeof message !== "string" || message.length > 1024) {
+			socket.close(1009, "Message too large");
+			return;
+		}
+		try {
+			const payload = JSON.parse(message) as { type?: string };
+			if (payload.type === "ping") socket.send(JSON.stringify({ type: "pong" }));
+			if (payload.type === "sync") {
+				const room = this.load();
+				const token = this.attachment(socket)?.token ?? "";
+				if (room) this.sendState(socket, room, token);
+			}
+		} catch {
+			// Unknown client messages do not mutate room state.
+		}
+	}
+
+	webSocketClose(socket: WebSocket): void {
+		this.recordDisconnect(socket);
+	}
+
+	webSocketError(socket: WebSocket): void {
+		this.recordDisconnect(socket);
+		try {
+			socket.close(1011, "Live connection failed");
+		} catch {
+			// The socket is already gone.
+		}
+	}
+
+	async alarm(): Promise<void> {
+		const room = this.load();
+		if (!room) return;
+		const expiresAt = room.updatedAt + ROOM_IDLE_TTL_MS;
+		if (Date.now() < expiresAt) {
+			await this.ctx.storage.setAlarm(expiresAt);
+			return;
+		}
+		for (const socket of this.ctx.getWebSockets()) {
+			try {
+				socket.close(1001, "Room expired after 30 days of inactivity");
+			} catch {
+				// The socket is already closed.
+			}
+		}
+		await this.ctx.storage.deleteAll();
+	}
+
+	private recordDisconnect(socket: WebSocket): void {
+		const room = this.load();
+		if (!room) return;
+		const token = this.attachment(socket)?.token ?? "";
+		if (token === room.hostToken && !this.hasOpenSocket(token, socket) && setHostOnline(room, false)) {
+			this.save(room);
+		}
+		this.broadcast(room, socket);
+	}
+
+	private load(): RoomState | null {
+		const table = this.ctx.storage.sql
+			.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'room_state'")
+			.toArray()[0];
+		if (!table) return null;
+		const row = this.ctx.storage.sql
+			.exec<{ json: string }>("SELECT json FROM room_state WHERE id = 1")
+			.toArray()[0];
+		return row ? (JSON.parse(row.json) as RoomState) : null;
+	}
+
+	private save(room: RoomState): void {
+		this.ctx.storage.sql.exec(
+			"INSERT INTO room_state (id, json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json",
+			JSON.stringify(room),
+		);
+		this.ctx.waitUntil(
+			this.ctx.storage
+				.setAlarm(room.updatedAt + ROOM_IDLE_TTL_MS)
+				.catch((error: unknown) => console.error("could not schedule room expiry", error)),
+		);
+	}
+
+	private onlineTokens(except?: WebSocket): Set<string> {
+		const tokens = new Set<string>();
+		for (const socket of this.ctx.getWebSockets()) {
+			if (socket === except || socket.readyState !== 1) continue;
+			const token = this.attachment(socket)?.token;
+			if (token) tokens.add(token);
+		}
+		return tokens;
+	}
+
+	private hasOpenSocket(token: string, except?: WebSocket): boolean {
+		return this.onlineTokens(except).has(token);
+	}
+
+	private socketCount(token: string): number {
+		let count = 0;
+		for (const socket of this.ctx.getWebSockets()) {
+			if (socket.readyState === 1 && this.attachment(socket)?.token === token) count += 1;
+		}
+		return count;
+	}
+
+	private broadcast(room: RoomState, except?: WebSocket): void {
+		for (const socket of this.ctx.getWebSockets()) {
+			if (socket === except || socket.readyState !== 1) continue;
+			const token = this.attachment(socket)?.token ?? "";
+			this.sendState(socket, room, token);
+		}
+	}
+
+	private sendState(socket: WebSocket, room: RoomState, token: string): void {
+		try {
+			socket.send(
+				JSON.stringify({
+					type: "state",
+					room: publicRoomState(room, token, this.onlineTokens()),
+				}),
+			);
+		} catch {
+			try {
+				socket.close(1011, "Could not send room state");
+			} catch {
+				// The socket is already gone.
+			}
+		}
+	}
+
+	private attachment(socket: WebSocket): SocketAttachment | undefined {
+		return socket.deserializeAttachment() as SocketAttachment | undefined;
+	}
+}
+
+export default {
+	async fetch(request: Request, env: Env): Promise<Response> {
+		const url = new URL(request.url);
+		if (!url.pathname.startsWith("/api/")) return env.ASSETS.fetch(request);
+
+		if (!sameOrigin(request)) return json({ error: "Cross-origin request rejected." }, 403);
+		const identity = ensureToken(request);
+
+		if (request.method === "POST" && url.pathname === "/api/rooms") {
+			const actor = request.headers.get("CF-Connecting-IP")?.trim() || identity.token;
+			const { success } = await env.ROOM_CREATION_RATE_LIMITER.limit({ key: `room-create:${actor}` });
+			if (!success) {
+				const response = json({ error: "Too many rooms were created from this connection. Try again shortly." }, 429);
+				response.headers.set("Retry-After", "60");
+				return withIdentityCookie(response, identity, request);
+			}
+			let body: Record<string, unknown>;
+			try {
+				body = await readJson(request);
+			} catch (error) {
+				if (error instanceof GameError) {
+					return withIdentityCookie(json({ error: error.message }, error.status), identity, request);
+				}
+				throw error;
+			}
+			for (let attempt = 0; attempt < 8; attempt += 1) {
+				const code = randomCode();
+				const response = await roomFetch(env, code, request, identity.token, "/create", {
+					code,
+					name: text(body.name),
+				});
+				if (response.status === 409) continue;
+				return withIdentityCookie(response, identity, request);
+			}
+			return withIdentityCookie(json({ error: "Could not reserve a room code. Try again." }, 503), identity, request);
+		}
+
+		const route = parseRoomRoute(url.pathname);
+		if (!route) return withIdentityCookie(json({ error: "Not found." }, 404), identity, request);
+		const { code, endpoint } = route;
+
+		if (endpoint === "socket" && identity.created) {
+			return json({ error: "Load the room once before opening its live connection." }, 401);
+		}
+
+		const response = await roomFetch(env, code, request, identity.token, `/${endpoint}`);
+		return endpoint === "socket" ? response : withIdentityCookie(response, identity, request);
+	},
+};
+
+async function roomFetch(
+	env: Env,
+	code: string,
+	request: Request,
+	token: string,
+	pathname: string,
+	body?: unknown,
+): Promise<Response> {
+	const id = env.ROOMS.idFromName(code);
+	const stub = env.ROOMS.get(id);
+	const headers = new Headers(request.headers);
+	headers.set("X-NonStopTalk-Token", token);
+	headers.delete("Cookie");
+	const init: RequestInit = { method: request.method, headers };
+	if (body !== undefined) {
+		headers.delete("Content-Length");
+		headers.set("Content-Type", "application/json");
+		init.body = JSON.stringify(body);
+	} else if (request.method !== "GET" && request.method !== "HEAD") {
+		init.body = request.body;
+	}
+	return stub.fetch(new Request(`https://room.internal${pathname}`, init));
+}
+
+function ensureToken(request: Request): TokenIdentity {
+	const cookies = parseCookies(request.headers.get("Cookie") ?? "");
+	const current = cookies[TOKEN_COOKIE];
+	if (validToken(current)) return { token: current, created: false };
+	const legacy = cookies[LEGACY_TOKEN_COOKIE];
+	if (validToken(legacy)) return { token: legacy, created: true };
+	const bytes = crypto.getRandomValues(new Uint8Array(32));
+	return {
+		token: Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+		created: true,
+	};
+}
+
+function withIdentityCookie(response: Response, identity: TokenIdentity, request: Request): Response {
+	if (!identity.created) return response;
+	const headers = new Headers(response.headers);
+	const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
+	headers.append(
+		"Set-Cookie",
+		`${TOKEN_COOKIE}=${identity.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${secure}`,
+	);
+	return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function parseCookies(header: string): Record<string, string> {
+	const cookies: Record<string, string> = {};
+	for (const segment of header.split(";")) {
+		const index = segment.indexOf("=");
+		if (index < 0) continue;
+		cookies[segment.slice(0, index).trim()] = segment.slice(index + 1).trim();
+	}
+	return cookies;
+}
+
+function validToken(value: string | undefined): value is string {
+	return Boolean(value && /^[a-f0-9]{64}$/.test(value));
+}
+
+function sameOrigin(request: Request): boolean {
+	const origin = request.headers.get("Origin");
+	if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+		return origin === new URL(request.url).origin;
+	}
+	if (request.method === "GET" || request.method === "HEAD") return true;
+	return !origin || origin === new URL(request.url).origin;
+}
+
+function randomCode(): string {
+	const values = crypto.getRandomValues(new Uint8Array(6));
+	return Array.from(values, (value) => CODE_ALPHABET[value % CODE_ALPHABET.length]).join("");
+}
+
+async function readJson(request: Request): Promise<Record<string, unknown>> {
+	const length = Number(request.headers.get("Content-Length") ?? 0);
+	if (length > 64 * 1024) throw new GameError("Request body is too large.", 413);
+	if (!request.body) return {};
+	const reader = request.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		total += value.byteLength;
+		if (total > 64 * 1024) {
+			await reader.cancel("request body too large");
+			throw new GameError("Request body is too large.", 413);
+		}
+		chunks.push(value);
+	}
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	const textBody = new TextDecoder().decode(bytes);
+	if (!textBody) return {};
+	try {
+		const value = JSON.parse(textBody);
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("not an object");
+		return value as Record<string, unknown>;
+	} catch {
+		throw new GameError("Could not read request data.", 400);
+	}
+}
+
+function text(value: unknown): string {
+	return typeof value === "string" ? value : "";
+}
+
+function json(value: unknown, status = 200): Response {
+	return Response.json(value, {
+		status,
+		headers: {
+			"Cache-Control": "no-store",
+			"Content-Type": "application/json; charset=utf-8",
+		},
+	});
+}

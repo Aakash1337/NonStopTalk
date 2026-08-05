@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"dontstoptalking/internal/game"
+	"github.com/Aakash1337/NonStopTalk/internal/game"
 )
 
 const (
@@ -19,15 +19,22 @@ const (
 
 	MaxRooms          = 200
 	MaxPlayersPerRoom = 12
+	MaxSubscribers    = 64
+	// MaxSubscribersPerToken prevents one browser identity from consuming a
+	// room's entire live-update allowance with duplicate tabs.
+	MaxSubscribersPerToken = 4
 
 	// idleTTL is how long a room survives without any activity.
 	idleTTL = 3 * time.Hour
 )
 
 var (
-	ErrRoomNotFound = errors.New("room not found")
-	ErrTooManyRooms = errors.New("too many active rooms, try again later")
-	ErrRoomFull     = errors.New("room is full")
+	ErrRoomNotFound        = errors.New("room not found")
+	ErrTooManyRooms        = errors.New("too many active rooms, try again later")
+	ErrRoomFull            = errors.New("room is full")
+	ErrTooManySubscribers  = errors.New("too many live connections in this room")
+	ErrTooManyTokenStreams = errors.New("too many live connections for this member")
+	ErrNotRoomMember       = errors.New("room membership required")
 )
 
 // Room owns one game session plus everything needed to share it: member
@@ -49,24 +56,30 @@ type Room struct {
 	version      int64
 	lastActive   time.Time
 	turnStarted  time.Time
+	done         chan struct{}
+	expired      bool
+	// topicGeneration identifies the newest in-flight generated-topic request
+	// so a slow older response cannot overwrite a newer host choice.
+	topicGeneration uint64
 }
 
 func (r *Room) touch() {
 	r.lastActive = time.Now()
 }
 
-// Do runs fn while holding the room lock, then wakes every subscriber so
-// their view refreshes. Use for any state mutation.
-func (r *Room) Do(fn func()) {
-	r.mu.Lock()
-	fn()
+func (r *Room) finishMutationLocked(touch bool) []chan struct{} {
 	r.version++
-	r.touch()
+	if touch {
+		r.touch()
+	}
 	subscribers := make([]chan struct{}, 0, len(r.subscribers))
 	for ch := range r.subscribers {
 		subscribers = append(subscribers, ch)
 	}
-	r.mu.Unlock()
+	return subscribers
+}
+
+func wakeSubscribers(subscribers []chan struct{}) {
 	for _, ch := range subscribers {
 		select {
 		case ch <- struct{}{}:
@@ -75,11 +88,58 @@ func (r *Room) Do(fn func()) {
 	}
 }
 
+// Do runs fn while holding the room lock, then wakes every subscriber so
+// their view refreshes. Use for any state mutation.
+func (r *Room) Do(fn func()) {
+	r.mu.Lock()
+	fn()
+	subscribers := r.finishMutationLocked(true)
+	r.mu.Unlock()
+	wakeSubscribers(subscribers)
+}
+
+// DoAuthorized evaluates authorize and, when allowed, runs fn under the same
+// room lock. This prevents host-transfer races between permission checks and
+// mutations. The callback receives the caller's current role and seat.
+func (r *Room) DoAuthorized(
+	token string,
+	authorize func(isHost bool, playerID string, session *game.Session) bool,
+	fn func(),
+) bool {
+	r.mu.Lock()
+	isHost := token != "" && token == r.hostToken
+	playerID := r.members[token]
+	if !authorize(isHost, playerID, r.Session) {
+		r.mu.Unlock()
+		return false
+	}
+	fn()
+	subscribers := r.finishMutationLocked(true)
+	r.mu.Unlock()
+	wakeSubscribers(subscribers)
+	return true
+}
+
+// DoAsHost atomically checks host ownership and applies fn.
+func (r *Room) DoAsHost(token string, fn func()) bool {
+	return r.DoAuthorized(token, func(isHost bool, _ string, _ *game.Session) bool {
+		return isHost
+	}, fn)
+}
+
+// DoAsHostInSetup applies a setup-only host mutation atomically. Keeping the
+// phase check under the room lock prevents delayed setup requests from changing
+// a game after it has started.
+func (r *Room) DoAsHostInSetup(token string, fn func()) bool {
+	return r.DoAuthorized(token, func(isHost bool, _ string, session *game.Session) bool {
+		return isHost && !session.Started
+	}, fn)
+}
+
 // View runs fn while holding the room lock without notifying subscribers.
 func (r *Room) View(fn func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.touch()
 	fn()
 }
 
@@ -120,11 +180,65 @@ func (r *Room) HostOfflineFor() time.Duration {
 }
 
 // TransferHostTo hands room control to another token and notifies everyone.
+// It is retained for trusted internal/test setup; request handlers should use
+// TransferHostByPlayer so authorization and lookup happen atomically.
 func (r *Room) TransferHostTo(token string) {
 	r.Do(func() {
 		r.hostToken = token
 		r.hostLastSeen = time.Now()
+		r.topicGeneration++
 	})
+}
+
+// TransferHostByPlayer atomically verifies the current host and transfers
+// control to the connected browser bound to playerID.
+func (r *Room) TransferHostByPlayer(actorToken, playerID string) bool {
+	r.mu.Lock()
+	if actorToken == "" || actorToken != r.hostToken {
+		r.mu.Unlock()
+		return false
+	}
+	targetToken := ""
+	for token, id := range r.members {
+		if id == playerID {
+			targetToken = token
+			break
+		}
+	}
+	if targetToken == "" {
+		r.mu.Unlock()
+		return false
+	}
+	r.hostToken = targetToken
+	r.hostLastSeen = time.Now()
+	r.topicGeneration++
+	subscribers := r.finishMutationLocked(true)
+	r.mu.Unlock()
+	wakeSubscribers(subscribers)
+	return true
+}
+
+// ClaimHost atomically transfers an absent host's role to a seated member.
+// It returns false when the caller is not seated or the current host is still
+// within the grace window. An already-current host succeeds as a no-op.
+func (r *Room) ClaimHost(token string, grace time.Duration) bool {
+	r.mu.Lock()
+	if token != "" && token == r.hostToken {
+		r.mu.Unlock()
+		return true
+	}
+	if token == "" || r.members[token] == "" || r.tokenConns[r.hostToken] > 0 ||
+		time.Since(r.hostLastSeen) < grace {
+		r.mu.Unlock()
+		return false
+	}
+	r.hostToken = token
+	r.hostLastSeen = time.Now()
+	r.topicGeneration++
+	subscribers := r.finishMutationLocked(true)
+	r.mu.Unlock()
+	wakeSubscribers(subscribers)
+	return true
 }
 
 // HostPlayerID returns the player seat bound to the host token, if any.
@@ -198,11 +312,56 @@ func (r *Room) MemberCount() int {
 	return len(r.members)
 }
 
+// BeginTopicGeneration registers the newest host generation request. The
+// returned sequence must be supplied to ApplyTopicGeneration.
+func (r *Room) BeginTopicGeneration(token string) (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if token == "" || token != r.hostToken || r.Session.Started {
+		return 0, false
+	}
+	r.topicGeneration++
+	return r.topicGeneration, true
+}
+
+// ApplyTopicGeneration applies only the newest request and only while the
+// original caller still owns the room.
+func (r *Room) ApplyTopicGeneration(token string, generation uint64, fn func()) bool {
+	r.mu.Lock()
+	if token == "" || token != r.hostToken || r.Session.Started || generation == 0 || generation != r.topicGeneration {
+		r.mu.Unlock()
+		return false
+	}
+	fn()
+	subscribers := r.finishMutationLocked(true)
+	r.mu.Unlock()
+	wakeSubscribers(subscribers)
+	return true
+}
+
+// InvalidateTopicGenerationLocked cancels any provider response that was
+// started before a newer manual/preset topic choice. Call it while locked.
+func (r *Room) InvalidateTopicGenerationLocked() {
+	r.topicGeneration++
+}
+
 // Subscribe registers a live-update listener for the given token and returns
 // the wake-up channel plus an unsubscribe function.
-func (r *Room) Subscribe(token string) (<-chan struct{}, func()) {
+func (r *Room) Subscribe(token string) (<-chan struct{}, func(), error) {
 	ch := make(chan struct{}, 1)
 	r.mu.Lock()
+	if r.expired || token == "" || (token != r.hostToken && r.members[token] == "") {
+		r.mu.Unlock()
+		return nil, func() {}, ErrNotRoomMember
+	}
+	if len(r.subscribers) >= MaxSubscribers {
+		r.mu.Unlock()
+		return nil, func() {}, ErrTooManySubscribers
+	}
+	if r.tokenConns[token] >= MaxSubscribersPerToken {
+		r.mu.Unlock()
+		return nil, func() {}, ErrTooManyTokenStreams
+	}
 	r.subscribers[ch] = token
 	r.tokenConns[token]++
 	if token == r.hostToken {
@@ -211,7 +370,6 @@ func (r *Room) Subscribe(token string) (<-chan struct{}, func()) {
 	if playerID, ok := r.members[token]; ok {
 		r.online[playerID]++
 	}
-	r.touch()
 	r.mu.Unlock()
 
 	r.notifyPresence()
@@ -235,12 +393,21 @@ func (r *Room) Subscribe(token string) (<-chan struct{}, func()) {
 		}
 		r.mu.Unlock()
 		r.notifyPresence()
-	}
+	}, nil
 }
 
 // notifyPresence bumps the version so rosters can re-render online markers.
 func (r *Room) notifyPresence() {
-	r.Do(func() {})
+	r.mu.Lock()
+	subscribers := r.finishMutationLocked(false)
+	r.mu.Unlock()
+	wakeSubscribers(subscribers)
+}
+
+// Done closes when the manager expires or removes this room. Live streams can
+// use it to stop promptly instead of pinning an otherwise idle room.
+func (r *Room) Done() <-chan struct{} {
+	return r.done
 }
 
 // BoundPlayers returns the player IDs claimed by a remote browser. Players
@@ -277,6 +444,69 @@ func (r *Room) BeginTurn() {
 	})
 }
 
+// StartTurnLocked starts (or returns) the active turn and clears the clock
+// only when a new turn was created. It must be called from a Do/DoAuthorized
+// callback while the room lock is held.
+func (r *Room) StartTurnLocked() (*game.Turn, error) {
+	created := r.Session.ActiveTurn == nil
+	turn, err := r.Session.StartTurn()
+	if err == nil && created {
+		r.turnStarted = time.Time{}
+	}
+	return turn, err
+}
+
+// RedrawActiveTurnLocked replaces the topic generation and atomically clears
+// its clock. It must be called while the room lock is held.
+func (r *Room) RedrawActiveTurnLocked() (*game.Turn, error) {
+	if !r.turnStarted.IsZero() {
+		return nil, errors.New("a topic can only be redrawn before speaking begins")
+	}
+	turn, err := r.Session.RedrawActiveTurn()
+	if err == nil {
+		r.turnStarted = time.Time{}
+	}
+	return turn, err
+}
+
+// ClearTurnClockLocked resets the clock while the caller holds the room lock.
+func (r *Room) ClearTurnClockLocked() {
+	r.turnStarted = time.Time{}
+}
+
+// BeginTurnLocked starts the clock while the room lock is held.
+func (r *Room) BeginTurnLocked() {
+	if r.turnStarted.IsZero() {
+		r.turnStarted = time.Now()
+	}
+}
+
+// EndTurnClockLocked returns and clears the current clock while locked.
+func (r *Room) EndTurnClockLocked() int {
+	if r.turnStarted.IsZero() {
+		return -1
+	}
+	elapsed := int(time.Since(r.turnStarted).Seconds())
+	r.turnStarted = time.Time{}
+	return elapsed
+}
+
+// BeginTurnFor starts the clock only when turnID is still the active turn.
+// This prevents a delayed browser request from starting a later turn's clock.
+func (r *Room) BeginTurnFor(turnID string) bool {
+	matched := false
+	r.Do(func() {
+		if turnID == "" || r.Session.ActiveTurn == nil || r.Session.ActiveTurn.ID != turnID {
+			return
+		}
+		matched = true
+		if r.turnStarted.IsZero() {
+			r.turnStarted = time.Now()
+		}
+	})
+	return matched
+}
+
 // TurnRunning reports whether the server-side turn clock is running.
 func (r *Room) TurnRunning() bool {
 	r.mu.Lock()
@@ -308,11 +538,38 @@ func (r *Room) EndTurnClock() int {
 	return elapsed
 }
 
+// EndTurnClockFor clears and returns the clock only when turnID still names
+// the active turn. The bool distinguishes a stopped clock from a stale action.
+func (r *Room) EndTurnClockFor(turnID string) (int, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if turnID == "" || r.Session.ActiveTurn == nil || r.Session.ActiveTurn.ID != turnID {
+		return -1, false
+	}
+	if r.turnStarted.IsZero() {
+		return -1, true
+	}
+	elapsed := int(time.Since(r.turnStarted).Seconds())
+	r.turnStarted = time.Time{}
+	return elapsed, true
+}
+
 // ClearTurnClock resets the clock without reading it (topic redraw, reset).
 func (r *Room) ClearTurnClock() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.turnStarted = time.Time{}
+}
+
+// ClearTurnClockFor resets the clock only while turnID is still active.
+func (r *Room) ClearTurnClockFor(turnID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if turnID == "" || r.Session.ActiveTurn == nil || r.Session.ActiveTurn.ID != turnID {
+		return false
+	}
+	r.turnStarted = time.Time{}
+	return true
 }
 
 type Manager struct {
@@ -346,6 +603,7 @@ func (m *Manager) Create(hostToken string) (*Room, error) {
 		online:       map[string]int{},
 		tokenConns:   map[string]int{},
 		lastActive:   time.Now(),
+		done:         make(chan struct{}),
 	}
 	m.rooms[code] = room
 	return room, nil
@@ -359,6 +617,16 @@ func (m *Manager) Get(code string) (*Room, error) {
 	if !ok {
 		return nil, ErrRoomNotFound
 	}
+	room.mu.Lock()
+	expired := room.lastActive.Before(time.Now().Add(-idleTTL))
+	if expired {
+		room.expireLocked()
+	}
+	room.mu.Unlock()
+	if expired {
+		delete(m.rooms, code)
+		return nil, ErrRoomNotFound
+	}
 	return room, nil
 }
 
@@ -366,7 +634,33 @@ func (m *Manager) Get(code string) (*Room, error) {
 func (m *Manager) Remove(code string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if room := m.rooms[code]; room != nil {
+		room.mu.Lock()
+		room.expireLocked()
+		room.mu.Unlock()
+	}
 	delete(m.rooms, code)
+}
+
+// ExpireIfIdle removes code once it has had no state mutation for the room
+// TTL. Live streams do not extend that lifetime.
+func (m *Manager) ExpireIfIdle(code string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	room := m.rooms[code]
+	if room == nil {
+		return true
+	}
+	room.mu.Lock()
+	expired := room.lastActive.Before(time.Now().Add(-idleTTL))
+	if expired {
+		room.expireLocked()
+	}
+	room.mu.Unlock()
+	if expired {
+		delete(m.rooms, code)
+	}
+	return expired
 }
 
 func (m *Manager) Count() int {
@@ -380,11 +674,25 @@ func (m *Manager) cleanupLocked() {
 	for code, room := range m.rooms {
 		room.mu.Lock()
 		idle := room.lastActive.Before(cutoff)
+		if idle {
+			room.expireLocked()
+		}
 		room.mu.Unlock()
 		if idle {
 			delete(m.rooms, code)
 		}
 	}
+}
+
+func (r *Room) expireLocked() {
+	if r.expired {
+		return
+	}
+	r.expired = true
+	if r.done == nil {
+		r.done = make(chan struct{})
+	}
+	close(r.done)
 }
 
 func (m *Manager) newCodeLocked() (string, error) {

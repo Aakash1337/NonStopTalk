@@ -1,111 +1,109 @@
 # AI and Privacy
 
-## Position
+This document describes the current NonStopTalk implementation. AI is an optional scoring modifier and topic-writing aid in the local Go edition; the complete game loop works without an AI provider. The free Cloudflare edition is classic-only.
 
-AI should enhance the game, not define it. Classic mode must work fully without AI, accounts, cloud processing, or audio upload.
+## At a glance
 
-## AI Use Cases
+| Situation | Microphone audio | Transcript | External AI |
+| --- | --- | --- | --- |
+| Classic play with microphone detection | Read locally by Web Audio | None | None |
+| Manual timer | Not required | None | None |
+| Cloudflare online edition | Read locally by Web Audio when microphone timing is chosen | None | None |
+| AI judge enabled, speaker chooses classic/manual | Not uploaded | None | None |
+| AI judge enabled, speaker consents, no Anthropic key | Read locally; not uploaded | Sent to the NonStopTalk server and graded by its offline heuristic | None |
+| AI judge enabled, speaker consents, Anthropic key configured | Read locally; not uploaded | Sent to the NonStopTalk server, then topic + transcript are sent to Anthropic | Anthropic grading |
+| Theme generation without an Anthropic key | Not involved | Not involved | None; server templates generate the pack |
+| Theme generation with an Anthropic key | Not involved | Not involved | The theme text is sent to Anthropic |
 
-### Transcription
+NonStopTalk does not record, upload, or persist microphone audio.
 
-Convert a player's turn audio into text.
+## Per-speaker consent
 
-Used for:
+Enabling the AI judge in room settings only makes it available. Before each turn, that speaker must choose one of:
 
-- Relevance grading
-- Post-turn summary
-- Repetition detection later
+- Use supported on-device transcription for this turn.
+- Play without transcription or an AI bonus.
 
-### Topic Relevance Grading
+The choice is per turn and is not silently carried into later turns. Starting the manual timer selects classic play and sends no transcript.
 
-Compare the transcript to the assigned topic and return:
+## On-device transcription requirement
 
-- Relevance score
-- Short explanation
-- Possible repetition penalty
-- Confidence level
+NonStopTalk deliberately fails closed. Browser transcription starts only when all of the following are true:
 
-### Topic Generation
+1. The host enabled the AI judge.
+2. The current speaker explicitly chose local transcription.
+3. The browser exposes `SpeechRecognition` (or its prefixed equivalent).
+4. The recognition object exposes `processLocally` and retains the value `true`.
+5. The exact live audio track selected for voice-activity detection can be supplied to recognition.
 
-Generate topic packs from a theme supplied by the host.
+If a check fails or recognition cannot start, the UI explains that the turn is continuing without a transcript or AI bonus. Classic and manual play remain available.
 
-Examples:
+This strict requirement means AI transcription is unavailable in many current browser versions. A browser's implementation is responsible for honoring `processLocally`; NonStopTalk does not fall back to browser-managed remote recognition.
 
-- "Family-friendly road trip topics"
-- "Debate topics for software engineers"
-- "Absurd topics for a birthday party"
+## Current data flow
 
-## Consent Rules
-
-Before AI mode records or processes audio, the app must explain:
-
-- That audio may be recorded during turns
-- Whether audio, transcripts, or both are sent to a provider
-- Whether anything is stored
-- How the host can disable AI mode
-
-The game should never silently upload microphone audio.
-
-## Data Handling
-
-Recommended default:
-
-- Classic mode: no server upload
-- AI mode: process only the current turn
-- Store transcript only for the current game unless the user explicitly saves it
-- Do not use transcripts for topic packs or analytics without explicit consent
-
-## AI Scoring Rules
-
-AI scores should be modifiers, not absolute truth.
-
-Recommended formula:
+### Classic or manual turn
 
 ```text
-final_score = classic_score + ai_bonus
+selected microphone -> browser Web Audio analysis -> timer/silence result -> NonStopTalk server
 ```
 
-Where:
+The result contains timing and completion state, not audio or a transcript.
+
+### Consented AI-judge turn
 
 ```text
-ai_bonus = round(ai_relevance_score * max_ai_bonus)
+selected microphone
+  -> browser on-device SpeechRecognition
+  -> text transcript (maximum 8 KiB)
+  -> NonStopTalk server
+  -> offline heuristic OR Anthropic
+  -> relevance, confidence, short feedback
+  -> bonus of up to 20 points
 ```
 
-Suggested max AI bonus: 20 points.
+The transcript is held only long enough to grade the turn. It is not a field on the game session, is not shown in game history, and is not written to the JSON room snapshot.
 
-This keeps the core speaking challenge more important than the AI judge.
+The server sends Anthropic the assigned topic and transcript only when `ANTHROPIC_API_KEY` is configured. Without the key, the server's keyword-overlap heuristic produces a clearly labeled low-confidence result.
 
-## UX Requirements
+Grading runs asynchronously with a timeout. Classic points are committed first. If grading fails, has no transcript, exceeds limits, is interrupted by a process restart, or cannot safely match its original turn, the game keeps the classic score and reports that no AI bonus was applied.
 
-AI feedback must be short and explainable.
+## Topic generation
 
-Good:
+The host can enter a theme to generate ten editable prompts.
+
+- With `ANTHROPIC_API_KEY`, only the theme text is sent to Anthropic.
+- Without the key, the server expands the theme through a fixed set of local templates.
+
+Room setup and any resulting topic list still travel through the NonStopTalk server like other game state. The privacy statement above is specifically about which text reaches the external provider.
+
+## Storage
+
+- No accounts are required.
+- Browser identity uses an HTTP-only room token cookie.
+- Custom topic drafts, saved presets, microphone choice, and sound preference are stored in that browser's local storage.
+- The local web server stores room/session snapshots in `data/rooms.json` by default. These include rosters, settings, topics, scores, turns, and room history, but not transcripts or audio.
+- Set `NONSTOPTALK_DATA_FILE=off` to keep rooms in memory only.
+- The Cloudflare edition stores classic-game room state in a private SQLite-backed Durable Object for up to 30 idle days. It has no transcript or AI-provider path.
+
+The operator of a self-hosted Go instance controls its server and any Anthropic credentials. Players should use an instance they trust.
+
+## Transport and browser permissions
+
+Remote microphone use requires HTTPS. Cloudflare provides HTTPS at the public edge; `localhost` is treated as a secure context for local development. Browser microphone permission can be denied at any time, in which case the manual timer remains available.
+
+NonStopTalk does not request microphone access from spectators. A remote speaker runs detection on their own device; a pass-and-play speaker runs it on the host device.
+
+## Scoring and fairness
+
+AI relevance is a modifier:
 
 ```text
-Mostly on topic. You gave several examples about the prompt, but repeated the same point near the end.
+final score = classic score + round(relevance × 20)
 ```
 
-Bad:
+Feedback includes a confidence label and is instructed to account for transcription artifacts and repetition. The host can adjust scores because recognition errors, accents, noisy rooms, and subjective relevance judgments can still produce unfair results.
 
-```text
-Score: 71.2
-```
+## Future, not implemented
 
-The host must be able to override AI results.
-
-## Risks
-
-- Transcription errors may punish accents, speech differences, or noisy rooms.
-- Relevance grading may feel subjective.
-- AI calls add latency and cost.
-- Privacy expectations are higher when microphones are involved.
-
-## Mitigations
-
-- Keep AI optional.
-- Show clear consent.
-- Prefer short-lived processing.
-- Show explanations.
-- Let the host override.
-- Never block Classic mode on AI availability.
-
+Post-turn AI summaries are backlog. NonStopTalk does not currently retain transcripts for summaries, analytics, profiles, or model training.
