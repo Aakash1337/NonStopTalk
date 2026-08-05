@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#10110f">
-  <meta name="description" content="NonStopTalk is a live party game about keeping the words going.">
+  <meta name="description" content="NonStopTalk is a private, on-device speech coach and live speaking game.">
   <title>NonStopTalk</title>
   <link rel="stylesheet" href="/app.css">
   <script src="/app.js" type="module"></script>
@@ -12,7 +12,12 @@
 <body>
   <header class="site-header">
     <a class="brand" href="/" data-home>NonStopTalk</a>
-    <span class="live-pill">Live rooms</span>
+    <nav class="primary-nav" aria-label="Primary navigation">
+      <a href="/practice" data-route data-nav>Practice</a>
+      <a href="/" data-route data-nav>Play</a>
+      <a href="/progress" data-route data-nav>Progress</a>
+    </nav>
+    <span class="live-pill">On-device + live</span>
   </header>
   <main id="app" class="shell">
     <section class="loading-card" role="status">Loading NonStopTalk…</section>
