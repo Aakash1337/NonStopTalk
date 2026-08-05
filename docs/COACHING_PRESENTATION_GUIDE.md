@@ -2,7 +2,8 @@
 
 This guide turns the prototype into a clear product story. It is written for a five-minute presentation, with optional technical depth for questions afterward.
 
-> **Short preparation path:** Follow [Learn NonStopTalk in 45 minutes](LEARN_IN_45_MINUTES.md), then keep the [presentation cheat sheet](PRESENTATION_CHEAT_SHEET.md) beside the live demo. This document remains the canonical long-form narrative and Q&A reference.
+**Short preparation path:** Follow [Learn NonStopTalk in 45 minutes](LEARN_IN_45_MINUTES.md), then keep the [presentation cheat sheet](PRESENTATION_CHEAT_SHEET.md) beside the live demo. This document remains the canonical long-form narrative and Q&A reference.
+
 > **Prototype status:** The coaching experience is an early, browser-only prototype in the native Cloudflare SPA. It demonstrates objective audio analysis, optional strict on-device transcription, deterministic retrieval/template advice, origin-local progress, and separately opted-in recording/captured-transcript retention. It is not a medical tool, a speech-language assessment, or a finished AI coach.
 
 ## The one-sentence pitch
