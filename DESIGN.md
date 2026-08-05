@@ -8,7 +8,7 @@ NonStopTalk now has three interface jobs:
 - **Play** remains a legible, pressure-filled group game that can be read from several feet away.
 - **Progress** helps a person compare their own attempts without turning speech into a universal grade.
 
-All three should feel like the same product: high contrast, decisive typography, compact controls, and an acid-lime signal color on a graphite field. The current native Cloudflare SPA at `127.0.0.1:8787` is the canonical visual direction.
+All three should feel like the same product: high contrast, decisive typography, compact controls, and an acid-lime signal color on a graphite field. The current native Cloudflare SPA is the canonical visual direction; Wrangler normally serves it at `127.0.0.1:8787` during development but may select another port.
 
 ## Visual direction
 

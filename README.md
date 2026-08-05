@@ -182,15 +182,18 @@ These ideas are not presented as current features:
 
 ## Documents
 
-- [Product Context](PRODUCT.md)
-- [Design Direction](DESIGN.md)
-- [Game Design](docs/GAME_DESIGN.md)
-- [Requirements and Status](docs/REQUIREMENTS.md)
-- [Technical Architecture](docs/TECHNICAL_ARCHITECTURE.md)
-- [Historical Web Version Plan](docs/WEB_VERSION_PLAN.md)
-- [Desktop Application](docs/DESKTOP_APPLICATION.md)
-- [Roadmap](docs/ROADMAP.md)
-- [AI and Privacy](docs/AI_AND_PRIVACY.md)
-- [Cloudflare Deployment](docs/CLOUDFLARE_DEPLOYMENT.md)
-- [Speech Coaching Prototype](docs/SPEECH_COACHING_PROTOTYPE.md)
-- [Coaching Presentation Guide](docs/COACHING_PRESENTATION_GUIDE.md)
+Start with the [documentation index](docs/INDEX.md), which routes readers by task and identifies the canonical reference for each subject.
+
+For a presentation or quick return to the project:
+
+- [Learn NonStopTalk in 45 minutes](docs/LEARN_IN_45_MINUTES.md)
+- [Presentation cheat sheet](docs/PRESENTATION_CHEAT_SHEET.md)
+- [Coaching presentation guide](docs/COACHING_PRESENTATION_GUIDE.md)
+
+Core references:
+
+- [Product context](PRODUCT.md) and [design direction](DESIGN.md)
+- [Requirements and implementation status](docs/REQUIREMENTS.md) and [roadmap](docs/ROADMAP.md)
+- [Speech coaching prototype](docs/SPEECH_COACHING_PROTOTYPE.md) and [technical architecture](docs/TECHNICAL_ARCHITECTURE.md)
+- [AI and privacy](docs/AI_AND_PRIVACY.md) and [Cloudflare deployment](docs/CLOUDFLARE_DEPLOYMENT.md)
+- [Game design](docs/GAME_DESIGN.md), [desktop application](docs/DESKTOP_APPLICATION.md), and the [historical web version plan](docs/WEB_VERSION_PLAN.md)

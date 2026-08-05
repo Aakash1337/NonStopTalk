@@ -2,6 +2,8 @@
 
 This guide turns the prototype into a clear product story. It is written for a five-minute presentation, with optional technical depth for questions afterward.
 
+> **Short preparation path:** Follow [Learn NonStopTalk in 45 minutes](LEARN_IN_45_MINUTES.md), then keep the [presentation cheat sheet](PRESENTATION_CHEAT_SHEET.md) beside the live demo. This document remains the canonical long-form narrative and Q&A reference.
+
 > **Prototype status:** The coaching experience is an early, browser-only prototype in the native Cloudflare SPA. It demonstrates objective audio analysis, optional strict on-device transcription, deterministic retrieval/template advice, origin-local progress, and separately opted-in recording/captured-transcript retention. It is not a medical tool, a speech-language assessment, or a finished AI coach.
 
 ## The one-sentence pitch
@@ -138,14 +140,18 @@ Name the guardrails: false tips, distraction, hardware and local-transcription a
 
 ### Before the presentation
 
-From the repository root:
+The coaching-capable edition requires Node.js 22 or newer. Node 24 is the exact CI and Cloudflare build target. If `node --version` prints `v20...`, install Node 24 from the [official Node.js download](https://nodejs.org/en/download), reopen the terminal, and check again. If `nvm` is already installed, run `nvm install 24` and `nvm use 24`. Then, from the repository root:
 
 ```sh
+node --version
 npm ci
+npx playwright install chromium
 npm run test:coach
 npm run smoke:coach
-npm run dev
+npm run dev -- --local --ip 127.0.0.1 --port 8787
 ```
+
+Confirm that `node --version` prints `v24...`; do not continue with Node 20. The smoke check launches and stops its own Wrangler process, so run it before the stable presentation server. If port 8787 is occupied, omit the explicit port and use the exact URL Wrangler prints.
 
 Then:
 
@@ -174,9 +180,13 @@ Use headphones if the presentation is remote to reduce echo cancellation and fee
 
 - **Microphone permission fails:** Explain that a secure context and permission are required, then use the already completed summary in `/progress`.
 - **No strict local transcription:** This is expected on many browser/language combinations. Show audio-only metrics and explain fail-closed behavior.
+- **No `MediaRecorder`:** Full-session retention is disabled, but coaching and compact summaries still work.
+- **No IndexedDB:** Review can still render, but the attempt may not save and Progress cannot load local history. Use a prepared result in the tested browser profile.
 - **Noisy room:** Use the result to explain why calibration, confidence indicators, and device testing are explicit roadmap items.
-- **Network is unavailable:** A previously loaded local Wrangler session can still demonstrate browser processing; deployed navigation itself naturally requires the site to be reachable.
+- **Network is unavailable:** An already-running local Wrangler server can demonstrate browser processing. A loaded deployed tab is not a guaranteed offline fallback because there is no service worker and the coaching engine is loaded as a separate module.
 - **Live demo risk is unacceptable:** Keep a completed summary at `/progress` on the same presentation origin and walk through it while narrating the data flow. If artifact buttons matter, prepare a non-sensitive opted-in attempt on that exact origin. If you want a screenshot fallback, capture it before the talk; no prepared screenshot is shipped in the repository. Do not enable a remote transcription fallback.
+
+Practice requires microphone input. Play's manual timer is a game fallback, not a coaching fallback.
 
 ## Likely audience questions
 
@@ -200,7 +210,7 @@ Every successfully saved attempt gets a compact local summary with aggregate mea
 
 ### “Can I keep or download the recording and transcript?”
 
-Yes, but only after selecting the separate unchecked full-session-retention option. Progress then shows the download controls supported by that attempt. Recordings and captured transcripts live in a separate origin-local artifact store and are excluded from JSON export. At finish the browser waits up to two seconds for recognition; if it errors or times out after returning text, the app preserves the text but warns in Review and Progress that it may be partial. **Delete local history** clears both browser stores, but it cannot delete files already downloaded to the device. The prototype has no automatic artifact expiration or per-attempt deletion yet.
+The separate unchecked full-session-retention option records the active attempt. It keeps a captured transcript only when the experimental transcript-analysis option was also enabled, strict local recognition returned text, and retention was selected. Progress then shows the download controls supported by that attempt. Recordings and captured transcripts live in a separate origin-local artifact store and are excluded from JSON export. At finish the browser waits up to two seconds for recognition; if it errors or times out after returning text, the app preserves the text but warns in Review and Progress that it may be partial. **Delete local history** clears both browser stores, but it cannot delete files already downloaded to the device. The prototype has no automatic artifact expiration or per-attempt deletion yet.
 
 ### “How does it know when I am speaking?”
 
@@ -240,12 +250,11 @@ The game is an approachable way to practice speaking under pressure with other p
 
 ## What to learn before presenting
 
-1. Read the [prototype walkthrough](SPEECH_COACHING_PROTOTYPE.md) once without opening code.
-2. Run one audio-only attempt and explain each result in plain language.
-3. Trace one signal from microphone sample to summary using the architecture diagram.
-4. Read the file tour, then open each file and locate the named responsibility.
-5. Practice answering the questions above without using “AI” as a substitute for a concrete mechanism.
-6. Rehearse the five-minute talk once with the live demo and once using only the fallback explanation.
+1. Follow the timed [45-minute learning guide](LEARN_IN_45_MINUTES.md), including its checkpoints and one audio-only attempt.
+2. Trace one signal from microphone sample to summary, then trace one Play action from the public Worker API to a room Durable Object.
+3. Practice the exact RAG, storage, and Durable Object answers on the [presentation cheat sheet](PRESENTATION_CHEAT_SHEET.md).
+4. Use the [prototype file tour](SPEECH_COACHING_PROTOTYPE.md#file-tour) only when you need deeper implementation detail.
+5. Rehearse the five-minute talk once with the live demo and once using only the prepared Progress fallback.
 
 ## Sources and responsible-use basis
 

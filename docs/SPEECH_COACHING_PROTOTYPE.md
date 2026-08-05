@@ -25,13 +25,16 @@ It does not prove that the current thresholds work equally well across microphon
 
 ## Try it locally
 
-The coaching prototype is part of the Worker-with-Assets edition:
+The coaching prototype is part of the Worker-with-Assets edition and requires Node.js 22 or newer. Node 24 is the exact CI and Cloudflare build target. If `node --version` prints `v20...`, install Node 24 from the [official Node.js download](https://nodejs.org/en/download), reopen the terminal, and check again. If `nvm` is already installed, run `nvm install 24` followed by `nvm use 24`. Then:
 
 ```sh
+node --version
 npm ci
 npm run test:coach
-npm run dev
+npm run dev -- --local --ip 127.0.0.1 --port 8787
 ```
+
+Confirm that the version check prints `v24...`; Wrangler does not support the Node 20 runtime currently active on some older development machines.
 
 Open:
 
@@ -39,7 +42,7 @@ Open:
 http://127.0.0.1:8787/practice
 ```
 
-Wrangler may print a different port if 8787 is already occupied; use the URL it prints. Loopback development and deployed HTTPS are secure contexts, which browsers require for microphone access and `AudioWorklet` module loading.
+If port 8787 is occupied, stop the process using it or rerun `npm run dev -- --local --ip 127.0.0.1` without `--port`; then use the exact URL Wrangler prints. Loopback development and deployed HTTPS are secure contexts, which browsers require for microphone access and `AudioWorklet` module loading.
 
 The local Go command serves the game, not this prototype:
 
