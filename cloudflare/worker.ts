@@ -18,28 +18,12 @@ const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const MAX_ROOM_SOCKETS = 64;
 const MAX_SOCKETS_PER_TOKEN = 4;
 const ROOM_IDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-
-interface AssetsBinding {
-	fetch(request: Request): Promise<Response>;
-}
-
-interface RoomStub {
-	fetch(request: Request): Promise<Response>;
-}
-
-interface RoomNamespace {
-	idFromName(name: string): unknown;
-	get(id: unknown): RoomStub;
-}
-
-interface RateLimitBinding {
-	limit(options: { key: string }): Promise<{ success: boolean }>;
-}
+const HOST_HTTP_PRESENCE_BUCKET_MS = 15_000;
 
 interface Env {
-	ROOMS: RoomNamespace;
-	ASSETS: AssetsBinding;
-	ROOM_CREATION_RATE_LIMITER: RateLimitBinding;
+	ROOMS: DurableObjectNamespace<RoomDurableObject>;
+	ASSETS: Fetcher;
+	ROOM_CREATION_RATE_LIMITER: RateLimit;
 }
 
 interface SocketAttachment {
@@ -69,31 +53,24 @@ export class RoomDurableObject extends DurableObject<Env> {
 		try {
 			const url = new URL(request.url);
 			const token = request.headers.get("X-NonStopTalk-Token") ?? "";
-			const room = this.load();
 
 			if (request.method === "POST" && url.pathname === "/create") {
-				if (room) return json({ error: "Room code collision." }, 409);
+				// Consume the body before reading SQLite. Durable Object requests
+				// can interleave across non-storage awaits, so load, mutation, and
+				// the synchronous SQL save must remain one uninterrupted section.
 				const body = await readJson(request);
+				const room = this.load();
+				if (room) return json({ error: "Room code collision." }, 409);
 				this.initializeSchema();
 				const created = createRoomState(text(body.code), token, text(body.name));
 				this.save(created);
 				return json({ room: publicRoomState(created, token, this.onlineTokens()) }, 201);
 			}
 
-			if (!room) return json({ error: "Room not found." }, 404);
-
-			if (request.method === "GET" && url.pathname === "/state") {
-				if (token === room.hostToken && !this.hasOpenSocket(token)) {
-					room.hostDisconnectedAt = Date.now();
-					room.version += 1;
-					room.updatedAt = Date.now();
-					this.save(room);
-				}
-				return json({ room: publicRoomState(room, token, this.onlineTokens()) });
-			}
-
 			if (request.method === "POST" && url.pathname === "/join") {
 				const body = await readJson(request);
+				const room = this.load();
+				if (!room) return json({ error: "Room not found." }, 404);
 				joinRoom(room, token, text(body.name));
 				this.save(room);
 				this.broadcast(room);
@@ -102,10 +79,21 @@ export class RoomDurableObject extends DurableObject<Env> {
 
 			if (request.method === "POST" && url.pathname === "/action") {
 				const action = (await readJson(request)) as Action;
+				const room = this.load();
+				if (!room) return json({ error: "Room not found." }, 404);
 				applyAction(room, token, action, Date.now(), this.onlineTokens());
 				this.save(room);
 				this.broadcast(room);
 				return json({ room: publicRoomState(room, token, this.onlineTokens()) });
+			}
+
+			const room = this.load();
+			if (!room) return json({ error: "Room not found." }, 404);
+
+			if (request.method === "GET" && url.pathname === "/state") {
+				const now = Date.now();
+				if (refreshHTTPHostPresence(room, token, this.hasOpenSocket(token), now)) this.save(room);
+				return json({ room: publicRoomState(room, token, this.onlineTokens(), now) });
 			}
 
 			if (request.method === "GET" && url.pathname === "/socket") {
@@ -124,8 +112,8 @@ export class RoomDurableObject extends DurableObject<Env> {
 
 				const pair = new WebSocketPair();
 				const [client, server] = Object.values(pair);
-				server.serializeAttachment({ token } satisfies SocketAttachment);
 				this.ctx.acceptWebSocket(server);
+				server.serializeAttachment({ token } satisfies SocketAttachment);
 				if (token === room.hostToken && setHostOnline(room, true)) this.save(room);
 				this.broadcast(room);
 				return new Response(null, { status: 101, webSocket: client } as ResponseInit);
@@ -146,7 +134,6 @@ export class RoomDurableObject extends DurableObject<Env> {
 		}
 		try {
 			const payload = JSON.parse(message) as { type?: string };
-			if (payload.type === "ping") socket.send(JSON.stringify({ type: "pong" }));
 			if (payload.type === "sync") {
 				const room = this.load();
 				const token = this.attachment(socket)?.token ?? "";
@@ -244,19 +231,25 @@ export class RoomDurableObject extends DurableObject<Env> {
 	}
 
 	private broadcast(room: RoomState, except?: WebSocket): void {
+		const onlineTokens = this.onlineTokens(except);
 		for (const socket of this.ctx.getWebSockets()) {
 			if (socket === except || socket.readyState !== 1) continue;
 			const token = this.attachment(socket)?.token ?? "";
-			this.sendState(socket, room, token);
+			this.sendState(socket, room, token, onlineTokens);
 		}
 	}
 
-	private sendState(socket: WebSocket, room: RoomState, token: string): void {
+	private sendState(
+		socket: WebSocket,
+		room: RoomState,
+		token: string,
+		onlineTokens = this.onlineTokens(),
+	): void {
 		try {
 			socket.send(
 				JSON.stringify({
 					type: "state",
-					room: publicRoomState(room, token, this.onlineTokens()),
+					room: publicRoomState(room, token, onlineTokens),
 				}),
 			);
 		} catch {
@@ -273,6 +266,28 @@ export class RoomDurableObject extends DurableObject<Env> {
 	}
 }
 
+function refreshHTTPHostPresence(
+	room: RoomState,
+	token: string,
+	hasOpenSocket: boolean,
+	now: number,
+): boolean {
+	if (token !== room.hostToken || hasOpenSocket) return false;
+
+	// Round the proof-of-presence timestamp up so all reads in this bucket can
+	// share one durable write without shortening the 30-second takeover grace.
+	// An absent HTTP-only host may therefore take up to one extra bucket to
+	// become claimable, while an active one keeps renewing the lease.
+	const presenceLease =
+		(Math.floor(now / HOST_HTTP_PRESENCE_BUCKET_MS) + 1) * HOST_HTTP_PRESENCE_BUCKET_MS;
+	if (room.hostDisconnectedAt !== null && room.hostDisconnectedAt >= presenceLease) return false;
+
+	room.hostDisconnectedAt = presenceLease;
+	room.version += 1;
+	room.updatedAt = now;
+	return true;
+}
+
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
@@ -285,6 +300,7 @@ export default {
 			const actor = request.headers.get("CF-Connecting-IP")?.trim() || identity.token;
 			const { success } = await env.ROOM_CREATION_RATE_LIMITER.limit({ key: `room-create:${actor}` });
 			if (!success) {
+				console.warn("Room creation rate limit rejected a request.");
 				const response = json({ error: "Too many rooms were created from this connection. Try again shortly." }, 429);
 				response.headers.set("Retry-After", "60");
 				return withIdentityCookie(response, identity, request);

@@ -448,6 +448,8 @@ async function runAutomaticEndingScenario(browser, baseURL) {
 async function runAIJudgeScenario(browser, baseURL) {
   const context = await browser.newContext();
   const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
   await page.addInitScript(fakeMicInit);
   await page.addInitScript(fakeSpeechInit);
 
@@ -510,7 +512,10 @@ async function runAIJudgeScenario(browser, baseURL) {
   assert(turnIdentity.stage && turnIdentity.stage === turnIdentity.form, `Expected one turn ID across actor requests, got ${JSON.stringify(turnIdentity)}`);
 
   // Speak with the fake mic: the mocked recognizer emits an on-topic
-  // transcript, then the silent mic eliminates the player after ~1s.
+  // transcript, then the silent mic eliminates the player after ~1s. Abort
+  // the best-effort clock notification to prove its rejected promise is
+  // handled rather than surfacing as an unhandled browser error.
+  await page.route("**/turn/begin", (route) => route.abort("failed"));
   await startButton.click();
   await page.waitForFunction(() => window.__speechTrackDeviceIDs?.includes("mic-beta"));
   const selectedAudio = await page.evaluate(() => ({
@@ -538,6 +543,7 @@ async function runAIJudgeScenario(browser, baseURL) {
   assert(await nextStartButton.isDisabled(), "Consent from the previous turn must not enable Start Talking");
   assert(!(await page.getByLabel("Use on-device transcription for this turn").isChecked()), "Local consent must not carry into another turn");
   assert(!(await page.getByLabel("Play without AI transcription").isChecked()), "Classic consent must not carry into another turn");
+  assert(pageErrors.length === 0, `Expected no unhandled browser errors, got ${JSON.stringify(pageErrors)}`);
 
   await context.close();
 }

@@ -1,4 +1,5 @@
 const app = document.querySelector("#app");
+const announcer = document.querySelector("#announcer");
 const toast = document.querySelector("#toast");
 
 let room = null;
@@ -23,8 +24,7 @@ loadRoute();
 
 async function loadRoute() {
   const generation = ++routeGeneration;
-  stopController();
-  disconnectSocket();
+  stopRoomLifecycle();
   room = null;
   const match = location.pathname.match(/^\/room\/([A-Z2-9]{6})\/?$/i);
   if (!match) {
@@ -35,7 +35,7 @@ async function loadRoute() {
   }
   roomCode = match[1].toUpperCase();
   document.title = `${roomCode} · NonStopTalk`;
-  app.innerHTML = `<section class="loading-card">Opening room ${escapeHTML(roomCode)}…</section>`;
+  app.innerHTML = `<section class="loading-card" role="status">Opening room ${escapeHTML(roomCode)}…</section>`;
   try {
     const payload = await api(`/api/rooms/${roomCode}/state`);
     if (generation !== routeGeneration) return;
@@ -94,7 +94,7 @@ function renderRoom() {
       <section class="panel stack" style="max-width:34rem;margin:2rem auto">
         <p class="eyebrow">Join ${escapeHTML(room.code)}</p>
         <h1 style="font-size:clamp(2.2rem,8vw,4.5rem)">Take a seat.</h1>
-        <p class="room-meta">${room.players.length} of 12 seats are currently filled.</p>
+        <p class="room-meta">${room.players.length} of ${room.maxPlayers} seats are currently filled.</p>
         ${room.phase === "setup" ? `<form class="stack" data-join-current-room>
           <label>Your name <input name="name" maxlength="40" autocomplete="nickname" required autofocus></label>
           <button class="button primary" type="submit">Join room</button>
@@ -123,7 +123,7 @@ function renderSetup() {
   return `
     <section class="room-grid">
       <div class="panel">
-        <div class="section-head"><div><p class="eyebrow">Lobby</p><h2>Players</h2></div><span>${room.players.length}/12</span></div>
+        <div class="section-head"><div><p class="eyebrow">Lobby</p><h2>Players</h2></div><span>${room.players.length}/${room.maxPlayers}</span></div>
         <div class="player-list">${room.players.map(renderPlayer).join("") || `<p class="hint">No players yet.</p>`}</div>
         ${viewer.isHost ? `
           <form class="inline" data-room-action>
@@ -210,7 +210,7 @@ function renderGame(current) {
     const last = room.lastTurn;
     return `<section class="room-grid">
       <div class="panel wide" style="text-align:center;padding:clamp(2rem,7vw,6rem)">
-        ${last ? `<p class="eyebrow">Turn scored</p><div class="score-callout">${escapeHTML(last.playerName)} earned ${last.score} points</div><p class="hint">${last.spokenSeconds} of ${last.duration} seconds${last.completed ? ` · ${25}-point completion bonus` : ""}</p>` : `<p class="eyebrow">Round ${room.currentRound}</p><h1 style="max-width:none;font-size:clamp(2.5rem,8vw,6rem)">${escapeHTML(current?.name || "Next player")} is up.</h1>`}
+        ${last ? `<p class="eyebrow">Turn scored</p><div class="score-callout">${escapeHTML(last.playerName)} earned ${last.score} points</div><p class="hint">${last.spokenSeconds} of ${last.duration} seconds${last.completed ? ` · ${room.completionBonus}-point completion bonus` : ""}</p>` : `<p class="eyebrow">Round ${room.currentRound}</p><h1 style="max-width:none;font-size:clamp(2.5rem,8vw,6rem)">${escapeHTML(current?.name || "Next player")} is up.</h1>`}
         ${canStart ? `<button class="button primary" type="button" data-command="start-turn">${last ? "Next turn" : "Draw topic"}</button>` : `<p class="hint">Waiting for ${escapeHTML(current?.name || "the next player")} or the host.</p>`}
       </div>
       <aside class="panel wide"><div class="section-head"><h2>Scoreboard</h2><span>${room.completedTurns.length} turns</span></div>${renderScores(true)}</aside>
@@ -332,11 +332,15 @@ async function handleClick(event) {
     } else if (command === "start-mic" || command === "resume-mic") {
       await startMicrophone(command === "start-mic");
     } else if (command === "redraw") {
-      await doAction({ type: "redraw-turn", turnId: room.activeTurn.id });
+      const turn = room?.activeTurn;
+      if (!turn) return;
+      await doAction({ type: "redraw-turn", turnId: turn.id });
     } else if (command === "end-turn") {
       await finishTurn(false, false);
     } else if (command === "mark-complete") {
-      await finishTurn(true, false, room.activeTurn.duration);
+      const turn = room?.activeTurn;
+      if (!turn) return;
+      await finishTurn(true, false, turn.duration);
     } else if (command === "reset") {
       await doAction({ type: "reset" });
     } else if (command === "claim-host") {
@@ -350,20 +354,35 @@ async function handleClick(event) {
 }
 
 async function startManual(notifyBegin) {
-  const turn = room.activeTurn;
+  const turn = room?.activeTurn;
   if (!turn) return;
+  const code = roomCode;
+  const generation = routeGeneration;
   if (notifyBegin && turn.begunAt === null) await doAction({ type: "begin-turn", turnId: turn.id });
-  controller = { turnId: room.activeTurn.id, mode: "manual", submitting: false };
-  updateClock();
+  if (!isCurrentTurn(code, generation, turn.id)) return;
+  stopController();
+  controller = { turnId: turn.id, mode: "manual", submitting: false };
+  renderRoom();
 }
 
 async function startMicrophone(notifyBegin) {
-  const turn = room.activeTurn;
+  const turn = room?.activeTurn;
   if (!turn) return;
+  const code = roomCode;
+  const generation = routeGeneration;
   if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone input is unavailable. Use the manual timer.");
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  let stream;
   let context;
+  const releasePendingMicrophone = async () => {
+    stream?.getTracks().forEach((track) => track.stop());
+    if (context && context.state !== "closed") await context.close().catch(() => {});
+  };
   try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (!isCurrentTurn(code, generation, turn.id)) {
+      await releasePendingMicrophone();
+      return;
+    }
     const AudioContext = window.AudioContext || window.webkitAudioContext;
     if (!AudioContext) throw new Error("Audio monitoring is unavailable. Use the manual timer.");
     context = new AudioContext();
@@ -372,11 +391,20 @@ async function startMicrophone(notifyBegin) {
     const analyser = context.createAnalyser();
     analyser.fftSize = 1024;
     source.connect(analyser);
+    if (!isCurrentTurn(code, generation, turn.id)) {
+      await releasePendingMicrophone();
+      return;
+    }
     if (notifyBegin && turn.begunAt === null) {
       await doAction({ type: "begin-turn", turnId: turn.id });
     }
+    if (!isCurrentTurn(code, generation, turn.id)) {
+      await releasePendingMicrophone();
+      return;
+    }
+    stopController();
     controller = {
-      turnId: room.activeTurn.id,
+      turnId: turn.id,
       mode: "mic",
       submitting: false,
       stream,
@@ -386,12 +414,18 @@ async function startMicrophone(notifyBegin) {
       lastVoiceAt: performance.now(),
       raf: 0,
     };
+    renderRoom();
     monitorMicrophone();
   } catch (error) {
-    stream.getTracks().forEach((track) => track.stop());
-    if (context && context.state !== "closed") await context.close().catch(() => {});
+    await releasePendingMicrophone();
+    if (stream && controller?.stream === stream) controller = null;
+    if (code !== roomCode || generation !== routeGeneration) return;
     throw error;
   }
+}
+
+function isCurrentTurn(code, generation, turnId) {
+  return code === roomCode && generation === routeGeneration && room?.activeTurn?.id === turnId;
 }
 
 function monitorMicrophone() {
@@ -468,12 +502,18 @@ function acceptRoom(next) {
   // Never let an older HTTP snapshot roll the client back after a newer live
   // update has already rendered.
   if (room && next.version < room.version) return;
+  const previous = room;
+  const focusedDraft = captureFocusedDraft();
+  const announcement = roomAnnouncement(previous, next);
   room = next;
   clockOffset = room.serverNow - Date.now();
   renderRoom();
+  restoreFocusedDraft(focusedDraft);
+  announce(announcement);
   if (room.viewer.isMember) connectSocket();
   if (!clockTimer) clockTimer = window.setInterval(updateClock, 200);
   clearTimeout(claimRefreshTimer);
+  claimRefreshTimer = 0;
   if (room.viewer.hostClaimWaitMs > 0) {
     claimRefreshTimer = window.setTimeout(refreshRoomState, room.viewer.hostClaimWaitMs + 150);
   }
@@ -502,6 +542,15 @@ function stopController() {
   controller.stream?.getTracks().forEach((track) => track.stop());
   if (controller.context && controller.context.state !== "closed") controller.context.close().catch(() => {});
   controller = null;
+}
+
+function stopRoomLifecycle() {
+  stopController();
+  disconnectSocket();
+  clearInterval(clockTimer);
+  clearTimeout(claimRefreshTimer);
+  clockTimer = 0;
+  claimRefreshTimer = 0;
 }
 
 function connectSocket() {
@@ -582,7 +631,106 @@ function showToast(message) {
 }
 
 function notice(message, error = false) {
-  return `<div class="notice ${error ? "error" : ""}">${escapeHTML(message)}</div>`;
+  return `<div class="notice ${error ? "error" : ""}"${error ? ` role="alert"` : ""}>${escapeHTML(message)}</div>`;
+}
+
+function captureFocusedDraft() {
+  if (!room || !roomCode) return null;
+  const control = document.activeElement;
+  if (!isEditableControl(control) || !app.contains(control)) return null;
+  const key = editableControlKey(control);
+  if (!key) return null;
+  let selectionStart = null;
+  let selectionEnd = null;
+  let selectionDirection = null;
+  try {
+    selectionStart = control.selectionStart;
+    selectionEnd = control.selectionEnd;
+    selectionDirection = control.selectionDirection;
+  } catch {
+    // Number inputs and selects do not expose a text selection.
+  }
+  return {
+    code: roomCode,
+    phase: room.phase,
+    generation: routeGeneration,
+    key,
+    value: control.value,
+    checked: "checked" in control ? control.checked : null,
+    selectionStart,
+    selectionEnd,
+    selectionDirection,
+  };
+}
+
+function restoreFocusedDraft(draft) {
+  if (!draft || draft.code !== roomCode || draft.phase !== room?.phase || draft.generation !== routeGeneration) return;
+  const control = Array.from(app.querySelectorAll("input, select, textarea"))
+    .find((candidate) => isEditableControl(candidate) && editableControlKey(candidate) === draft.key);
+  if (!control) return;
+  control.value = draft.value;
+  if (draft.checked !== null && "checked" in control) control.checked = draft.checked;
+  control.focus({ preventScroll: true });
+  if (draft.selectionStart === null || typeof control.setSelectionRange !== "function") return;
+  try {
+    control.setSelectionRange(draft.selectionStart, draft.selectionEnd, draft.selectionDirection);
+  } catch {
+    // The restored control may not support a text selection.
+  }
+}
+
+function isEditableControl(control) {
+  if (!(control instanceof HTMLInputElement || control instanceof HTMLSelectElement || control instanceof HTMLTextAreaElement)) return false;
+  if (control.disabled || control.readOnly) return false;
+  return !(control instanceof HTMLInputElement) || !["hidden", "button", "submit", "reset", "image"].includes(control.type);
+}
+
+function editableControlKey(control) {
+  if (!control.name) return "";
+  const form = control.form;
+  if (!form || !app.contains(form)) return "";
+  if (form.matches("[data-join-current-room]")) return `join-current:${control.name}`;
+  if (!form.matches("[data-room-action]")) return "";
+  const action = formFieldValue(form, "type");
+  const target = formFieldValue(form, "playerId") || formFieldValue(form, "id");
+  return `room-action:${action}:${target}:${control.name}`;
+}
+
+function formFieldValue(form, name) {
+  const field = form.elements.namedItem(name);
+  return field && "value" in field ? String(field.value) : "";
+}
+
+function roomAnnouncement(previous, next) {
+  if (!previous) {
+    if (!next.viewer.isMember) return `Room ${next.code} is ready to join.`;
+    return next.phase === "setup" ? `Room ${next.code} lobby loaded.` : `Room ${next.code} loaded.`;
+  }
+  if (previous.phase !== next.phase) {
+    if (next.phase === "finished") return `${next.winner?.name || "The winner"} wins with ${next.winner?.score ?? 0} points.`;
+    if (next.phase === "playing") return `Game started. ${next.players[next.currentPlayer]?.name || "The first player"} is up next.`;
+    return "The room returned to game setup.";
+  }
+  if (previous.lastTurn?.id !== next.lastTurn?.id && next.lastTurn) {
+    return `${next.lastTurn.playerName} earned ${next.lastTurn.score} points.`;
+  }
+  if (previous.activeTurn?.id !== next.activeTurn?.id && next.activeTurn) {
+    return `${next.activeTurn.playerName}'s turn. Topic: ${next.activeTurn.topic}`;
+  }
+  if (!previous.viewer.hostDisconnected && next.viewer.hostDisconnected) {
+    return "The host disconnected. Host controls can be claimed after the grace period.";
+  }
+  if (!previous.viewer.canClaimHost && next.viewer.canClaimHost) return "Host controls can now be claimed.";
+  return "";
+}
+
+function announce(message) {
+  if (!message || !announcer) return;
+  const generation = routeGeneration;
+  announcer.textContent = "";
+  queueMicrotask(() => {
+    if (generation === routeGeneration) announcer.textContent = message;
+  });
 }
 
 function escapeHTML(value) {
@@ -592,9 +740,5 @@ function escapeHTML(value) {
 }
 
 function shutdown() {
-  stopController();
-  disconnectSocket();
-  clearInterval(clockTimer);
-  clearTimeout(claimRefreshTimer);
-  clockTimer = 0;
+  stopRoomLifecycle();
 }

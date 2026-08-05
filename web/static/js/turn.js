@@ -219,6 +219,8 @@
         keepalive: true,
         headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
         body: new URLSearchParams({ turnID }),
+      }).catch(() => {
+        // Best-effort only.
       });
     } catch {
       // Best-effort only.
@@ -923,6 +925,7 @@
       raf = requestAnimationFrame(micTick);
     } catch {
       running = false;
+      setTurnRunningFlag(false);
       mode = "idle";
       stopMic();
       setReadyControls();
@@ -979,7 +982,7 @@
     destroyed = true;
     running = false;
     mode = "idle";
-    window.__nonStopTalkTurnRunning = false;
+    setTurnRunningFlag(false);
     cancelAnimationFrame(raf);
     cancelAnimationFrame(previewRaf);
     cancelAnimationFrame(resumeRaf);

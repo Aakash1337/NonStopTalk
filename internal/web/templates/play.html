@@ -30,8 +30,8 @@
     </div>
 
     {{if .Session.Settings.AIJudgeEnabled}}
-      <div class="ai-banner" data-ai-consent>
-        <p><strong>AI judge choice for this turn</strong></p>
+      <div class="ai-banner" data-ai-consent role="radiogroup" aria-labelledby="ai-consent-heading">
+        <p id="ai-consent-heading"><strong>AI judge choice for this turn</strong></p>
         <p>Choose supported on-device transcription, which sends only the resulting text to the judge, or play this turn without transcription or an AI bonus. NonStopTalk never uploads microphone audio.</p>
         <label class="toggle-row">
           <input type="radio" name="ai-turn-choice" value="local" data-ai-consent-local>
@@ -154,7 +154,7 @@
     {{template "standings" .}}
   </aside>
   {{if or .IsActor (and .IsHost (not .ActorIsRemote))}}
-    <script src="/static/js/turn.js?v=11" defer></script>
+    <script src="/static/js/turn.js?v=12" defer></script>
   {{end}}
 </main>
 {{end}}

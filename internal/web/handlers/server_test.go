@@ -436,6 +436,14 @@ func TestGlobalProviderBudgetAndUTF8TranscriptCap(t *testing.T) {
 	if len(truncated) > maxTranscriptBytes || strings.ToValidUTF8(truncated, "") != truncated {
 		t.Fatalf("expected valid rune-aligned truncation, len=%d", len(truncated))
 	}
+
+	split := truncateUTF8Bytes(strings.Repeat("é", 4), 5)
+	if split != strings.Repeat("é", 2) {
+		t.Fatalf("expected the split rune to be dropped, got %q", split)
+	}
+	if truncateUTF8Bytes("é", 0) != "" {
+		t.Fatal("expected a zero byte limit to return an empty string")
+	}
 }
 
 func TestLegacyIdentityCookieMigratesWithoutLosingHost(t *testing.T) {

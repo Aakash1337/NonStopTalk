@@ -48,6 +48,7 @@ func main() {
 		Addr:              addr,
 		Handler:           server.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
 	if err := httpServer.ListenAndServe(); err != nil {

@@ -77,7 +77,7 @@ There is no pre-turn countdown, pause state, or restart-current-turn action yet.
 - A remote player's browser is bound to their seat and runs that player's turn. Other clients receive room changes through SSE in the Go edition or hibernatable WebSockets on Cloudflare.
 - The server clock caps remote time claims and allows a small completion grace for browser/server timing skew.
 - The same browser token restores a player's seat after a reconnect while the room still exists.
-- A seated player can claim hosting after the current host has been absent for 30 seconds.
+- A seated player can claim hosting after the current host has been absent for 30 seconds. The online edition coalesces rapid HTTP-only presence reads, so its fallback path can conservatively extend that wait by up to 15 seconds; normal WebSocket disconnects remain exact.
 
 This is lightweight coordination for a social game, not adversarial anti-cheat.
 

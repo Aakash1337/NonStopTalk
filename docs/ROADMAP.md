@@ -26,7 +26,7 @@ The game loop is playable. Formal accessibility and broad hardware/browser valid
 - Pass-and-play and remote seats in one room
 - Server-Sent Events synchronization in the Go edition and hibernatable WebSockets on Cloudflare
 - Server-side turn clock for remote score caps
-- Explicit host transfer and claim after 30 seconds of absence
+- Explicit host transfer and claim after a short absence grace period (30 seconds normally; up to 45 seconds for coalesced HTTP-only presence)
 - Same-origin checks, rate/capacity/input limits, and idle-room cleanup
 
 The supplied native Cloudflare edition runs on Workers Free. Each room has one SQLite-backed Durable Object, so room state survives hibernation, restarts, and deployments until its 30-day idle expiry.

@@ -6,7 +6,7 @@ The playable core exists today. The project is still being hardened, and the [ro
 
 ## Implemented now
 
-- Six-character rooms with a host, remote seats, browser-based reconnect, live updates (SSE in the local Go app and hibernatable WebSockets online), host transfer, and takeover after the host has been absent for 30 seconds
+- Six-character rooms with a host, remote seats, browser-based reconnect, live updates (SSE in the local Go app and hibernatable WebSockets online), host transfer, and takeover after a short absence grace period
 - Local pass-and-play and remote turns in the same room
 - Player add, rename, remove, and reorder controls
 - Configurable 10–300 second turns, 1–10 second silence limits, and 1–10 rounds

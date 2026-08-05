@@ -4,6 +4,7 @@ import test from "node:test";
 import {
 	COMPLETION_BONUS,
 	GameError,
+	MAX_PLAYERS,
 	TOPIC_PACKS,
 	applyAction,
 	createRoomState,
@@ -129,6 +130,8 @@ test("public state never exposes identity tokens", () => {
 	assert.equal(view.viewer.playerId, "p2");
 	assert.equal(view.players[1].online, true);
 	assert.equal(view.topicCount, room.topics.length);
+	assert.equal(view.maxPlayers, MAX_PLAYERS);
+	assert.equal(view.completionBonus, COMPLETION_BONUS);
 	assert.deepEqual(view.topics, []);
 	assert.deepEqual(hostView.topics, room.topics);
 	assert.equal(serialized.includes(host), false);
@@ -164,6 +167,22 @@ test("successful host HTTP actions refresh takeover grace without weakening auth
 	applyAction(room, host, { type: "claim-host" }, 80_000);
 	assert.equal(room.hostToken, host);
 	assert.equal(room.hostDisconnectedAt, 80_000);
+});
+
+test("score overrides and host transfers remain host-only", () => {
+	const room = createRoomState("ABC234", host, "Alice", 0);
+	const bob = joinRoom(room, guest, "Bob", 1);
+	assert.ok(bob);
+
+	assert.throws(() => applyAction(room, guest, { type: "score", playerId: bob.id, delta: 5 }, 2), GameError);
+	applyAction(room, host, { type: "score", playerId: bob.id, delta: 5 }, 3);
+	assert.equal(bob.score, 5);
+
+	assert.throws(() => applyAction(room, guest, { type: "transfer-host", playerId: bob.id }, 4), GameError);
+	applyAction(room, host, { type: "transfer-host", playerId: bob.id }, 5, new Set([guest]));
+	assert.equal(room.hostToken, guest);
+	assert.equal(room.hostDisconnectedAt, null);
+	assert.throws(() => applyAction(room, host, { type: "score", playerId: bob.id, delta: 5 }, 6), GameError);
 });
 
 test("redraw and next-turn replay guards invalidate delayed actions", () => {

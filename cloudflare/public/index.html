@@ -14,9 +14,10 @@
     <a class="brand" href="/" data-home>NonStopTalk</a>
     <span class="live-pill">Live rooms</span>
   </header>
-  <main id="app" class="shell" aria-live="polite">
-    <section class="loading-card">Loading NonStopTalk…</section>
+  <main id="app" class="shell">
+    <section class="loading-card" role="status">Loading NonStopTalk…</section>
   </main>
+  <div id="announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
   <div id="toast" class="toast" role="status" hidden></div>
 </body>
 </html>

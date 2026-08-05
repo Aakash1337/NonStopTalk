@@ -1,5 +1,6 @@
 export const MAX_PLAYERS = 12;
 export const COMPLETION_BONUS = 25;
+export const HOST_CLAIM_GRACE_MS = 30_000;
 
 export interface Player {
 	id: string;
@@ -403,7 +404,7 @@ export function applyAction(
 		}
 		case "claim-host": {
 			if (!playerId) throw new GameError("Join the room before claiming host.", 403);
-			if (room.hostDisconnectedAt === null || now - room.hostDisconnectedAt < 30_000) {
+			if (room.hostDisconnectedAt === null || now - room.hostDisconnectedAt < HOST_CLAIM_GRACE_MS) {
 				throw new GameError("The host is still here.", 409);
 			}
 			room.hostToken = token;
@@ -440,6 +441,8 @@ export function publicRoomState(room: RoomState, token: string, onlineTokens: Se
 		code: room.code,
 		version: room.version,
 		serverNow: now,
+		maxPlayers: MAX_PLAYERS,
+		completionBonus: COMPLETION_BONUS,
 		phase: room.phase,
 		players: room.players.map((player) => ({ ...player, online: onlinePlayerIds.has(player.id) })),
 		settings: room.settings,
@@ -463,11 +466,11 @@ export function publicRoomState(room: RoomState, token: string, onlineTokens: Se
 			hostClaimWaitMs:
 				room.hostDisconnectedAt === null
 					? 0
-					: Math.max(0, 30_000 - (now - room.hostDisconnectedAt)),
+					: Math.max(0, HOST_CLAIM_GRACE_MS - (now - room.hostDisconnectedAt)),
 			canClaimHost:
 				Boolean(playerId) &&
 				room.hostDisconnectedAt !== null &&
-				now - room.hostDisconnectedAt >= 30_000,
+				now - room.hostDisconnectedAt >= HOST_CLAIM_GRACE_MS,
 		},
 	};
 }
