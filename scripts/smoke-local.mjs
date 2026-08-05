@@ -487,6 +487,22 @@ async function runAIJudgeScenario(browser, baseURL) {
   await page.getByLabel("Use on-device transcription for this turn").check();
   assert(!(await startButton.isDisabled()), "Expected explicit local-transcription consent to enable Start Talking");
 
+  // A room update can replace the turn controls between consent and the click.
+  // The explicit choice must survive that same-turn swap, but never carry into
+  // another turn (the browser state is keyed by the authoritative turn ID).
+  await page.evaluate(async () => {
+    const app = document.getElementById("app");
+    await window.htmx.ajax("GET", `${app.dataset.roomBase}/partial`, {
+      target: "#app",
+      swap: "outerHTML",
+    });
+  });
+  await page.waitForFunction(() => {
+    const button = document.querySelector("[data-start-turn]");
+    const localConsent = document.querySelector("[data-ai-consent-local]");
+    return button && !button.disabled && localConsent?.checked;
+  });
+
   const turnIdentity = await page.locator("[data-turn]").evaluate((element) => ({
     stage: element.dataset.turnId,
     form: element.querySelector('input[name="turnID"]')?.value,
@@ -512,6 +528,16 @@ async function runAIJudgeScenario(browser, baseURL) {
   await page.waitForSelector(".result-band", { timeout: 15000 });
   await expectText(page, ".ai-verdict", "Offline judge");
   await expectText(page, ".score-breakdown", "AI relevance");
+
+  await page.getByRole("button", { name: "Next Turn" }).click();
+  await page.waitForFunction((previousTurnID) => {
+    const nextTurn = document.querySelector("[data-turn]");
+    return nextTurn?.dataset.turnId && nextTurn.dataset.turnId !== previousTurnID;
+  }, turnIdentity.stage);
+  const nextStartButton = page.getByRole("button", { name: "Start Talking" });
+  assert(await nextStartButton.isDisabled(), "Consent from the previous turn must not enable Start Talking");
+  assert(!(await page.getByLabel("Use on-device transcription for this turn").isChecked()), "Local consent must not carry into another turn");
+  assert(!(await page.getByLabel("Play without AI transcription").isChecked()), "Classic consent must not carry into another turn");
 
   await context.close();
 }

@@ -67,7 +67,15 @@
   let lastTickSecond = -1;
   let silenceWarned = false;
   let soundEnabled = readSoundSetting();
-  let aiConsentChoice = "";
+  const rememberedAIConsent = window.__nonStopTalkAIConsent;
+  let aiConsentChoice = (
+    aiJudgeEnabled
+    && rememberedAIConsent?.turnID === turnID
+    && (rememberedAIConsent.choice === "local" || rememberedAIConsent.choice === "classic")
+  ) ? rememberedAIConsent.choice : "";
+  if (rememberedAIConsent && rememberedAIConsent.turnID !== turnID) {
+    delete window.__nonStopTalkAIConsent;
+  }
   let recognitionTrack = null;
   let destroyed = false;
   let resultPrepared = false;
@@ -243,6 +251,17 @@
     aiConsentStatus.classList.toggle("is-warning", warning);
   };
 
+  const rememberAIConsent = (choice) => {
+    if (!aiJudgeEnabled || (choice !== "local" && choice !== "classic")) return;
+    window.__nonStopTalkAIConsent = { turnID, choice };
+  };
+
+  const forgetAIConsent = () => {
+    if (window.__nonStopTalkAIConsent?.turnID === turnID) {
+      delete window.__nonStopTalkAIConsent;
+    }
+  };
+
   const syncAIConsentControls = () => {
     if (!aiJudgeEnabled) return;
     const localAvailable = supportsLocalRecognition();
@@ -254,8 +273,11 @@
     }
     if (!localAvailable && aiConsentChoice === "local") {
       aiConsentChoice = "";
+      forgetAIConsent();
       if (aiConsentLocal) aiConsentLocal.checked = false;
     }
+    if (aiConsentLocal) aiConsentLocal.checked = aiConsentChoice === "local";
+    if (aiConsentClassic) aiConsentClassic.checked = aiConsentChoice === "classic";
     startButton.disabled = running || aiConsentChoice === "";
     if (!localAvailable && aiConsentChoice === "") {
       setAIConsentStatus("On-device speech recognition is unavailable here. Choose classic play or use Manual Timer.", true);
@@ -264,6 +286,7 @@
 
   const chooseAIConsent = (choice) => {
     aiConsentChoice = choice;
+    rememberAIConsent(choice);
     if (choice === "local") {
       setAIConsentStatus("On-device transcription is approved for this turn. Only its transcript will be sent to the judge.");
     } else {
@@ -313,6 +336,7 @@
         transcriptParts = [];
         if (transcriptInput) transcriptInput.value = "";
         aiConsentChoice = "classic";
+        rememberAIConsent("classic");
         if (aiConsentClassic) aiConsentClassic.checked = true;
         if (aiConsentLocal) aiConsentLocal.checked = false;
         setAIConsentStatus("On-device transcription stopped. Continuing without a transcript or AI bonus.", true);
@@ -884,6 +908,7 @@
       transcriptParts = [];
       if (aiConsentChoice === "local" && !startTranscription(audioTrack)) {
         aiConsentChoice = "classic";
+        rememberAIConsent("classic");
         if (aiConsentClassic) aiConsentClassic.checked = true;
         if (aiConsentLocal) aiConsentLocal.checked = false;
         setAIConsentStatus("On-device transcription could not start with this microphone. Continuing without a transcript or AI bonus.", true);
@@ -1034,6 +1059,11 @@
   syncSoundToggle();
   renderMicList();
   setReadyControls();
+  if (aiConsentChoice === "local") {
+    setAIConsentStatus("On-device transcription is approved for this turn. Only its transcript will be sent to the judge.");
+  } else if (aiConsentChoice === "classic") {
+    setAIConsentStatus("Classic play selected. This turn will send no transcript and receive no AI bonus.");
+  }
   if (serverTurnRunning) {
     updateResumeTimer();
   }

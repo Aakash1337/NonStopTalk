@@ -414,6 +414,14 @@ export function applyAction(
 			throw new GameError("Unknown room action.", 404);
 	}
 
+	// When the live socket is unavailable, a successful HTTP action is still
+	// proof that the current host is present. Refresh the fallback timestamp
+	// atomically with the mutation. Rejected actions never reach this point,
+	// successful non-host actions fail the ownership check, and a completed
+	// transfer no longer considers the old token the room host.
+	if (room.hostToken === token && !onlineTokens.has(token)) {
+		room.hostDisconnectedAt = now;
+	}
 	touch(room, now);
 }
 

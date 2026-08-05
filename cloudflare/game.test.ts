@@ -145,6 +145,27 @@ test("a seated player can claim hosting only after the disconnect grace", () => 
 	assert.equal(room.hostToken, guest);
 });
 
+test("successful host HTTP actions refresh takeover grace without weakening authorization", () => {
+	const room = createRoomState("ABC234", host, "Alice", 0);
+	joinRoom(room, guest, "Bob", 1);
+	setHostOnline(room, true, 500);
+	setHostOnline(room, false, 1_000);
+
+	applyAction(room, host, { type: "settings", duration: 45 }, 20_000);
+	assert.equal(room.hostDisconnectedAt, 20_000);
+	assert.throws(() => applyAction(room, guest, { type: "settings", duration: 10 }, 25_000), GameError);
+	assert.equal(room.hostDisconnectedAt, 20_000);
+	assert.throws(() => applyAction(room, guest, { type: "claim-host" }, 49_999), GameError);
+
+	applyAction(room, guest, { type: "claim-host" }, 50_000);
+	assert.equal(room.hostToken, guest);
+	assert.equal(room.hostDisconnectedAt, 50_000);
+	assert.throws(() => applyAction(room, host, { type: "claim-host" }, 79_999), GameError);
+	applyAction(room, host, { type: "claim-host" }, 80_000);
+	assert.equal(room.hostToken, host);
+	assert.equal(room.hostDisconnectedAt, 80_000);
+});
+
 test("redraw and next-turn replay guards invalidate delayed actions", () => {
 	const room = createRoomState("ABC234", host, "Alice", 0);
 	joinRoom(room, guest, "Bob", 1);
