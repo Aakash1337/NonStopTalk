@@ -1,107 +1,91 @@
 # Roadmap
 
-## Phase 1: Web Local Playable MVP
+Status labels in this document are explicit:
 
-Goal: Make the Go + HTMX web version fun and complete without online multiplayer or AI.
+- **Implemented**: present in the current repository.
+- **In progress**: usable work exists, but the stated outcome is not complete.
+- **Backlog**: not implemented and not a current product claim.
 
-Deliverables:
+## 1. Playable web game — Implemented
 
-- Go web project scaffold
-- Go templates and HTMX partials
-- Static CSS tokens
-- Small browser JavaScript module for microphone and timer behavior
-- Local player setup
-- Game settings
-- Preset topic packs
-- Custom topic list
-- Turn screen
-- Microphone permission flow
-- Basic voice and silence detection
-- Classic scoring
-- Scoreboard
-- Winner screen
-- Host override controls
+- Go game engine, handlers, embedded templates/static assets, and official HTMX 2.0.10
+- Player roster and configurable settings
+- Five preset packs and editable custom topics
+- Random, non-repeating topic cycles
+- Browser microphone selection, voice-activity/silence detection, sound cues, and manual timing
+- Multi-round turn progression, classic scoring, breakdowns, standings, winner, and host corrections
+- Responsive layout, focus styles, and reduced-motion support
 
-Exit criteria:
+The game loop is playable. Formal accessibility and broad hardware/browser validation remain in progress.
 
-- Two or more people can play a full local game.
-- The app can recover from bad microphone detection through host controls.
-- Scores are understandable.
-- The app runs locally from a Go server.
+## 2. Online rooms — Implemented
 
-## Phase 2: Game Feel and Content
+- Six-character room codes
+- Remote join, leave, browser-token reconnect, and live presence
+- Host-gated setup and scoring controls
+- Pass-and-play and remote seats in one room
+- Server-Sent Events synchronization in the Go edition and hibernatable WebSockets on Cloudflare
+- Server-side turn clock for remote score caps
+- Explicit host transfer and claim after a short absence grace period (30 seconds normally; up to 45 seconds for coalesced HTTP-only presence)
+- Same-origin checks, rate/capacity/input limits, and idle-room cleanup
 
-Goal: Make repeated local play more polished.
+The supplied native Cloudflare edition runs on Workers Free. Each room has one SQLite-backed Durable Object, so room state survives hibernation, restarts, and deployments until its 30-day idle expiry.
 
-Deliverables:
+## 3. Content, sharing, and retention — Implemented locally
 
-- More topic packs
-- Topic difficulty tags
-- Saved custom topic lists
-- Sound cues
-- Better timer pressure states
-- Mobile layout pass
-- Keyboard accessibility pass
-- Reduced motion support
+- Preset packs with difficulty labels
+- Offline or Anthropic-assisted theme generation
+- Browser-local saved presets
+- Plain-text custom-topic import/export
+- Per-room history for the last 20 completed games
+- Local web JSON snapshots with restore and 10-second autosave
 
-Exit criteria:
+Profiles and server-side custom-pack libraries are not part of this phase's implemented scope.
 
-- A host can set up a game quickly on laptop or mobile.
-- The game has enough topic variety for replay.
+## 4. Optional AI judge — Implemented locally
 
-## Phase 3: Online Multiplayer
+- Host opt-in plus per-speaker, per-turn consent
+- Fail-closed on-device `SpeechRecognition` requirement
+- No microphone-audio upload by NonStopTalk
+- Anthropic relevance grading when configured
+- Transparent server-side offline heuristic without an API key
+- Asynchronous, capped relevance bonus with confidence and short feedback
+- Classic-score preservation on missing transcript, timeout, provider failure, or interrupted restore
+- Host score correction
 
-Goal: Support remote players through rooms.
+Because strict local-recognition support is not widely available, classic/manual play remains the primary compatibility path.
 
-Status: delivered — rooms with join codes, host-gated controls, join/leave/reconnect, SSE-synced state, a server-side turn clock capping remote score claims, abuse protections (origin checks, rate limits, input and capacity caps, idle-room cleanup), host migration (explicit transfer plus claim-after-absence), and room persistence across server restarts via JSON snapshots.
+## 5. Deployment and hardening — In progress
 
-Deliverables:
+Implemented work includes:
 
-- Room codes
-- Host controls over room state
-- Player join and leave
-- Reconnect handling
-- Synced turn state
-- Server-authoritative scoring
-- Server-Sent Events or WebSocket transport
-- Basic abuse prevention
+- Embedded assets so compiled binaries run outside the repository
+- Unique persisted turn identities for delayed-action safety
+- Persisted shuffled topic-deck state
+- Reconciliation of unfinished judge work after restore
+- Browser timer resume from the server clock
+- Native Workers Static Assets + SQLite-backed Durable Object deployment and guide
+- Hibernatable online room WebSockets and 30-day storage cleanup alarms
+- Atomic host authorization, external-provider ceilings, connection caps, and replay-safe turn transitions
+- Go unit, handler, race, vet, and Playwright smoke validation
+- TypeScript game/route tests and a Wrangler deploy dry run
 
-Exit criteria:
+Remaining hardening:
 
-- Players on separate devices can complete a full game.
-- Host controls remain clear.
+- Feature parity between the Go and Cloudflare editions
+- Stronger automated cross-edition rule-parity checks
+- Broader browser/device testing
+- Observability and production operations guidance
+- Formal security and accessibility reviews
 
-## Phase 4: AI Judge Mode
+## 6. Explicit product backlog
 
-Goal: Add optional relevance grading without making AI mandatory.
+These are future ideas, not current features:
 
-Status: delivered — host-toggled AI judge with explicit consent copy, browser-side transcription (Web Speech API, no audio upload), Claude-backed relevance grading applied asynchronously as a capped bonus with plain-language feedback and a confidence label, repetition called out in feedback, an offline heuristic fallback when no API key is configured, host score override, and AI topic-pack generation from a host-supplied theme (offline template fallback included).
-
-Deliverables:
-
-- Audio recording per turn
-- Transcription provider
-- Relevance grading provider
-- AI scoring modifier
-- Explainable feedback
-- Consent and privacy messaging
-- Host override
-
-Exit criteria:
-
-- AI mode can grade a turn without blocking Classic mode.
-- Players can understand and challenge the score.
-
-## Phase 5: Sharing and Retention
-
-Goal: Make the game easier to return to and share.
-
-Status: core delivered — saved presets (settings + custom topics, on the host's device, applied atomically), topic pack export/import as shareable text files, and per-room game history (last 20 finished games, persisted with the room). Remaining: lightweight profiles if ever needed.
-
-Deliverables:
-
-- Saved presets
-- Topic pack import/export
-- Shareable custom packs
-- Game history
-- Lightweight profiles later if needed
+- Party voting
+- Named Lightning and Strict modes
+- Pause, skip-player, and restart-current-turn controls
+- Native desktop wrapper, installers, signing, and updates
+- User profiles
+- Family/content filters
+- Post-turn AI summaries

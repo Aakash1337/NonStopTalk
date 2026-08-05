@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm clean-install
+      - run: go test ./...
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: npm run typecheck:cloudflare
+      - run: npm run test:cloudflare
+      - run: npm run check:cloudflare
+      - run: npx playwright install --with-deps chromium
+      - run: npm run smoke

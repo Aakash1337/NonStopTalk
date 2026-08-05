@@ -2,7 +2,7 @@
 
 ## Intent
 
-Don't Stop Talking is a product UI for a live group game. The interface should feel immediate, legible, and pressure-filled without becoming visually chaotic. During turns, the screen should behave like a game table centerpiece: topic, timer, voice status, and score are visible from a few feet away.
+NonStopTalk is a product UI for a live group game. The interface should feel immediate, legible, and pressure-filled without becoming visually chaotic. During turns, the screen should behave like a game table centerpiece: topic, timer, voice status, and score are visible from a few feet away.
 
 Physical scene: a group is gathered around a laptop or TV in a living room or classroom, with mixed lighting, background noise, and players glancing at the screen while speaking.
 
@@ -107,4 +107,3 @@ Motion should communicate state:
 - Score applied
 
 Keep transitions around 150 to 250 ms. Support reduced motion.
-

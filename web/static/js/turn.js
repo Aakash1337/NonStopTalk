@@ -6,6 +6,11 @@
   const aiJudgeEnabled = stage.dataset.ai === "1";
   const duration = Number(stage.dataset.duration || 60);
   const silenceLimit = Number(stage.dataset.silence || 2);
+  const turnID = stage.dataset.turnId || "";
+  const initialRemaining = Math.min(duration, Math.max(0, Number(stage.dataset.remaining || duration)));
+  const serverTurnRunning = stage.dataset.turnRunning === "1";
+  const pageLoadedAt = performance.now();
+  const initialElapsed = serverTurnRunning ? duration - initialRemaining : 0;
   const timer = stage.querySelector("[data-timer]");
   const meter = stage.querySelector("[data-meter]");
   const voiceLabel = stage.querySelector("[data-voice-label]");
@@ -27,10 +32,15 @@
   const eliminatedInput = stage.querySelector("[data-eliminated]");
   const transcriptInput = stage.querySelector("[data-transcript]");
   const soundToggle = stage.querySelector("[data-sound-toggle]");
+  const aiConsentLocal = stage.querySelector("[data-ai-consent-local]");
+  const aiConsentClassic = stage.querySelector("[data-ai-consent-classic]");
+  const aiConsentStatus = stage.querySelector("[data-ai-consent-status]");
 
   const autoMicValue = "auto";
-  const micStorageKey = "dont-stop-talking.mic-id";
-  const soundStorageKey = "dont-stop-talking.sound";
+  const micStorageKey = "nonstoptalk.mic-id";
+  const legacyMicStorageKey = "dont-stop-talking.mic-id";
+  const soundStorageKey = "nonstoptalk.sound";
+  const legacySoundStorageKey = "dont-stop-talking.sound";
   const speakingThreshold = 0.035;
   const barCount = 8;
 
@@ -43,7 +53,8 @@
   let previewData;
   let previewStream;
   let previewRaf = 0;
-  let startedAt = 0;
+  let resumeRaf = 0;
+  let startedAt = serverTurnRunning ? pageLoadedAt - initialElapsed * 1000 : 0;
   let lastVoiceAt = 0;
   let raf = 0;
   let running = false;
@@ -56,10 +67,44 @@
   let lastTickSecond = -1;
   let silenceWarned = false;
   let soundEnabled = readSoundSetting();
+  const rememberedAIConsent = window.__nonStopTalkAIConsent;
+  let aiConsentChoice = (
+    aiJudgeEnabled
+    && rememberedAIConsent?.turnID === turnID
+    && (rememberedAIConsent.choice === "local" || rememberedAIConsent.choice === "classic")
+  ) ? rememberedAIConsent.choice : "";
+  if (rememberedAIConsent && rememberedAIConsent.turnID !== turnID) {
+    delete window.__nonStopTalkAIConsent;
+  }
+  let recognitionTrack = null;
+  let destroyed = false;
+  let resultPrepared = false;
+
+  function readMigratedStorage(key, legacyKey) {
+    const current = window.localStorage.getItem(key);
+    if (current !== null) {
+      try {
+        window.localStorage.removeItem(legacyKey);
+      } catch {
+        // The current value is still usable when legacy cleanup is blocked.
+      }
+      return current;
+    }
+    const legacy = window.localStorage.getItem(legacyKey);
+    if (legacy !== null) {
+      try {
+        window.localStorage.setItem(key, legacy);
+        window.localStorage.removeItem(legacyKey);
+      } catch {
+        // Read through the legacy value when migration cannot be persisted.
+      }
+    }
+    return legacy;
+  }
 
   function readSoundSetting() {
     try {
-      return window.localStorage.getItem(soundStorageKey) !== "off";
+      return readMigratedStorage(soundStorageKey, legacySoundStorageKey) !== "off";
     } catch {
       return true;
     }
@@ -72,6 +117,7 @@
       } else {
         window.localStorage.setItem(soundStorageKey, "off");
       }
+      window.localStorage.removeItem(legacySoundStorageKey);
     } catch {
       // Persistence is best-effort.
     }
@@ -79,7 +125,7 @@
 
   function readSavedMic() {
     try {
-      return window.localStorage.getItem(micStorageKey) || autoMicValue;
+      return readMigratedStorage(micStorageKey, legacyMicStorageKey) || autoMicValue;
     } catch {
       return autoMicValue;
     }
@@ -92,6 +138,7 @@
       } else {
         window.localStorage.removeItem(micStorageKey);
       }
+      window.localStorage.removeItem(legacyMicStorageKey);
     } catch {
       // Selection persistence is best-effort.
     }
@@ -165,36 +212,117 @@
   // the moment speaking starts. Fire-and-forget: local play continues even
   // if the notification is lost, the server just scores conservatively.
   const notifyTurnBegin = () => {
-    if (!base) return;
+    if (!base || !turnID) return;
     try {
-      fetch(`${base}/turn/begin`, { method: "POST", keepalive: true });
+      fetch(`${base}/turn/begin`, {
+        method: "POST",
+        keepalive: true,
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: new URLSearchParams({ turnID }),
+      }).catch(() => {
+        // Best-effort only.
+      });
     } catch {
       // Best-effort only.
     }
   };
 
   const setTurnRunningFlag = (value) => {
-    window.__dstTurnRunning = value;
+    window.__nonStopTalkTurnRunning = value;
     if (!value) {
-      document.dispatchEvent(new CustomEvent("dst:turn-idle"));
+      document.dispatchEvent(new CustomEvent("nonstoptalk:turn-idle"));
     }
   };
 
-  // With the AI judge on, the speaker's own browser transcribes the turn via
-  // the Web Speech API. Only the resulting text is submitted with the turn;
-  // audio never leaves the device. Everything here is best-effort: without
-  // speech support the turn simply gets no relevance bonus.
+  const recognitionConstructor = () => window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  const supportsLocalRecognition = () => {
+    const Recognition = recognitionConstructor();
+    if (!Recognition) return false;
+    try {
+      const probe = new Recognition();
+      return "processLocally" in probe;
+    } catch {
+      return false;
+    }
+  };
+
+  const setAIConsentStatus = (message, warning = false) => {
+    if (!aiConsentStatus) return;
+    aiConsentStatus.textContent = message;
+    aiConsentStatus.classList.toggle("is-warning", warning);
+  };
+
+  const rememberAIConsent = (choice) => {
+    if (!aiJudgeEnabled || (choice !== "local" && choice !== "classic")) return;
+    window.__nonStopTalkAIConsent = { turnID, choice };
+  };
+
+  const forgetAIConsent = () => {
+    if (window.__nonStopTalkAIConsent?.turnID === turnID) {
+      delete window.__nonStopTalkAIConsent;
+    }
+  };
+
+  const syncAIConsentControls = () => {
+    if (!aiJudgeEnabled) return;
+    const localAvailable = supportsLocalRecognition();
+    if (aiConsentLocal) {
+      aiConsentLocal.disabled = !localAvailable || running;
+    }
+    if (aiConsentClassic) {
+      aiConsentClassic.disabled = running;
+    }
+    if (!localAvailable && aiConsentChoice === "local") {
+      aiConsentChoice = "";
+      forgetAIConsent();
+      if (aiConsentLocal) aiConsentLocal.checked = false;
+    }
+    if (aiConsentLocal) aiConsentLocal.checked = aiConsentChoice === "local";
+    if (aiConsentClassic) aiConsentClassic.checked = aiConsentChoice === "classic";
+    startButton.disabled = running || aiConsentChoice === "";
+    if (!localAvailable && aiConsentChoice === "") {
+      setAIConsentStatus("On-device speech recognition is unavailable here. Choose classic play or use Manual Timer.", true);
+    }
+  };
+
+  const chooseAIConsent = (choice) => {
+    aiConsentChoice = choice;
+    rememberAIConsent(choice);
+    if (choice === "local") {
+      setAIConsentStatus("On-device transcription is approved for this turn. Only its transcript will be sent to the judge.");
+    } else {
+      setAIConsentStatus("Classic play selected. This turn will send no transcript and receive no AI bonus.");
+    }
+    syncAIConsentControls();
+  };
+
+  // AI transcription is fail-closed: it starts only when this speaker chose it,
+  // the browser guarantees local recognition, and the exact live track used by
+  // voice activity detection can be supplied to the recognizer.
   let recognition = null;
   let transcriptParts = [];
 
-  const startTranscription = () => {
-    if (!aiJudgeEnabled || !transcriptInput) return;
-    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!Recognition) return;
+  const startTranscription = (audioTrack) => {
+    if (!aiJudgeEnabled || aiConsentChoice !== "local" || !transcriptInput) return false;
+    const Recognition = recognitionConstructor();
+    if (!Recognition || !audioTrack || audioTrack.kind !== "audio" || audioTrack.readyState !== "live") {
+      return false;
+    }
     try {
       recognition = new Recognition();
+      if (!("processLocally" in recognition)) {
+        recognition = null;
+        return false;
+      }
+      recognition.processLocally = true;
+      if (recognition.processLocally !== true) {
+        recognition = null;
+        return false;
+      }
       recognition.continuous = true;
       recognition.interimResults = false;
+      recognitionTrack = audioTrack;
       recognition.onresult = (event) => {
         for (let i = event.resultIndex; i < event.results.length; i += 1) {
           const result = event.results[i];
@@ -203,25 +331,46 @@
           }
         }
       };
+      recognition.onerror = () => {
+        const failed = recognition;
+        recognition = null;
+        recognitionTrack = null;
+        transcriptParts = [];
+        if (transcriptInput) transcriptInput.value = "";
+        aiConsentChoice = "classic";
+        rememberAIConsent("classic");
+        if (aiConsentClassic) aiConsentClassic.checked = true;
+        if (aiConsentLocal) aiConsentLocal.checked = false;
+        setAIConsentStatus("On-device transcription stopped. Continuing without a transcript or AI bonus.", true);
+        try {
+          failed?.abort();
+        } catch {
+          // The recognizer has already stopped.
+        }
+      };
       // Restart if the browser ends recognition early while still speaking.
       recognition.onend = () => {
-        if (running && mode === "mic" && recognition) {
+        if (running && mode === "mic" && recognition && recognitionTrack?.readyState === "live") {
           try {
-            recognition.start();
+            recognition.start(recognitionTrack);
           } catch {
             // Recognition is best-effort.
           }
         }
       };
-      recognition.start();
+      recognition.start(recognitionTrack);
+      return true;
     } catch {
       recognition = null;
+      recognitionTrack = null;
+      return false;
     }
   };
 
   const stopTranscription = () => {
     const active = recognition;
     recognition = null;
+    recognitionTrack = null;
     if (active) {
       try {
         active.stop();
@@ -242,7 +391,12 @@
 
   const closeAudioContext = (context) => {
     if (context) {
-      context.close();
+      try {
+        const closing = context.close();
+        if (closing?.catch) closing.catch(() => {});
+      } catch {
+        // Audio cleanup is best-effort.
+      }
     }
   };
 
@@ -431,7 +585,7 @@
   };
 
   const previewTick = () => {
-    if (running || mode !== "idle" || !previewAnalyser || !previewData) return;
+    if (destroyed || running || mode !== "idle" || !previewAnalyser || !previewData) return;
     const volume = volumeLevel(previewAnalyser, previewData);
     const displayLevel = Math.min(1, volume * 8);
     const hearing = volume > speakingThreshold;
@@ -446,7 +600,7 @@
   };
 
   const startPreview = async () => {
-    if (running || mode !== "idle") return;
+    if (destroyed || running || mode !== "idle") return;
     if (!window.isSecureContext) {
       setMicStatus("Mic requires localhost or HTTPS", true);
       return;
@@ -462,6 +616,10 @@
 
     try {
       previewStream = await requestSelectedStream();
+      if (destroyed || running || mode !== "idle") {
+        stopPreview();
+        return;
+      }
       const AudioContextConstructor = audioContextConstructor();
       if (!AudioContextConstructor) throw new Error("audio context unavailable");
       previewAudioContext = new AudioContextConstructor();
@@ -481,7 +639,7 @@
   };
 
   const populateMics = async ({ requestPermission = false, startTest = false } = {}) => {
-    if (!micList) return;
+    if (destroyed || !micList) return;
     if (!window.isSecureContext) {
       micSelectionAvailable = false;
       renderMicList();
@@ -511,6 +669,7 @@
       }
 
       const devices = await navigator.mediaDevices.enumerateDevices();
+      if (destroyed) return;
       micDevices = devices.filter((device) => device.kind === "audioinput" && device.deviceId);
       micDevicesLoaded = true;
       renderMicList();
@@ -536,7 +695,7 @@
   };
 
   const selectMic = async (deviceID) => {
-    if (running || mode !== "idle") return;
+    if (destroyed || running || mode !== "idle") return;
     selectedMicID = deviceID;
     saveMic(selectedMicID);
     renderMicList();
@@ -544,7 +703,7 @@
   };
 
   const openMicDialog = async () => {
-    if (!micDialog || running || mode !== "idle") return;
+    if (destroyed || !micDialog || running || mode !== "idle") return;
     micDialog.hidden = false;
     renderMicList();
     await populateMics({ requestPermission: true, startTest: true });
@@ -563,7 +722,7 @@
       openMicButton.focus();
     }
     // Let any live update deferred while the dialog was open land now.
-    document.dispatchEvent(new CustomEvent("dst:turn-idle"));
+    document.dispatchEvent(new CustomEvent("nonstoptalk:turn-idle"));
   };
 
   const setStatus = (label, level, warning = false) => {
@@ -579,17 +738,33 @@
     if (manualButton) manualButton.disabled = true;
     if (redrawButton) redrawButton.disabled = true;
     setMicControlsDisabled(true);
+    if (aiConsentLocal) aiConsentLocal.disabled = true;
+    if (aiConsentClassic) aiConsentClassic.disabled = true;
   };
 
   const setReadyControls = () => {
     startButton.disabled = false;
-    startButton.textContent = "Start Talking";
-    if (manualButton) manualButton.disabled = false;
+    startButton.textContent = serverTurnRunning ? "Resume Talking" : "Start Talking";
+    if (manualButton) {
+      manualButton.disabled = false;
+      manualButton.textContent = serverTurnRunning ? "Resume Manual Timer" : "Manual Timer";
+    }
     if (redrawButton) redrawButton.disabled = false;
     setMicControlsDisabled(false);
+    syncAIConsentControls();
   };
 
   const elapsedSeconds = () => Math.min(duration, Math.max(0, Math.round((performance.now() - startedAt) / 1000)));
+
+  const updateResumeTimer = () => {
+    if (destroyed || running || !serverTurnRunning) return;
+    const remaining = Math.max(0, Math.ceil(duration - (performance.now() - startedAt) / 1000));
+    timer.textContent = String(remaining);
+    timer.classList.toggle("is-low", remaining <= 10 && remaining > 5);
+    timer.classList.toggle("is-critical", remaining <= 5);
+    spokenInput.value = String(elapsedSeconds());
+    resumeRaf = requestAnimationFrame(updateResumeTimer);
+  };
 
   const updateTimer = () => {
     const elapsed = elapsedSeconds();
@@ -605,10 +780,12 @@
   };
 
   const submitResult = (spokenSeconds, completed, eliminated) => {
+    resultPrepared = true;
     running = false;
     setTurnRunningFlag(false);
     mode = "idle";
     cancelAnimationFrame(raf);
+    cancelAnimationFrame(resumeRaf);
     stopTranscription();
     stopPreview();
     stopMic();
@@ -641,6 +818,13 @@
     const elapsed = (now - startedAt) / 1000;
     updateTimer();
 
+    // Reaching the full duration wins over a silence timeout crossed in the
+    // same animation frame.
+    if (elapsed >= duration) {
+      finish(true, false);
+      return;
+    }
+
     const volume = volumeLevel(analyser, data);
     const speaking = volume > speakingThreshold;
     if (speaking) {
@@ -663,10 +847,6 @@
       }
     }
 
-    if (elapsed >= duration) {
-      finish(true, false);
-      return;
-    }
     raf = requestAnimationFrame(micTick);
   };
 
@@ -674,7 +854,7 @@
     if (!running || mode !== "manual") return;
     const elapsed = updateTimer();
     setStatus("Manual timing", 1, false);
-    silenceLabel.textContent = "Host controlled";
+    silenceLabel.textContent = "Speaker controlled";
 
     if (elapsed >= duration) {
       finish(true, false);
@@ -684,11 +864,16 @@
   };
 
   const start = async () => {
-    if (running) return;
+    if (destroyed || running) return;
+    if (aiJudgeEnabled && aiConsentChoice === "") {
+      setAIConsentStatus("Choose on-device transcription or classic play before starting.", true);
+      return;
+    }
     closeMicDialog({ restoreFocus: false });
     stopPreview();
+    cancelAnimationFrame(resumeRaf);
     setStartedControls();
-    startButton.textContent = "Listening";
+    startButton.textContent = serverTurnRunning ? "Resuming" : "Listening";
     mode = "mic";
     setStatus("Listening", 0, false);
     try {
@@ -699,7 +884,15 @@
         throw new Error("microphone unavailable");
       }
       stream = await requestSelectedStream();
+      if (destroyed) {
+        stopMic();
+        return;
+      }
       await populateMics({ startTest: false });
+      if (destroyed) {
+        stopMic();
+        return;
+      }
       setMicControlsDisabled(true);
       setMicStatus(selectedMicLabelText(), false);
       const AudioContextConstructor = audioContextConstructor();
@@ -710,46 +903,112 @@
       analyser.fftSize = 1024;
       data = new Uint8Array(analyser.fftSize);
       source.connect(analyser);
+      const audioTrack = stream.getAudioTracks?.()[0] || stream.getTracks().find((track) => track.kind === "audio");
       running = true;
       setTurnRunningFlag(true);
       notifyTurnBegin();
       transcriptParts = [];
-      startTranscription();
-      startedAt = performance.now();
-      lastVoiceAt = startedAt;
+      if (aiConsentChoice === "local" && !startTranscription(audioTrack)) {
+        aiConsentChoice = "classic";
+        rememberAIConsent("classic");
+        if (aiConsentClassic) aiConsentClassic.checked = true;
+        if (aiConsentLocal) aiConsentLocal.checked = false;
+        setAIConsentStatus("On-device transcription could not start with this microphone. Continuing without a transcript or AI bonus.", true);
+      }
+      if (!serverTurnRunning) {
+        startedAt = performance.now();
+      }
+      lastVoiceAt = performance.now();
       lastTickSecond = -1;
       silenceWarned = false;
       cues.start();
       raf = requestAnimationFrame(micTick);
     } catch {
       running = false;
+      setTurnRunningFlag(false);
       mode = "idle";
       stopMic();
       setReadyControls();
       setStatus("Mic blocked", 0, true);
       silenceLabel.textContent = "Manual mode ready";
+      if (serverTurnRunning && !destroyed) {
+        updateResumeTimer();
+      }
     }
   };
 
   const startManual = () => {
-    if (running) return;
+    if (destroyed || running) return;
+    if (aiJudgeEnabled) {
+      if (aiConsentClassic) aiConsentClassic.checked = true;
+      if (aiConsentLocal) aiConsentLocal.checked = false;
+      chooseAIConsent("classic");
+    }
     closeMicDialog({ restoreFocus: false });
     stopPreview();
+    cancelAnimationFrame(resumeRaf);
     mode = "manual";
     running = true;
     setTurnRunningFlag(true);
     notifyTurnBegin();
-    startedAt = performance.now();
+    if (!serverTurnRunning) {
+      startedAt = performance.now();
+    }
     lastTickSecond = -1;
     cues.start();
     setStartedControls();
     setStatus("Manual timing", 1, false);
-    silenceLabel.textContent = "Host controlled";
+    silenceLabel.textContent = "Speaker controlled";
     raf = requestAnimationFrame(manualTick);
+  };
+
+  const deviceChangeHandler = () => {
+    if (!destroyed) populateMics({ startTest: true });
+  };
+
+  const afterSwapHandler = () => {
+    if (!stage.isConnected) teardown();
+  };
+
+  const beforeCleanupHandler = (event) => {
+    const removed = event.detail?.elt;
+    if (removed === stage || removed?.contains?.(stage)) teardown();
+  };
+
+  const pageHideHandler = () => teardown();
+
+  const teardown = () => {
+    if (destroyed) return;
+    destroyed = true;
+    running = false;
+    mode = "idle";
+    setTurnRunningFlag(false);
+    cancelAnimationFrame(raf);
+    cancelAnimationFrame(previewRaf);
+    cancelAnimationFrame(resumeRaf);
+    stopTranscription();
+    stopPreview();
+    stopMic();
+    closeAudioContext(cueContext);
+    cueContext = null;
+    navigator.mediaDevices?.removeEventListener?.("devicechange", deviceChangeHandler);
+    document.removeEventListener("htmx:beforeCleanupElement", beforeCleanupHandler);
+    document.removeEventListener("htmx:afterSwap", afterSwapHandler);
+    window.removeEventListener("pagehide", pageHideHandler);
   };
 
   startButton.addEventListener("click", start);
   if (manualButton) manualButton.addEventListener("click", startManual);
+  if (aiConsentLocal) {
+    aiConsentLocal.addEventListener("change", () => {
+      if (aiConsentLocal.checked) chooseAIConsent("local");
+    });
+  }
+  if (aiConsentClassic) {
+    aiConsentClassic.addEventListener("change", () => {
+      if (aiConsentClassic.checked) chooseAIConsent("classic");
+    });
+  }
   if (soundToggle) {
     soundToggle.addEventListener("click", () => {
       soundEnabled = !soundEnabled;
@@ -777,19 +1036,23 @@
     });
   }
   if (navigator.mediaDevices?.addEventListener) {
-    navigator.mediaDevices.addEventListener("devicechange", () => populateMics({ startTest: true }));
+    navigator.mediaDevices.addEventListener("devicechange", deviceChangeHandler);
   }
+  document.addEventListener("htmx:beforeCleanupElement", beforeCleanupHandler);
+  document.addEventListener("htmx:afterSwap", afterSwapHandler);
+  window.addEventListener("pagehide", pageHideHandler);
   if (completeButton) {
     completeButton.addEventListener("click", () => finish(true, false, { fullDuration: true }));
   }
   form.addEventListener("submit", () => {
-    if (running) {
+    if (!resultPrepared && (running || serverTurnRunning)) {
       spokenInput.value = String(elapsedSeconds());
     }
     running = false;
     setTurnRunningFlag(false);
     mode = "idle";
     cancelAnimationFrame(raf);
+    cancelAnimationFrame(resumeRaf);
     stopTranscription();
     stopPreview();
     stopMic();
@@ -798,5 +1061,14 @@
   fillLevelMeter(micSummaryLevel);
   syncSoundToggle();
   renderMicList();
+  setReadyControls();
+  if (aiConsentChoice === "local") {
+    setAIConsentStatus("On-device transcription is approved for this turn. Only its transcript will be sent to the judge.");
+  } else if (aiConsentChoice === "classic") {
+    setAIConsentStatus("Classic play selected. This turn will send no transcript and receive no AI bonus.");
+  }
+  if (serverTurnRunning) {
+    updateResumeTimer();
+  }
   populateMics();
 })();

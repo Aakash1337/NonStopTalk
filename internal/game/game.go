@@ -2,7 +2,9 @@ package game
 
 import (
 	"errors"
+	"math/rand"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -77,6 +79,10 @@ const (
 )
 
 type Turn struct {
+	// ID is unique for the lifetime of the session and identifies one exact
+	// active-topic generation. A redraw deliberately rotates it so delayed
+	// actions cannot affect the replacement topic.
+	ID            string
 	PlayerID      string
 	PlayerName    string
 	Round         int
@@ -133,22 +139,33 @@ type GameRecord struct {
 const MaxHistory = 20
 
 type Session struct {
-	ID               string
-	Players          []Player
-	Settings         Settings
-	Topics           []string
-	TopicCursor      int
-	CurrentPlayer    int
-	CurrentRound     int
-	Started          bool
-	Finished         bool
-	ActiveTurn       *Turn
-	CompletedTurns   []Turn
-	History          []GameRecord
-	CreatedAt        time.Time
+	ID       string
+	Players  []Player
+	Settings Settings
+	Topics   []string
+	// TopicDeck is a shuffled list of indexes into Topics. Keeping the order
+	// separate means random play never mutates the host's source topic list.
+	// The deck and its cursor are exported so an in-progress cycle survives
+	// persistence.
+	TopicDeck       []int
+	TopicDeckCursor int
+	TopicCursor     int
+	LastTopicIndex  int
+	HasLastTopic    bool
+	CurrentPlayer   int
+	CurrentRound    int
+	Started         bool
+	Finished        bool
+	ActiveTurn      *Turn
+	CompletedTurns  []Turn
+	History         []GameRecord
+	CreatedAt       time.Time
 	// NextPlayerNumber is exported so sessions survive serialization; new
 	// player IDs must not collide with ones handed out before a restart.
 	NextPlayerNumber int
+	// NextTurnNumber is likewise persisted so delayed asynchronous results can
+	// never collide with a turn created after a reset or restart.
+	NextTurnNumber int
 }
 
 func NewSession(id string) *Session {
@@ -158,6 +175,7 @@ func NewSession(id string) *Session {
 		CurrentRound:     1,
 		CreatedAt:        time.Now(),
 		NextPlayerNumber: 1,
+		NextTurnNumber:   1,
 	}
 }
 
@@ -277,7 +295,70 @@ func (s *Session) SetTopics(topics []string) {
 		}
 	}
 	s.Topics = cleaned
+	s.TopicDeck = nil
+	s.TopicDeckCursor = 0
 	s.TopicCursor = 0
+	s.LastTopicIndex = 0
+	s.HasLastTopic = false
+}
+
+// resetTopicDeck starts a fresh shuffled cycle while remembering the most
+// recently drawn topic. That memory prevents the last topic of one cycle or
+// game from immediately becoming the first topic of the next.
+func (s *Session) resetTopicDeck() {
+	s.TopicDeck = nil
+	s.TopicDeckCursor = 0
+	s.TopicCursor = 0
+}
+
+func (s *Session) topicDeckValid() bool {
+	if len(s.TopicDeck) != len(s.Topics) || s.TopicDeckCursor < 0 || s.TopicDeckCursor > len(s.TopicDeck) {
+		return false
+	}
+	seen := make([]bool, len(s.Topics))
+	for _, index := range s.TopicDeck {
+		if index < 0 || index >= len(s.Topics) || seen[index] {
+			return false
+		}
+		seen[index] = true
+	}
+	return true
+}
+
+func (s *Session) shuffleTopicDeck() {
+	s.TopicDeck = make([]int, len(s.Topics))
+	for index := range s.TopicDeck {
+		s.TopicDeck[index] = index
+	}
+	rand.Shuffle(len(s.TopicDeck), func(i, j int) {
+		s.TopicDeck[i], s.TopicDeck[j] = s.TopicDeck[j], s.TopicDeck[i]
+	})
+
+	// A fresh cycle must not begin with the topic that ended the previous one.
+	// Swapping with a random later entry retains randomness among the allowed
+	// first topics. A one-topic pack necessarily repeats.
+	if len(s.TopicDeck) > 1 && s.HasLastTopic &&
+		s.LastTopicIndex >= 0 && s.LastTopicIndex < len(s.Topics) &&
+		s.TopicDeck[0] == s.LastTopicIndex {
+		swapWith := 1 + rand.Intn(len(s.TopicDeck)-1)
+		s.TopicDeck[0], s.TopicDeck[swapWith] = s.TopicDeck[swapWith], s.TopicDeck[0]
+	}
+	s.TopicDeckCursor = 0
+}
+
+func (s *Session) drawTopic() (int, error) {
+	if len(s.Topics) == 0 {
+		return 0, errors.New("choose at least one topic")
+	}
+	if !s.topicDeckValid() || s.TopicDeckCursor >= len(s.TopicDeck) {
+		s.shuffleTopicDeck()
+	}
+	index := s.TopicDeck[s.TopicDeckCursor]
+	s.TopicDeckCursor++
+	s.TopicCursor++
+	s.LastTopicIndex = index
+	s.HasLastTopic = true
+	return index, nil
 }
 
 // archiveFinishedGame records a completed game in the room history before
@@ -300,6 +381,7 @@ func (s *Session) archiveFinishedGame() {
 // ResetForNewGame clears play state while keeping the roster, settings, and
 // topics so remote players stay bound to their seats across games.
 func (s *Session) ResetForNewGame() {
+	s.repairNextTurnNumber()
 	s.archiveFinishedGame()
 	s.Started = false
 	s.Finished = false
@@ -307,7 +389,7 @@ func (s *Session) ResetForNewGame() {
 	s.CurrentRound = 1
 	s.ActiveTurn = nil
 	s.CompletedTurns = nil
-	s.TopicCursor = 0
+	s.resetTopicDeck()
 	for i := range s.Players {
 		s.Players[i].Score = 0
 	}
@@ -324,6 +406,7 @@ func (s *Session) Start() error {
 	if len(s.Topics) == 0 {
 		return errors.New("choose at least one topic")
 	}
+	s.repairNextTurnNumber()
 	s.archiveFinishedGame()
 	s.Started = true
 	s.Finished = false
@@ -331,6 +414,7 @@ func (s *Session) Start() error {
 	s.CurrentRound = 1
 	s.ActiveTurn = nil
 	s.CompletedTurns = nil
+	s.resetTopicDeck()
 	for i := range s.Players {
 		s.Players[i].Score = 0
 	}
@@ -347,14 +431,21 @@ func (s *Session) StartTurn() (*Turn, error) {
 		return nil, errors.New("game is finished")
 	}
 	if s.ActiveTurn != nil {
+		if s.ActiveTurn.ID == "" {
+			s.ActiveTurn.ID = s.nextTurnID()
+		}
 		return s.ActiveTurn, nil
 	}
 	if len(s.Players) == 0 || len(s.Topics) == 0 {
 		return nil, errors.New("game is not ready")
 	}
 	player := s.Players[s.CurrentPlayer]
-	topicIndex := s.TopicCursor % len(s.Topics)
+	topicIndex, err := s.drawTopic()
+	if err != nil {
+		return nil, err
+	}
 	turn := &Turn{
+		ID:           s.nextTurnID(),
 		PlayerID:     player.ID,
 		PlayerName:   player.Name,
 		Round:        s.CurrentRound,
@@ -363,7 +454,6 @@ func (s *Session) StartTurn() (*Turn, error) {
 		Duration:     s.Settings.SpeakingDurationSeconds,
 		SilenceLimit: s.Settings.SilenceTimeoutSeconds,
 	}
-	s.TopicCursor++
 	s.ActiveTurn = turn
 	return turn, nil
 }
@@ -376,18 +466,17 @@ func (s *Session) RedrawActiveTurn() (*Turn, error) {
 		return nil, errors.New("choose at least one topic")
 	}
 
-	nextIndex := s.ActiveTurn.TopicIndex
-	for attempts := 0; attempts < len(s.Topics); attempts++ {
-		candidate := s.TopicCursor % len(s.Topics)
-		s.TopicCursor++
-		if len(s.Topics) == 1 || candidate != s.ActiveTurn.TopicIndex {
-			nextIndex = candidate
-			break
-		}
+	nextIndex, err := s.drawTopic()
+	if err != nil {
+		return nil, err
 	}
 
 	s.ActiveTurn.TopicIndex = nextIndex
 	s.ActiveTurn.Topic = s.Topics[nextIndex]
+	// A redraw invalidates every request rendered for the previous topic.
+	// Give the replacement its own ID so delayed begin/redraw/submit actions
+	// cannot operate on the newly displayed topic.
+	s.ActiveTurn.ID = s.nextTurnID()
 	return s.ActiveTurn, nil
 }
 
@@ -432,37 +521,98 @@ func (s *Session) MarkTurnAIPending() int {
 		return -1
 	}
 	index := len(s.CompletedTurns) - 1
-	s.CompletedTurns[index].AIStatus = AIStatusPending
+	turn := &s.CompletedTurns[index]
+	if turn.ID == "" {
+		turn.ID = s.nextTurnID()
+	}
+	switch turn.AIStatus {
+	case "":
+		turn.AIStatus = AIStatusPending
+	case AIStatusPending:
+		// Marking an already-pending turn is idempotent.
+	default:
+		// A resolved turn must never be reopened for another bonus.
+		return -1
+	}
 	return index
 }
 
 // ResolveTurnAI records the judge's outcome for a previously submitted turn
-// and applies the bonus to the player's score. The playerID and topic guard
-// against the roster or game changing while the judge was thinking.
-func (s *Session) ResolveTurnAI(index int, playerID, topic string, relevance *float64, confidence *float64, feedback string, status string) bool {
+// and applies the bonus to the player's score. The persisted turn ID guards
+// against a reset creating the same player/topic/index combination while the
+// judge was thinking. Only a pending turn can resolve, so applying a verdict is
+// exactly-once.
+func (s *Session) ResolveTurnAI(index int, turnID string, relevance *float64, confidence *float64, feedback string, status string) bool {
 	if index < 0 || index >= len(s.CompletedTurns) {
 		return false
 	}
 	turn := &s.CompletedTurns[index]
-	if turn.PlayerID != playerID || turn.Topic != topic {
+	if turnID == "" || turn.ID != turnID || turn.AIStatus != AIStatusPending {
+		return false
+	}
+	if status != AIStatusDone && status != AIStatusSkipped && status != AIStatusFailed {
+		return false
+	}
+	if status == AIStatusDone && relevance == nil {
 		return false
 	}
 	turn.AIStatus = status
 	turn.AIFeedback = feedback
 	turn.AIConfidence = confidence
 	if relevance == nil || status != AIStatusDone {
+		turn.AIRelevance = nil
 		return true
 	}
 	turn.AIRelevance = relevance
-	bonus := int(*relevance * 20)
+	bonus := aiRelevanceBonus(*relevance)
 	turn.Score += bonus
 	for i := range s.Players {
-		if s.Players[i].ID == playerID {
+		if s.Players[i].ID == turn.PlayerID {
 			s.Players[i].Score += bonus
 			break
 		}
 	}
 	return true
+}
+
+const restoredPendingAIFeedback = "The judge did not finish before the game was restored, so scoring stays classic."
+
+// ReconcilePendingAI fails any grading work that could not survive a process
+// restart. Pending turns have no committed AI bonus, but recomputing their
+// classic score also repairs an inconsistent snapshot without disturbing any
+// separate host score override.
+func (s *Session) ReconcilePendingAI() int {
+	reconciled := 0
+	for index := range s.CompletedTurns {
+		turn := &s.CompletedTurns[index]
+		if turn.AIStatus != AIStatusPending {
+			continue
+		}
+		classicScore := Score(ScoreInput{
+			DurationSeconds: turn.Duration,
+			SpokenSeconds:   turn.SpokenSeconds,
+			Completed:       turn.Completed,
+		})
+		delta := classicScore - turn.Score
+		turn.Score = classicScore
+		turn.AIStatus = AIStatusFailed
+		turn.AIRelevance = nil
+		turn.AIConfidence = nil
+		turn.AIFeedback = restoredPendingAIFeedback
+		if delta != 0 {
+			for playerIndex := range s.Players {
+				if s.Players[playerIndex].ID == turn.PlayerID {
+					s.Players[playerIndex].Score += delta
+					if s.Players[playerIndex].Score < 0 {
+						s.Players[playerIndex].Score = 0
+					}
+					break
+				}
+			}
+		}
+		reconciled++
+	}
+	return reconciled
 }
 
 func (s *Session) OverrideScore(playerID string, delta int) {
@@ -501,6 +651,38 @@ func (s *Session) advance() {
 	}
 	if s.CurrentRound > s.Settings.Rounds {
 		s.Finished = true
+	}
+}
+
+func (s *Session) nextTurnID() string {
+	s.repairNextTurnNumber()
+	id := "t" + itoa(s.NextTurnNumber)
+	s.NextTurnNumber++
+	return id
+}
+
+func (s *Session) repairNextTurnNumber() {
+	maxUsed := 0
+	remember := func(id string) {
+		if len(id) < 2 || id[0] != 't' {
+			return
+		}
+		number, err := strconv.Atoi(id[1:])
+		if err == nil && number > maxUsed {
+			maxUsed = number
+		}
+	}
+	if s.ActiveTurn != nil {
+		remember(s.ActiveTurn.ID)
+	}
+	for _, turn := range s.CompletedTurns {
+		remember(turn.ID)
+	}
+	if s.NextTurnNumber <= maxUsed {
+		s.NextTurnNumber = maxUsed + 1
+	}
+	if s.NextTurnNumber < 1 {
+		s.NextTurnNumber = 1
 	}
 }
 

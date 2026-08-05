@@ -11,7 +11,7 @@ import (
 
 const anthropicModel = anthropic.ModelClaudeOpus4_8
 
-const systemPrompt = `You are the judge in "Don't Stop Talking", a party game where a player must speak
+const systemPrompt = `You are the judge in "NonStopTalk", a party game where a player must speak
 about an assigned topic without stopping. You receive the topic and an automatic
 speech transcript of the turn.
 

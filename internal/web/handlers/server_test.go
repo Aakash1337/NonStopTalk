@@ -7,19 +7,26 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"dontstoptalking/internal/judge"
-	"dontstoptalking/internal/room"
+	"github.com/Aakash1337/NonStopTalk/internal/game"
+	"github.com/Aakash1337/NonStopTalk/internal/judge"
+	"github.com/Aakash1337/NonStopTalk/internal/room"
 )
 
 // client is a fake browser: it keeps its identity cookie across requests.
 type client struct {
-	t      *testing.T
-	router http.Handler
-	cookie string
+	t           *testing.T
+	router      http.Handler
+	cookie      string
+	turnID      string
+	afterTurnID string
 }
+
+var turnIDPattern = regexp.MustCompile(`data-turn-id="([^"]+)"`)
+var afterTurnIDPattern = regexp.MustCompile(`name="afterTurnID" value="([^"]+)"`)
 
 func newTestRouter(t *testing.T) http.Handler {
 	t.Helper()
@@ -36,6 +43,20 @@ func newClient(t *testing.T, router http.Handler) *client {
 
 func (c *client) do(method, path string, form url.Values) *httptest.ResponseRecorder {
 	c.t.Helper()
+	if method == http.MethodPost &&
+		(strings.HasSuffix(path, "/turn/begin") || strings.HasSuffix(path, "/turn/redraw") || strings.HasSuffix(path, "/turn/submit")) &&
+		c.turnID != "" {
+		if form == nil {
+			form = url.Values{}
+		}
+		form.Set("turnID", c.turnID)
+	}
+	if method == http.MethodPost && strings.HasSuffix(path, "/turn/start") && c.afterTurnID != "" {
+		if form == nil {
+			form = url.Values{}
+		}
+		form.Set("afterTurnID", c.afterTurnID)
+	}
 	var req *http.Request
 	if form != nil {
 		req = httptest.NewRequest(method, path, strings.NewReader(form.Encode()))
@@ -49,9 +70,17 @@ func (c *client) do(method, path string, form url.Values) *httptest.ResponseReco
 	res := httptest.NewRecorder()
 	c.router.ServeHTTP(res, req)
 	for _, sc := range res.Result().Cookies() {
-		if sc.Name == "dst_token" {
-			c.cookie = "dst_token=" + sc.Value
+		if sc.Name == tokenCookie {
+			c.cookie = tokenCookie + "=" + sc.Value
 		}
+	}
+	if match := turnIDPattern.FindStringSubmatch(res.Body.String()); match != nil {
+		c.turnID = match[1]
+	} else if res.Code == http.StatusOK {
+		c.turnID = ""
+	}
+	if match := afterTurnIDPattern.FindStringSubmatch(res.Body.String()); match != nil {
+		c.afterTurnID = match[1]
 	}
 	return res
 }
@@ -230,6 +259,7 @@ func TestRemoteSpeakerScoresAreServerAuthoritative(t *testing.T) {
 	})
 
 	// Blair is next and can start their own turn.
+	guest.do(http.MethodGet, base+"/partial", nil)
 	res := guest.do(http.MethodPost, base+"/turn/start", nil)
 	if !strings.Contains(res.Body.String(), "Start Talking") {
 		t.Fatalf("expected guest to start own turn, got %s", res.Body.String())
@@ -292,6 +322,56 @@ func TestLeaveRemovesSeat(t *testing.T) {
 	}
 }
 
+func TestStartedGameRejectsSetupMutations(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.SetTopicGenerator(stubGenerator{})
+	router := server.Routes()
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	guest := newClient(t, router)
+	guest.join(code, "Blair")
+	host.do(http.MethodPost, base+"/game/start", nil)
+	activeID := host.turnID
+
+	outsider := newClient(t, router)
+	if res := outsider.join(code, "Charlie"); res.Header().Get("Location") != "/?err=started" {
+		t.Fatalf("expected started-game join rejection, got %q", res.Header().Get("Location"))
+	}
+
+	host.do(http.MethodPost, base+"/players", url.Values{"name": {"Late player"}})
+	host.do(http.MethodPost, base+"/players/rename", url.Values{"id": {"p1"}, "name": {"Changed"}})
+	host.do(http.MethodPost, base+"/players/move", url.Values{"id": {"p2"}, "offset": {"-1"}})
+	host.do(http.MethodPost, base+"/players/remove", url.Values{"id": {"p2"}})
+	host.do(http.MethodPost, base+"/settings", url.Values{"duration": {"10"}, "silence": {"1"}, "rounds": {"2"}})
+	host.do(http.MethodPost, base+"/topics/custom", url.Values{"topics": {"Leaked replacement"}})
+	host.do(http.MethodPost, base+"/topics/generate", url.Values{"theme": {"late request"}})
+	host.do(http.MethodPost, base+"/presets/apply", url.Values{
+		"duration": {"10"}, "silence": {"1"}, "rounds": {"2"}, "topicPack": {"custom"}, "topics": {"Preset replacement"},
+	})
+	guest.do(http.MethodPost, base+"/leave", nil)
+	host.do(http.MethodPost, base+"/game/reset", nil)
+
+	rm, err := server.rooms.Get(code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rm.View(func() {
+		if !rm.Session.Started || rm.Session.Finished || rm.Session.ActiveTurn == nil || rm.Session.ActiveTurn.ID != activeID {
+			t.Fatalf("setup replay changed active game: %+v", rm.Session.ActiveTurn)
+		}
+		if len(rm.Session.Players) != 2 || rm.Session.Players[0].Name != "Avery" || rm.Session.Players[1].Name != "Blair" {
+			t.Fatalf("setup replay changed roster: %+v", rm.Session.Players)
+		}
+		if rm.Session.Settings.SpeakingDurationSeconds != 60 || strings.Contains(strings.Join(rm.Session.Topics, "\n"), "replacement") {
+			t.Fatalf("setup replay changed settings/topics: %+v %v", rm.Session.Settings, rm.Session.Topics)
+		}
+	})
+}
+
 func TestRoomFullRejectsJoin(t *testing.T) {
 	router := newTestRouter(t)
 	host := newClient(t, router)
@@ -319,6 +399,309 @@ func TestCrossOriginPostRejected(t *testing.T) {
 	}
 }
 
+func TestClientKeyHandlesProxyAndIPv6Addresses(t *testing.T) {
+	server := &Server{}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "[2001:db8::1]:4321"
+	if got := server.clientKey(req); got != "2001:db8::1" {
+		t.Fatalf("expected parsed IPv6 key, got %q", got)
+	}
+	req.Header.Set("CF-Connecting-IP", "203.0.113.9")
+	if got := server.clientKey(req); got != "2001:db8::1" {
+		t.Fatalf("expected untrusted proxy header ignored, got %q", got)
+	}
+	server.trustCloudflareIP = true
+	if got := server.clientKey(req); got != "203.0.113.9" {
+		t.Fatalf("expected trusted Cloudflare client key, got %q", got)
+	}
+	req.Header.Set("CF-Connecting-IP", "not-an-ip")
+	if got := server.clientKey(req); got != "2001:db8::1" {
+		t.Fatalf("expected invalid proxy header ignored, got %q", got)
+	}
+}
+
+func TestGlobalProviderBudgetAndUTF8TranscriptCap(t *testing.T) {
+	server := &Server{limiter: newRateLimiter(), externalProvider: true}
+	for i := 0; i < maxProviderCallsPerHour; i++ {
+		if !server.allowProviderCall() {
+			t.Fatalf("provider call %d unexpectedly rejected", i+1)
+		}
+	}
+	if server.allowProviderCall() {
+		t.Fatal("expected process-wide hourly provider ceiling")
+	}
+
+	value := strings.Repeat("é", maxTranscriptBytes)
+	truncated := truncateUTF8Bytes(value, maxTranscriptBytes)
+	if len(truncated) > maxTranscriptBytes || strings.ToValidUTF8(truncated, "") != truncated {
+		t.Fatalf("expected valid rune-aligned truncation, len=%d", len(truncated))
+	}
+
+	split := truncateUTF8Bytes(strings.Repeat("é", 4), 5)
+	if split != strings.Repeat("é", 2) {
+		t.Fatalf("expected the split rune to be dropped, got %q", split)
+	}
+	if truncateUTF8Bytes("é", 0) != "" {
+		t.Fatal("expected a zero byte limit to return an empty string")
+	}
+}
+
+func TestLegacyIdentityCookieMigratesWithoutLosingHost(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := server.Routes()
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	token := strings.TrimPrefix(host.cookie, tokenCookie+"=")
+	if !validToken(token) {
+		t.Fatalf("expected a valid primary token, got %q", token)
+	}
+
+	legacyBrowser := newClient(t, router)
+	legacyBrowser.cookie = legacyTokenCookie + "=" + token
+	res := legacyBrowser.do(http.MethodGet, "/room/"+code, nil)
+	if !strings.Contains(res.Body.String(), "Start Game") {
+		t.Fatalf("expected migrated browser to retain host controls, got %s", res.Body.String())
+	}
+	if legacyBrowser.cookie != tokenCookie+"="+token {
+		t.Fatalf("expected primary cookie migration, got %q", legacyBrowser.cookie)
+	}
+}
+
+func TestSecureCookieBehindHTTPSProxy(t *testing.T) {
+	router := newTestRouter(t)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	cookies := res.Result().Cookies()
+	if len(cookies) == 0 || cookies[0].Name != tokenCookie || !cookies[0].Secure {
+		t.Fatalf("expected a Secure identity cookie behind HTTPS, got %+v", cookies)
+	}
+}
+
+func TestInvalidOrOversizedFormIsRejected(t *testing.T) {
+	router := newTestRouter(t)
+
+	large := httptest.NewRequest(http.MethodPost, "/rooms",
+		strings.NewReader("name="+strings.Repeat("x", maxRequestBody)))
+	large.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	largeRes := httptest.NewRecorder()
+	router.ServeHTTP(largeRes, large)
+	if largeRes.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for oversized body, got %d: %s", largeRes.Code, largeRes.Body.String())
+	}
+
+	malformed := httptest.NewRequest(http.MethodPost, "/rooms", strings.NewReader("not-a-multipart-body"))
+	malformed.Header.Set("Content-Type", "multipart/form-data; boundary=missing")
+	malformedRes := httptest.NewRecorder()
+	router.ServeHTTP(malformedRes, malformed)
+	if malformedRes.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed multipart data, got %d: %s", malformedRes.Code, malformedRes.Body.String())
+	}
+}
+
+func TestStaleTurnRequestCannotAffectNextTurn(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := server.Routes()
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	host.do(http.MethodPost, base+"/players", url.Values{"name": {"Blair"}})
+	host.do(http.MethodPost, base+"/game/start", nil)
+	firstTurnID := host.turnID
+	host.do(http.MethodPost, base+"/turn/submit", url.Values{
+		"spokenSeconds": {"5"}, "completed": {"false"},
+	})
+	host.do(http.MethodPost, base+"/turn/start", nil)
+	secondTurnID := host.turnID
+	if firstTurnID == "" || secondTurnID == "" || firstTurnID == secondTurnID {
+		t.Fatalf("expected distinct turn IDs, got %q and %q", firstTurnID, secondTurnID)
+	}
+	host.do(http.MethodPost, base+"/turn/begin", nil)
+
+	staleForm := url.Values{
+		"turnID": {firstTurnID}, "spokenSeconds": {"60"}, "completed": {"true"},
+	}
+	req := httptest.NewRequest(http.MethodPost, base+"/turn/submit", strings.NewReader(staleForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Cookie", host.cookie)
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if !strings.Contains(res.Body.String(), `data-turn-id="`+secondTurnID+`"`) {
+		t.Fatalf("expected current turn to remain active, got %s", res.Body.String())
+	}
+	rm, err := server.rooms.Get(code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rm.TurnRunning() {
+		t.Fatal("expected stale submission to leave the current turn clock running")
+	}
+	activeID := ""
+	rm.View(func() {
+		if rm.Session.ActiveTurn != nil {
+			activeID = rm.Session.ActiveTurn.ID
+		}
+	})
+	if activeID != secondTurnID {
+		t.Fatalf("expected active turn %q, got %q", secondTurnID, activeID)
+	}
+}
+
+func TestDuplicateStartTurnKeepsRunningClock(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := server.Routes()
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	host.do(http.MethodPost, base+"/players", url.Values{"name": {"Blair"}})
+	host.do(http.MethodPost, base+"/game/start", nil)
+	host.do(http.MethodPost, base+"/turn/submit", url.Values{"spokenSeconds": {"5"}})
+	host.do(http.MethodPost, base+"/turn/start", nil)
+	activeID := host.turnID
+	host.do(http.MethodPost, base+"/turn/begin", nil)
+
+	res := host.do(http.MethodPost, base+"/turn/start", nil)
+	if !strings.Contains(res.Body.String(), `data-turn-id="`+activeID+`"`) {
+		t.Fatalf("expected duplicate start to keep turn %q, got %s", activeID, res.Body.String())
+	}
+	rm, err := server.rooms.Get(code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rm.TurnRunning() {
+		t.Fatal("expected duplicate start to preserve the running clock")
+	}
+}
+
+func TestDelayedNextTurnReplayCannotStartLaterTurn(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := server.Routes()
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	host.do(http.MethodPost, base+"/players", url.Values{"name": {"Blair"}})
+	host.do(http.MethodPost, base+"/settings", url.Values{
+		"duration": {"60"}, "silence": {"2"}, "rounds": {"2"}, "topicPack": {"everyday"},
+	})
+	host.do(http.MethodPost, base+"/game/start", nil)
+	host.do(http.MethodPost, base+"/turn/submit", url.Values{"spokenSeconds": {"5"}})
+	staleAfter := host.afterTurnID
+	host.do(http.MethodPost, base+"/turn/start", nil)
+	host.do(http.MethodPost, base+"/turn/submit", url.Values{"spokenSeconds": {"5"}})
+
+	form := url.Values{"afterTurnID": {staleAfter}}
+	req := httptest.NewRequest(http.MethodPost, base+"/turn/start", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Cookie", host.cookie)
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if !strings.Contains(res.Body.String(), "next-turn request is stale") {
+		t.Fatalf("expected stale replay rejection, got %s", res.Body.String())
+	}
+	rm, err := server.rooms.Get(code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rm.View(func() {
+		if rm.Session.ActiveTurn != nil {
+			t.Fatalf("stale replay started turn %+v", rm.Session.ActiveTurn)
+		}
+	})
+}
+
+func TestRetriedRedrawCannotRedrawReplacementTopic(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := server.Routes()
+	host := newClient(t, router)
+	code := host.createRoom("Avery")
+	base := "/room/" + code
+	host.do(http.MethodPost, base+"/players", url.Values{"name": {"Blair"}})
+	host.do(http.MethodPost, base+"/game/start", nil)
+	oldID := host.turnID
+	host.do(http.MethodPost, base+"/turn/redraw", nil)
+	newID := host.turnID
+	if newID == "" || newID == oldID {
+		t.Fatalf("expected redraw to rotate ID, old=%q new=%q", oldID, newID)
+	}
+
+	rm, err := server.rooms.Get(code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rm.TurnRunning() {
+		t.Fatal("expected a pre-turn redraw to leave the clock stopped")
+	}
+	cursor := 0
+	rm.View(func() { cursor = rm.Session.TopicCursor })
+
+	host.do(http.MethodPost, base+"/turn/begin", nil)
+	res := host.do(http.MethodPost, base+"/turn/redraw", nil)
+	if !strings.Contains(res.Body.String(), "only be redrawn before speaking begins") {
+		t.Fatalf("expected running-turn redraw rejection, got %s", res.Body.String())
+	}
+	if !rm.TurnRunning() {
+		t.Fatal("rejected redraw must not clear the running clock")
+	}
+
+	form := url.Values{"turnID": {oldID}}
+	req := httptest.NewRequest(http.MethodPost, base+"/turn/redraw", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Cookie", host.cookie)
+	staleRes := httptest.NewRecorder()
+	router.ServeHTTP(staleRes, req)
+	if !strings.Contains(staleRes.Body.String(), `data-turn-id="`+newID+`"`) {
+		t.Fatalf("expected replacement turn to remain, got %s", staleRes.Body.String())
+	}
+	rm.View(func() {
+		if rm.Session.TopicCursor != cursor {
+			t.Fatalf("stale redraw advanced topic cursor from %d to %d", cursor, rm.Session.TopicCursor)
+		}
+	})
+}
+
+func TestNormalizeRemoteTurnClaim(t *testing.T) {
+	tests := []struct {
+		name             string
+		claimed, elapsed int
+		wantsCompleted   bool
+		wantSpoken       int
+		wantCompleted    bool
+	}{
+		{name: "no clock", claimed: 60, elapsed: -1, wantsCompleted: true, wantSpoken: 0},
+		{name: "too early", claimed: 60, elapsed: 57, wantsCompleted: true, wantSpoken: 58},
+		{name: "grace boundary", claimed: 60, elapsed: 58, wantsCompleted: true, wantSpoken: 60, wantCompleted: true},
+		{name: "no completion claim", claimed: 60, elapsed: 58, wantSpoken: 59},
+		{name: "past duration", claimed: 80, elapsed: 61, wantsCompleted: true, wantSpoken: 60, wantCompleted: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			spoken, completed := normalizeRemoteTurnClaim(test.claimed, test.wantsCompleted, test.elapsed, 60)
+			if spoken != test.wantSpoken || completed != test.wantCompleted {
+				t.Fatalf("got (%d,%v), want (%d,%v)", spoken, completed, test.wantSpoken, test.wantCompleted)
+			}
+			if completed && game.Score(game.ScoreInput{DurationSeconds: 60, SpokenSeconds: spoken, Completed: true}) != 85 {
+				t.Fatal("accepted completion must include the full-time bonus")
+			}
+		})
+	}
+}
+
 func TestJoinRateLimit(t *testing.T) {
 	router := newTestRouter(t)
 	guest := newClient(t, router)
@@ -343,6 +726,99 @@ func (stubJudge) Grade(context.Context, string, string) (judge.Verdict, error) {
 	return judge.Verdict{Relevance: 0.5, Feedback: "Stub: solid effort on the topic."}, nil
 }
 
+type blockingJudge struct {
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (blockingJudge) Name() string { return "blocking judge" }
+
+func (b blockingJudge) Grade(context.Context, string, string) (judge.Verdict, error) {
+	b.started <- struct{}{}
+	<-b.release
+	return judge.Verdict{Relevance: 0.5, Feedback: "reviewed"}, nil
+}
+
+func TestAIProviderConcurrencyIsBounded(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, maxProviderCalls)
+	release := make(chan struct{})
+	server.SetJudge(blockingJudge{started: started, release: release})
+
+	type pendingTurn struct {
+		rm    *room.Room
+		index int
+		turn  game.Turn
+	}
+	makePending := func() pendingTurn {
+		rm, createErr := server.rooms.Create("host")
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		var result pendingTurn
+		var setupErr error
+		result.rm = rm
+		rm.Do(func() {
+			rm.Session.AddPlayer("Avery")
+			rm.Session.AddPlayer("Blair")
+			rm.Session.SetTopics([]string{"A topic"})
+			if err := rm.Session.Start(); err != nil {
+				setupErr = err
+				return
+			}
+			if _, err := rm.Session.StartTurn(); err != nil {
+				setupErr = err
+				return
+			}
+			turn, err := rm.Session.SubmitTurn(5, false, false)
+			if err != nil {
+				setupErr = err
+				return
+			}
+			result.turn = turn
+			result.index = rm.Session.MarkTurnAIPending()
+		})
+		if setupErr != nil {
+			t.Fatal(setupErr)
+		}
+		return result
+	}
+
+	pending := make([]pendingTurn, maxProviderCalls+1)
+	for i := range pending {
+		pending[i] = makePending()
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < maxProviderCalls; i++ {
+		wg.Add(1)
+		go func(work pendingTurn) {
+			defer wg.Done()
+			server.gradeTurn(work.rm, work.index, work.turn, "transcript")
+		}(pending[i])
+	}
+	for i := 0; i < maxProviderCalls; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("provider calls did not reach the concurrency ceiling")
+		}
+	}
+
+	overflow := pending[len(pending)-1]
+	server.gradeTurn(overflow.rm, overflow.index, overflow.turn, "transcript")
+	overflow.rm.View(func() {
+		turn := overflow.rm.Session.CompletedTurns[overflow.index]
+		if turn.AIStatus != game.AIStatusFailed || !strings.Contains(turn.AIFeedback, "busy") {
+			t.Fatalf("expected overflow review to fail closed, got %+v", turn)
+		}
+	})
+	close(release)
+	wg.Wait()
+}
+
 func TestAIJudgeGradesTurnAsynchronously(t *testing.T) {
 	server, err := NewServer("../templates/*.html")
 	if err != nil {
@@ -363,7 +839,7 @@ func TestAIJudgeGradesTurnAsynchronously(t *testing.T) {
 
 	res := host.do(http.MethodPost, base+"/turn/submit", url.Values{
 		"spokenSeconds": {"10"}, "completed": {"true"}, "eliminated": {"false"},
-		"transcript":    {"I truly believe pancakes are the best breakfast food ever made"},
+		"transcript": {"I truly believe pancakes are the best breakfast food ever made"},
 	})
 	if res.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", res.Code, res.Body.String())
@@ -437,7 +913,7 @@ func TestNoAIVerdictWhenDisabled(t *testing.T) {
 
 	res := host.do(http.MethodPost, base+"/turn/submit", url.Values{
 		"spokenSeconds": {"10"}, "completed": {"true"}, "eliminated": {"false"},
-		"transcript":    {"words that should be ignored"},
+		"transcript": {"words that should be ignored"},
 	})
 	body := res.Body.String()
 	if strings.Contains(body, "AI") && strings.Contains(body, "reviewing") {
@@ -503,7 +979,7 @@ func TestGenerateTopicsIsHostOnly(t *testing.T) {
 	guest.join(code, "Blair")
 
 	res := guest.do(http.MethodPost, "/room/"+code+"/topics/generate", url.Values{"theme": {"pirates"}})
-	if !strings.Contains(res.Body.String(), "Only the host can generate topics.") {
+	if !strings.Contains(res.Body.String(), "Only the host can generate topics") {
 		t.Fatalf("expected host-only message, got %s", res.Body.String())
 	}
 	page := host.do(http.MethodGet, "/room/"+code, nil).Body.String()
@@ -560,6 +1036,10 @@ func TestClaimHostRequiresAbsentHost(t *testing.T) {
 	base := "/room/" + code
 	guest := newClient(t, router)
 	guest.join(code, "Blair")
+	guestPage := guest.do(http.MethodGet, base, nil).Body.String()
+	if !strings.Contains(guestPage, "data-host-claim-wait-ms=") {
+		t.Fatalf("expected guest page to schedule host-claim availability, got %s", guestPage)
+	}
 
 	// Host was just active: claim refused under the default grace.
 	res := guest.do(http.MethodPost, base+"/host/claim", nil)
@@ -649,7 +1129,7 @@ func TestApplyPresetInstallsSettingsAndTopics(t *testing.T) {
 	guest := newClient(t, router)
 	guest.join(code, "Blair")
 	res = guest.do(http.MethodPost, base+"/presets/apply", url.Values{"duration": {"10"}})
-	if !strings.Contains(res.Body.String(), "Only the host can apply presets.") {
+	if !strings.Contains(res.Body.String(), "Only the host can apply presets") {
 		t.Fatalf("expected host-only message, got %s", res.Body.String())
 	}
 }

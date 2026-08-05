@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"dontstoptalking/internal/game"
+	"github.com/Aakash1337/NonStopTalk/internal/game"
 )
 
 // roomSnapshot is the durable part of a room. Live connections, presence,
@@ -102,6 +102,10 @@ func (m *Manager) LoadFrom(path string) error {
 		if err := json.Unmarshal(saved.Session, session); err != nil {
 			continue
 		}
+		// Provider goroutines are process-local and cannot survive a restart.
+		// Resolve any persisted pending grades to their classic score so the UI
+		// never waits forever and a delayed result cannot apply twice.
+		session.ReconcilePendingAI()
 		members := saved.Members
 		if members == nil {
 			members = map[string]string{}
@@ -116,6 +120,7 @@ func (m *Manager) LoadFrom(path string) error {
 			online:       map[string]int{},
 			tokenConns:   map[string]int{},
 			lastActive:   saved.LastActive,
+			done:         make(chan struct{}),
 		}
 	}
 	return nil

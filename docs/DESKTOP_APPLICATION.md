@@ -1,48 +1,51 @@
 # Desktop Application
 
-## Current Desktop Target
+## Current desktop target
 
-The desktop version starts a local Go server on `127.0.0.1` and opens the game in the user's default browser. This gives the app desktop-style launch behavior while keeping the Go + HTMX architecture intact.
+NonStopTalk currently provides a browser-launcher executable rather than a native window. It:
 
-This approach is intentional for the first implementation:
+1. Starts the same Go server used by the web command on an available `127.0.0.1` port.
+2. Opens that address in the default browser.
+3. Keeps running until the launcher process is stopped.
 
-- It works with the Web Audio API on `localhost`.
-- It avoids native wrapper complexity before the game loop is proven.
-- It shares the same handlers, templates, CSS, and JavaScript as the web version.
-- It keeps future packaging options open.
+This shares the game engine, HTTP handlers, embedded templates, official HTMX 2.0.10 asset, CSS, and vanilla JavaScript with `cmd/web`. The native Cloudflare edition is a separate runtime. `localhost` also provides a browser secure context for microphone permission.
+
+The desktop launcher keeps room state in memory. The `NONSTOPTALK_DATA_FILE` setting applies to `cmd/web`; `cmd/desktop` does not currently enable JSON autosave.
 
 ## Run
 
-```text
+```sh
 go run ./cmd/desktop
 ```
 
-The launcher chooses an available local port and opens the app automatically.
+If the browser cannot be opened automatically, the launcher logs the local address to open manually.
 
 ## Build
 
-```text
-go build -o bin/dont-stop-talking-desktop.exe ./cmd/desktop
+Templates and browser assets are embedded, so the resulting executable can be launched outside the repository:
+
+```sh
+go build -o nonstoptalk-desktop ./cmd/desktop
 ```
 
-## Native Wrapper Later
+On Windows, an explicit executable name can be used:
 
-Once the local game loop is stable, the desktop target can move to a native WebView wrapper such as Wails or webview. The application should still keep the Go game engine and server-rendered UI boundaries.
+```powershell
+go build -o nonstoptalk-desktop.exe ./cmd/desktop
+```
 
-Suggested later options:
+## Available features
 
-- Wails for a polished installable desktop app
-- WebView wrapper for a smaller native shell
-- Tauri only if the project later accepts a Rust build dependency
+The launcher exposes the same current feature set as the local web server:
 
-## Desktop MVP Scope
+- Pass-and-play rooms using one or more browser windows on the same computer
+- Player, settings, topic, turn, scoring, and history screens
+- Microphone selection, local voice-activity detection, and manual timing
+- Optional on-device transcription with offline or Anthropic-backed judging
+- Saved browser presets and custom-topic import/export
 
-- Launch local app
-- Add players
-- Configure settings
-- Choose preset or custom topics
-- Play local turns
-- Use microphone silence detection
-- Score turns
-- Show final winner
+The launcher binds only to `127.0.0.1`, so its automatically opened address is local to that computer. Use `cmd/web` or the documented online deployment for players on other devices.
 
+## Native wrapper backlog
+
+A packaged native WebView application is not implemented. A future wrapper could use Wails, a small WebView shell, or another platform-specific approach while preserving the Go game engine and shared web UI. Installer creation, code signing, automatic updates, and native profiles are also outside the current scope.

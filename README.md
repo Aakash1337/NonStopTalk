@@ -1,146 +1,179 @@
-# Don't Stop Talking
+# NonStopTalk
 
-Don't Stop Talking is a multiplayer party game where players take turns speaking about random topics without pausing. It supports local pass-and-play first, then online rooms, custom topic packs, and optional AI-assisted speech relevance scoring.
+NonStopTalk is a work-in-progress multiplayer party game about speaking on a surprise topic without pausing for too long. It supports pass-and-play on one device and online rooms for players on separate devices.
 
-## Core Idea
+The playable core exists today. The project is still being hardened, and the [roadmap](docs/ROADMAP.md) separates implemented features from future ideas.
 
-On each turn, a player receives a topic and must speak continuously for a configured duration. If they stop speaking for longer than the silence timeout, their turn ends. Each player gets turns across one or more rounds, and the player with the highest score wins.
+## Implemented now
 
-Default settings:
+- Six-character rooms with a host, remote seats, browser-based reconnect, live updates (SSE in the local Go app and hibernatable WebSockets online), host transfer, and takeover after a short absence grace period
+- Local pass-and-play and remote turns in the same room
+- Player add, rename, remove, and reorder controls
+- Configurable 10–300 second turns, 1–10 second silence limits, and 1–10 rounds
+- Five built-in topic packs plus custom lists; the local Go edition also has import/export, offline or Anthropic-assisted theme generation, and device-local saved presets
+- A shuffled topic deck that uses every available topic before repeating; with more than one topic, a new cycle does not immediately repeat the previous draw
+- Local voice-activity and silence detection plus a manual timer fallback; the Go edition also has microphone selection and sound cues
+- Classic scoring, score explanations, host adjustments, standings, winner view, and the last 20 finished games in each room; optional AI relevance bonuses are available in the local Go edition
+- Periodic JSON room snapshots locally and SQLite-backed Durable Object room persistence online
 
-- Speaking duration: 60 seconds
-- Silence timeout: 2 seconds
-- Rounds: 1
-- Play style: local multiplayer
+## Privacy and AI
 
-## MVP Scope
+Classic play does not require an account, an API key, transcription, or audio upload. The browser uses its microphone locally for voice-activity detection. NonStopTalk does not upload or persist microphone audio.
 
-The first playable version should be a web app focused on local multiplayer:
+The free Cloudflare edition is classic-only: it does not transcribe speech or call an AI provider. The following optional AI behavior belongs to the local Go edition.
 
-- Add and reorder players
-- Pick preset or custom topics
-- Configure timer, silence timeout, and rounds
-- Detect speech and silence through the browser microphone
-- Run each turn with clear host controls
-- Score every turn
-- Show round standings and final winner
+The AI judge is opt-in at two levels: the host enables it for the room, then the current speaker chooses whether to use transcription for that turn. Transcription starts only when the browser exposes `SpeechRecognition` with `processLocally` support and accepts the selected live microphone track. If any of those checks fail, the turn continues with classic scoring or the manual timer.
 
-## Online Rooms
+When a speaker consents, the resulting text transcript is submitted to the NonStopTalk server with that turn. The transcript is used for grading and is not stored in room history or JSON snapshots.
 
-Every game runs in a room with a six-character join code:
+- With `ANTHROPIC_API_KEY` configured, the server sends the topic and transcript to Anthropic for relevance grading. Theme generation sends only the host's theme.
+- Without the key, grading and theme generation use deterministic local heuristics on the server; no external AI provider is contacted.
+- Choosing classic or manual play sends no transcript and awards no AI bonus.
 
-- The host creates a room, optionally taking a seat, and controls settings, topics, pacing, and score overrides.
-- Remote players join with the code, get their own seat bound to their browser, and see the game update live over Server-Sent Events.
-- Pass-and-play still works: local seats the host adds run from the host's screen.
-- The current speaker runs the mic on their own device; the server keeps its own turn clock, so remote players cannot claim more speaking time than the server observed.
-- Reconnecting is automatic: rejoin with the same browser and you keep your seat.
-- Hosting can move: the host can hand control to any player on their own device ("Make Host"), and if the host disappears for more than 30 seconds, any seated player can take over.
-- Rooms survive server restarts: game state is snapshotted to `data/rooms.json` every 10 seconds (set `DST_DATA_FILE` to relocate it, or `DST_DATA_FILE=off` to keep everything in memory).
+Browser support for guaranteed on-device speech recognition is limited. AI grading is therefore an enhancement, not a requirement. See [AI and Privacy](docs/AI_AND_PRIVACY.md) for the exact data flow.
 
-Protections: same-origin checks on all state changes, per-IP rate limits on room create/join, capped request bodies, name/topic length limits, room and seat caps, and idle-room cleanup.
+## Run locally
 
-## AI Judge Mode (optional)
+The module currently requires Go 1.26.
 
-The host can enable an AI judge in game settings. When on:
+Run the web server:
 
-- The current speaker's browser transcribes their words with the Web Speech API. Audio never leaves the device; only the transcript of the current turn is submitted with the turn.
-- The server asks Claude (model `claude-opus-4-8`) how relevant the speech was to the topic and applies a bonus of up to 20 points, with a short explanation shown on the score screen.
-- Grading is asynchronous and best-effort: classic scoring always lands first, and a judge failure just means no bonus. The host can override any score.
-- Without an `ANTHROPIC_API_KEY`, a transparent offline keyword-overlap judge is used instead, so the mode stays playable and testable everywhere.
-
-The host can also generate a themed topic pack: type a theme (for example "road trips with dragons") and Claude writes ten speaking prompts into the editable custom list. Only the theme text is sent to the provider; without an API key, simple offline templates are used instead.
-
-The judge reports its confidence with every verdict (noisy transcripts and ambiguous topics lower it), shown next to the feedback, and it is told to call out heavy repetition.
-
-## Presets, Sharing, and History
-
-- **Presets**: the host can save the current settings and custom topics under a name (stored on their device) and re-apply everything with one click.
-- **Topic pack sharing**: export the custom topic list as a plain text file and import one someone shared with you.
-- **Game history**: each room remembers its last 20 finished games (winner, standings, turn count) — shown on the setup screen and persisted with the room.
-
-Run with the AI judge backed by Claude:
-
-```text
-ANTHROPIC_API_KEY=sk-ant-... go run ./cmd/web
+```sh
+go run ./cmd/web
 ```
 
-See [AI and Privacy](docs/AI_AND_PRIVACY.md) for the consent and data-handling rules this implements.
+Open [http://localhost:8080](http://localhost:8080). The web command saves room snapshots to `data/rooms.json` by default.
 
-## Preferred Web Stack
+Run the desktop-style launcher:
 
-The preferred implementation path is a Go web application using HTMX for server-rendered interactions.
+```sh
+go run ./cmd/desktop
+```
 
-- Backend: Go
-- Rendering: Go templates
-- UI interactions: HTMX
-- Browser-only behavior: small vanilla JavaScript modules for microphone access, voice activity, and precise timers
-- Future online play: Go server with WebSocket or Server-Sent Events room updates
+The launcher starts the same app on an available `127.0.0.1` port and opens the default browser. Its room state is in memory for that process.
 
-HTMX can cover setup forms, player lists, topic selection, scoreboards, and host actions. Microphone detection still requires browser JavaScript because server-rendered HTML cannot directly access the user's audio input.
+Templates, CSS, and JavaScript are embedded in production binaries, so a built executable does not depend on the repository as its working directory:
 
-## Future Scope
+```sh
+go build -o nonstoptalk-web ./cmd/web
+go build -o nonstoptalk-desktop ./cmd/desktop
+```
 
-- Online room codes
-- Real-time multiplayer
-- AI transcription and topic relevance grading
+Online microphone access requires HTTPS. Browsers treat `localhost` as a secure context for local development; if microphone access is unavailable, the manual timer remains playable.
+
+## Run online
+
+The repository includes a separate native Cloudflare edition for no-cost online hosting. Static files are served through Workers Static Assets, each room is coordinated and persisted by a SQLite-backed Durable Object, and live updates use hibernatable WebSockets. The local Go edition remains independent.
+
+With a Cloudflare Workers Free account, Node.js 22+, and Wrangler authentication:
+
+```sh
+npm ci
+npx wrangler login
+npm run deploy
+```
+
+No Docker engine, Container subscription, or static build-output setting is required. The public routes are `/` and `/room/ABC123`; the Durable Object binding is internal and has no separate public URL. See [Cloudflare Deployment](docs/CLOUDFLARE_DEPLOYMENT.md) for the free-tier limits, dashboard settings, local Worker development, and custom-domain routing.
+
+## Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `8080` | Web server port. A value with or without a leading colon is accepted. |
+| `NONSTOPTALK_DATA_FILE` | `data/rooms.json` | Local JSON snapshot path. Set to `off` for memory-only rooms. |
+| `DST_DATA_FILE` | unset | Deprecated compatibility fallback used only when `NONSTOPTALK_DATA_FILE` is not set. |
+| `ANTHROPIC_API_KEY` | unset | Enables Anthropic relevance grading and topic generation. Without it, server-side offline heuristics are used. |
+| `NONSTOPTALK_TRUST_CLOUDFLARE_IP` | `false` | For the local Go server only: trust `CF-Connecting-IP` for rate limiting when an operator has placed the server behind a trusted Cloudflare proxy. |
+
+Example memory-only local run:
+
+```sh
+NONSTOPTALK_DATA_FILE=off go run ./cmd/web
+```
+
+## Scoring
+
+Classic scoring is deliberately simple:
+
+```text
+score = seconds_spoken + 25 points when the full timer is completed
+```
+
+The optional judge adds `round(relevance × 20)` points. Judge work is asynchronous and best-effort, so a timeout, missing transcript, provider error, or interrupted restore leaves the classic score intact. The host can adjust any player's total in five-point increments.
+
+For remote speakers, the server keeps its own turn clock and caps client-reported speaking time. This is lightweight party-game authority, not an anti-cheat system.
+
+## Test
+
+Run the Go suite, race detector, and static checks:
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+```
+
+The browser smoke test requires Node.js/npm and Playwright's Chromium:
+
+```sh
+npm ci
+npx playwright install chromium
+npm run smoke
+```
+
+The smoke suite drives five flows: microphone-denied manual play with reload/resume, automatic timer completion with a mocked microphone, a two-browser online room synchronized by SSE, an on-device AI-judge turn using the offline provider, and a fail-closed classic fallback when local transcription is unavailable.
+
+To use an existing Chromium binary:
+
+```sh
+SMOKE_CHROMIUM=/path/to/chromium npm run smoke
+```
+
+Set `HEADED=1` to watch the browser run.
+
+Validate the native Cloudflare game rules and deploy bundle:
+
+```sh
+npm run test:cloudflare
+npm run check:cloudflare
+```
+
+## Architecture
+
+- Go `net/http` server and domain packages for local/self-hosted play
+- Embedded Go templates and static assets
+- Official HTMX 2.0.10 vendored for server-rendered interactions
+- Vanilla JavaScript for microphone selection, Web Audio voice activity, on-device speech recognition, timers, presets, and SSE refreshes
+- In-memory Go room manager with optional periodic JSON snapshots
+- Anthropic Go SDK behind a small judge/topic-generator interface
+- Native TypeScript Worker, Workers Static Assets, and one SQLite-backed Durable Object per online room
+- Hibernatable WebSockets for cost-efficient online synchronization
+- Playwright browser smoke coverage plus Go unit and handler tests
+
+There is no frontend build step for local play.
+
+## Explicit future backlog
+
+These ideas are not presented as current features:
+
 - Party voting
-- Topic pack sharing
-- Accessibility and family-safe content filters
-- Saved game presets
+- Named Lightning and Strict modes
+- Pause, skip-player, and restart-current-turn controls
+- A packaged native desktop wrapper
+- User profiles
+- Family/content filters
+- Post-turn AI summaries
+- Full feature parity between the local Go and free Cloudflare editions (AI judge, saved presets, import/export, microphone picker, and sound cues)
 
 ## Documents
 
 - [Product Context](PRODUCT.md)
 - [Design Direction](DESIGN.md)
 - [Game Design](docs/GAME_DESIGN.md)
-- [Requirements](docs/REQUIREMENTS.md)
+- [Requirements and Status](docs/REQUIREMENTS.md)
 - [Technical Architecture](docs/TECHNICAL_ARCHITECTURE.md)
-- [Web Version Plan](docs/WEB_VERSION_PLAN.md)
+- [Historical Web Version Plan](docs/WEB_VERSION_PLAN.md)
 - [Desktop Application](docs/DESKTOP_APPLICATION.md)
 - [Roadmap](docs/ROADMAP.md)
 - [AI and Privacy](docs/AI_AND_PRIVACY.md)
-
-## Run the Desktop Version
-
-```text
-go run ./cmd/desktop
-```
-
-This starts a local Go server and opens the game in your browser as the first desktop target.
-
-## Run the Web Server
-
-```text
-go run ./cmd/web
-```
-
-Then open `http://localhost:8080`.
-
-Set `PORT` to run the server on a different port:
-
-```text
-$env:PORT=8081; go run ./cmd/web
-```
-
-## Test
-
-Run Go tests:
-
-```text
-go test ./...
-```
-
-Run the local browser smoke test:
-
-```text
-npm.cmd install
-npm.cmd run smoke
-```
-
-The smoke test starts its own Go server on a temporary port and drives three full games in a browser: a pass-and-play game with the mic-denied manual timer fallback, an automatic-ending game with a mocked microphone, and a two-browser remote room game joined by code and synced over Server-Sent Events.
-
-If the Playwright-managed browser is not installed, point the smoke test at an existing Chromium binary:
-
-```text
-SMOKE_CHROMIUM=/path/to/chromium npm run smoke
-```
+- [Cloudflare Deployment](docs/CLOUDFLARE_DEPLOYMENT.md)
