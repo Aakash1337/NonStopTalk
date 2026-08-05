@@ -19,7 +19,7 @@ It currently supports:
 - A post-attempt strength, highest-value focus, evidence, and retry drill
 - Optional transcript-derived pace/filler/repetition evidence through strict on-device browser recognition; consented derived word patterns remain in the compact summary
 - Aggregate session summaries in IndexedDB, plus JSON export
-- Separate, off-by-default local retention of the attempt recording and available full transcript, with per-attempt downloads and confirmed two-store deletion
+- Separate, off-by-default local retention of the attempt recording and available captured transcript, with partial-text warnings, per-attempt downloads, and confirmed two-store deletion
 
 It does not prove that the current thresholds work equally well across microphones, rooms, languages, accents, disabilities, or browsers. It does not yet pair a baseline with an unassisted retry or establish a learning outcome.
 
@@ -62,7 +62,7 @@ The setup asks for:
 
 Choosing one goal limits the amount of advice and makes a later retry interpretable. The three prompts are fixed prototype content, not a curriculum or generated AI content.
 
-The two optional data choices do different jobs. Transcript analysis adds pace/count/pattern evidence and, when it succeeds, stores bounded derived filler/repetition patterns in the compact summary. Full-session retention records the active attempt and can keep the full transcript only if transcript analysis was also enabled and successful. Neither checkbox silently enables the other.
+The two optional data choices do different jobs. Transcript analysis adds pace/count/pattern evidence and, when it captures text, stores bounded derived filler/repetition patterns in the compact summary. Full-session retention records the active attempt and can keep captured transcript text only if transcript analysis was also enabled and returned text. Neither checkbox silently enables the other.
 
 ### 2. Consent and calibrate
 
@@ -102,7 +102,8 @@ The review contains:
 - Input-level consistency
 - A voice/quiet/unobserved timeline for the current review
 - Unobserved duration when audio-level callbacks were missing
-- Optional word count, words per minute, filler/repetition counts, and derived pattern labels when local transcript analysis succeeded
+- Optional word count, words per minute, filler/repetition counts, and derived pattern labels when local transcript analysis captured text
+- A warning when recognition finalization did not finish cleanly and captured text may be partial
 
 The timeline exists only in the in-memory review. It is intentionally excluded from the stored summary.
 
@@ -112,7 +113,7 @@ The timeline exists only in the in-memory review. It is intentionally excluded f
 
 `/progress` reads summaries for the current site origin in the current browser profile. It shows attempt count, average speaking ratio, the latest raw speaking-ratio change, and individual attempt summaries. The latest change is descriptive, not a quality judgment: a higher speaking ratio is not always better, especially when the selected goal is purposeful pauses.
 
-The user can export summary JSON. When a completed attempt has separately retained artifacts, Progress shows individual **Download recording** and/or **Download transcript** controls. JSON export never includes those full artifacts. **Delete local history** clears both coaching stores for that origin after confirmation. Another domain, scheme, port, or browser profile has separate IndexedDB storage; for example, `127.0.0.1:8787` and a different Wrangler port do not share history.
+The user can export summary JSON. When a completed attempt has separately retained artifacts, Progress shows individual **Download recording** and/or **Download transcript** controls and repeats any partial-transcript warning. JSON export never includes those retained artifacts. **Delete local history** clears both coaching stores for that origin after confirmation. Another domain, scheme, port, or browser profile has separate IndexedDB storage; for example, `127.0.0.1:8787` and a different Wrangler port do not share history.
 
 ## Architecture and data flow
 
@@ -146,10 +147,12 @@ Workers Static Assets
             │
             ├─ goal + evidence query
             │    → lexical retrieval over bundled coaching cards
-            │    → top card's prewritten drill + source
+            │    → normally top card's prewritten drill
+            │    → evidence-safety fallback when card is unsupported
             │
             └─ rule-selected strength/focus
-                 + retrieved drill + fixed comparison sentence → review
+                 + supported drill + fixed comparison sentence → review
+                  ├─ card labeled used guidance or retrieved context
                   └─ IndexedDB v2 → /progress
                        ├─ session-summaries (every saved attempt)
                        └─ session-artifacts (only after separate opt-in)
@@ -280,7 +283,7 @@ Scores at least `0.75` are labeled high; scores at least `0.50` are medium; the 
 
 | Metric | Calculation shape | What it can support | Important limitation |
 | --- | --- | --- | --- |
-| Attempt duration | End time minus attempt start, capped by target duration | Wall-clock attempt/progress timing | It can exceed the duration with reliable audio frames |
+| Attempt duration | End time minus attempt start, capped by target duration | Wall-clock attempt/progress timing | It includes both observed and unobserved time, but never exceeds the selected target |
 | Observed duration | Voice duration plus silence duration | Amount of time backed by held level frames | Each frame is held for at most 250 ms; missing callbacks reduce it |
 | Unobserved duration | Attempt duration minus observed duration | Discloses missing level evidence instead of inventing delivery behavior | It does not explain why callbacks stopped |
 | Signal coverage | `observed duration / attempt duration` | Caps confidence and protects advice when input is unstable | It is an availability measure, not speaking quality |
@@ -314,7 +317,9 @@ Sample density compares observed frames with a conservative minimum of `max(8, o
 
 ## Optional transcript measurements
 
-The prototype does not send audio to a transcription service. When the user checks the option and the browser exposes mandatory local processing, it creates `SpeechRecognition`, sets `processLocally = true`, supplies the active microphone track, and keeps interim text in memory up to 20,000 characters.
+The prototype does not send audio to a transcription service. When the user checks the option and the browser exposes mandatory local processing, it creates `SpeechRecognition`, sets `processLocally = true`, supplies the active microphone track, and keeps interim text in memory up to 20,000 characters. Failed initialization or an attempt with no captured text yields no transcript metrics.
+
+At finish, the page calls `recognition.stop()` and allows up to two seconds for final `onresult` delivery and clean termination. A recognition error or timeout after text arrived does not erase that text: the analyzer may use it, but Review warns that it may be partial. With separate full-session retention, both the artifact and summary artifact metadata set `transcriptMayBePartial`, so Progress repeats the warning. Error events and their payloads are never retained, and the application never describes captured text as complete.
 
 At finish, the deterministic transcript analyzer computes:
 
@@ -325,13 +330,13 @@ At finish, the deterministic transcript analyzer computes:
 
 Words are Unicode letter/number tokens with internal apostrophes; matching is case-normalized. Multiword filler matches reserve their token positions so the same words are not double-counted by another filler pattern. “Very very” counts one immediate repetition; separated repetitions do not.
 
-The compact summary retains numeric aggregates plus bounded derived pattern arrays: each array keeps at most 50 filler/repeated-word entries, and each label is trimmed to at most 64 characters. These labels are not the full transcript, but they can still contain sensitive lexical content—for example, an immediately repeated name. The full transcript is then cleared by default. Filler markers and repetitions can be intentional, and a summary without the full transcript cannot support later context review. Recognition errors, punctuation, language mismatch, or an unavailable local language pack can also make these estimates wrong. The prototype does not attempt a remote fallback, semantic relevance, structure, sentiment, emotion, or accent scoring.
+The compact summary retains numeric aggregates plus bounded derived pattern arrays: each array keeps at most 50 filler/repeated-word entries, and each label is trimmed to at most 64 characters. These labels are not the captured transcript, but they can still contain sensitive lexical content—for example, an immediately repeated name. Captured transcript text is then cleared by default. A summary without that text cannot support later context review. Filler markers and repetitions can be intentional, and recognition errors, punctuation, language mismatch, or an unavailable local language pack can make these estimates wrong. The prototype does not attempt a remote fallback, semantic relevance, structure, sentiment, emotion, or accent scoring.
 
 The Web Speech on-device APIs are experimental and browser-dependent. MDN documents [`processLocally`, availability checks, and language packs](https://developer.mozilla.org/en-US/docs/Web/API/Web_Speech_API/Using_the_Web_Speech_API#on-device_speech_recognition). The current prototype detects the mandatory-local property and fails back to acoustic analysis if recognition cannot start; it does not manage language-pack installation.
 
 ## Optional full-session artifacts
 
-Attempt-recording/full-transcript retention is independent from transcript analysis and starts unchecked on a fresh page load. **Try again** preserves the visible setup selections so the user can review or uncheck them before the next attempt. If `MediaRecorder` is unavailable, the setup disables this option and compact summaries still work.
+Attempt-recording/captured-transcript retention is independent from transcript analysis and starts unchecked on a fresh page load. **Try again** preserves the visible setup selections so the user can review or uncheck them before the next attempt. If `MediaRecorder` is unavailable, the setup disables this option and compact summaries still work.
 
 When selected:
 
@@ -341,7 +346,7 @@ When selected:
 4. Finishing stops the recorder and combines non-empty chunks into an audio `Blob`.
 5. The application saves that encoded `Blob` and any captured transcript to `session-artifacts`, linked to the summary by ID.
 
-Recording retention does not enable transcription. If transcript analysis was off or failed, the artifact may contain audio only. If the recorder failed but a full transcript exists, a transcript-only artifact can be saved. Canceling or navigating away stops the recorder, clears pending chunks, and saves no unfinished artifact.
+Recording retention does not enable transcription. If transcript analysis was off or produced no text, the artifact may contain audio only. If the recorder failed but captured transcript text exists, a transcript-only artifact can be saved. Canceling or navigating away stops the recorder, clears pending chunks, and saves no unfinished artifact.
 
 ## Small local RAG, deterministic tips, and advice
 
@@ -351,15 +356,16 @@ The prototype uses a small retrieval-augmented generation pattern entirely insid
 selected goal + measured evidence
   → lexical query
   → ranked match from curated in-app coaching cards
-  → top card's prewritten drill kept intact
+  → normally keep top card's prewritten drill intact
+  → otherwise keep an evidence-backed priority drill
   → fixed comparison sentence selected from the top measurement priority
   → separate rules select strength/focus and assemble the review
-  → review names the grounding source
+  → review labels the card as used guidance or retrieved context
 ```
 
-It is labeled **retrieval-augmented deterministic generation**, where “generation” is bounded template assembly. The engine does not rewrite the retrieved drill or synthesize open-ended prose: it appends one prewritten, metric-specific comparison sentence. This is not the common production RAG stack: there is no LLM, embedding model, vector database, remote corpus, or network request.
+It is labeled **retrieval-augmented deterministic generation**, where “generation” is bounded template assembly. Normally the engine keeps the retrieved drill intact and appends one prewritten, metric-specific comparison sentence. An evidence-safety rule can substitute the measured priority's drill when the retrieved card would add unsupported advice. This is not the common production RAG stack: there is no LLM, embedding model, vector database, remote corpus, or network request.
 
-“Deterministic” means the same measurements and goal lead to the same live-tip, strength/focus, retrieved-card, and comparison-template decisions. Retrieval makes the base drill traceable to curated product material without introducing a variable model response.
+“Deterministic” means the same measurements and goal lead to the same live-tip, strength/focus, retrieved-card, used-card, safety-override, and comparison-template decisions. When a card contributes the base drill, that contribution is traceable to curated product material without introducing a variable model response.
 
 This design was chosen for the presentation prototype because it is:
 
@@ -367,7 +373,7 @@ This design was chosen for the presentation prototype because it is:
 - **No-cost:** there is no inference, embedding, or database service.
 - **Low-latency:** the card library is already loaded with the application.
 - **Auditable:** a reviewer can inspect every card, ranking rule, and source label.
-- **Testable:** controlled evidence can assert the exact retrieved card and advice.
+- **Testable:** controlled evidence can assert the exact retrieved card, whether it was actually used, and the resulting advice.
 
 A future LLM-backed RAG layer could retrieve richer curriculum passages and generate more contextual explanations. It would also add provider/model behavior, embeddings or another semantic index, latency, cost, consent and retention boundaries, source/version governance, prompt-injection defenses, and a much larger relevance, safety, and fairness evaluation.
 
@@ -394,7 +400,7 @@ The lexical ranker:
 4. Sorts by descending score and uses frozen corpus order as the deterministic tie-break.
 5. Treats a score below `4` as too weak to claim grounding, returns at most two qualifying cards in the current advice call, and otherwise returns `repeat-and-compare` as a score-zero fallback.
 
-The grounding record exposes retrieval mode, generation mode `deterministic-template`, library version, used card ID, source label, score, and matched terms. This is why the presenter can show not just advice, but where its local context came from. The numeric retrieval score is a ranking aid, not a probability or coaching-quality score.
+The grounding record exposes retrieval mode, generation mode `deterministic-template`, library version, `usedCardId`, retrieved cards, source labels, scores, and matched terms. `usedCardId` identifies the card only when its drill actually contributed; it is `null` when an evidence-safety rule supplies the drill. The review therefore says either that the card shaped the retry or that it was retrieved as context. For example, missing callbacks require the restore-input drill and must not turn a lexical match into unsupported microphone-distance advice. The numeric retrieval score is a ranking aid, not a probability or coaching-quality score.
 
 The live policy evaluates acoustic conditions for pauses/long speech runs, level consistency, and clipping. Choosing the pace or pauses goal lowers the acoustic long-run threshold; transcript-derived WPM, fillers, and local card retrieval happen only after the attempt for review advice, not live tips. The surrounding UI adds three anti-distraction controls:
 
@@ -435,12 +441,14 @@ focus next
 
 drill
   ├─ title
-  └─ top retrieved card's intact retry instruction
+  └─ normally top retrieved card's intact retry instruction
+       or evidence-backed priority instruction after a safety override
        + one fixed comparison sentence selected by the top priority
 
 grounding
   ├─ curated coaching-card identity/source
-  └─ lexical score and matched terms for this goal/evidence
+  ├─ lexical score and matched terms for this goal/evidence
+  └─ usedCardId = card ID when used, otherwise null
 ```
 
 Advice wording is intentionally behavioral. It may say to insert a reset pause, move closer to the microphone, or reduce clipping; it must not say the speaker is anxious, dishonest, unprofessional, or medically impaired.
@@ -522,7 +530,8 @@ Conceptual summary record:
     audioStored,
     audioBytes,
     audioMimeType,
-    transcriptStored
+    transcriptStored,
+    transcriptMayBePartial
   }
 }
 ```
@@ -535,13 +544,14 @@ Conceptual full-artifact record, created only after the separate retention choic
   createdAt,
   audioBlob,     // Blob | null
   audioMimeType,
-  transcript     // full string, possibly empty
+  transcript,    // captured string, possibly empty
+  transcriptMayBePartial
 }
 ```
 
-The full in-memory review also contains speech/pause segments and local-retrieval grounding (card/source/score/matched terms). `buildCoachingSummary` deliberately excludes segments, grounding metadata, raw frames, raw audio, and full transcript text, while retaining the allowlisted aggregate metrics, derived word patterns, advice, and artifact-presence metadata. If an artifact exists, the summary and artifact are written in one IndexedDB transaction.
+The full in-memory review also contains speech/pause segments and local-retrieval grounding (retrieved cards, `usedCardId`, source, score, and matched terms). `buildCoachingSummary` deliberately excludes segments, grounding metadata, raw frames, raw audio, and captured transcript text, while retaining the allowlisted aggregate metrics, derived word patterns, advice, and artifact-presence metadata—including `transcriptMayBePartial`. If an artifact exists, the summary and artifact are written in one IndexedDB transaction.
 
-JSON export reads only `session-summaries` and adds product/export schema metadata. It therefore includes consented derived pattern labels and artifact-presence metadata but never the audio `Blob` or full transcript. The visible card source remains available only in the immediate review, not historical `/progress` records. Artifact download buttons read one `session-artifacts` record at a time; recording extensions follow its MIME type, and transcripts download as UTF-8 `.txt` files.
+JSON export reads only `session-summaries` and adds product/export schema metadata. It therefore includes consented derived pattern labels and artifact-presence metadata—including the partial-text flag—but never the audio `Blob` or captured transcript text. The visible card source remains available only in the immediate review, not historical `/progress` records. Artifact download buttons read one `session-artifacts` record at a time; recording extensions follow its MIME type, and transcripts download as UTF-8 `.txt` files.
 
 ## Privacy and consent checklist
 
@@ -551,10 +561,11 @@ JSON export reads only `session-summaries` and adds product/export schema metada
 | Microphone | Browser permission requested after an explanation |
 | Default audio path | Reduced in the audio graph; not recorded, persisted, or uploaded |
 | Live measurement frames | Kept in page memory for the active attempt |
-| Transcript analysis | Separate opt-in; mandatory local processing; derived counts/patterns enter the summary; full text cleared by default |
-| Full-session retention | Independent, unchecked opt-in; stores attempt audio and any available full transcript in `session-artifacts` |
-| Stored summary | Aggregate metrics, consented derived patterns, normalized advice, and artifact-presence metadata in origin-scoped IndexedDB |
-| Export | Summary store only; excludes audio `Blob` and full transcript |
+| Transcript analysis | Separate opt-in; mandatory local processing; derived counts/patterns enter the summary; captured text cleared by default |
+| Transcript finalization | Waits up to two seconds after `stop()`; preserves returned text on error/timeout, warns that it may be partial, and never retains error payloads |
+| Full-session retention | Independent, unchecked opt-in; stores attempt audio and any available captured transcript in `session-artifacts` |
+| Stored summary | Aggregate metrics, consented derived patterns, normalized advice, and artifact-presence metadata—including `transcriptMayBePartial`—in origin-scoped IndexedDB |
+| Export | Summary store only; excludes audio `Blob` and captured transcript text |
 | Individual download | Reads the opted-in artifact and creates a recording file or UTF-8 transcript file |
 | Delete | Clears `session-summaries` and `session-artifacts` after confirmation; previously downloaded files are outside its scope |
 | Navigation/cancel | Stops recognition/recorder, discards unsaved chunks, stops microphone tracks/worklet/intervals/context, and rejects delayed permission/worklet activation |
@@ -586,8 +597,8 @@ Use this sequence instead of starting with file names:
 4. **Classify:** The analyzer turns frames into voiced/unvoiced segments with timing stability.
 5. **Measure:** Segment durations and voiced levels produce inspectable aggregate metrics.
 6. **Retrieve:** The selected goal and measured evidence rank curated local coaching cards.
-7. **Assemble advice:** The top retrieved card supplies the intact base drill; deterministic rules append one metric-specific comparison sentence and select strength/focus.
-8. **Store by consent:** The default path clears live media/full text and writes an allowlisted summary; the separate retention choice additionally writes a linked audio/transcript artifact.
+7. **Assemble advice:** The top retrieved card normally supplies the intact base drill; an evidence-safety rule can keep the measured priority's drill instead. Deterministic rules append one metric-specific comparison sentence, select strength/focus, and record whether the card was used.
+8. **Store by consent:** The default path clears live media/captured text and writes an allowlisted summary; the separate retention choice additionally writes a linked audio/transcript artifact and any partial-text warning metadata.
 
 This makes the privacy boundary and the coaching mechanism understandable without calling every calculation “AI.”
 
@@ -616,8 +627,8 @@ npm run test:cloudflare
 
 What each coaching check demonstrates:
 
-- `test:coach` runs 20 tests that feed controlled frames/transcripts into the pure engine and check calibration, segmentation (including zero callbacks → zero coverage), observed/unknown time, continuity confidence, metrics, tips, retrieval, deterministic drill assembly, and advice.
-- `smoke:coach` drives `/practice` with synthetic audio/transcription. It proves a default-off attempt constructs no recorder/artifact, upgrades a synthetic v1 database to both v2 stores, verifies an opted-in non-empty recording `Blob` and transcript, reads real recording/transcript downloads, parses JSON export and confirms full-artifact exclusion, checks Progress reload and route-heading focus, clears both stores, handles canceled permission/worklet loading and active/calibration stalls without leaked intervals/tracks, and makes no application `/api/*` request.
+- `test:coach` runs 21 tests that feed controlled frames/transcripts into the pure engine and check calibration, segmentation (including zero callbacks → zero coverage), observed/unknown time, continuity confidence, metrics, tips, retrieval, card-use grounding safety, deterministic drill assembly, and advice.
+- `smoke:coach` drives `/practice` with synthetic audio/transcription. It proves a default-off attempt constructs no recorder/artifact, upgrades a synthetic v1 database to both v2 stores, verifies an opted-in non-empty recording `Blob` and transcript, preserves captured text and partial-warning metadata after a late recognition error, reads real recording/transcript downloads, parses JSON export and confirms artifact exclusion, checks Progress reload and route-heading focus, clears both stores, handles canceled permission/worklet loading and active/calibration stalls without leaked intervals/tracks, and makes no application `/api/*` request.
 - `check:cloudflare` confirms that the Worker and all Static Assets, including the coaching modules, form a valid deploy bundle.
 
 These tests do not replace real-device, accessibility, security, or fairness validation.
@@ -634,7 +645,7 @@ These tests do not replace real-device, accessibility, security, or fairness val
 - Progress compares standalone summaries and does not yet pair a baseline with an unassisted retry.
 - Speaking ratio change is descriptive; it is not a universal improvement direction.
 - The local coaching-card library is intentionally small; retrieval is lexical rather than semantic and still requires relevance/fairness evaluation.
-- Derived filler/repetition labels may contain sensitive words even though they are not a full transcript.
+- Derived filler/repetition labels may contain sensitive words even though they are not captured transcript text.
 - Retained artifacts have no automatic expiration, per-attempt deletion, quota dashboard, or app-level encryption; anyone with access to the unlocked browser profile may reach them.
 - No accounts, sync, retention policy across devices, educator view, or shared report exists.
 - No formal WCAG, security, privacy, microphone/device, learning-outcome, or subgroup-fairness study has been completed.

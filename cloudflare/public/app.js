@@ -217,6 +217,42 @@ function renderPracticeCalibration() {
     </section>`;
 }
 
+function updateCalibrationStage({ headingText, instructionsText, statusText, progress }) {
+  let stage = document.querySelector("[data-coach-calibration]");
+  if (!stage) {
+    renderPractice();
+    stage = document.querySelector("[data-coach-calibration]");
+  }
+  if (!stage) return;
+  const heading = stage.querySelector("#calibration-title");
+  const instructions = stage.querySelector(".lede");
+  const status = stage.querySelector("[data-coach-calibration-status]");
+  const bar = stage.querySelector("[data-coach-calibration-bar]");
+  if (heading) heading.textContent = headingText;
+  if (instructions) instructions.textContent = instructionsText;
+  if (status) status.textContent = statusText;
+  if (bar) bar.style.width = `${progress}%`;
+  announce(`${headingText} ${statusText}`);
+}
+
+function showQuietCalibrationStage() {
+  updateCalibrationStage({
+    headingText: "Stay quiet for a moment.",
+    instructionsText: "We are learning the sound of your room so pauses are measured fairly. Calibration audio is not retained.",
+    statusText: "Measuring room level…",
+    progress: 30,
+  });
+}
+
+function showSpeakingCalibrationStage() {
+  updateCalibrationStage({
+    headingText: "Now speak normally.",
+    instructionsText: "Say: “I am ready to practice my speaking.” Calibration audio is not retained.",
+    statusText: "Measuring your speaking level…",
+    progress: 50,
+  });
+}
+
 function renderPracticeLive() {
   const scenario = scenarioById(practice.setup.scenario);
   const goal = goalById(practice.setup.goal);
@@ -282,7 +318,7 @@ function renderPracticeReview() {
           ${report.unknownMs > 0 ? reviewMetric(formatDuration(report.unknownMs), "unobserved audio") : ""}
         </div>
         ${renderCoachTimeline(report)}
-        ${transcript ? `<div class="transcript-evidence"><div><span class="device-badge">On-device transcript</span><strong>${transcript.wordCount ?? 0} words · ${formatNumber(transcript.wordsPerMinute)} wpm</strong></div><p>${escapeHTML(formatTranscriptPatternSummary(transcript))} ${practice.savedArtifacts?.transcriptStored ? "You opted to retain the full captured transcript locally." : "The full captured transcript has been discarded; these derived patterns are retained locally for analysis."}</p></div>` : `<p class="hint privacy-note">No transcript metrics were used or stored.${practice.savedArtifacts?.transcriptStored ? " A captured transcript artifact was retained locally at your request." : ""}</p>`}
+        ${transcript ? `<div class="transcript-evidence"><div><span class="device-badge">On-device transcript</span><strong>${transcript.wordCount ?? 0} words · ${formatNumber(transcript.wordsPerMinute)} wpm</strong></div><p>${escapeHTML(formatTranscriptPatternSummary(transcript))} ${practice.savedArtifacts?.transcriptStored ? practice.savedArtifacts.transcriptMayBePartial ? "You opted to retain the captured transcript locally; finalization did not complete, so it may be partial." : "You opted to retain the captured transcript locally." : "The captured transcript has been discarded; these derived patterns are retained locally for analysis."}</p></div>` : `<p class="hint privacy-note">No transcript metrics were used or stored.${practice.savedArtifacts?.transcriptStored ? " A captured transcript artifact was retained locally at your request." : ""}</p>`}
         ${renderCoachGrounding(grounding)}
       </section>
       <div class="review-actions">
@@ -293,11 +329,12 @@ function renderPracticeReview() {
 }
 
 function retainedArtifactCopy(artifacts = {}) {
+  const transcriptCaveat = artifacts.transcriptMayBePartial ? " The captured transcript may be partial because finalization did not complete cleanly." : "";
   if (artifacts.audioStored && artifacts.transcriptStored) {
-    return "The browser-encoded recording and captured transcript are stored only for this site in this browser profile.";
+    return `The browser-encoded recording and captured transcript are stored only for this site in this browser profile.${transcriptCaveat}`;
   }
   if (artifacts.audioStored) return "The browser-encoded recording is stored only for this site in this browser profile; no captured transcript was saved.";
-  if (artifacts.transcriptStored) return "The captured transcript is stored only for this site in this browser profile; no recording was saved.";
+  if (artifacts.transcriptStored) return `The captured transcript is stored only for this site in this browser profile; no recording was saved.${transcriptCaveat}`;
   return "No full-session artifact was available to save.";
 }
 
@@ -305,9 +342,13 @@ function renderCoachGrounding(grounding = {}) {
   const card = Array.isArray(grounding.retrieved) ? grounding.retrieved[0] : null;
   if (!card) return "";
   const terms = Array.isArray(card.matchedTerms) ? card.matchedTerms.slice(0, 5).join(", ") : "";
+  const cardWasUsed = grounding.usedCardId === card.id;
+  const provenance = cardWasUsed
+    ? "This card shaped the retry drill through deterministic generation."
+    : "This card was retrieved as context, but a higher-priority evidence rule supplied the retry drill.";
   return `<aside class="grounding-evidence" data-coach-grounding aria-label="Local RAG advice grounding">
     <div><span class="device-badge">Local RAG · retrieved</span><h3>${escapeHTML(card.title || "Curated coaching guidance")}</h3><small>${escapeHTML(card.source || "NonStopTalk Coaching Library")}</small></div>
-    <div><p>${escapeHTML(card.excerpt || "")}</p><p class="hint">This card shaped the retry drill through deterministic generation.${terms ? ` Matched locally: ${escapeHTML(terms)}.` : ""} No model or network call was used.</p></div>
+    <div><p>${escapeHTML(card.excerpt || "")}</p><p class="hint">${escapeHTML(provenance)}${terms ? ` Matched locally: ${escapeHTML(terms)}.` : ""} No model or network call was used.</p></div>
   </aside>`;
 }
 
@@ -354,6 +395,7 @@ async function beginCoachingSession(values) {
   pendingCoachingToken = token;
   let stream;
   let context;
+  let run;
   try {
     const engine = await loadCoachEngine();
     if (pendingCoachingToken !== token || generation !== routeGeneration || !isPracticeRoute()) return;
@@ -368,20 +410,13 @@ async function beginCoachingSession(values) {
     const AudioContext = window.AudioContext || window.webkitAudioContext;
     if (!AudioContext) throw new Error("This browser cannot analyze microphone audio.");
     context = new AudioContext();
-    await context.resume();
-    if (pendingCoachingToken !== token || generation !== routeGeneration || !isPracticeRoute()) {
-      stream.getTracks().forEach((track) => track.stop());
-      await context.close().catch(() => {});
-      return;
-    }
-    const source = context.createMediaStreamSource(stream);
-    const run = coachingRun = {
+    run = coachingRun = {
       token,
       generation,
       engine,
       stream,
       context,
-      source,
+      source: null,
       quietSamples: [],
       voiceSamples: [],
       calibrationStartedAt: performance.now(),
@@ -391,6 +426,7 @@ async function beginCoachingSession(values) {
       lastTipAt: -Infinity,
       tipUntil: 0,
       transcript: "",
+      transcriptFinalizationWarning: "",
       recognition: null,
       recorder: null,
       recordedChunks: [],
@@ -405,6 +441,13 @@ async function beginCoachingSession(values) {
     run.inputTrack = stream.getAudioTracks()[0] || null;
     run.inputEndedHandler = () => handleCoachingInputEnded(run);
     run.inputTrack?.addEventListener?.("ended", run.inputEndedHandler, { once: true });
+    await context.resume();
+    if (!isPendingCoachingRun(run)) {
+      stopCoachingHardware(run);
+      if (coachingRun === run) coachingRun = null;
+      return;
+    }
+    run.source = context.createMediaStreamSource(stream);
     const attached = await attachCoachingMeter(run);
     if (!attached || !isPendingCoachingRun(run)) {
       stopCoachingHardware(run);
@@ -417,7 +460,7 @@ async function beginCoachingSession(values) {
     practice.phase = "calibrating";
     practice.calibrationStage = "quiet";
     practice.live = { elapsedMs: 0, level: 0, pauseCount: 0, speakingRatio: 0 };
-    renderPractice();
+    showQuietCalibrationStage();
     run.updateTimer = window.setInterval(updateCoachingUI, 100);
     run.calibrationTimer = window.setTimeout(() => {
       if (run !== coachingRun || practice.phase !== "calibrating") return;
@@ -495,7 +538,7 @@ function ingestCoachingFrame(frame) {
     practice.live.level = Math.min(1, frame.rms * 8);
     if (elapsed >= 2_000 && practice.calibrationStage !== "voice") {
       practice.calibrationStage = "voice";
-      renderPractice();
+      showSpeakingCalibrationStage();
     }
     if (elapsed >= 4_000 && !run.activating) activateCoachingAttempt(run);
     return;
@@ -566,9 +609,10 @@ function startLocalRecognition(run) {
       let text = "";
       for (let index = 0; index < event.results.length; index += 1) text += `${event.results[index][0]?.transcript || ""} `;
       run.transcript = text.trim().slice(0, 20_000);
+      if (run.transcript) practice.transcriptUnavailable = false;
     };
     recognition.onerror = () => {
-      if (run === coachingRun) practice.transcriptUnavailable = true;
+      if (run === coachingRun && !run.transcript.trim()) practice.transcriptUnavailable = true;
     };
     const track = run.stream.getAudioTracks()[0];
     recognition.start(track);
@@ -635,18 +679,31 @@ function finishLocalRecognition(run) {
   if (!recognition) return Promise.resolve(run.transcript);
   return new Promise((resolve) => {
     let settled = false;
+    const priorOnEnd = recognition.onend;
+    const priorOnError = recognition.onerror;
     const finish = () => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      recognition.onend = priorOnEnd;
+      recognition.onerror = priorOnError;
       resolve(run.transcript);
     };
-    const priorOnEnd = recognition.onend;
     recognition.onend = (event) => {
-      priorOnEnd?.call(recognition, event);
-      finish();
+      try { priorOnEnd?.call(recognition, event); } finally { finish(); }
     };
-    const timeout = setTimeout(finish, 350);
+    recognition.onerror = (event) => {
+      if (run.transcript.trim()) {
+        run.transcriptFinalizationWarning = "The captured transcript may be partial because on-device recognition ended with an error.";
+      }
+      try { priorOnError?.call(recognition, event); } finally { finish(); }
+    };
+    const timeout = setTimeout(() => {
+      if (run.transcript.trim()) {
+        run.transcriptFinalizationWarning = "The captured transcript may be partial because on-device recognition did not finish within two seconds.";
+      }
+      finish();
+    }, 2_000);
     try { recognition.stop(); } catch { finish(); }
   });
 }
@@ -661,7 +718,9 @@ async function finishCoachingSession(reason = "manual") {
     finishLocalRecognition(run),
     practice.setup.retainArtifacts ? stopArtifactRecorder(run) : Promise.resolve(null),
   ]);
-  const transcriptText = practice.transcriptUnavailable ? "" : capturedTranscript;
+  const transcriptText = typeof capturedTranscript === "string" ? capturedTranscript.trim() : "";
+  const transcriptMayBePartial = Boolean(transcriptText && run.transcriptFinalizationWarning);
+  if (transcriptMayBePartial) practice.artifactWarning ||= run.transcriptFinalizationWarning;
   let report;
   let advice;
   try {
@@ -689,7 +748,7 @@ async function finishCoachingSession(reason = "manual") {
   try {
     const summary = buildCoachingSummary(report, advice);
     const artifact = practice.setup.retainArtifacts
-      ? buildCoachingArtifact(summary.id, summary.createdAt, audioBlob, transcriptText)
+      ? buildCoachingArtifact(summary.id, summary.createdAt, audioBlob, transcriptText, transcriptMayBePartial)
       : null;
     if (practice.setup.retainArtifacts && !artifact) {
       practice.artifactWarning ||= "No full recording or transcript artifact was available to save for this attempt.";
@@ -864,7 +923,7 @@ function buildCoachingSummary(report, advice) {
   };
 }
 
-function buildCoachingArtifact(id, createdAt, audioBlob, transcriptText) {
+function buildCoachingArtifact(id, createdAt, audioBlob, transcriptText, transcriptMayBePartial = false) {
   const transcript = typeof transcriptText === "string" ? transcriptText.trim() : "";
   if (!(audioBlob instanceof Blob) && !transcript) return null;
   return {
@@ -873,6 +932,7 @@ function buildCoachingArtifact(id, createdAt, audioBlob, transcriptText) {
     audioBlob: audioBlob instanceof Blob ? audioBlob : null,
     audioMimeType: audioBlob instanceof Blob ? audioBlob.type || "audio/webm" : "",
     transcript,
+    transcriptMayBePartial: Boolean(transcript && transcriptMayBePartial),
   };
 }
 
@@ -882,6 +942,7 @@ function artifactMetadata(artifact) {
     audioBytes: finiteNumber(artifact?.audioBlob?.size),
     audioMimeType: String(artifact?.audioMimeType || ""),
     transcriptStored: Boolean(artifact?.transcript),
+    transcriptMayBePartial: Boolean(artifact?.transcript && artifact?.transcriptMayBePartial),
   };
 }
 
@@ -966,12 +1027,13 @@ async function renderProgress(generation = routeGeneration) {
   }
   if (generation !== routeGeneration || !/^\/progress\/?$/i.test(location.pathname)) return;
   summaries.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
-  const averageRatio = summaries.length
-    ? summaries.reduce((total, item) => total + finiteNumber(item.metrics?.speakingRatio), 0) / summaries.length
-    : 0;
+  const ratios = summaries.map(progressSpeakingRatio).filter((value) => value !== null);
+  const averageRatio = ratios.length ? ratios.reduce((total, value) => total + value, 0) / ratios.length : null;
   const latest = summaries[0];
   const earlier = summaries[1];
-  const change = latest && earlier ? latest.metrics.speakingRatio - earlier.metrics.speakingRatio : null;
+  const latestRatio = progressSpeakingRatio(latest);
+  const earlierRatio = progressSpeakingRatio(earlier);
+  const change = latestRatio !== null && earlierRatio !== null ? latestRatio - earlierRatio : null;
   app.innerHTML = `
     <section class="progress-page" data-coach-progress>
       <div class="progress-hero">
@@ -981,7 +1043,7 @@ async function renderProgress(generation = routeGeneration) {
       ${storageError ? notice(storageError, true) : ""}
       <div class="progress-metrics">
         ${reviewMetric(String(summaries.length), `${summaries.length === 1 ? "attempt" : "attempts"} for this site`)}
-        ${reviewMetric(formatPercent(averageRatio), "average speaking ratio")}
+        ${reviewMetric(averageRatio === null ? "—" : formatPercent(averageRatio), "average speaking ratio")}
         ${reviewMetric(change === null ? "—" : `${change >= 0 ? "+" : ""}${Math.round(change * 100)} pts`, "latest ratio shift")}
       </div>
       <section class="panel progress-history">
@@ -993,6 +1055,13 @@ async function renderProgress(generation = routeGeneration) {
         <div class="action-row"><button class="button ghost" type="button" data-command="coach-export" ${summaries.length ? "" : "disabled"}>Export JSON</button><button class="button danger ghost" type="button" data-command="coach-delete" ${summaries.length ? "" : "disabled"}>Delete local history</button></div>
       </section>
     </section>`;
+}
+
+function progressSpeakingRatio(item) {
+  const value = item?.metrics?.speakingRatio;
+  if (!(["number", "string"].includes(typeof value)) || (typeof value === "string" && !value.trim())) return null;
+  const ratio = Number(value);
+  return Number.isFinite(ratio) && ratio >= 0 && ratio <= 1 ? ratio : null;
 }
 
 function renderProgressItem(item) {
@@ -1013,6 +1082,7 @@ function renderArtifactActions(item) {
   return `<div class="artifact-actions" aria-label="Saved full session artifacts">
     ${artifacts.audioStored ? `<button class="button ghost small" type="button" data-command="coach-download-audio" data-session-id="${id}">Download recording</button>` : ""}
     ${artifacts.transcriptStored ? `<button class="button ghost small" type="button" data-command="coach-download-transcript" data-session-id="${id}">Download transcript</button>` : ""}
+    ${artifacts.transcriptMayBePartial ? `<p class="hint">Captured transcript may be partial; local recognition did not finalize cleanly.</p>` : ""}
   </div>`;
 }
 
@@ -1071,7 +1141,8 @@ async function withCoachTransaction(storeNames, mode, callback) {
       const transaction = database.transaction(storeNames, mode);
       let result;
       try { result = callback(transaction); } catch (error) { reject(error); return; }
-      transaction.oncomplete = () => resolve(result?.result ?? result);
+      const isRequest = typeof IDBRequest === "function" && result instanceof IDBRequest;
+      transaction.oncomplete = () => resolve(isRequest ? result.result : result);
       transaction.onerror = () => reject(transaction.error || new Error("Coaching history operation failed"));
       transaction.onabort = () => reject(transaction.error || new Error("Coaching history operation was cancelled"));
     });
@@ -1410,7 +1481,8 @@ async function handleSubmit(event) {
 
 async function handleClick(event) {
   const routeLink = event.target.closest("[data-route]");
-  if (routeLink) {
+  const isUnmodifiedPrimaryClick = event.button === 0 && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey;
+  if (routeLink && isUnmodifiedPrimaryClick) {
     event.preventDefault();
     navigate(new URL(routeLink.href, location.href).pathname);
     return;

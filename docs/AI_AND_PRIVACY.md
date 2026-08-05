@@ -14,7 +14,7 @@ NonStopTalk does not upload microphone audio in any of these paths. In coaching 
 | --- | --- | --- | --- |
 | Coaching, default acoustic path | Reduced to measurements in the browser; no recording retained | None | None |
 | Coaching with transcript analysis only | Reduced in the browser; no recording retained | Mandatory-on-device captured text is discarded after analysis; bounded derived counts and filler/repetition patterns remain in the summary | None |
-| Coaching with separate full-session retention | Browser-encoded attempt is stored locally as a `Blob`; never uploaded | Captured text is also stored locally only if transcript analysis was enabled and succeeded | None |
+| Coaching with separate full-session retention | Browser-encoded attempt is stored locally as a `Blob`; never uploaded | Captured text is also stored locally only if transcript analysis was enabled and produced text | None |
 | Classic game with microphone detection | Read locally by Web Audio | None | None |
 | Manual game timer | Not required | None | None |
 | Local Go AI judge enabled, speaker chooses classic/manual | Not uploaded | None | None |
@@ -36,9 +36,9 @@ The user can opt into experimental transcript analysis. That checkbox is enabled
 5. Clears the captured transcript after building the review unless the user also selected full-session retention.
 6. Never falls back to browser-managed remote recognition.
 
-If recognition is absent, cannot be initialized, rejects the track, or reports an error, the acoustic attempt continues without transcript metrics. The browser owns its implementation of the experimental Web Speech API; NonStopTalk relies on the browser to honor mandatory local processing.
+If recognition is absent, cannot be initialized, rejects the track, or captures no text, the acoustic attempt continues without transcript metrics. At finish, NonStopTalk asks recognition to stop and allows up to two seconds for final results. If an error or timeout occurs after `onresult` has delivered text, NonStopTalk preserves and analyzes that text but never calls it complete; Review warns that it may be partial. When the separate full-session option retains the text, both the artifact and summary artifact metadata set `transcriptMayBePartial`, so Progress warns too. Recognition error events and their payloads are never retained. The browser owns its implementation of the experimental Web Speech API; NonStopTalk relies on the browser to honor mandatory local processing.
 
-Full-session retention is an independent second checkbox and starts unchecked on a fresh page load. It is enabled only when `MediaRecorder` exists. If selected, recording begins after calibration when the attempt starts. On completion, the application saves the encoded attempt recording and any captured transcript that is available to a separate local artifact store. Selecting recording retention does not silently enable transcription; selecting transcript analysis does not silently retain the full transcript. **Try again** preserves both visible setup selections so the user can review or uncheck them before the next attempt. Canceling or navigating away before completion stops the recorder and discards its unsaved chunks.
+Full-session retention is an independent second checkbox and starts unchecked on a fresh page load. It is enabled only when `MediaRecorder` exists. If selected, recording begins after calibration when the attempt starts. On completion, the application saves the encoded attempt recording and any captured transcript that is available to a separate local artifact store. Selecting recording retention does not silently enable transcription; selecting transcript analysis does not silently retain captured transcript text. **Try again** preserves both visible setup selections so the user can review or uncheck them before the next attempt. Canceling or navigating away before completion stops the recorder and discards its unsaved chunks.
 
 This is intentionally stricter than detecting a generic `SpeechRecognition` API, whose default processing location may be chosen by the browser. MDN documents the [`processLocally` contract and on-device language-pack behavior](https://developer.mozilla.org/en-US/docs/Web/API/Web_Speech_API/Using_the_Web_Speech_API#on-device_speech_recognition). Availability is browser-, version-, language-, and device-dependent.
 
@@ -67,12 +67,12 @@ same local audio path
       → transcript in page memory
       → counts, pace estimate, and derived word patterns
       → bounded derived fields enter the local summary
-      → full transcript cleared by default
+      → captured transcript text cleared by default
 ```
 
-The summary stores word count, words per minute, filler and repetition counts/rates, plus bounded filler-phrase and immediately repeated-word labels with counts. This is derived lexical content and may still be sensitive—for example, an immediately repeated name could appear. Each pattern array is limited to 50 entries and each label to 64 characters. The full transcript is not displayed in Progress or included in JSON export. It enters the separate artifact store only after full-session-retention consent.
+The summary stores word count, words per minute, filler and repetition counts/rates, plus bounded filler-phrase and immediately repeated-word labels with counts. This is derived lexical content and may still be sensitive—for example, an immediately repeated name could appear. Each pattern array is limited to 50 entries and each label to 64 characters. Captured transcript text is not displayed in Progress or included in JSON export. It enters the separate artifact store only after full-session-retention consent.
 
-### Separately retained full artifacts
+### Separately retained session artifacts
 
 ```text
 same live microphone MediaStream
@@ -80,10 +80,10 @@ same live microphone MediaStream
   → encoded audio chunks in page memory
   → audio Blob at completion ───────────────┐
                                              ├─ session-artifacts (IndexedDB)
-optional captured full transcript ──────────┘
+optional captured transcript ───────────────┘
 ```
 
-The artifact record is linked to its summary by the same random session ID. It contains creation time, the recording `Blob` and MIME type when recording succeeded, and the full transcript when transcript analysis was enabled and produced text. A partial artifact is possible: for example, a recording can be retained when transcription is unavailable. Progress exposes only the download buttons supported by that artifact.
+The artifact record is linked to its summary by the same random session ID. It contains creation time, the recording `Blob` and MIME type when recording succeeded, any text captured by transcript analysis, and `transcriptMayBePartial`. A partial artifact is possible: for example, a recording can be retained when transcription is unavailable. The transcript flag is true when final recognition results did not arrive cleanly within the two-second stop window; it is metadata about capture completeness, not a reconstruction of missing words. Progress exposes only the downloads supported by the artifact and repeats the warning for possibly partial text.
 
 ### Local retrieval-selected drill
 
@@ -91,11 +91,13 @@ The artifact record is linked to its summary by the same random session ID. It c
 selected goal + measured evidence
   → lexical query in browser memory
   → curated coaching card bundled with the app
-  → top card's prewritten drill + fixed priority-specific comparison sentence
-  → source shown in the review
+  → normally use top card's prewritten drill
+  → or use evidence-backed priority drill when the card is unsupported
+  → fixed priority-specific comparison sentence
+  → review labels the card as used guidance or retrieved context
 ```
 
-This small local RAG path introduces no new network or model trust boundary. It uses no LLM, embedding model, vector database, remote corpus, or open-ended prose synthesis. The curated, product-authored card library, lexical ranking, and comparison templates ship as application code. The top card's drill remains intact and deterministic assembly appends a measurement-specific comparison sentence; separate rules select strength and focus. Its source label is provenance, not proof that the guidance has been independently validated.
+This small local RAG path introduces no new network or model trust boundary. It uses no LLM, embedding model, vector database, remote corpus, or open-ended prose synthesis. The curated, product-authored card library, lexical ranking, and comparison templates ship as application code. Normally the top card's drill remains intact and deterministic assembly appends a measurement-specific comparison sentence. If the card would introduce unsupported advice—for example, microphone-distance guidance when callbacks are missing—the evidence-safety rule keeps the restore-input drill instead. In that case `grounding.usedCardId` is `null`, and the UI calls the card retrieved context rather than claiming it shaped the drill. Separate rules select strength and focus. A source label is provenance, not proof that the guidance has been independently validated.
 
 A future production LLM RAG system would be a materially different privacy design. Semantic queries, transcript-derived content, retrieved passages, and prompts could reach embedding/model providers; sources and model versions would need retention, consent, injection, access-control, and evaluation policies. None of that is silently enabled by the current microphone or transcript checkbox.
 
@@ -103,7 +105,7 @@ A future production LLM RAG system would be a materially different privacy desig
 
 The coaching pages, curated coaching cards, and JavaScript are delivered as Workers Static Assets. After those files load, coaching analysis/retrieval does not call `/api/*`, a Durable Object, the Go server, Anthropic, a vector database, or another speech service. Multiplayer room requests continue to use the Worker normally, but that is a separate product path.
 
-The automated coaching smoke test watches application API requests and asserts that coaching makes none. It proves a default-off attempt never constructs `MediaRecorder` or creates an artifact, upgrades a synthetic v1 database to both v2 stores, and exercises the opted-in path: the summary contains bounded derived patterns but no recording/captured transcript, the artifact store contains a non-empty encoded `Blob` and transcript, the actual recording/transcript downloads contain data, JSON export excludes both full artifacts, and confirmed deletion clears both stores. Separate flows cover cancellation and stalled input. That is useful evidence about the implemented application, not a complete packet-level audit and not proof about every browser extension, operating-system service, or future browser implementation.
+The automated coaching smoke test watches application API requests and asserts that coaching makes none. It proves a default-off attempt never constructs `MediaRecorder` or creates an artifact, upgrades a synthetic v1 database to both v2 stores, and exercises the opted-in path: the summary contains bounded derived patterns but no recording/captured transcript, the artifact store contains a non-empty encoded `Blob` and transcript, a late recognition error preserves captured text and its partial-warning metadata, the actual recording/transcript downloads contain data, JSON export excludes both session artifacts, and confirmed deletion clears both stores. Separate flows cover cancellation and stalled input. That is useful evidence about the implemented application, not a complete packet-level audit and not proof about every browser extension, operating-system service, or future browser implementation.
 
 ## Coaching storage
 
@@ -114,17 +116,17 @@ The automated coaching smoke test watches application API requests and asserts t
 - Aggregate duration, speech/pause, level consistency, clipping, and confidence measurements
 - Optional transcript counts, rates, and bounded filler/repeated-word patterns
 - The rule-selected strength/focus and deterministically assembled drill text
-- Artifact-presence metadata: whether audio/transcript exists, recording size, and MIME type
+- Artifact-presence metadata: whether audio/transcript exists, recording size, MIME type, and whether retained transcript text may be partial
 
 It does not contain:
 
 - Raw microphone samples
 - Per-frame RMS or peak messages
-- Audio blobs or full transcript text
+- Audio blobs or captured transcript text
 - The in-memory local-retrieval score, matched terms, or source metadata
 - Names, email addresses, room identities, or account identifiers
 
-The separate `session-artifacts` store is empty unless full-session retention was selected and at least one artifact was captured. Each record can contain the session ID/time, audio `Blob`, MIME type, and full transcript. `/progress` reads an artifact only for an individual download. **Export JSON** reads only `session-summaries`: it includes derived patterns and artifact-presence metadata, but excludes the recording and full transcript. **Delete local history** clears both stores after confirmation. A downloaded recording/transcript becomes an ordinary file outside browser storage and is not removed by the in-app delete action.
+The separate `session-artifacts` store is empty unless full-session retention was selected and at least one artifact was captured. Each record can contain the session ID/time, audio `Blob`, MIME type, captured transcript text, and `transcriptMayBePartial`. `/progress` reads an artifact only for an individual download and uses summary metadata to show any partial-text warning. **Export JSON** reads only `session-summaries`: it includes derived patterns and artifact-presence metadata, but excludes the recording and captured transcript text. **Delete local history** clears both stores after confirmation. A downloaded recording/transcript becomes an ordinary file outside browser storage and is not removed by the in-app delete action.
 
 IndexedDB is scoped to a site origin (scheme, host, and port) within a browser profile. Records are best-effort browser storage: site-data deletion, private browsing behavior, or storage pressure may remove them. Conversely, the prototype has no automatic artifact expiration, so retained data may remain until the user deletes local history or site data. A custom domain, `workers.dev`, `127.0.0.1:8787`, and another local port each have separate history. There is no account, app-level encryption, cloud backup, cross-device synchronization, server analytics, or server retention timer.
 

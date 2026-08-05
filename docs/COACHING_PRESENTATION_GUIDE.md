@@ -2,7 +2,7 @@
 
 This guide turns the prototype into a clear product story. It is written for a five-minute presentation, with optional technical depth for questions afterward.
 
-> **Prototype status:** The coaching experience is an early, browser-only prototype in the native Cloudflare SPA. It demonstrates objective audio analysis, optional strict on-device transcription, deterministic retrieval/template advice, origin-local progress, and separately opted-in recording/full-transcript retention. It is not a medical tool, a speech-language assessment, or a finished AI coach.
+> **Prototype status:** The coaching experience is an early, browser-only prototype in the native Cloudflare SPA. It demonstrates objective audio analysis, optional strict on-device transcription, deterministic retrieval/template advice, origin-local progress, and separately opted-in recording/captured-transcript retention. It is not a medical tool, a speech-language assessment, or a finished AI coach.
 
 ## The one-sentence pitch
 
@@ -41,13 +41,13 @@ The prototype was designed around constraints that materially change the solutio
 The resulting design has six layers:
 
 1. **Private signal extraction.** An `AudioWorklet` receives microphone sample frames on the browser's audio rendering thread and reduces them to objective measurements such as level, clipping, speech time, and pauses. Raw frames are not stored or sent to the application server.
-2. **Optional local words.** If the browser can guarantee `SpeechRecognition.processLocally`, the user may opt into transcript analysis for pace and word-pattern estimates. Bounded derived filler/repetition patterns stay with the summary; the full transcript is discarded by default. If strict local recognition is unavailable, the audio-only coach still works.
+2. **Optional local words.** If the browser can guarantee `SpeechRecognition.processLocally`, the user may opt into transcript analysis for pace and word-pattern estimates. Bounded derived filler/repetition patterns stay with the summary; captured transcript text is discarded by default. If strict local recognition is unavailable, the audio-only coach still works.
 3. **Small local retrieval.** The selected goal and measured evidence form a query over a curated set of coaching cards shipped with the application. Lexical retrieval selects relevant context; there are no embeddings, vector database, model, or network request.
-4. **Sparse, traceable coaching.** Transparent rules produce sparse live acoustic tips and separately choose review strength/focus. After the attempt, the highest-ranked card supplies the intact base drill; a fixed template appends the top priority's comparison instruction, and the review shows the card source. Cooldowns prevent a wall of live warnings. The same inputs produce the same result.
-5. **Local progress.** The browser stores compact summaries—including consented derived patterns—in origin-scoped IndexedDB for `/progress`. JSON export contains those summaries, not full audio/transcripts.
-6. **Separate full-artifact choice.** An unchecked `MediaRecorder` option can retain the active-attempt recording and any available full transcript in a second local store. Progress downloads them individually; confirmed deletion clears both stores. Nothing is uploaded.
+4. **Sparse, traceable coaching.** Transparent rules produce sparse live acoustic tips and separately choose review strength/focus. Normally the highest-ranked card supplies the intact base drill. If the measurements do not support that card's advice, a safety rule keeps the measurement-backed drill and labels the card as retrieved context instead of used guidance. A fixed template appends what to compare, and cooldowns prevent a wall of live warnings. The same inputs produce the same result.
+5. **Local progress.** The browser stores compact summaries—including consented derived patterns—in origin-scoped IndexedDB for `/progress`. JSON export contains those summaries, not retained audio or captured transcript text.
+6. **Separate artifact choice.** An unchecked `MediaRecorder` option can retain the active-attempt recording and any available captured transcript in a second local store. Recognition gets up to two seconds to finish; if it times out or errors after returning text, Review and Progress warn that the retained transcript may be partial. Progress downloads artifacts individually, confirmed deletion clears both stores, and nothing is uploaded.
 
-This is **retrieval-augmented deterministic generation**: the retrieved card supplies an unchanged base drill, then bounded template assembly appends one prewritten metric-comparison sentence. It is a small local RAG pattern, not the common “vector database + LLM” stack. It was chosen because it is private, no-cost, fast, inspectable, and testable card by card. A production LLM-backed RAG layer could retrieve richer curriculum passages and generate contextual language, but it would add model/version behavior, embeddings or another search index, latency, cost, privacy/consent boundaries, source governance, prompt-injection defenses, and substantially more evaluation.
+This is **retrieval-augmented deterministic generation**: a retrieved card normally supplies an unchanged base drill, then bounded template assembly appends one prewritten metric-comparison sentence. Evidence-safety rules can substitute a supported drill and leave the card as context only. It is a small local RAG pattern, not the common “vector database + LLM” stack. It was chosen because it is private, no-cost, fast, inspectable, and testable card by card. A production LLM-backed RAG layer could retrieve richer curriculum passages and generate contextual language, but it would add model/version behavior, embeddings or another search index, latency, cost, privacy/consent boundaries, source governance, prompt-injection defenses, and substantially more evaluation.
 
 The multiplayer game remains available as **Play**. Coaching is a new **Practice** path rather than a replacement for the game.
 
@@ -83,7 +83,7 @@ The prototype sends no product analytics. An initial study must use explicitly c
 | Local-transcription availability | Sessions where the browser verifies strict on-device recognition divided by requests for transcript-assisted coaching, segmented by browser/language. | Do not make transcript metrics part of the universal experience. |
 | Privacy network violations | Automated and manual network audits that observe audio samples, audio blobs, or transcript text leaving the browser. | This is a release blocker; the expected count is zero. |
 | Retention-boundary violations | Automated checks that full retention starts unchecked, artifacts appear only after that choice, summary export excludes full artifacts, and deletion clears both local stores. | Stop release and repair consent/storage boundaries before adding more data features. |
-| Retrieval grounding quality | Human review of whether the retrieved coaching card matches the selected goal/evidence, plus the percentage of advice views that display a valid curated source. | Revise card vocabulary, ranking, fallback, or generated wording before expanding the library. |
+| Retrieval grounding quality | Human review of whether the retrieved card matches the goal/evidence and whether the review truthfully labels it as used guidance or context only, plus the percentage of advice views that display a valid curated source. | Revise card vocabulary, ranking, evidence-safety rules, fallback, or wording before expanding the library. |
 | Subgroup fairness | Compare availability, false-tip rate, and selected-goal deltas across voluntary, sufficiently sized language/accent groups and device classes. Never infer group membership from audio. | Investigate thresholds, copy, recognition coverage, and sampling before broad claims. |
 
 No adoption, improvement, or fairness target is claimed yet. The first pilot should validate event definitions, measurement repeatability, and subgroup coverage; targets come after there is a trustworthy baseline.
@@ -118,7 +118,7 @@ Use careful language:
 
 ### 2:25–3:30 — Explain the technical design
 
-> “The microphone feeds an AudioWorklet, which reduces sample blocks into RMS and peak measurements. The page aggregates those into speech time and pauses. After the attempt, the goal and aggregate evidence query a curated local card library. Rules select the strength and focus; the top card supplies an intact base drill and a fixed template appends what to compare on the retry. Optional strict local recognition adds pace and word-pattern evidence. A compact summary stays in this site's IndexedDB; retaining the full recording or available transcript requires a second, unchecked choice.”
+> “The microphone feeds an AudioWorklet, which reduces sample blocks into RMS and peak measurements. The page aggregates those into speech time and pauses. After the attempt, the goal and evidence query a small local card library. A card normally supplies the drill, but a safety rule keeps measurement-backed advice when a card is not supported, and the screen says which happened. Optional on-device recognition adds pace and word-pattern estimates. A compact summary stays in this browser; retaining the recording or captured transcript requires a second, unchecked choice.”
 
 Show the architecture diagram in [Speech Coaching Prototype](SPEECH_COACHING_PROTOTYPE.md#architecture-and-data-flow).
 
@@ -162,13 +162,13 @@ Use headphones if the presentation is remote to reduce echo cancellation and fee
 ### A stable live sequence
 
 1. Show the landing page and choose **Practice**.
-2. Explain the two independent options. Transcript analysis may retain bounded derived patterns; full-session recording/transcript retention is separate and starts off.
+2. Explain the two independent options. Transcript analysis may retain bounded derived patterns; full-session recording/captured-transcript retention is separate and starts off.
 3. Start a short attempt with both optional boxes off for the safest primary demo.
 4. Speak, pause for about one second, resume speaking, then finish. A measured pause needs voice on both sides; ending on silence is intentionally treated as trailing quiet, not a completed pause.
-5. Explain the analysis, deterministic recommendation, and visible Local RAG source/matched terms.
+5. Explain the analysis, deterministic recommendation, and the Local RAG label that distinguishes used guidance from retrieved context.
 6. Open **Progress** to show the compact summary.
 7. If your tested browser supports strict local recognition, repeat with it enabled and show pace/filler estimates as an enhancement.
-8. If artifact retention is part of the presentation, repeat with the second box explicitly enabled, then show the per-attempt recording/transcript download controls and explain that JSON export still excludes those full artifacts.
+8. If artifact retention is part of the presentation, repeat with the second box explicitly enabled, then show the per-attempt recording/transcript download controls and explain that JSON export still excludes those retained artifacts.
 
 ### Fallbacks
 
@@ -182,11 +182,11 @@ Use headphones if the presentation is remote to reduce echo cancellation and fee
 
 ### “Is this AI?”
 
-The prototype does not use a generative model. It analyzes measured signals with transparent rules, retrieves a local card, keeps that card's base drill intact, and appends a fixed comparison sentence selected from the top measurement priority. Some people group this retrieval-and-response-assembly pattern under AI; the precise explanation is lexical retrieval plus deterministic template assembly, all in the browser. The optional transcript comes from the browser only when strict on-device recognition is supported.
+The prototype does not use a generative model. It analyzes measured signals with transparent rules and retrieves a local card. Normally that card contributes its unchanged drill; if its advice lacks measurement support, a safety rule uses the measured priority's drill and shows the card as context only. A fixed comparison sentence is appended either way. Some people group this retrieval-and-response-assembly pattern under AI; the precise explanation is lexical retrieval plus deterministic template assembly, all in the browser. The optional transcript comes from the browser only when strict on-device recognition is supported.
 
 ### “Are we using RAG?”
 
-Yes, in a deliberately small local form. The selected goal and aggregate evidence become a lexical query over bundled coaching cards. The top card contributes its prewritten base drill; deterministic template assembly appends one priority-specific comparison sentence, separately selected rules supply strength/focus, and the review shows the card source. There is no LLM, free-form model prose, embedding model, vector database, or network call, so call it **retrieval-augmented deterministic generation**, not LLM RAG.
+Yes, in a deliberately small local form. The selected goal and aggregate evidence become a lexical query over bundled coaching cards. The top card normally contributes its prewritten drill. If an evidence-safety rule substitutes the measured priority's drill, the review calls the card retrieved context rather than used guidance. Deterministic assembly appends one comparison sentence, and separate rules supply strength/focus. There is no LLM, free-form model prose, embedding model, vector database, or network call, so call it **retrieval-augmented deterministic generation**, not LLM RAG.
 
 That choice makes tomorrow's prototype private, free, low-latency, auditable, and deterministic. A production LLM RAG system could add semantic retrieval and more personalized phrasing, but it would also add provider/model behavior, cost, latency, source/version governance, privacy consent, prompt-injection risk, and a larger evaluation burden.
 
@@ -200,7 +200,7 @@ Every successfully saved attempt gets a compact local summary with aggregate mea
 
 ### “Can I keep or download the recording and transcript?”
 
-Yes, but only after selecting the separate unchecked full-session-retention option. Progress then shows the download controls supported by that attempt. Recordings/full transcripts live in a separate origin-local artifact store and are excluded from JSON export. **Delete local history** clears both browser stores, but it cannot delete files already downloaded to the device. The prototype has no automatic artifact expiration or per-attempt deletion yet.
+Yes, but only after selecting the separate unchecked full-session-retention option. Progress then shows the download controls supported by that attempt. Recordings and captured transcripts live in a separate origin-local artifact store and are excluded from JSON export. At finish the browser waits up to two seconds for recognition; if it errors or times out after returning text, the app preserves the text but warns in Review and Progress that it may be partial. **Delete local history** clears both browser stores, but it cannot delete files already downloaded to the device. The prototype has no automatic artifact expiration or per-attempt deletion yet.
 
 ### “How does it know when I am speaking?”
 
@@ -212,7 +212,7 @@ AudioWorklet processing runs with the browser's audio rendering work instead of 
 
 ### “What proves these boundaries work?”
 
-Twenty deterministic engine tests cover calibration, segmentation—including an attempt with zero callbacks and zero coverage—observed/unknown time, continuity confidence, tips, transcript analysis, retrieval, template assembly, and advice. The browser smoke test proves that a default-off attempt constructs no recorder/artifact, v1 history upgrades to the v2 stores, opted-in audio/transcript persist, real downloads contain data, JSON export excludes full artifacts, both stores delete, route focus moves correctly, canceled permission/worklet work releases resources, stalled active input reaches its wall-clock review without inventing speech, stalled calibration fails cleanly, and no coaching `/api/*` request occurs. These are strong implementation checks, not real-device accuracy, accessibility, privacy-certification, or fairness studies.
+Twenty-one deterministic engine tests cover calibration, segmentation—including an attempt with zero callbacks and zero coverage—observed/unknown time, continuity confidence, tips, transcript analysis, retrieval, grounding safety, template assembly, and advice. The browser smoke test proves that a default-off attempt constructs no recorder/artifact, v1 history upgrades to the v2 stores, opted-in audio/transcript persist, a late recognition error preserves text with a partial warning, real downloads contain data, JSON export excludes retained artifacts, both stores delete, route focus moves correctly, canceled permission/worklet work releases resources, stalled active input reaches its wall-clock review without inventing speech, stalled calibration fails cleanly, and no coaching `/api/*` request occurs. These are strong implementation checks, not real-device accuracy, accessibility, privacy-certification, or fairness studies.
 
 ### “Why not send audio to a more accurate model?”
 

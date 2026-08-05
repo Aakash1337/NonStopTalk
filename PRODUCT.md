@@ -40,7 +40,7 @@ choose one goal
   → compare with the baseline
 ```
 
-The first prototype implements standalone practice attempts, analysis/advice, and origin-scoped IndexedDB summaries in the current browser profile. Consented transcript analysis retains derived filler/repetition patterns in the summary but discards the full transcript by default. A separate, unchecked choice can retain the attempt recording and available full transcript locally for individual download; summary export omits those full artifacts, and deleting local history clears them. Its small local RAG pattern ranks curated in-app coaching cards; the top card supplies the intact base drill, deterministic template assembly appends a metric-specific comparison sentence, and separate rules select the strength and focus while the source remains visible. Explicit baseline/retry pairing and validated learning outcomes are still work in progress.
+The first prototype implements standalone practice attempts, analysis/advice, and origin-scoped IndexedDB summaries in the current browser profile. Consented transcript analysis retains derived filler/repetition patterns in the summary but discards captured transcript text by default. A separate, unchecked choice can retain the attempt recording and available captured transcript locally for individual download; a two-second finalization timeout or late recognition error preserves existing text but marks it as possibly partial in Review and Progress. Summary export omits those artifacts, and deleting local history clears them. Its small local RAG pattern ranks curated in-app coaching cards; the top card normally supplies the intact base drill, but an evidence-safety rule uses the measured priority's drill when the retrieved card lacks support. The review distinguishes a card used for the drill from context-only retrieval. Explicit baseline/retry pairing and validated learning outcomes are still work in progress.
 
 Play creates a lightweight speaking challenge: keep talking about a topic without exceeding the silence limit. It makes rules visible, handles timing and scoring, and reduces host bookkeeping.
 
@@ -83,9 +83,9 @@ NonStopTalk should not feel like:
 1. The current speaking task is always the center of attention.
 2. Show one live coaching cue at a time; move deeper analysis to the review.
 3. Connect every recommendation to an observable measurement and a concrete retry.
-4. Show which product-authored curated card supplied the retry drill; require expert/source review before calling a future curriculum authoritative.
+4. Show whether a product-authored curated card supplied the retry drill or was retrieved only as context; require expert/source review before calling a future curriculum authoritative.
 5. State uncertainty and unavailable signals instead of manufacturing a score.
-6. Keep attempt-recording and full-transcript retention off by default, explain that derived word patterns remain in the compact summary when transcript analysis is enabled, and separate every additional consent boundary.
+6. Keep attempt-recording and captured-transcript retention off by default, explain that derived word patterns remain in the compact summary when transcript analysis is enabled, warn when retained text may be partial, and separate every additional consent boundary.
 7. Treat accents and dialects as language variation, not defects.
 8. Preserve complete, explainable game scoring independently from coaching progress.
 9. Keep local play complete while the online and coaching editions evolve.

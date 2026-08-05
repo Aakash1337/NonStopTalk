@@ -9,7 +9,7 @@ The deployment consists of:
 - one SQLite-backed Durable Object per six-character room code
 - hibernatable WebSockets for live room updates
 
-The multiplayer game uses the Worker and Durable Objects. The speech-coaching prototype at `/practice` and its origin-local browser history at `/progress` run entirely in the browser after the static assets load. Coaching summaries, recordings, and transcript text are not sent to the Worker, a Durable Object, or an external model. A separate unchecked option can retain a recording and available full transcript in that origin's IndexedDB; it does not consume Durable Object storage.
+The multiplayer game uses the Worker and Durable Objects. The speech-coaching prototype at `/practice` and its origin-local browser history at `/progress` run entirely in the browser after the static assets load. Coaching summaries, recordings, and transcript text are not sent to the Worker, a Durable Object, or an external model. A separate unchecked option can retain a recording and available captured transcript in that origin's IndexedDB; possibly partial text is flagged in Review and Progress, and it does not consume Durable Object storage.
 
 The Durable Object binding is internal. Players use the normal public Worker URL:
 
@@ -80,7 +80,7 @@ npm run dev
 
 Wrangler starts the Worker, local Durable Object storage, and static assets. Its local state lives under `.wrangler`, which is ignored by Git.
 
-Open `http://127.0.0.1:8787/practice` for the coaching prototype or `/progress` for summaries and separately opted-in artifacts scoped to that origin and browser profile. Wrangler prints the actual URL if it selects a different port; a different port is a different origin and has separate IndexedDB history. These routes do not create a Durable Object. They use the SPA asset fallback documented by Cloudflare; microphone processing, summary storage, and optional recording/full-transcript storage stay in the browser. `MediaRecorder` support is required only for the full-session-retention option.
+Open `http://127.0.0.1:8787/practice` for the coaching prototype or `/progress` for summaries and separately opted-in artifacts scoped to that origin and browser profile. Wrangler prints the actual URL if it selects a different port; a different port is a different origin and has separate IndexedDB history. These routes do not create a Durable Object. They use the SPA asset fallback documented by Cloudflare; microphone processing, summary storage, and optional recording/captured-transcript storage stay in the browser. `MediaRecorder` support is required only for the full-session-retention option.
 
 The original Go edition is still the richer local app and remains available independently:
 

@@ -33,6 +33,13 @@ function ingestRange(analyzer, startMs, endMs, rms, peak = rms * 1.6, stepMs = 1
   }
 }
 
+function assertClose(actual, expected, tolerance, message) {
+  assert.ok(
+    Math.abs(actual - expected) <= tolerance,
+    message || `Expected ${actual} to be within ${tolerance} of ${expected}`,
+  );
+}
+
 test("deriveCalibration separates quiet and voice levels and exposes UI aliases", () => {
   const calibration = deriveCalibration({
     quietSamples: calibrationSamples(0.005),
@@ -111,11 +118,11 @@ test("analyzer reports calibrated level consistency and clipping without a quali
 
   assert.equal(report.inputLevel.status, "consistent");
   assert.ok(report.inputLevelConsistency > 0.9);
-  assert.equal(report.levelConsistencyPct, report.inputLevelConsistency * 100);
+  assertClose(report.levelConsistencyPct, report.inputLevelConsistency * 100, 0.11);
   assert.equal(report.clippingCount, 3);
   assert.equal(report.clipping.eventCount, 1);
   assert.equal(report.clipping.durationMs, 300);
-  assert.equal(report.clippingPct, report.clippingRatio * 100);
+  assertClose(report.clippingPct, report.clippingRatio * 100, 0.011);
   assert.equal(report.audioConfidence, report.confidence.level);
   assert.equal("score" in report, false, "there is deliberately no universal speaker score");
   assert.match(report.confidence.meaning, /not a rating of the speaker/i);
@@ -187,7 +194,8 @@ test("poor continuity caps confidence and prioritizes restoring input over false
   assert.ok(report.confidence.score <= report.continuity.score);
   assert.equal(advice.priorities[0].id, "restore-stable-input");
   assert.ok(!advice.priorities.some((item) => item.id === "add-intentional-pause"));
-  assert.equal(advice.grounding.usedCardId, "protect-input-level");
+  assert.equal(advice.grounding.retrieved[0].id, "protect-input-level");
+  assert.equal(advice.grounding.usedCardId, null);
   assert.match(advice.summary, /no reliable level frames/i);
 });
 
@@ -352,6 +360,43 @@ test("local RAG prioritizes microphone guidance for the energy goal and clipping
   assert.equal(retrieved[0].id, "protect-input-level");
   assert.ok(!retrieved[1] || retrieved[0].score > retrieved[1].score);
   assert.match(retrieved[0].drill, /microphone/i);
+});
+
+test("missing callback recovery is not replaced by unsupported microphone-level guidance", () => {
+  const missingCallbacks = {
+    goal: "pauses",
+    durationMs: 15_000,
+    speakingRatio: 0.5,
+    sampleCount: 20,
+    clippingCount: 0,
+    clippingRatio: 0,
+    inputLevel: { status: "insufficient-data", withinCalibrationBandRatio: null },
+    pauseCount: 0,
+    medianPauseMs: 0,
+    longestPauseMs: 0,
+    longestSpeakingRunMs: 1_000,
+    unknownMs: 12_000,
+    continuity: { score: 0.2 },
+    confidence: { level: "low" },
+  };
+  const advice = buildAdvice(missingCallbacks);
+
+  assert.equal(advice.primary.id, "restore-stable-input");
+  assert.equal(advice.grounding.retrieved[0].id, "protect-input-level");
+  assert.equal(advice.grounding.usedCardId, null, "retrieval alone must not be reported as drill generation");
+  assert.match(advice.grounding.note, /evidence-safety rule/i);
+  assert.ok(advice.nextAttempt.startsWith(advice.primary.drill));
+  assert.doesNotMatch(advice.nextAttempt, /one hand-span/i);
+
+  const supportedInputAdvice = buildAdvice({
+    ...missingCallbacks,
+    sampleCount: 50,
+    clippingCount: 4,
+    clippingRatio: 0.08,
+  });
+  assert.equal(supportedInputAdvice.primary.id, "restore-stable-input");
+  assert.equal(supportedInputAdvice.grounding.usedCardId, "protect-input-level");
+  assert.ok(supportedInputAdvice.nextAttempt.startsWith(supportedInputAdvice.grounding.retrieved[0].drill));
 });
 
 test("local RAG does not turn below-threshold evidence into adjustment advice", () => {

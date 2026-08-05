@@ -7,10 +7,10 @@ The playable game and a demonstrable coaching prototype exist today. The project
 ## Implemented now
 
 - A Cloudflare-SPA coaching prototype at `/practice`: 30–90 second interview, presentation, or impromptu attempts; microphone calibration; browser-side audio measurements; sparse deterministic live tips; and evidence-based review
-- A small local RAG layer: goal/evidence queries lexically retrieve curated in-app coaching cards; the top card supplies an intact base drill, deterministic template assembly appends a metric-specific comparison sentence, and separate rules select strength/focus—with visible provenance and no LLM, free-form model prose, embeddings, vector database, or network call
-- Optional pace and word-pattern estimates only when the user consents and the browser supports strict on-device speech recognition; the summary retains derived filler/repetition patterns, while the full transcript is discarded by default
+- A small local RAG layer: goal/evidence queries lexically retrieve curated in-app coaching cards; normally the top card supplies an intact base drill, but an evidence-safety rule can use the measured priority's drill instead when the card is unsupported. The review distinguishes used guidance from context-only retrieval, with no LLM, free-form model prose, embeddings, vector database, or network call
+- Optional pace and word-pattern estimates only when the user consents and the browser supports strict on-device speech recognition; the summary retains derived filler/repetition patterns, while captured transcript text is discarded by default
 - Origin-local coaching summaries, JSON export, and deletion at `/progress` through IndexedDB in the current browser profile
-- A separate, off-by-default retention choice that can keep the attempt recording and, when local transcription succeeds, its full transcript in the same origin-local IndexedDB database; Progress downloads those artifacts individually, JSON export excludes them, and deletion clears both stores
+- A separate, off-by-default retention choice that can keep the attempt recording and any locally captured transcript in the same origin-local IndexedDB database; recognition gets up to two seconds to flush at finish, and a timeout or error after text was captured preserves it but marks it as possibly partial in Review and Progress. JSON export excludes these artifacts, and deletion clears both stores
 - Six-character rooms with a host, remote seats, browser-based reconnect, live updates (SSE in the local Go app and hibernatable WebSockets online), host transfer, and takeover after a short absence grace period
 - Local pass-and-play and remote turns in the same room
 - Player add, rename, remove, and reorder controls
@@ -23,9 +23,9 @@ The playable game and a demonstrable coaching prototype exist today. The project
 
 ## Privacy and AI
 
-Classic play does not require an account, an API key, transcription, or audio upload. The browser uses its microphone locally for voice-activity detection. The coaching prototype similarly processes microphone frames in the browser and makes no coaching API call. It does not upload coaching audio or transcripts. Attempt-recording/full-transcript retention is a separate, off-by-default local-storage option; without it, audio is reduced to measurements and the full transcript is discarded.
+Classic play does not require an account, an API key, transcription, or audio upload. The browser uses its microphone locally for voice-activity detection. The coaching prototype similarly processes microphone frames in the browser and makes no coaching API call. It does not upload coaching audio or transcripts. Attempt-recording/captured-transcript retention is a separate, off-by-default local-storage option; without it, audio is reduced to measurements and captured transcript text is discarded.
 
-The free Cloudflare multiplayer game remains classic-only and calls no AI provider. Its separate coaching path may create a transcript only after explicit consent and only when the browser supports mandatory on-device recognition. Derived filler/repetition patterns are saved with its compact summary. By default the full transcript is discarded; if the user separately enables full-session retention, the recording and available full transcript are stored only for that site origin and browser profile. Coaching-card retrieval and deterministic review assembly also stay in the browser. The following AI-judge behavior belongs to the local Go game edition.
+The free Cloudflare multiplayer game remains classic-only and calls no AI provider. Its separate coaching path may create a transcript only after explicit consent and only when the browser supports mandatory on-device recognition. Derived filler/repetition patterns are saved with its compact summary. By default captured transcript text is discarded; if the user separately enables full-session retention, the recording and available captured transcript are stored only for that site origin and browser profile. A finalization warning is persisted and shown whenever retained text may be partial. Coaching-card retrieval and deterministic review assembly also stay in the browser. The following AI-judge behavior belongs to the local Go game edition.
 
 The AI judge is opt-in at two levels: the host enables it for the room, then the current speaker chooses whether to use transcription for that turn. Transcription starts only when the browser exposes `SpeechRecognition` with `processLocally` support and accepts the selected live microphone track. If any of those checks fail, the turn continues with classic scoring or the manual timer.
 
@@ -146,7 +146,7 @@ npm run check:cloudflare
 npm run smoke:coach
 ```
 
-`test:coach` runs 20 deterministic measurement, continuity, transcript-analysis, retrieval, and advice tests without a microphone. `smoke:coach` drives the Cloudflare SPA with synthetic media; it proves a default-off attempt never constructs `MediaRecorder` or creates an artifact, exercises a v1→v2 storage upgrade, verifies opted-in recording/transcript and real downloads, checks JSON artifact exclusion and two-store deletion, renders a voice/quiet timeline, moves focus after SPA navigation, cleans up canceled permission/worklet work, handles active/calibration stalls, and makes no application `/api/*` request.
+`test:coach` runs 21 deterministic measurement, continuity, transcript-analysis, retrieval, grounding-safety, and advice tests without a microphone. `smoke:coach` drives the Cloudflare SPA with synthetic media; it proves a default-off attempt never constructs `MediaRecorder` or creates an artifact, exercises a v1→v2 storage upgrade, verifies opted-in recording/transcript and real downloads, preserves captured text with a partial-transcript warning after a late recognition error, checks JSON artifact exclusion and two-store deletion, renders a voice/quiet timeline, moves focus after SPA navigation, cleans up canceled permission/worklet work, handles active/calibration stalls, and makes no application `/api/*` request.
 
 ## Architecture
 
@@ -159,7 +159,7 @@ npm run smoke:coach
 - Native TypeScript Worker, Workers Static Assets, and one SQLite-backed Durable Object per online room
 - Hibernatable WebSockets for cost-efficient online synchronization
 - Browser `AudioWorklet` (with an `AnalyserNode` compatibility fallback) for coaching signal reduction, plus deterministic analysis and local lexical coaching-card retrieval
-- Origin-scoped IndexedDB v2 for compact coaching summaries and a separate, explicitly opted-in full-artifact store; exports exclude full recordings/transcripts and local deletion clears both stores
+- Origin-scoped IndexedDB v2 for compact coaching summaries and a separate, explicitly opted-in recording/captured-transcript store; exports exclude those artifacts and local deletion clears both stores
 - Playwright browser smoke coverage plus Go unit and handler tests
 
 There is no frontend build step for local play.

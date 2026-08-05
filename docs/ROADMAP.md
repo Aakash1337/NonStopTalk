@@ -19,11 +19,11 @@ Implemented prototype scope:
 - Objective audio measurements for input level, clipping, speech/silence time, and pauses
 - Optional pace and filler estimates only when the browser supports strict on-device speech recognition and the user opts in
 - Lexical retrieval over a curated in-app coaching-card library, with no embeddings, vector database, model, or network request
-- Deterministic, sparse acoustic live tips, rule-selected review evidence/focus, and a post-attempt instruction assembled from the top retrieved card's prewritten drill plus a metric-specific comparison sentence, with visible provenance
+- Deterministic, sparse acoustic live tips, rule-selected review evidence/focus, and a post-attempt instruction normally assembled from the top retrieved card's prewritten drill plus a metric-specific comparison sentence; an evidence-safety rule can supply the drill instead, and the review labels the card as used or context only
 - Compact session summaries in origin-scoped IndexedDB in the current browser profile, including consented derived filler/repetition patterns
-- Separate, off-by-default retention of the attempt recording and available full transcript in an origin-local artifact store, with individual downloads; full artifacts are excluded from summary JSON export
+- Separate, off-by-default retention of the attempt recording and available captured transcript in an origin-local artifact store, with individual downloads; finalization errors/timeouts mark retained text as possibly partial in Review and Progress, and artifacts are excluded from summary JSON export
 - No coaching audio or transcript upload; confirmed deletion clears both local coaching stores
-- Twenty deterministic coaching-engine tests and a strengthened browser smoke flow covering default-off and opted-in storage, v1→v2 migration, real downloads/export, observed/unknown timing, timeline rendering, focus, cancellation/stall cleanup, and no coaching API request
+- Twenty-one deterministic coaching-engine tests and a strengthened browser smoke flow covering grounding safety, default-off and opted-in storage, v1→v2 migration, real downloads/export, partial-transcript warnings, observed/unknown timing, timeline rendering, focus, cancellation/stall cleanup, and no coaching API request
 
 This prototype demonstrates the technical and interaction loop. It does not yet establish measurement accuracy across devices, learning outcomes, clinical value, accessibility conformance, or accent/language fairness.
 

@@ -728,7 +728,7 @@ export function buildAdvice(report) {
     .slice(0, 2)
     .map(({ priority: _priority, ...item }) => item);
   const retrieved = retrieveCoachingGuidance({ goal: report.goal, report, limit: 2 });
-  const nextAttempt = generateGroundedNextAttempt(retrieved[0], priorities[0]);
+  const generatedAttempt = generateGroundedNextAttempt(retrieved[0], priorities[0], report);
   const caveats = [
     "These measurements describe this attempt; they do not infer confidence, emotion, personality, accent quality, or health.",
     ...(confidence === "low" ? ["Treat this review as provisional because the measurement evidence is limited."] : []),
@@ -740,21 +740,32 @@ export function buildAdvice(report) {
     strengths: strengths.slice(0, 2),
     priorities,
     primary: priorities[0] ?? null,
-    nextAttempt,
+    nextAttempt: generatedAttempt.text,
     grounding: {
       mode: "local-lexical-rag",
       generation: "deterministic-template",
       libraryVersion: "v1",
-      usedCardId: retrieved[0]?.id ?? null,
+      usedCardId: generatedAttempt.usedCardId,
       retrieved,
-      note: "Selected locally from product-authored coaching cards using the goal and aggregate measurements, then assembled with a metric-specific comparison prompt; no transcript text, model, or network call is used.",
+      note: generatedAttempt.usedCardId
+        ? "Selected locally from product-authored coaching cards using the goal and aggregate measurements, then assembled with a metric-specific comparison prompt; no transcript text, model, or network call is used."
+        : "A product-authored card was retrieved locally, but an evidence-safety rule supplied the retry drill because the card's adjustment was not supported by this attempt; no transcript text, model, or network call is used.",
     },
     caveats,
   };
 }
 
-function generateGroundedNextAttempt(card, priority) {
-  const base = card?.drill
+function generateGroundedNextAttempt(card, priority, report = {}) {
+  const clippingRatio = finiteNumber(report.clippingRatio, finiteNumber(report.clippingPct, 0) / 100);
+  const protectInputCardHasEvidence = card?.id === "protect-input-level" && (
+    report.inputLevel?.status === "variable"
+    || (report.sampleCount >= 20 && report.clippingCount >= 3 && clippingRatio >= 0.02)
+  );
+  const preserveSignalRecovery = priority?.id === "restore-stable-input"
+    && card?.id === "protect-input-level"
+    && !protectInputCardHasEvidence;
+  const cardContributed = Boolean(card?.drill) && !preserveSignalRecovery;
+  const base = preserveSignalRecovery ? priority.drill : card?.drill
     ?? priority?.drill
     ?? "Repeat the same prompt once with one selected change.";
   const comparison = {
@@ -768,7 +779,10 @@ function generateGroundedNextAttempt(card, priority) {
     "reduce-immediate-repetition": "Then compare immediate repetitions per 100 words.",
     "longer-baseline": "Use that longer attempt as the baseline for one comparable retry.",
   }[priority?.id] ?? "Then compare the same selected measurement with this attempt.";
-  return `${base} ${comparison}`;
+  return {
+    text: `${base} ${comparison}`,
+    usedCardId: cardContributed ? card.id : null,
+  };
 }
 
 function tipCandidates(snapshot) {

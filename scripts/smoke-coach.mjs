@@ -15,6 +15,14 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function normalizeHyphenatedText(value) {
+  return String(value)
+    .toLocaleLowerCase()
+    .replace(/[-\u2010-\u2015\u2212]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
 async function getFreePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -99,8 +107,10 @@ const syntheticCoachAudio = () => {
         const now = context.currentTime;
         gain.gain.setValueAtTime(0.0001, now);
         gain.gain.setValueAtTime(0.075, now + 2.05);
-        gain.gain.setValueAtTime(0.0002, now + 5.8);
-        gain.gain.setValueAtTime(0.075, now + 6.8);
+        for (let cycleStart = 5.8; cycleStart < 5 * 60; cycleStart += 4) {
+          gain.gain.setValueAtTime(0.0002, now + cycleStart);
+          gain.gain.setValueAtTime(0.075, now + cycleStart + 1);
+        }
         oscillator.start();
         const stream = destination.stream;
         for (const track of stream.getTracks()) {
@@ -132,7 +142,15 @@ const syntheticCoachAudio = () => {
         this.onresult?.({ results: { 0: result, length: 1 } });
       }, 500);
     }
-    stop() { clearTimeout(this.timer); }
+    stop() {
+      clearTimeout(this.timer);
+      this.timer = window.setTimeout(() => {
+        const alternative = { transcript: "Um basically my idea solves the problem and my idea gives people a clearer next step after the delayed flush" };
+        const result = { 0: alternative, length: 1, isFinal: true };
+        this.onresult?.({ results: { 0: result, length: 1 } });
+        this.onerror?.({ type: "error", error: "no-speech" });
+      }, window.__coachRecognitionFinalDelay ?? 600);
+    }
     abort() { clearTimeout(this.timer); }
   }
   Object.defineProperty(window, "SpeechRecognition", { configurable: true, value: LocalRecognition });
@@ -163,6 +181,7 @@ const delayedCoachPermission = () => {
 
 const delayedCoachWorklet = () => {
   window.__activeCoachIntervals = new Set();
+  window.__coachIntervalBaseline = new Set();
   const nativeSetInterval = window.setInterval.bind(window);
   const nativeClearInterval = window.clearInterval.bind(window);
   window.setInterval = (callback, milliseconds, ...args) => {
@@ -174,6 +193,11 @@ const delayedCoachWorklet = () => {
     window.__activeCoachIntervals.delete(id);
     return nativeClearInterval(id);
   };
+  window.__captureCoachIntervalBaseline = () => {
+    window.__coachIntervalBaseline = new Set(window.__activeCoachIntervals);
+  };
+  window.__coachIntervalsAfterBaseline = () => [...window.__activeCoachIntervals]
+    .filter((id) => !window.__coachIntervalBaseline.has(id)).length;
   AudioWorklet.prototype.addModule = () => new Promise((resolve) => {
     window.__resolveCoachWorklet = resolve;
   });
@@ -236,6 +260,7 @@ async function storedArtifacts(page) {
           audioSize: item.audioBlob instanceof Blob ? item.audioBlob.size : -1,
           audioType: item.audioBlob instanceof Blob ? item.audioBlob.type : "",
           transcript: item.transcript,
+          transcriptMayBePartial: item.transcriptMayBePartial,
         })));
         request.onerror = () => reject(request.error);
       });
@@ -258,7 +283,7 @@ async function runPracticeFlow(browser, origin) {
 
   await page.goto(`${origin}/practice`);
   await page.waitForSelector("[data-coach-setup]");
-  assert((await page.locator("body").innerText()).toLocaleLowerCase().includes("on device"), "Practice setup must disclose on-device processing");
+  assert(normalizeHyphenatedText(await page.locator("body").innerText()).includes("on device"), "Practice setup must disclose on-device processing");
   const retentionCheckbox = page.getByLabel("Optional full session retention").getByRole("checkbox");
   assert(!(await retentionCheckbox.isChecked()), "Raw audio/full transcript retention must be opt-in");
   await page.getByLabel("Optional transcript analysis").getByRole("checkbox").check();
@@ -279,6 +304,7 @@ async function runPracticeFlow(browser, origin) {
   for (const expected of ["Strength", "Focus next", "Drill", "speaking ratio", "level consistency", "clipping frames", "On-device transcript", "Local RAG", "NonStopTalk Coaching Library"]) {
     assert(normalizedReview.includes(expected.toLocaleLowerCase()), `Expected review to include ${JSON.stringify(expected)}`);
   }
+  assert(normalizedReview.includes("transcript may be partial"), "A late recognition error must preserve captured text while warning that it may be partial");
   const summaries = await storedSummaries(page);
   assert(summaries.length === 1, `Expected one locally stored summary, got ${summaries.length}`);
   const summary = summaries[0];
@@ -288,10 +314,13 @@ async function runPracticeFlow(browser, origin) {
   assert(JSON.stringify(Object.keys(summary).sort()) === JSON.stringify(["advice", "analysisSchemaVersion", "artifacts", "createdAt", "goal", "id", "metrics", "scenario", "targetDurationMs"].sort()), "Stored summary must use the reviewed top-level allowlist");
   assert(!("segments" in summary.metrics) && !("transcript" in summary.metrics) && !("frames" in summary.metrics), "Stored metrics must exclude timelines, raw transcripts, and live frames");
   assert(summary.metrics.transcriptMetrics?.fillerOccurrences?.some((item) => item.phrase === "um"), "Consented derived filler patterns should be retained locally for analysis");
+  assert(summary.artifacts.transcriptMayBePartial === true, "Summary metadata must preserve the partial-transcript warning without storing full text there");
   const artifacts = await storedArtifacts(page);
   assert(artifacts.length === 1, `Expected one opted-in full session artifact, got ${artifacts.length}`);
   assert(artifacts[0].audioSize > 0, "The opted-in browser-encoded recording should be stored as a non-empty Blob");
-  assert(artifacts[0].transcript.includes("basically my idea"), "Opted-in full transcript should be retained locally");
+  assert(artifacts[0].transcript.includes("basically my idea"), "Opted-in captured transcript should be retained locally");
+  assert(artifacts[0].transcript.includes("delayed flush"), "Final local-recognition results arriving after the old 350ms cutoff should be retained");
+  assert(artifacts[0].transcriptMayBePartial === true, "A retained transcript followed by a recognition error must be marked as possibly partial");
   assert(apiRequests.length === 0, `Practice mode unexpectedly called the backend: ${apiRequests.join(", ")}`);
   assert(pageErrors.length === 0, `Practice page emitted errors: ${JSON.stringify(pageErrors)}`);
 
@@ -333,6 +362,25 @@ async function runPracticeFlow(browser, origin) {
     }
   }
   assert(reloadedProgress.toLocaleLowerCase().includes("interview answer"), `Progress must survive a reload; storage=${reloadStorageDebug}; got ${JSON.stringify(reloadedProgress)}`);
+  await page.evaluate(async (sessionId) => {
+    const database = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching", 2);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      await new Promise((resolve, reject) => {
+        const transaction = database.transaction("session-artifacts", "readwrite");
+        transaction.objectStore("session-artifacts").delete(sessionId);
+        transaction.oncomplete = resolve;
+        transaction.onerror = () => reject(transaction.error);
+      });
+    } finally {
+      database.close();
+    }
+  }, summary.id);
+  await page.getByRole("button", { name: "Download recording" }).click();
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent === "That saved session artifact is unavailable.");
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Delete local history" }).click();
   await page.waitForSelector(".empty-progress");
@@ -371,6 +419,35 @@ async function runDefaultRetentionFlow(browser, origin) {
   await context.close();
 }
 
+async function runTranscriptFinalizationTimeoutFlow(browser, origin) {
+  const context = await browser.newContext();
+  await context.addInitScript(syntheticCoachAudio);
+  await context.addInitScript(() => { window.__coachRecognitionFinalDelay = 2_100; });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.goto(`${origin}/practice`);
+  await page.getByLabel("Optional transcript analysis").getByRole("checkbox").check();
+  await page.getByLabel("Optional full session retention").getByRole("checkbox").check();
+  await page.getByRole("button", { name: /Calibrate microphone/ }).click();
+  await page.waitForSelector("[data-coach-live]", { timeout: 12_000 });
+  await page.waitForTimeout(700);
+  await page.locator("[data-coach-stop]").click();
+  await page.waitForSelector("[data-coach-review]", { timeout: 5_000 });
+  const review = (await page.locator("[data-coach-review]").innerText()).toLocaleLowerCase();
+  assert(review.includes("did not finish within two seconds"), "A recognition flush timeout must be disclosed in the review");
+  const summaries = await storedSummaries(page);
+  const artifacts = await storedArtifacts(page);
+  assert(summaries[0]?.artifacts?.transcriptMayBePartial === true, "Timeout state must survive in compact summary metadata");
+  assert(artifacts[0]?.transcriptMayBePartial === true, "Timeout state must survive with the captured transcript artifact");
+  assert(artifacts[0]?.transcript && !artifacts[0].transcript.includes("delayed flush"), "Timed-out final speech must not be silently represented as captured");
+  await page.getByRole("link", { name: "View progress" }).click();
+  await page.waitForSelector("[data-coach-progress]");
+  assert((await page.locator("[data-coach-progress]").innerText()).toLocaleLowerCase().includes("captured transcript may be partial"), "Progress must preserve the partial-transcript disclosure");
+  assert(pageErrors.length === 0, `Transcript finalization timeout flow emitted errors: ${JSON.stringify(pageErrors)}`);
+  await context.close();
+}
+
 async function runVersionOneMigrationFlow(browser, origin) {
   const context = await browser.newContext();
   const page = await context.newPage();
@@ -381,6 +458,15 @@ async function runVersionOneMigrationFlow(browser, origin) {
       request.onupgradeneeded = () => {
         const store = request.result.createObjectStore("session-summaries", { keyPath: "id" });
         store.createIndex("createdAt", "createdAt");
+        store.put({
+          id: "legacy-v1-summary",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          scenario: "interview",
+          goal: "pauses",
+          targetDurationMs: 45_000,
+          metrics: { durationMs: 30_000, speakingRatio: 0.6, pauseCount: 1 },
+          advice: { focus: "Legacy focus preserved" },
+        });
       };
       request.onsuccess = () => {
         request.result.close();
@@ -391,17 +477,152 @@ async function runVersionOneMigrationFlow(browser, origin) {
   });
   await page.goto(`${origin}/progress`);
   await page.waitForSelector("[data-coach-progress]");
-  const stores = await page.evaluate(async () => {
+  const migration = await page.evaluate(async () => {
     const database = await new Promise((resolve, reject) => {
       const request = indexedDB.open("nonstoptalk-coaching", 2);
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
-    const names = [...database.objectStoreNames];
-    database.close();
-    return names;
+    try {
+      const stores = [...database.objectStoreNames];
+      const legacySummary = await new Promise((resolve, reject) => {
+        const request = database.transaction("session-summaries", "readonly")
+          .objectStore("session-summaries")
+          .get("legacy-v1-summary");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      return { stores, legacySummary };
+    } finally {
+      database.close();
+    }
   });
-  assert(stores.includes("session-summaries") && stores.includes("session-artifacts"), "IndexedDB v1 history should upgrade to both v2 stores");
+  assert(migration.stores.includes("session-summaries") && migration.stores.includes("session-artifacts"), "IndexedDB v1 history should upgrade to both v2 stores");
+  assert(migration.legacySummary?.advice?.focus === "Legacy focus preserved", "IndexedDB v2 migration must preserve legacy v1 summaries");
+  await context.close();
+}
+
+async function runLegacyProgressFlow(browser, origin) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.goto(origin);
+  await page.evaluate(async () => {
+    const database = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching", 2);
+      request.onupgradeneeded = () => {
+        const summaries = request.result.createObjectStore("session-summaries", { keyPath: "id" });
+        summaries.createIndex("createdAt", "createdAt");
+        const artifacts = request.result.createObjectStore("session-artifacts", { keyPath: "id" });
+        artifacts.createIndex("createdAt", "createdAt");
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction("session-summaries", "readwrite");
+      const store = transaction.objectStore("session-summaries");
+      store.put({ id: "legacy-missing", createdAt: "2026-08-05T12:00:00.000Z", scenario: "interview", goal: "pace" });
+      store.put({ id: "legacy-invalid", createdAt: "2026-08-05T11:00:00.000Z", scenario: "presentation", goal: "pauses", metrics: { speakingRatio: "unknown" } });
+      store.put({ id: "legacy-valid", createdAt: "2026-08-05T10:00:00.000Z", scenario: "impromptu", goal: "energy", metrics: { speakingRatio: 0.6 } });
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error);
+    });
+    database.close();
+  });
+  await page.goto(`${origin}/progress`);
+  await page.waitForSelector("[data-coach-progress]");
+  const progressMetrics = page.locator(".progress-metrics .review-metric strong");
+  assert(await progressMetrics.nth(1).innerText() === "60%", "Progress averages should exclude legacy records without a valid speaking ratio");
+  assert(await progressMetrics.nth(2).innerText() === "—", "Progress should not invent a latest-ratio shift from missing or non-numeric metrics");
+  assert(pageErrors.length === 0, `Legacy progress flow emitted errors: ${JSON.stringify(pageErrors)}`);
+  await context.close();
+}
+
+async function runRouteLinkClickFlow(browser, origin) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  await page.goto(origin);
+  const result = await page.evaluate(() => {
+    const link = document.querySelector("[data-route]");
+    const dispatch = (init) => {
+      let appPreventedDefault = false;
+      window.addEventListener("click", (event) => {
+        appPreventedDefault = event.defaultPrevented;
+        event.preventDefault();
+      }, { once: true });
+      link.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, ...init }));
+      return { appPreventedDefault, pathname: location.pathname };
+    };
+    return {
+      modified: dispatch({ button: 0, ctrlKey: true }),
+      nonPrimary: dispatch({ button: 1 }),
+      primary: dispatch({ button: 0 }),
+    };
+  });
+  assert(!result.modified.appPreventedDefault && result.modified.pathname === "/", "Modified route-link clicks should retain native browser behavior");
+  assert(!result.nonPrimary.appPreventedDefault && result.nonPrimary.pathname === "/", "Non-primary route-link clicks should retain native browser behavior");
+  assert(result.primary.appPreventedDefault && result.primary.pathname === "/practice", "Unmodified primary route-link clicks should still use SPA navigation");
+  await context.close();
+}
+
+async function runCancelledAudioResumeFlow(browser, origin) {
+  const context = await browser.newContext();
+  await context.addInitScript(syntheticCoachAudio);
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.goto(`${origin}/practice`);
+  await page.evaluate(() => {
+    const NativeAudioContext = window.AudioContext || window.webkitAudioContext;
+    class StalledAudioContext extends NativeAudioContext {
+      resume() {
+        window.__coachAppResumeStarted = true;
+        return new Promise(() => {});
+      }
+    }
+    Object.defineProperty(window, "AudioContext", { configurable: true, value: StalledAudioContext });
+  });
+  await page.getByRole("button", { name: /Calibrate microphone/ }).click();
+  await page.waitForFunction(() => window.__coachAppResumeStarted === true);
+  await page.getByRole("button", { name: "Cancel" }).click();
+  await page.waitForSelector("[data-coach-setup]");
+  await page.waitForFunction(() => window.__coachTrackStopped === true);
+  assert(await page.evaluate(() => window.__coachTrackStopped), "Cancelling a stalled AudioContext resume must stop the acquired microphone track");
+  assert(pageErrors.length === 0, `Cancelled AudioContext resume flow emitted errors: ${JSON.stringify(pageErrors)}`);
+  await context.close();
+}
+
+async function runCalibrationAccessibilityFlow(browser, origin) {
+  const context = await browser.newContext();
+  await context.addInitScript(syntheticCoachAudio);
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.goto(`${origin}/practice`);
+  await page.evaluate(() => {
+    const getSyntheticStream = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    navigator.mediaDevices.getUserMedia = (...args) => new Promise((resolve, reject) => {
+      window.__resolveCoachSyntheticPermission = () => getSyntheticStream(...args).then(resolve, reject);
+    });
+  });
+  await page.getByRole("button", { name: /Calibrate microphone/ }).click();
+  await page.getByRole("heading", { name: "Allow microphone access." }).waitFor();
+  const cancel = page.getByRole("button", { name: "Cancel" });
+  await cancel.focus();
+  await page.waitForFunction(() => typeof window.__resolveCoachSyntheticPermission === "function");
+  await page.evaluate(() => window.__resolveCoachSyntheticPermission());
+  await page.getByRole("heading", { name: "Stay quiet for a moment." }).waitFor({ timeout: 12_000 });
+  assert(await cancel.evaluate((button) => document.activeElement === button), "The permission-to-quiet calibration update must preserve keyboard focus");
+  await page.waitForFunction(() => document.querySelector("#announcer")?.textContent.includes("Stay quiet"));
+  await page.getByRole("heading", { name: "Now speak normally." }).waitFor();
+  assert(await cancel.evaluate((button) => document.activeElement === button), "The quiet-to-speaking calibration update must preserve keyboard focus");
+  await page.waitForFunction(() => document.querySelector("#announcer")?.textContent.includes("Now speak normally"));
+  await cancel.click();
+  await page.waitForSelector("[data-coach-setup]");
+  assert(await page.evaluate(() => window.__coachTrackStopped), "Cancelling the accessibility calibration flow must stop the microphone");
+  assert(pageErrors.length === 0, `Calibration accessibility flow emitted errors: ${JSON.stringify(pageErrors)}`);
   await context.close();
 }
 
@@ -417,7 +638,7 @@ async function runCancelledPermissionFlow(browser, origin) {
   await page.getByRole("button", { name: "Cancel" }).click();
   await page.waitForSelector("[data-coach-setup]");
   await page.evaluate(() => window.__resolveCoachPermission());
-  await page.waitForTimeout(300);
+  await page.waitForFunction(() => window.__lateCoachTrackStopped === true);
   assert(await page.evaluate(() => window.__lateCoachTrackStopped), "A microphone stream resolving after cancellation must be stopped");
   assert(await page.locator("[data-coach-live]").count() === 0, "A cancelled permission request must not start coaching later");
   assert(pageErrors.length === 0, `Cancelled permission flow emitted errors: ${JSON.stringify(pageErrors)}`);
@@ -432,14 +653,15 @@ async function runCancelledWorkletFlow(browser, origin) {
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
   await page.goto(`${origin}/practice`);
+  await page.evaluate(() => window.__captureCoachIntervalBaseline());
   await page.getByRole("button", { name: /Calibrate microphone/ }).click();
   await page.waitForFunction(() => typeof window.__resolveCoachWorklet === "function");
   await page.getByRole("button", { name: "Cancel" }).click();
   await page.waitForSelector("[data-coach-setup]");
   await page.evaluate(() => window.__resolveCoachWorklet());
-  await page.waitForTimeout(300);
+  await page.waitForFunction(() => window.__coachTrackStopped === true && window.__coachIntervalsAfterBaseline() === 0);
   assert(await page.evaluate(() => window.__coachTrackStopped), "Cancelling during AudioWorklet loading must stop the microphone track");
-  assert(await page.evaluate(() => window.__activeCoachIntervals.size) === 0, "Cancelling during AudioWorklet loading must not leave a fallback interval");
+  assert(await page.evaluate(() => window.__coachIntervalsAfterBaseline()) === 0, "Cancelling during AudioWorklet loading must not leave a fallback interval");
   assert(await page.locator("[data-coach-live]").count() === 0, "A cancelled AudioWorklet load must not start coaching later");
   assert(pageErrors.length === 0, `Cancelled AudioWorklet flow emitted errors: ${JSON.stringify(pageErrors)}`);
   await context.close();
@@ -465,6 +687,7 @@ async function runStalledActiveFlow(browser, origin) {
   const review = (await page.locator("[data-coach-review]").innerText()).toLocaleLowerCase();
   assert(review.includes("unobserved audio"), "A stalled active meter should disclose unobserved audio rather than invent speech");
   assert(!review.includes("create an idea boundary"), "A stalled meter must not produce false continuous-speech advice");
+  assert(review.includes("retrieved as context") && review.includes("higher-priority evidence rule"), "RAG provenance must not claim an unused card shaped signal-recovery advice");
   assert(await page.evaluate(() => window.__coachTrackStopped), "The wall-clock deadline must stop the microphone after a stalled callback stream");
   assert(pageErrors.length === 0, `Stalled active flow emitted errors: ${JSON.stringify(pageErrors)}`);
   await context.close();
@@ -509,12 +732,20 @@ try {
   browser = await launchBrowser();
   await runPracticeFlow(browser, origin);
   await runDefaultRetentionFlow(browser, origin);
+  await runTranscriptFinalizationTimeoutFlow(browser, origin);
   await runVersionOneMigrationFlow(browser, origin);
+  await runLegacyProgressFlow(browser, origin);
+  await runRouteLinkClickFlow(browser, origin);
+  await runCancelledAudioResumeFlow(browser, origin);
+  await runCalibrationAccessibilityFlow(browser, origin);
   await runCancelledPermissionFlow(browser, origin);
   await runCancelledWorkletFlow(browser, origin);
   await runStalledActiveFlow(browser, origin);
   await runStalledCalibrationFlow(browser, origin);
   console.log("Speech coaching browser smoke test passed.");
+} catch (error) {
+  if (logs.trim()) console.error(`Wrangler output captured before failure:\n${logs.trim()}`);
+  throw error;
 } finally {
   await browser?.close().catch(() => {});
   stopProcessTree(child);

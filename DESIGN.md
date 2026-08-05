@@ -110,14 +110,14 @@ Practice and Progress:
 - Scenario and focus-goal selector
 - Prompt surface
 - Microphone readiness/privacy disclosure
-- Separate, unchecked controls for optional on-device transcript analysis and optional attempt-recording/full-transcript retention
+- Separate, unchecked controls for optional on-device transcript analysis and optional attempt-recording/captured-transcript retention
 - Live level indicator, with a sparse clipping cue when the measured condition qualifies
 - Single-tip coaching surface
 - Evidence row with value, unit, and explanation
-- Compact source label for the retrieved coaching card that supplied the retry drill
+- Compact grounding label that says whether the retrieved coaching card supplied the retry drill or was context only because an evidence-safety rule supplied it
 - Actionable review card
 - Device-local attempt history and empty state
-- Per-attempt download controls only when the relevant full artifact exists, plus one confirmed action that clears summaries and artifacts
+- Per-attempt download controls only when the relevant retained artifact exists, plus one confirmed action that clears summaries and artifacts; possibly partial transcripts carry a visible warning
 
 Play:
 
