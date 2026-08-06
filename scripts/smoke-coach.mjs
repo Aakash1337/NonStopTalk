@@ -144,14 +144,21 @@ const syntheticCoachAudio = () => {
     }
     stop() {
       clearTimeout(this.timer);
+      window.__coachRecognitionLateFlushOutcome = "pending";
       this.timer = window.setTimeout(() => {
+        window.__coachRecognitionLateFlushOutcome = "delivered";
         const alternative = { transcript: "Um basically my idea solves the problem and my idea gives people a clearer next step after the delayed flush" };
         const result = { 0: alternative, length: 1, isFinal: true };
         this.onresult?.({ results: { 0: result, length: 1 } });
         this.onerror?.({ type: "error", error: "no-speech" });
       }, window.__coachRecognitionFinalDelay ?? 600);
     }
-    abort() { clearTimeout(this.timer); }
+    abort() {
+      if (window.__coachRecognitionLateFlushOutcome === "pending") {
+        window.__coachRecognitionLateFlushOutcome = "cancelled";
+      }
+      clearTimeout(this.timer);
+    }
   }
   Object.defineProperty(window, "SpeechRecognition", { configurable: true, value: LocalRecognition });
 };
@@ -434,10 +441,12 @@ async function runTranscriptFinalizationTimeoutFlow(browser, origin) {
   await page.waitForTimeout(700);
   await page.locator("[data-coach-stop]").click();
   await page.waitForSelector("[data-coach-review]", { timeout: 5_000 });
+  await page.waitForFunction(() => ["delivered", "cancelled"].includes(window.__coachRecognitionLateFlushOutcome));
   const review = (await page.locator("[data-coach-review]").innerText()).toLocaleLowerCase();
   assert(review.includes("did not finish within two seconds"), "A recognition flush timeout must be disclosed in the review");
   const summaries = await storedSummaries(page);
   const artifacts = await storedArtifacts(page);
+  assert(await page.evaluate(() => window.__coachRecognitionLateFlushOutcome) === "cancelled", "The timed-out local-recognition flush should be cancelled during cleanup");
   assert(summaries[0]?.artifacts?.transcriptMayBePartial === true, "Timeout state must survive in compact summary metadata");
   assert(artifacts[0]?.transcriptMayBePartial === true, "Timeout state must survive with the captured transcript artifact");
   assert(artifacts[0]?.transcript && !artifacts[0].transcript.includes("delayed flush"), "Timed-out final speech must not be silently represented as captured");
