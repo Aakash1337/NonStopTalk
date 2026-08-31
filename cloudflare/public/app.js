@@ -1,3 +1,5 @@
+import { cloudProgress, mergeCoachingSummaries } from "./cloud-progress.js";
+
 const app = document.querySelector("#app");
 const announcer = document.querySelector("#announcer");
 const toast = document.querySelector("#toast");
@@ -19,6 +21,7 @@ let pendingCoachingToken = null;
 let coachEnginePromise = null;
 let routeFocusRequested = false;
 let practice = freshPracticeState();
+let progressSessions = [];
 
 const PRACTICE_SCENARIOS = [
   { id: "interview", name: "Interview answer", prompt: "Tell me about a time you solved a difficult problem." },
@@ -30,6 +33,7 @@ const PRACTICE_GOALS = [
   { id: "pauses", name: "Purposeful pauses", detail: "Replace rushed transitions with short, deliberate pauses." },
   { id: "energy", name: "Steady delivery", detail: "Keep your vocal level consistent without clipping." },
 ];
+const ROOM_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{6}$/i;
 
 document.addEventListener("click", handleClick);
 document.addEventListener("submit", handleSubmit);
@@ -63,7 +67,7 @@ async function loadRoute() {
     focusRouteHeading();
     return;
   }
-  const match = location.pathname.match(/^\/room\/([A-Z2-9]{6})\/?$/i);
+  const match = location.pathname.match(/^\/room\/([A-HJ-NP-Z2-9]{6})\/?$/i);
   if (!match) {
     roomCode = "";
     document.title = "NonStopTalk";
@@ -105,7 +109,7 @@ function renderLanding(message = "") {
         </form>
         <form class="panel stack" data-join-room>
           <div class="panel-head"><h2>Join a room</h2><span class="tag">Player</span></div>
-          <label>Room code <input name="code" minlength="6" maxlength="6" autocapitalize="characters" autocomplete="off" placeholder="ABC123" required></label>
+          <label>Room code <input name="code" minlength="6" maxlength="6" autocapitalize="characters" autocomplete="off" placeholder="ABC234" required></label>
           <label>Your name <input name="name" maxlength="40" autocomplete="nickname" required></label>
           <button class="button" type="submit">Join game</button>
         </form>
@@ -122,6 +126,7 @@ function freshPracticeState(setup = {}) {
       duration: Number(setup.duration) || 45,
       transcriptConsent: Boolean(setup.transcriptConsent),
       retainArtifacts: Boolean(setup.retainArtifacts),
+      cloudSync: Boolean(setup.cloudSync),
     },
     error: "",
     report: null,
@@ -162,8 +167,8 @@ function renderPracticeSetup() {
       <div class="privacy-card">
         <span class="device-badge"><span aria-hidden="true">●</span> On device</span>
         <h2>Your voice stays here.</h2>
-        <p>Audio is analyzed live in this tab and never uploaded. Recording is off by default; the optional full-session setting below stores it only for this site in this browser profile.</p>
-        <ul class="check-list"><li>AudioWorklet live analysis</li><li>No coaching API calls</li><li>Delete all local coaching data anytime</li></ul>
+        <p>Audio is analyzed live in this tab and never uploaded. Recording is off by default. A separate choice can back up only the compact metric summary to NonStopTalk's database.</p>
+        <ul class="check-list"><li>AudioWorklet live analysis</li><li>No audio or captured-transcript upload</li><li>Local and cloud data controls</li></ul>
       </div>
     </section>
     ${practice.error ? notice(practice.error, true) : ""}
@@ -191,7 +196,14 @@ function renderPracticeSetup() {
         <legend>Optional full session retention</legend>
         <label class="choice-row">
           <input type="checkbox" name="retainArtifacts" ${practice.setup.retainArtifacts && canRecord ? "checked" : ""}>
-          <span><strong>Keep the recording and captured transcript when available</strong><small>${canRecord ? "Stores the browser-encoded attempt recording and, when local transcription is enabled and succeeds, its captured transcript for this site in this browser profile. Nothing is uploaded. There is no automatic expiry; Progress downloads them or deletes all local coaching data. Downloaded copies are yours to manage." : "This browser cannot create a local audio recording. Compact coaching summaries still work."}</small></span>
+          <span><strong>Keep the recording and captured transcript when available</strong><small>${canRecord ? "Stores the browser-encoded attempt recording and, when local transcription is enabled and succeeds, its captured transcript for this site in this browser profile. Those artifacts are never uploaded. There is no automatic local expiry; Progress downloads them or deletes all local coaching data. Downloaded copies are yours to manage." : "This browser cannot create a local audio recording. Compact coaching summaries still work."}</small></span>
+        </label>
+      </fieldset>
+      <fieldset class="consent-card" aria-label="Optional cloud summary backup">
+        <legend>Optional cloud summary backup</legend>
+        <label class="choice-row">
+          <input type="checkbox" name="cloudSync" ${practice.setup.cloudSync ? "checked" : ""}>
+          <span><strong>Back up this attempt's compact summary online</strong><small>Sends measurements, advice, and any derived word-pattern counts to NonStopTalk's database. It never sends audio or captured transcript text. Until accounts exist, access is tied to this browser and anonymous backups expire after 30 days without cloud use.</small></span>
         </label>
       </fieldset>
       <div class="coach-start-row">
@@ -281,7 +293,7 @@ function renderPracticeLive() {
             <h2 data-coach-tip-text>${escapeHTML(live.tip?.text || "Listening for a useful pattern…")}</h2>
             <p data-coach-tip-evidence>${escapeHTML(live.tip?.evidence || "Tips appear only when the signal is consistent.")}</p>
           </div>
-          <div class="privacy-card compact"><h3>Private by design</h3><p>${practice.setup.retainArtifacts ? "You chose to keep full session artifacts for this site in this browser profile. Nothing is uploaded." : `Audio is reduced to measurements in memory. ${practice.setup.transcriptConsent ? "The full local transcript is discarded after derived word-pattern analysis." : "Transcription is off."}`}</p></div>
+          <div class="privacy-card compact"><h3>Private by design</h3><p>${practice.setup.retainArtifacts ? "You chose to keep full session artifacts only in this browser profile." : `Audio is reduced to measurements in memory. ${practice.setup.transcriptConsent ? "The captured transcript is discarded after derived word-pattern analysis." : "Transcription is off."}`} ${practice.setup.cloudSync ? "After the attempt, only the compact summary will be backed up online." : "Cloud summary backup is off."}</p></div>
         </aside>
       </div>
     </section>`;
@@ -293,6 +305,7 @@ function renderPracticeReview() {
   const transcript = report.transcriptMetrics;
   const grounding = practice.advice?.grounding;
   const retainedCopy = retainedArtifactCopy(practice.savedArtifacts);
+  const storageCopy = coachingReviewStorageCopy(retainedCopy);
   app.innerHTML = `
     <section class="coach-review" data-coach-review>
       ${practice.artifactWarning ? notice(practice.artifactWarning, true) : ""}
@@ -322,10 +335,37 @@ function renderPracticeReview() {
         ${renderCoachGrounding(grounding)}
       </section>
       <div class="review-actions">
-        <div><strong>${practice.saved ? practice.artifactSaved ? "Summary and available selected artifacts saved locally" : "Saved for this site in this browser profile" : "Review ready"}</strong><p class="hint">${practice.artifactSaved ? retainedCopy : "Metrics, advice, and consented derived word patterns are kept locally—no full recording or captured transcript."}</p></div>
+        <div><strong>${escapeHTML(storageCopy.title)}</strong><p class="hint">${escapeHTML(storageCopy.detail)}</p></div>
         <div class="action-row"><a class="button ghost" href="/progress" data-route>View progress</a><button class="button primary" type="button" data-command="coach-again">Try again <span aria-hidden="true">↻</span></button></div>
       </div>
     </section>`;
+}
+
+function coachingReviewStorageCopy(retainedCopy) {
+  if (practice.saved) {
+    const title = practice.cloudSaved
+      ? "Saved locally and backed up online"
+      : practice.artifactSaved
+        ? "Summary and available selected artifacts saved locally"
+        : "Saved for this site in this browser profile";
+    const local = practice.artifactSaved
+      ? retainedCopy
+      : "Metrics, advice, and consented derived word patterns are kept locally—no full recording or captured transcript.";
+    return {
+      title,
+      detail: `${local}${practice.cloudSaved ? " The online backup contains only the compact summary." : ""}`,
+    };
+  }
+  if (practice.cloudSaved) {
+    return {
+      title: "Backed up online; local save failed",
+      detail: "The compact summary is online for this anonymous browser identity, but no local summary, recording, or captured transcript was saved.",
+    };
+  }
+  return {
+    title: "Review ready; storage failed",
+    detail: "The analysis is visible now, but this browser did not save a local record and no online backup completed.",
+  };
 }
 
 function retainedArtifactCopy(artifacts = {}) {
@@ -388,6 +428,7 @@ async function beginCoachingSession(values) {
     duration: clamp(Number(values.duration) || 45, 15, 180),
     transcriptConsent: values.transcriptConsent === "on" && speech.supported,
     retainArtifacts: values.retainArtifacts === "on" && typeof window.MediaRecorder === "function",
+    cloudSync: values.cloudSync === "on",
   });
   practice.phase = "permission";
   renderPractice();
@@ -745,15 +786,15 @@ async function finishCoachingSession(reason = "manual") {
   run.transcript = "";
   stopCoachingHardware(run);
   coachingRun = null;
+  const summary = buildCoachingSummary(report, advice);
+  const artifact = practice.setup.retainArtifacts
+    ? buildCoachingArtifact(summary.id, summary.createdAt, audioBlob, transcriptText, transcriptMayBePartial)
+    : null;
+  if (practice.setup.retainArtifacts && !artifact) {
+    practice.artifactWarning ||= "No full recording or transcript artifact was available to save for this attempt.";
+  }
+  summary.artifacts = artifactMetadata(artifact);
   try {
-    const summary = buildCoachingSummary(report, advice);
-    const artifact = practice.setup.retainArtifacts
-      ? buildCoachingArtifact(summary.id, summary.createdAt, audioBlob, transcriptText, transcriptMayBePartial)
-      : null;
-    if (practice.setup.retainArtifacts && !artifact) {
-      practice.artifactWarning ||= "No full recording or transcript artifact was available to save for this attempt.";
-    }
-    summary.artifacts = artifactMetadata(artifact);
     await saveCoachingSession(summary, artifact);
     practice.saved = true;
     practice.artifactSaved = Boolean(artifact);
@@ -763,6 +804,15 @@ async function finishCoachingSession(reason = "manual") {
     practice.artifactSaved = false;
     practice.savedArtifacts = null;
     practice.artifactWarning ||= "This browser could not save the local coaching record.";
+  }
+  if (practice.setup.cloudSync) {
+    try {
+      await cloudProgress.save(summary);
+      practice.cloudSaved = true;
+    } catch {
+      practice.cloudSaved = false;
+      practice.artifactWarning ||= "The compact summary was saved locally, but its optional online backup did not complete.";
+    }
   }
   if (/^\/progress\/?$/i.test(location.pathname)) {
     await renderProgress(routeGeneration);
@@ -1018,15 +1068,26 @@ function microphoneErrorMessage(error) {
 
 async function renderProgress(generation = routeGeneration) {
   app.innerHTML = `<section class="loading-card" role="status">Loading private progress…</section>`;
-  let summaries = [];
+  let localSummaries = [];
+  let cloudSummaries = [];
   let storageError = "";
+  let cloudError = "";
   try {
-    summaries = await readCoachingSummariesWithRetry();
+    localSummaries = await readCoachingSummariesWithRetry();
   } catch {
     storageError = "Local progress storage is unavailable in this browser.";
   }
+  const cloudEnabled = cloudProgress.isEnabled();
+  if (cloudEnabled) {
+    try {
+      cloudSummaries = await cloudProgress.list();
+    } catch {
+      cloudError = "Online summary backup is temporarily unavailable. Your local history is still shown.";
+    }
+  }
   if (generation !== routeGeneration || !/^\/progress\/?$/i.test(location.pathname)) return;
-  summaries.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  const summaries = mergeCoachingSummaries(localSummaries, cloudSummaries);
+  progressSessions = summaries;
   const ratios = summaries.map(progressSpeakingRatio).filter((value) => value !== null);
   const averageRatio = ratios.length ? ratios.reduce((total, value) => total + value, 0) / ratios.length : null;
   const latest = summaries[0];
@@ -1037,10 +1098,11 @@ async function renderProgress(generation = routeGeneration) {
   app.innerHTML = `
     <section class="progress-page" data-coach-progress>
       <div class="progress-hero">
-        <div><p class="eyebrow">Private progress</p><h1>Your baseline, not a leaderboard.</h1><p class="lede">Track patterns against your own previous attempts. These compact summaries stay with this site in this browser profile.</p></div>
+        <div><p class="eyebrow">Private progress</p><h1>Your baseline, not a leaderboard.</h1><p class="lede">Track patterns against your own previous attempts. Summaries stay in this browser unless you explicitly enable compact online backup.</p></div>
         <a class="button primary" href="/practice" data-route>New practice</a>
       </div>
       ${storageError ? notice(storageError, true) : ""}
+      ${cloudError ? notice(cloudError, true) : ""}
       <div class="progress-metrics">
         ${reviewMetric(String(summaries.length), `${summaries.length === 1 ? "attempt" : "attempts"} for this site`)}
         ${reviewMetric(averageRatio === null ? "—" : formatPercent(averageRatio), "average speaking ratio")}
@@ -1051,8 +1113,8 @@ async function renderProgress(generation = routeGeneration) {
         ${summaries.length ? `<div class="attempt-list">${summaries.map(renderProgressItem).join("")}</div>` : `<div class="empty-progress"><h2>No attempts yet.</h2><p>Complete a practice session and its metric summary will appear here.</p><a class="button" href="/practice" data-route>Build a baseline</a></div>`}
       </section>
       <section class="storage-controls">
-        <div><h2>Your data, your controls.</h2><p class="hint">JSON exports contain metrics, advice, and derived word patterns. Opted-in recordings and full transcripts stay in a separate local artifact store and download individually.</p></div>
-        <div class="action-row"><button class="button ghost" type="button" data-command="coach-export" ${summaries.length ? "" : "disabled"}>Export JSON</button><button class="button danger ghost" type="button" data-command="coach-delete" ${summaries.length ? "" : "disabled"}>Delete local history</button></div>
+        <div><h2>Your data, your controls.</h2><p class="hint">JSON exports contain metrics, advice, and derived word patterns. Opted-in recordings and captured transcripts always stay in the separate local artifact store.${cloudEnabled ? " Compact online backup is enabled for summaries you choose to sync." : " Online backup is off. You can explicitly check for a prior anonymous backup if this browser's preference was cleared."}</p></div>
+        <div class="action-row">${cloudEnabled ? "" : `<button class="button ghost" type="button" data-command="coach-check-cloud">Check online backups</button>`}<button class="button ghost" type="button" data-command="coach-export" ${summaries.length ? "" : "disabled"}>Export JSON</button><button class="button danger ghost" type="button" data-command="coach-delete" ${summaries.length || cloudEnabled ? "" : "disabled"}>${cloudEnabled ? summaries.length ? "Delete local + cloud history" : "Disable online backup" : "Delete local history"}</button></div>
       </section>
     </section>`;
 }
@@ -1191,12 +1253,14 @@ function clearCoachingSummaries() {
 }
 
 async function exportCoachingSummaries() {
-  const sessions = await readCoachingSummaries();
+  const sessions = /^\/progress\/?$/i.test(location.pathname) && progressSessions.length
+    ? progressSessions
+    : await readCoachingSummaries();
   const payload = JSON.stringify({
     product: "NonStopTalk",
     schemaVersion: 2,
     exportedAt: new Date().toISOString(),
-    privacy: "Local coaching metrics, advice, and consented derived word patterns; no audio or full transcript.",
+    privacy: "Coaching metrics, advice, and consented derived word patterns; no audio or captured transcript text.",
     sessions,
   }, null, 2);
   const url = URL.createObjectURL(new Blob([payload], { type: "application/json" }));
@@ -1313,6 +1377,30 @@ function renderSetup() {
         ${viewer.isHost ? renderHostSettings() : renderSettingsSummary()}
       </div>
       ${viewer.isHost ? `
+        <div class="panel wide">
+          <div class="section-head"><div><p class="eyebrow">Topic generator</p><h2>Turn a theme into a draft</h2></div><span>Optional</span></div>
+          <form class="stack" data-model-topics>
+            <div class="topic-model-fields">
+              <label>Theme
+                <input name="theme" maxlength="200" autocomplete="off" placeholder="Example: strange inventions at a school science fair" required>
+              </label>
+              <label>Model tier
+                <select name="tier">
+                  <option value="routine">Routine · operator-selected GLM Flash when enabled</option>
+                  <option value="escalated">Escalated · Gemma 4 31B when enabled</option>
+                </select>
+              </label>
+            </div>
+            <fieldset class="consent-card">
+              <legend>One-request external processing consent</legend>
+              <label class="choice-row">
+                <input type="checkbox" name="externalConsent">
+                <span><strong>Allow this theme to be sent for this generation request</strong><small>If the selected external provider is enabled, the normalized theme above is the only host or room content sent, alongside fixed generation instructions and settings. NonStopTalk never sends room names, tokens, audio, or transcript text. Provider policies differ: Google currently says Gemma 4 free-tier content may be used to improve its products. Leave this unchecked to prevent external contact; an externally configured request will be declined.</small></span>
+              </label>
+            </fieldset>
+            <div class="action-row topic-model-actions"><button class="button" type="submit">Generate editable draft</button><p class="hint">Routine and escalated providers are separately configured by the site operator. One provider attempt at most; failures fall back to deterministic topics.</p></div>
+          </form>
+        </div>
         <div class="panel wide">
           <div class="section-head"><div><p class="eyebrow">Topic editor</p><h2>Custom list</h2></div><span>One per line</span></div>
           <form class="stack" data-room-action>
@@ -1463,12 +1551,46 @@ async function handleSubmit(event) {
       navigate(`/room/${payload.room.code}`);
     } else if (form.matches("[data-join-room]")) {
       const code = String(values.code || "").trim().toUpperCase();
-      if (!/^[A-Z2-9]{6}$/.test(code)) throw new Error("Enter a six-character room code.");
+      if (!ROOM_CODE_PATTERN.test(code)) throw new Error("Enter a valid six-character room code.");
       await api(`/api/rooms/${code}/join`, { name: values.name }, "POST");
       navigate(`/room/${code}`);
     } else if (form.matches("[data-join-current-room]")) {
       const payload = await api(`/api/rooms/${roomCode}/join`, { name: values.name }, "POST");
       acceptRoom(payload.room);
+    } else if (form.matches("[data-model-topics]")) {
+      const code = roomCode;
+      const generation = routeGeneration;
+      const externalConsent = values.externalConsent === "on";
+      const consentControl = form.querySelector('input[name="externalConsent"]');
+      if (consentControl) consentControl.checked = false;
+      const payload = await api("/api/v1/models/topics", {
+        roomCode: code,
+        theme: String(values.theme || "").trim(),
+        tier: values.tier === "escalated" ? "escalated" : "routine",
+        externalConsent,
+      }, "POST");
+      if (code !== roomCode || generation !== routeGeneration || room?.phase !== "setup" || !room?.viewer.isHost) return;
+      if (!Number.isSafeInteger(payload.topicGeneration) || payload.topicGeneration < 1) {
+        throw new Error("The generated topic draft could not be safely applied.");
+      }
+      await doAction({
+        type: "custom-topics",
+        topics: payload.topics,
+        topicGeneration: payload.topicGeneration,
+      });
+      const externalName = payload.externalProvider === "gemma31"
+        ? "Gemma 4 31B"
+        : payload.externalModel === "glm-5.3-flash"
+          ? "GLM 5.3 Flash"
+          : "GLM 4.7 Flash";
+      if (payload.external && payload.provider === "offline") {
+        showToast(`${externalName} was contacted, but its result failed; ${payload.topics.length} offline topics were applied.`);
+      } else {
+        const source = payload.external
+          ? externalName
+          : payload.fallbackCode ? "the offline fallback" : "the offline generator";
+        showToast(`${payload.topics.length} editable topics created with ${source}.`);
+      }
     } else if (form.matches("[data-room-action]")) {
       await doAction(values);
     }
@@ -1541,11 +1663,26 @@ async function handleClick(event) {
       await downloadCoachingArtifact(button.dataset.sessionId, "audio");
     } else if (command === "coach-download-transcript") {
       await downloadCoachingArtifact(button.dataset.sessionId, "transcript");
-    } else if (command === "coach-delete") {
-      if (window.confirm("Delete every coaching summary, recording, and transcript artifact stored for this NonStopTalk site in this browser profile?")) {
-        await clearCoachingSummaries();
+    } else if (command === "coach-check-cloud") {
+      const sessions = await cloudProgress.list();
+      if (sessions.length) {
+        cloudProgress.setEnabled(true);
         await renderProgress(routeGeneration);
-        showToast("Local coaching history deleted.");
+        showToast(`${sessions.length} online coaching ${sessions.length === 1 ? "summary" : "summaries"} found.`);
+      } else {
+        showToast("No online coaching summaries were found for this browser.");
+      }
+    } else if (command === "coach-delete") {
+      const cloudEnabled = cloudProgress.isEnabled();
+      const scope = cloudEnabled
+        ? "Disable online backup and delete every local coaching summary/artifact plus every compact summary backed up online for this browser?"
+        : "Delete every coaching summary, recording, and transcript artifact stored for this NonStopTalk site in this browser profile?";
+      if (window.confirm(scope)) {
+        if (cloudEnabled) await cloudProgress.clear();
+        await clearCoachingSummaries();
+        progressSessions = [];
+        await renderProgress(routeGeneration);
+        showToast(cloudEnabled ? "Online backup disabled; local and online coaching history deleted." : "Local coaching history deleted.");
       }
     }
   } catch (error) {
@@ -1808,8 +1945,11 @@ async function api(path, body, method = "GET") {
   let payload = {};
   try { payload = await response.json(); } catch { /* A non-JSON edge error is handled below. */ }
   if (!response.ok) {
-    const error = new Error(payload.error || `Request failed (${response.status}).`);
+    const message = typeof payload.error === "string" ? payload.error : payload.error?.message;
+    const error = new Error(message || `Request failed (${response.status}).`);
     error.status = response.status;
+    error.code = payload.error?.code || "";
+    error.requestId = payload.requestId || response.headers.get("X-Request-ID") || "";
     throw error;
   }
   return payload;

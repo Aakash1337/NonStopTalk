@@ -4,7 +4,7 @@ Keep this page open beside the demo. Use [Learn NonStopTalk in 45 minutes](LEARN
 
 ## 30-second pitch
 
-> NonStopTalk turns private speaking rehearsal into a deliberate-practice loop: speak, see a small number of explainable signals, get one useful next action, and try again. Practice provides private browser-side coaching, Play keeps the original multiplayer game, and Progress shows local Practice history. The prototype uses transparent signal processing and a small local retrieval layer, not a paid speech service or an LLM.
+> NonStopTalk turns private speaking rehearsal into a deliberate-practice loop: speak, see a small number of explainable signals, get one useful next action, and try again. Practice provides private browser-side coaching, Play keeps the original multiplayer game, and Progress is local-first with optional compact-summary backup. The prototype uses transparent signal processing and a small local retrieval layer, not a paid speech service or an LLM.
 
 ## Three tabs
 
@@ -12,7 +12,7 @@ Keep this page open beside the demo. Use [Learn NonStopTalk in 45 minutes](LEARN
 | --- | --- |
 | **Practice** `/practice` | “This is the coaching mode: calibrate, speak, review evidence, and retry.” |
 | **Play** `/` | “This is the social speaking game. Online rooms use a Worker and one Durable Object per room.” |
-| **Progress** `/progress` | “This is origin-local Practice history, not a leaderboard or universal speech score.” |
+| **Progress** `/progress` | “This is local-first Practice history with an optional compact-summary backup, not a leaderboard or universal speech score.” |
 
 Memory aid: **Practice coaches. Play motivates. Progress makes practice visible.**
 
@@ -21,11 +21,14 @@ Memory aid: **Practice coaches. Play motivates. Progress makes practice visible.
 ```text
 Practice: mic → AudioWorklet → measurements → local card → advice → IndexedDB
 Progress:                                                     ↑ reads IndexedDB
+                       explicit compact-summary backup → Worker API → D1
 
 Play: browser → /api/rooms/... Worker → ROOMS binding → SQLite Durable Object
                                       ↕ hibernatable WebSockets
 
-Cloudflare serves the SPA files. Coaching data does not enter /api or a Durable Object.
+Default/off coaching makes no coaching-data API call. The optional backup sends only an
+allowlisted summary to D1. Audio, recordings, and captured transcripts stay local, and
+coaching data never enters a room Durable Object.
 ```
 
 ## Five-minute story
@@ -41,11 +44,12 @@ Cloudflare serves the SPA files. Coaching data does not enter /api or a Durable 
 
 ## Stable demo sequence
 
-Install or select Node 24 first—the timed learning guide covers both the official installer and a version-manager example—then start the coaching-capable edition:
+Use Node 22 or newer; Node 24 matches CI and is the preferred demo choice. The timed learning guide covers both the official installer and a version-manager example. Then start the coaching-capable edition:
 
 ```sh
-node --version # must print v24...
+node --version # v22+; v24 matches CI
 npm ci
+npm run db:migrate:local
 npm run dev -- --local --ip 127.0.0.1 --port 8787
 ```
 
@@ -55,7 +59,7 @@ Then:
 
 1. Open `/` and name the three tabs.
 2. Open `/practice`; choose Presentation opening, Purposeful pauses, 30 seconds.
-3. Leave both optional boxes off for the primary demo.
+3. Leave all optional choices off for the primary demo.
 4. Calibrate: about two seconds quiet, then two seconds normal speech.
 5. Speak, pause for about one second, and speak again. Voice must occur on both sides for an interior pause.
 6. On Review, show Strength, Focus next, Drill, evidence, timeline, and Local RAG grounding label.
@@ -77,31 +81,39 @@ What is retrieved? **A coaching card.** What is generated? **A bounded assembly 
 | Default attempt | Compact allowlisted measurement/advice summary in this origin's IndexedDB |
 | Transcript analysis checked | Strict on-device recognition may add pace/counts and bounded derived word patterns; no remote fallback |
 | Full-session retention checked | Separate store may keep a browser-encoded attempt recording and available captured transcript; calibration is excluded |
+| Compact cloud backup checked | Sends only allowlisted measurements/advice and bounded derived word-pattern fields to D1 under an anonymous browser identity |
 | JSON export | Summaries only; no recording or captured transcript |
-| Delete local history | Clears both app stores for this origin; cannot delete already downloaded files |
+| Delete history | Clears both local stores and, when cloud backup is enabled/reachable, this browser identity's compact D1 summaries; cannot delete downloaded files |
 
-Both optional boxes start off on a fresh page and do different jobs. **Try again** preserves the visible selections so the user can review or uncheck them. There is no coaching upload, automatic artifact expiry, account, cloud backup, or cross-device sync. IndexedDB is best-effort: clearing site data, private-browsing behavior, or storage pressure can remove records. A transcript that fails to finalize after captured text arrives can be kept with a visible **possibly partial** warning.
+The optional choices start off and do different jobs. **Try again** preserves the visible selections so the user can review or uncheck them. Cloud backup is not an account: access is tied to this anonymous browser identity. One UTC-day-bucketed device lease controls all its summaries and lasts at least 30 and less than 31 days after cloud use. New saves stop when 250 summaries already exist; migration does not forcibly delete valid unexpired legacy rows. There is no cross-device authentication or sync. Local artifacts have no automatic expiry. A transcript that fails to finalize after captured text arrives can be retained locally with a visible **possibly partial** warning.
 
 ## Durable Object answer
 
-> Durable Objects coordinate multiplayer Play rooms only. The player opens `/room/ABC123`; the browser uses `/api/rooms/ABC123/{state|join|action|socket}`. The Worker validates the request, selects one SQLite-backed object by room code through the internal `ROOMS` binding, and forwards the operation. The Durable Object has no separate public URL. Practice and Progress do not create or call one.
+> Durable Objects coordinate multiplayer Play rooms only. The player opens `/room/ABC234`; the browser uses `/api/rooms/ABC234/{state|join|action|socket}`. The Worker validates the request, selects one SQLite-backed object by room code through the internal `ROOMS` binding, and forwards the operation. The Durable Object has no separate public URL. Practice and Progress do not create or call one.
 
 Deployment description: **Worker with Static Assets plus a SQLite Durable Object**, not Pages-only and not a Container.
 
 ## Deploy quick reference
 
 ```sh
-node --version # must print v24...
+node --version # v22+; v24 matches CI
 npm ci
 npm run typecheck:cloudflare
 npm run test:cloudflare
 npm run test:coach
+npm run test:cloud-progress
 npm run check:cloudflare
+npm run smoke:platform
 npx wrangler login
+npm run db:create
+# copy the returned database UUID into wrangler.jsonc
+npm run db:migrate:remote
+npx wrangler secret put ANALYTICS_ADMIN_TOKEN
+npx wrangler secret put ROOM_FACT_HASH_KEY
 npm run deploy
 ```
 
-For a repository-connected build, create a **Worker** project, use repository root `/`, select Node 24, leave the output directory unset, use `npm run typecheck:cloudflare && npm run test:cloudflare && npm run test:coach` as the build command, and use `npm run deploy` as the deploy command.
+For a repository-connected build, create a **Worker** project, use repository root `/`, select Node 22 or newer (24 matches CI), leave the output directory unset, and run the Cloudflare, coach, and cloud-progress tests in the build command. Provision D1, apply its migrations, and configure both secrets once per environment before using `npm run deploy`.
 
 ## Safe claims
 
@@ -113,7 +125,7 @@ For a repository-connected build, create a **Worker** project, use repository ro
 | Local lexical retrieval and deterministic templates | LLM-generated or vector-searched advice |
 | Browser-encoded recording after opt-in | Raw PCM retention |
 | Engineering behavior covered by deterministic and browser tests | Proven real-device accuracy, learning, fairness, accessibility, security, or privacy certification |
-| Descriptive local attempt history | Progress already proves improvement |
+| Descriptive local-first attempt history | Progress already proves improvement |
 | General rehearsal tool | Speech therapy, diagnosis, or replacement for a professional |
 
 Never say the app infers confidence, emotion, honesty, personality, health, identity, professionalism, or accent quality.
@@ -130,7 +142,7 @@ It estimates voice activity from RMS thresholds calibrated to the current room a
 
 **Does my voice go to Cloudflare?**
 
-No coaching audio, transcript, summary, or recording does. Cloudflare serves files and coordinates Play rooms.
+No coaching audio, recording, or captured transcript does. Cloud backup is off by default; if selected, only the compact allowlisted summary goes to the NonStopTalk Worker/D1 platform.
 
 **Can I keep the recording and transcript?**
 
@@ -146,7 +158,7 @@ That adds cost, latency, provider and consent boundaries, nondeterminism, source
 
 **How do you know it helps?**
 
-We do not claim that yet. The next pilot should measure completed baseline/review/unassisted-retry loops, paired goal-specific change, false tips, distraction, availability, privacy, grounding, device effects, and fairness. The app sends no product analytics today; a pilot needs consented summary exports and participant/facilitator ratings or a separately consented study logger.
+We do not claim that yet. The next pilot should measure completed baseline/review/unassisted-retry loops, paired goal-specific change, false tips, distraction, availability, privacy, grounding, device effects, and fairness. The platform's best-effort room/summary-save/delete/consent counters do not measure learning outcomes; a pilot still needs a separate consented study design.
 
 **Why did the original Cloudflare deploy fail?**
 
@@ -154,7 +166,7 @@ Wrangler had no declared Worker entry point or static asset directory. `wrangler
 
 **Is it free?**
 
-The design requires no paid speech, AI, embedding, vector, database, or Container service and is configured for current Workers Free allocations. Do not promise unlimited or permanent pricing.
+The design uses free/low-cost Cloudflare primitives and requires no paid speech, AI, embedding, vector, Queue, R2, or Container service. Accounts, external coaching AI, Queues, and R2 are future choices. Do not promise unlimited or permanent pricing.
 
 **Why keep Play?**
 
@@ -163,7 +175,7 @@ Play creates social repetition and motivation; Practice creates deliberate perso
 ## Demo fallback order
 
 1. Keep local Wrangler running even if the deployed site is the primary demo.
-2. Pre-create one non-sensitive summary on both the deployed origin and local origin; they do not synchronize.
+2. Pre-create one non-sensitive local summary on each demo origin; anonymous cloud backup is browser/origin-bound and is not cross-device sync.
 3. Keep `/progress` open in a backup tab.
 4. If strict local transcription is unavailable, demonstrate audio-only coaching and explain fail-closed behavior.
 5. If `AudioWorklet` is unavailable, point out the automatic Analyser compatibility mode.

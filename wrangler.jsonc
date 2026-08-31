@@ -7,11 +7,38 @@
 	"observability": {
 		"enabled": true
 	},
+	"triggers": {
+		"crons": [
+			"17 3 * * *"
+		]
+	},
+	// The UUID is the non-secret identifier for the production D1 database.
+	// Local Wrangler development still uses an isolated local database unless
+	// a command explicitly opts into a remote binding.
+	"d1_databases": [
+		{
+			"binding": "PLATFORM_DB",
+			"database_name": "nonstoptalk-platform",
+			"database_id": "df98e497-cd4e-4e78-b201-2a393ea0d7cf",
+			"migrations_dir": "cloudflare/migrations"
+		}
+	],
+	"analytics_engine_datasets": [
+		{
+			"binding": "PRODUCT_ANALYTICS",
+			"dataset": "nonstoptalk_product"
+		}
+	],
+	"ai": {
+		"binding": "AI"
+	},
 	"assets": {
 		"directory": "./cloudflare/public",
 		"binding": "ASSETS",
 		"not_found_handling": "single-page-application",
-		"run_worker_first": ["/api/*"]
+		"run_worker_first": [
+			"/api/*"
+		]
 	},
 	"ratelimits": [
 		{
@@ -19,6 +46,22 @@
 			"namespace_id": "6677867",
 			"simple": {
 				"limit": 10,
+				"period": 60
+			}
+		},
+		{
+			"name": "API_RATE_LIMITER",
+			"namespace_id": "6677868",
+			"simple": {
+				"limit": 60,
+				"period": 60
+			}
+		},
+		{
+			"name": "MODEL_RATE_LIMITER",
+			"namespace_id": "6677869",
+			"simple": {
+				"limit": 5,
 				"period": 60
 			}
 		}
@@ -34,7 +77,9 @@
 	"migrations": [
 		{
 			"tag": "v1",
-			"new_sqlite_classes": ["RoomDurableObject"]
+			"new_sqlite_classes": [
+				"RoomDurableObject"
+			]
 		}
 	]
 }

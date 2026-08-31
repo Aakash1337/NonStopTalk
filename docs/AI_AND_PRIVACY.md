@@ -1,12 +1,13 @@
 # AI and privacy
 
-This document describes the current NonStopTalk implementation. There are three distinct paths with different boundaries:
+This document describes the current NonStopTalk implementation and the explicitly marked in-progress platform slice. There are four distinct paths with different boundaries:
 
 1. The local and online multiplayer game, which can run with classic scoring and no transcript.
-2. The optional AI judge and topic generator in the local Go game edition.
-3. The speech-coaching prototype in the native Cloudflare SPA, which performs analysis and curated coaching-card retrieval in the browser and calls no coaching or AI service.
+2. The optional, disabled-by-default theme-to-topics providers in the Cloudflare game edition.
+3. The optional AI judge and topic generator in the local Go game edition.
+4. The speech-coaching prototype in the native Cloudflare SPA, which performs analysis and curated coaching-card retrieval in the browser, with an off-by-default API for compact-summary backup and no external coaching/AI service.
 
-NonStopTalk does not upload microphone audio in any of these paths. In coaching only, a separate unchecked option can record the active attempt and retain it locally in this site's browser storage. That option never sends the recording to the Worker or another service.
+NonStopTalk does not upload microphone audio in any of these paths. In coaching only, a separate unchecked option can record the active attempt and retain it locally in this site's browser storage. That recording and any captured transcript are never sent to the Worker or another service. A different explicit choice may send only an allowlisted compact measurement/advice summary to NonStopTalk's D1 database.
 
 ## At a glance
 
@@ -15,13 +16,43 @@ NonStopTalk does not upload microphone audio in any of these paths. In coaching 
 | Coaching, default acoustic path | Reduced to measurements in the browser; no recording retained | None | None |
 | Coaching with transcript analysis only | Reduced in the browser; no recording retained | Mandatory-on-device captured text is discarded after analysis; bounded derived counts and filler/repetition patterns remain in the summary | None |
 | Coaching with separate full-session retention | When recording succeeds, the browser-encoded attempt is stored locally as a `Blob`; never uploaded | Captured text is also stored locally only if transcript analysis was enabled and produced text | None |
+| Coaching with compact cloud backup | Never uploaded | Captured text is never uploaded; consented bounded derived counts/pattern labels may be included in the allowlisted summary | None; the summary goes only to the NonStopTalk Worker/D1 platform |
 | Classic game with microphone detection | Read locally by Web Audio | None | None |
 | Manual game timer | Not required | None | None |
+| Cloudflare topic draft, offline/default | Not involved | Not involved | None; deterministic templates expand the host's theme |
+| Cloudflare routine topic draft, direct GLM-4.7 selected and host consents for this attempt | Not involved | Not involved | The normalized theme (at most 200 characters) is the only host or room content sent directly to Z.AI |
+| Cloudflare routine topic draft, Workers AI GLM-5.3 selected and host consents for this attempt | Not involved | Not involved | The normalized theme (at most 200 characters) is the only host or room content sent through Cloudflare's `AI` binding to `@cf/zai-org/glm-5.3-flash` |
+| Cloudflare escalated topic draft, host explicitly selects it and consents for this attempt | Not involved | Not involved | The normalized theme (at most 200 characters) is the only host or room content sent to Google's Gemini API for Gemma 4 31B when the operator enabled it |
 | Local Go AI judge enabled, speaker chooses classic/manual | Not uploaded | None | None |
-| Local Go AI judge, speaker consents, no Anthropic key | Read locally; not uploaded | Sent to the trusted Go server and graded by its offline heuristic | None |
-| Local Go AI judge, speaker consents, Anthropic key configured | Read locally; not uploaded | Sent to the Go server, then topic + transcript are sent to Anthropic | Anthropic grading |
-| Theme generation without an Anthropic key | Not involved | Not involved | None; server templates generate the pack |
-| Theme generation with an Anthropic key | Not involved | Not involved | The host's theme text is sent to Anthropic |
+| Local Go AI judge, speaker consents, offline/unavailable provider selection | Read locally; not uploaded | Sent to the trusted Go server and graded by its offline heuristic | None |
+| Local Go AI judge, speaker consents, Anthropic selected and keyed | Read locally; not uploaded | Sent to the Go server, then topic + transcript are sent to Anthropic | Anthropic grading |
+| Local Go AI judge, speaker consents, GLM selected and keyed | Read locally; not uploaded | Sent to the Go server, then topic + transcript are sent to Z.AI | GLM-4.7-Flash grading |
+| Local Go theme generation with the offline/unavailable provider | Not involved | Not involved | None; server templates generate the pack |
+| Local Go theme generation with an external provider selected and keyed | Not involved | Not involved | The host's theme is the only user content sent to Anthropic or Z.AI |
+
+## Cloudflare theme-to-topics consent and boundary
+
+The online room host can request an editable topic draft during setup. External processing is disabled by default: `TOPIC_ROUTINE_PROVIDER=offline` keeps the routine path deterministic, and `TOPIC_ESCALATION_PROVIDER=off` makes escalation unavailable. An operator can select direct Z.AI GLM-4.7-Flash with `TOPIC_ROUTINE_PROVIDER=glm` and the `ZAI_API_KEY` Wrangler secret, or select Workers AI GLM-5.3-Flash with `TOPIC_ROUTINE_PROVIDER=glm53` and the configured `AI` binding. The latter uses public model name `glm-5.3-flash`, binding ID `@cf/zai-org/glm-5.3-flash`, and no vendor API-key secret, but this build's plain `AI.run()` path requires Workers Paid. Prepaid AI Gateway credits would require a gateway ID and Unified billing, which are not implemented. The operator can independently make Gemma 4 31B available with `TOPIC_ESCALATION_PROVIDER=gemma31` and the `GEMINI_API_KEY` secret.
+
+Configuration does not grant consent. For each generation attempt, the host chooses routine or escalated generation and must separately check the one-request external-processing control. Escalation additionally requires the host to select the escalated tier; it is never chosen automatically because the routine provider failed. If a configured external tier is requested without consent, the Worker rejects it before reserving budget or contacting the provider. A disabled tier, missing provider key, invalid selector, unavailable/exhausted daily budget, or provider call/output failure returns deterministic topics instead. The public platform status marks an invalid selector or selected provider without its key as degraded without exposing the key or arbitrary selector value.
+
+The normalized theme, capped at 200 characters, is the only host or room content in the external request. Fixed provider instructions and model settings are also present, but microphone audio, recordings, captured transcript text, player and room names, the room code/member token, coaching summaries, game history, and NonStopTalk request IDs are excluded. Provider-produced topics become an editable draft and are installed through an ordinary host-authorized custom-topic action. Z.AI, Cloudflare Workers AI, or Google processes the theme under that provider's own service terms.
+
+As checked August 31, 2026, [Cloudflare's Workers AI data-use policy](https://developers.cloudflare.com/workers-ai/platform/data-usage/) says Cloudflare does not use customer content to train models or improve services without explicit consent and stores content only when the customer separately uses a storage product. This is a provider-policy statement, not a technical guarantee by NonStopTalk, and terms can change.
+
+Gemma escalation has a notable privacy tradeoff. As checked August 31, 2026, [Google's Gemini Developer API pricing](https://ai.google.dev/gemini-api/docs/pricing#gemma-4) lists Gemma 4 input, output, and caching as free of charge, a paid tier as unavailable, and free-tier content as used to improve Google's products. Provider terms can change. NonStopTalk therefore keeps Gemma operator-disabled by default, requires the host to select escalation and consent for that attempt, and sends no host or room content beyond the normalized theme.
+
+```text
+host enters theme (maximum 200 characters)
+  + chooses routine or escalated tier
+  + explicitly consents for this generation attempt
+      → Worker verifies host/setup authorization and daily D1 budget
+      → deterministic generator, direct GLM-4.7-Flash,
+        Workers AI GLM-5.3-Flash, or explicitly selected Gemma 4 31B
+      → bounded validated editable topic draft
+```
+
+D1 stores aggregate UTC-day provider usage needed to enforce `MODEL_DAILY_CALL_LIMIT`, which defaults to 100 external attempts per day. Its rows aggregate reservations/completions, successes/failures, provider/model, input/output/total/cached-input/reasoning token totals, and total latency. They do not store the theme, generated topics, names, room codes, room/member/authentication tokens, audio, or transcripts. The secret-protected `/api/v1/admin/model-usage` readout exposes those aggregate operational fields, not model prompts or responses. A timeout or other failure without provider usage still counts the reservation/call, but its token fields remain zero and can undercount work the vendor ultimately bills. This first slice makes at most one external call per host action. It does not retry a provider and does not use a Queue; deterministic generation is the immediate fallback after an authorized, consented provider attempt fails.
 
 ## Coaching consent and boundary
 
@@ -38,7 +69,9 @@ The user can opt into experimental transcript analysis. That checkbox is enabled
 
 If recognition is absent, cannot be initialized, rejects the track, or captures no text, the acoustic attempt continues without transcript metrics. At finish, NonStopTalk asks recognition to stop and allows up to two seconds for final results. If an error or timeout occurs after `onresult` has delivered text, NonStopTalk preserves and analyzes that text but never calls it complete; Review warns that it may be partial. When the separate full-session option retains the text, both the artifact and summary artifact metadata set `transcriptMayBePartial`, so Progress warns too. Recognition error events and their payloads are never retained. The browser owns its implementation of the experimental Web Speech API; NonStopTalk relies on the browser to honor mandatory local processing.
 
-Full-session retention is an independent second checkbox and starts unchecked on a fresh page load. It is enabled only when `MediaRecorder` exists. If selected, recording begins after calibration when the attempt starts. On completion, the application saves the encoded attempt recording when recording succeeds and any captured transcript that is available to a separate local artifact store. A transcript-only artifact can still be saved if recording fails after transcript analysis returned text. Selecting recording retention does not silently enable transcription; selecting transcript analysis does not silently retain captured transcript text. **Try again** preserves both visible setup selections so the user can review or uncheck them before the next attempt. Canceling or navigating away before completion stops the recorder and discards its unsaved chunks.
+Full-session retention is an independent checkbox and starts unchecked on a fresh page load. It is enabled only when `MediaRecorder` exists. If selected, recording begins after calibration when the attempt starts. On completion, the application saves the encoded attempt recording when recording succeeds and any captured transcript that is available to a separate local artifact store. A transcript-only artifact can still be saved if recording fails after transcript analysis returned text. Selecting recording retention does not silently enable transcription; selecting transcript analysis does not silently retain captured transcript text. **Try again** preserves the visible setup selections so the user can review or uncheck them before the next attempt. Canceling or navigating away before completion stops the recorder and discards its unsaved chunks.
+
+Compact cloud backup is a third, independent choice and also starts off. Selecting it for an attempt sends only a strictly allowlisted summary: scenario/goal/time, aggregate measurements, deterministic advice, and any bounded derived word-pattern fields already permitted in the summary. It excludes raw samples, measurement frames, segments, recordings, captured transcript text, artifact metadata, names, room identity, and account data. The API ties the backup to the existing high-entropy HTTP-only browser token and stores only its SHA-256 digest in D1. This is not an account or a recovery credential: clearing the cookie can make the records unreachable, there is no cross-device access, and one device-level inactivity lease controls all of this browser's cloud summaries. The lease is bucketed to a UTC day, lasts at least 30 and less than 31 days after cloud use, and does not require each summary to be rewritten on ordinary reads. New saves are rejected once 250 summaries exist; valid unexpired legacy rows are preserved rather than forcibly deleted.
 
 This is intentionally stricter than detecting a generic `SpeechRecognition` API, whose default processing location may be chosen by the browser. MDN documents the [`processLocally` contract and on-device language-pack behavior](https://developer.mozilla.org/en-US/docs/Web/API/Web_Speech_API/Using_the_Web_Speech_API#on-device_speech_recognition). Availability is browser-, version-, language-, and device-dependent.
 
@@ -54,6 +87,7 @@ microphone MediaStream
   → browser coaching analyzer
   → live cue + post-attempt metrics/advice
   → compact summary in this site's IndexedDB in the current browser profile
+  → optional allowlisted-summary backup to Worker API → D1
 ```
 
 The `AudioWorklet` receives raw sample arrays because sample-level processing is its browser job. It immediately reduces roughly one-tenth-second windows to root-mean-square level and peak amplitude. The page receives those numbers. Raw arrays and live measurement frames are not written to IndexedDB, cookies, local storage, a Durable Object, or the Go server. This default analysis path does not create a recording.
@@ -70,7 +104,7 @@ same local audio path
       → captured transcript text cleared by default
 ```
 
-The summary stores word count, words per minute, filler and repetition counts/rates, plus bounded filler-phrase and immediately repeated-word labels with counts. This is derived lexical content and may still be sensitive—for example, an immediately repeated name could appear. Each pattern array is limited to 50 entries and each label to 64 characters. Captured transcript text is not displayed in Progress or included in JSON export. It enters the separate artifact store only after full-session-retention consent.
+The summary stores word count, words per minute, filler and repetition counts/rates, plus bounded filler-phrase and immediately repeated-word labels with counts. This is derived lexical content and may still be sensitive—for example, an immediately repeated name could appear. Each pattern array is limited to 50 entries and each label to 64 characters. These bounded summary fields may be backed up only after the separate cloud choice. Captured transcript text is not displayed in Progress, included in JSON export, or uploaded. It enters the separate artifact store only after full-session-retention consent.
 
 ### Separately retained session artifacts
 
@@ -103,9 +137,9 @@ A future production LLM RAG system would be a materially different privacy desig
 
 ### Network behavior
 
-The coaching pages, curated coaching cards, and JavaScript are delivered as Workers Static Assets. After those files load, coaching analysis/retrieval does not call `/api/*`, a Durable Object, the Go server, Anthropic, a vector database, or another speech service. Multiplayer room requests continue to use the Worker normally, but that is a separate product path.
+The coaching pages, curated coaching cards, and JavaScript are delivered as Workers Static Assets. Coaching analysis, local retrieval, and the default/off storage path call no coaching-data API, Durable Object, Go server, Anthropic endpoint, topic-model endpoint, vector database, or speech service. When compact cloud backup is explicitly selected, the browser calls `/api/v1/progress/sessions` to create/list/delete allowlisted summaries in D1. It still never sends audio, a recording, or captured transcript text, and coaching never uses a room Durable Object. The separate host-only theme generator does not inherit any coaching consent or receive coaching data.
 
-The automated coaching smoke test watches application API requests and asserts that coaching makes none. It proves a default-off attempt never constructs `MediaRecorder` or creates an artifact, upgrades a synthetic v1 database to both v2 stores, and exercises the opted-in path: the summary contains bounded derived patterns but no recording/captured transcript, the artifact store contains a non-empty encoded `Blob` and transcript, a late recognition error preserves captured text and its partial-warning metadata, the actual recording/transcript downloads contain data, JSON export excludes both session artifacts, and confirmed deletion clears both stores. Separate flows cover cancellation and stalled input. That is useful evidence about the implemented application, not a complete packet-level audit and not proof about every browser extension, operating-system service, or future browser implementation.
+The automated coaching smoke test watches the default/off flow and asserts that it makes no coaching-data API request. It also proves local default-off and artifact-retention behavior. Separate cloud-progress tests check the upload allowlist and opt-in API client; platform tests cover server-side validation, ownership, expiry, and analytics boundaries. That is useful evidence about the implemented application, not a complete packet-level audit and not proof about every browser extension, operating-system service, or future browser implementation.
 
 ## Coaching storage
 
@@ -128,7 +162,11 @@ It does not contain:
 
 The separate `session-artifacts` store is empty unless full-session retention was selected and at least one artifact was captured. Each record can contain the session ID/time, audio `Blob`, MIME type, captured transcript text, and `transcriptMayBePartial`. `/progress` reads an artifact only for an individual download and uses summary metadata to show any partial-text warning. **Export JSON** reads only `session-summaries`: it includes derived patterns and artifact-presence metadata, but excludes the recording and captured transcript text. **Delete local history** clears both stores after confirmation. A downloaded recording/transcript becomes an ordinary file outside browser storage and is not removed by the in-app delete action.
 
-IndexedDB is scoped to a site origin (scheme, host, and port) within a browser profile. Records are best-effort browser storage: site-data deletion, private browsing behavior, or storage pressure may remove them. Conversely, the prototype has no automatic artifact expiration, so retained data may remain until the user deletes local history or site data. A custom domain, `workers.dev`, `127.0.0.1:8787`, and another local port each have separate history. There is no account, app-level encryption, cloud backup, cross-device synchronization, server analytics, or server retention timer.
+IndexedDB is scoped to a site origin (scheme, host, and port) within a browser profile. Records are best-effort browser storage: site-data deletion, private browsing behavior, or storage pressure may remove them. Local artifacts have no automatic expiration, so they may remain until the user deletes local history or site data. A custom domain, `workers.dev`, `127.0.0.1:8787`, and another local port each have separate local history.
+
+The in-progress cloud store is separate. It keeps only explicitly backed-up compact summaries and versioned consent records in D1, keyed by a hashed anonymous browser identity. Cloud use refreshes one UTC-day-bucketed device lease; scheduled cleanup removes expired anonymous detail in bounded batches and leaves any remaining backlog for a later cron run. The Progress delete control clears local stores and, when cloud backup is enabled and reachable, the current anonymous browser's D1 summaries. There is still no account, recovery flow, app-level encryption, or cross-device synchronization.
+
+Product analytics are coarse aggregates, not a copy of coaching progress. Server-authoritative room milestones and accepted summary-save/delete/consent transitions attempt small daily D1 increments and Analytics Engine writes. Both sinks are best-effort: failures are caught so rooms and coaching continue, room writes run through the Durable Object's `waitUntil`, and events can be missed. Aggregate event values may include turn/session duration or completed-turn counts. Separate aggregate D1 model-usage rows enforce the external-topic daily budget; they contain no theme or generated topic text. Analytics and usage counters exclude names, IP addresses, user agents, raw browser tokens, room-member tokens, audio, captured transcripts, word patterns, advice, and delivery-quality measurements such as speaking ratio. The protected admin API queries D1 rollups, but those rows are operational estimates rather than audit, billing, or delivery-exact truth.
 
 Private/local storage does not mean risk-free storage. Anyone with access to the same unlocked browser profile may be able to view Progress or download retained recordings/transcripts; exported/downloaded files may be accessible elsewhere on the device. A shared-device demonstration should keep full retention off unless needed and delete browser history plus any downloaded files afterward.
 
@@ -158,16 +196,16 @@ selected microphone
   → browser on-device SpeechRecognition
   → text transcript (maximum 8 KiB)
   → trusted NonStopTalk Go server
-  → offline heuristic OR Anthropic
+  → offline heuristic OR selected Anthropic/Z.AI provider
   → relevance, confidence, short feedback
   → bonus of up to 20 points
 ```
 
 The game transcript is held only long enough to grade the turn. It is not a field on the game session, is not shown in game history, and is not written to the JSON room snapshot.
 
-The Go server sends Anthropic the assigned topic and transcript only when `ANTHROPIC_API_KEY` is configured. Without the key, a keyword-overlap heuristic produces a clearly labeled low-confidence result. Grading is asynchronous; any failure preserves classic scoring.
+`NONSTOPTALK_AI_PROVIDER` selects `offline`, `anthropic`, or `glm` for both local-Go judging and theme generation. Explicit `offline` wins even when API keys exist. With the selector unset, a configured `ANTHROPIC_API_KEY` preserves the legacy Anthropic behavior; otherwise the server stays offline, and a `ZAI_API_KEY` alone does not silently opt in. Explicit `anthropic` requires `ANTHROPIC_API_KEY`; explicit `glm` requires `ZAI_API_KEY` and uses GLM-4.7-Flash. Invalid selectors and explicit selections without their key emit an operator warning and fail closed to the offline heuristic. The local Go selector does not use Cloudflare's `glm53` option.
 
-Theme generation sends Anthropic only the host's theme when a key is configured. Without a key, fixed server templates expand the theme. Resulting topics still become ordinary room state.
+When the speaker has consented to transcript-assisted judging, the selected external provider receives the assigned topic and the size-capped transcript as user data; audio and room metadata are excluded. Grading is asynchronous, and any provider failure preserves classic scoring. Local theme generation is a separate host action: with an external provider selected, the theme is its only user content; with the offline provider, fixed server templates expand the theme. Runtime failure during external theme generation returns an error so the host can retry or write topics manually; it does not switch providers.
 
 ## Other application storage
 
@@ -176,8 +214,9 @@ Theme generation sends Anthropic only the host's theme when a key is configured.
 - The local Go game keeps custom topic drafts, saved presets, microphone choice, and sound preference in local storage.
 - The local web server stores room/session snapshots in `data/rooms.json` by default. They include rosters, settings, topics, scores, turns, and room history, but not transcripts or audio. Set `NONSTOPTALK_DATA_FILE=off` for memory-only rooms.
 - The Cloudflare edition stores multiplayer game state in a private SQLite-backed Durable Object for up to 30 idle days. Coaching summaries and full artifacts never enter that object.
+- The central D1 platform store holds only the allowlisted records described above: anonymous device ownership/expiry, consented compact summaries, consent records, 90-day HMAC-pseudonymous room facts, retained best-effort daily analytics aggregates, and aggregate daily model-usage budget counters. Themes, generated topic text, raw room codes, and the HMAC key are not stored in D1.
 
-The operator of a self-hosted Go instance controls its server and Anthropic credentials. Players should use an instance they trust.
+The Cloudflare operator controls which routine option is enabled, whether Gemma escalation is available, the Z.AI/Gemini credentials, and access to the Workers AI binding. The operator of a self-hosted Go instance separately controls `NONSTOPTALK_AI_PROVIDER` and its Anthropic or Z.AI credential. Players should use an instance they trust.
 
 ## Transport and lifecycle
 
@@ -199,6 +238,7 @@ Current limitations create fairness risks:
 - Fixed timing rules may not fit a person's language, disability, assistive device, speaking style, or task.
 - Browser support for strict local recognition is not evenly distributed across languages and devices.
 - A small lexical coaching-card library can retrieve an irrelevant or culturally narrow suggestion even when its measurements are correct.
+- An external topic model can produce inaccurate, repetitive, culturally narrow, or inappropriate prompts; bounded validation and host editing reduce but do not eliminate that risk.
 
 The prototype therefore shows availability and signal confidence, keeps transcript metrics optional, avoids a universal quality score, and labels thresholds as engineering defaults. A consented pilot must measure false tips, distraction, device/transcription availability, privacy behavior, and subgroup fairness before broad effectiveness claims. Liang et al.'s [automated presentation-coaching survey](https://aclanthology.org/2026.bea-1.4/) likewise identifies low-latency diagnostics, limited annotated corpora, and accent-fair feedback as open challenges.
 
@@ -206,10 +246,11 @@ The prototype therefore shows availability and signal confidence, keeps transcri
 
 - Automatic baseline-to-unassisted-retry pairing and goal-specific comparison
 - Validated learning-outcome or fairness targets
-- Accounts, cross-device progress, educator assignments, or shared coaching reports
-- Per-attempt artifact deletion, automatic local expiration, storage-quota controls, app-level encryption, or server-side coaching analytics
+- Accounts, cross-device authentication/progress, educator assignments, or shared coaching reports
+- Per-attempt artifact deletion, automatic local expiration, storage-quota controls, or app-level encryption
 - Semantic analysis of structure, relevance, concision, examples, or answer completeness
 - Production semantic/LLM RAG, local-model, self-hosted, bring-your-own-key, or paid-provider coaching adapters
+- Queue-backed provider work or R2 storage for coaching media
 - Clinical assessment or treatment features
 
-Any future audio/transcript upload, cloud synchronization, human sharing, or external-model feature requires a separate explicit consent and retention design. It must not silently inherit permission from microphone analysis, transcript analysis, or local artifact retention.
+Any future audio/transcript upload, account-based synchronization, human sharing, or external-model feature requires a separate explicit consent and retention design. It must not silently inherit permission from microphone analysis, transcript analysis, local artifact retention, or compact-summary backup.

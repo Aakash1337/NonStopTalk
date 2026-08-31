@@ -4,6 +4,8 @@ NonStopTalk is a work-in-progress speaking-practice product and multiplayer part
 
 The playable game and a demonstrable coaching prototype exist today. The project is still being validated and hardened; the [roadmap](docs/ROADMAP.md) separates implemented work, prototype claims, and future ideas.
 
+An incremental [web platform foundation](docs/WEB_PLATFORM_PLAN.md) is now in progress. It keeps the existing local-first product intact while adding a central D1 database, opt-in compact-summary backup, and privacy-safe aggregate analytics through small replaceable modules. The design prefers Cloudflare's free allowances and adds paid services only when a validated feature needs them.
+
 ## Implemented now
 
 - A Cloudflare-SPA coaching prototype at `/practice`: 30–90 second interview, presentation, or impromptu attempts; microphone calibration; browser-side audio measurements; sparse deterministic live tips; and evidence-based review
@@ -15,24 +17,33 @@ The playable game and a demonstrable coaching prototype exist today. The project
 - Local pass-and-play and remote turns in the same room
 - Player add, rename, remove, and reorder controls
 - Configurable 10–300 second turns, 1–10 second silence limits, and 1–10 rounds
-- Five built-in topic packs plus custom lists; the local Go edition also has import/export, offline or Anthropic-assisted theme generation, and device-local saved presets
+- Five built-in topic packs plus custom lists; the local Go edition also has import/export, offline or provider-assisted theme generation, and device-local saved presets. The Cloudflare edition can turn a host theme into an editable draft through deterministic templates by default, direct Z.AI GLM-4.7-Flash as the strict-free routine option, Workers AI GLM-5.3-Flash as the preferred low-cost paid routine option, or Gemma 4 31B for an explicitly selected escalation.
 - A shuffled topic deck that uses every available topic before repeating; with more than one topic, a new cycle does not immediately repeat the previous draw
 - Local voice-activity and silence detection plus a manual timer fallback; the Go edition also has microphone selection and sound cues
 - Classic scoring, score explanations, host adjustments, standings, winner view, and the last 20 finished games in each room; optional AI relevance bonuses are available in the local Go edition
 - Periodic JSON room snapshots locally and SQLite-backed Durable Object room persistence online
 
+## Web platform foundation — in progress
+
+The first platform slice adds versioned Worker APIs, a central D1 store, consent records, anonymous-cloud-progress cleanup, and privacy-safe aggregate analytics. Cloud progress is off by default. When selected for an attempt, it sends only an allowlisted compact measurement/advice summary—including consented derived word-pattern fields—to D1. Access is tied to the existing high-entropy HTTP-only browser token; D1 stores its SHA-256 digest, never the raw token. One UTC-day-bucketed device lease controls inactivity retention for that browser's summaries, lasts at least 30 and less than 31 days after cloud use, and avoids rewriting every summary merely to renew access. New saves stop when that identity already has 250 summaries; valid unexpired legacy rows are preserved rather than forcibly deleted. Scheduled cleanup uses bounded batches so a backlog can continue on the next run. This is not an account or a cross-device recovery mechanism.
+
+Raw microphone samples, browser-encoded recordings, and captured transcript text always stay in the browser. Live rooms remain in per-room Durable Objects; D1 is the queryable platform store, and aggregate analytics intentionally exclude names, IP addresses, room-member tokens, audio, transcript text, and per-person identifiers. D1 daily rollups and Analytics Engine delivery are both best-effort: failures do not break rooms or coaching. Protected admin readouts expose aggregate product analytics and model usage for operations, not audit or billing truth. `/api/v1/admin/model-usage` returns only global/daily call, outcome, provider/model/task, input/output/total/cached-input/reasoning token, and latency aggregates—never prompts, responses, room data, identities, or authentication tokens. A timed-out provider call is counted even when it returns no usage; its token totals can therefore undercount vendor-billed work. The public status route checks D1 and reports non-secret configured or degraded platform capabilities. Accounts and cross-device authentication, external coaching AI, Queues, and R2 are future options, not parts of this slice.
+
+The platform also includes a narrow, disabled-by-default theme-to-topics provider boundary. The host must explicitly approve each external generation attempt. The only host or room content sent to a provider is that request's normalized theme, capped at 200 characters: never audio, transcript text, names, room authorization data, or a room token. `TOPIC_ROUTINE_PROVIDER=glm` selects direct Z.AI GLM-4.7-Flash with `ZAI_API_KEY`; `TOPIC_ROUTINE_PROVIDER=glm53` selects the `AI` binding's `@cf/zai-org/glm-5.3-flash` model without a vendor key. GLM-4.7 is the strict-free choice, while GLM-5.3 is the preferred cheap model when Workers Paid is acceptable. `TOPIC_ESCALATION_PROVIDER=gemma31` makes Gemma 4 31B available only when the host selects the escalated tier. Each topic request passes the general 60-requests-per-minute scoped API limiter and a dedicated `MODEL_RATE_LIMITER` capped at five requests per source connection per minute. D1 keeps aggregate daily provider usage and enforces a configurable call ceiling; the default is 100 external calls per UTC day. A missing key or binding, invalid selector, unavailable budget/database, or provider failure uses deterministic topics; status reports invalid or incomplete deployment configuration as degraded. Missing consent rejects a configured external request before budget reservation or provider contact. There is one external attempt at most and no provider retry or Queue in this slice.
+
 ## Privacy and AI
 
-Classic play does not require an account, an API key, transcription, or audio upload. The browser uses its microphone locally for voice-activity detection. The coaching prototype similarly processes microphone frames in the browser and makes no coaching API call. It does not upload coaching audio or transcripts. Attempt-recording/captured-transcript retention is a separate, off-by-default local-storage option; without it, audio is reduced to measurements and captured transcript text is discarded.
+Classic play does not require an account, an API key, transcription, or audio upload. The browser uses its microphone locally for voice-activity detection. Coaching similarly processes microphone frames in the browser and never uploads audio or captured transcript text. With cloud summary backup off—the default—a coaching attempt makes no coaching-data API call. If the user explicitly enables backup, the app sends only the compact allowlisted summary to the NonStopTalk Worker/D1 platform. Attempt-recording/captured-transcript retention is a separate, off-by-default local-storage option; without it, audio is reduced to measurements and captured transcript text is discarded.
 
-The free Cloudflare multiplayer game remains classic-only and calls no AI provider. Its separate coaching path may create a transcript only after explicit consent and only when the browser supports mandatory on-device recognition. Derived filler/repetition patterns are saved with its compact summary. By default captured transcript text is discarded; if the user separately enables full-session retention, the recording and available captured transcript are stored only for that site origin and browser profile. A finalization warning is persisted and shown whenever retained text may be partial. Coaching-card retrieval and deterministic review assembly also stay in the browser. The following AI-judge behavior belongs to the local Go game edition.
+The free Cloudflare multiplayer game remains classic-only for scoring. Its optional topic generator can make a single external request only after the host consents for that generation attempt; the normalized theme, capped at 200 characters, is the only host or room content sent to the provider. Audio, transcript text, names, and room tokens are excluded. Deterministic topic generation remains the default and fallback. The separate coaching path may create a transcript only after explicit consent and only when the browser supports mandatory on-device recognition. Derived filler/repetition patterns are saved with its compact summary and may be part of an explicitly selected cloud backup; captured transcript text is never part of that backup. By default captured transcript text is discarded; if the user separately enables full-session retention, the recording and available captured transcript are stored only for that site origin and browser profile. A finalization warning is persisted and shown whenever retained text may be partial. Coaching-card retrieval and deterministic review assembly also stay in the browser. The following AI-judge behavior belongs to the local Go game edition.
 
 The AI judge is opt-in at two levels: the host enables it for the room, then the current speaker chooses whether to use transcription for that turn. Transcription starts only when the browser exposes `SpeechRecognition` with `processLocally` support and accepts the selected live microphone track. If any of those checks fail, the turn continues with classic scoring or the manual timer.
 
 When a speaker consents, the resulting text transcript is submitted to the NonStopTalk server with that turn. The transcript is used for grading and is not stored in room history or JSON snapshots.
 
-- With `ANTHROPIC_API_KEY` configured, the server sends the topic and transcript to Anthropic for relevance grading. Theme generation sends only the host's theme.
-- Without the key, grading and theme generation use deterministic local heuristics on the server; no external AI provider is contacted.
+- `NONSTOPTALK_AI_PROVIDER=offline|anthropic|glm` selects the local Go judge and topic generator. Explicit `offline` wins even when API keys exist. If the selector is unset, an existing `ANTHROPIC_API_KEY` preserves the legacy Anthropic behavior; otherwise the server stays offline, and a Z.AI key alone does not opt in.
+- Explicit `anthropic` requires `ANTHROPIC_API_KEY`; explicit `glm` requires `ZAI_API_KEY` and uses GLM-4.7-Flash. An invalid selector or missing selected credential logs a warning and fails closed to deterministic local heuristics.
+- After the speaker's existing per-turn transcript consent, the selected external judge receives the assigned topic and transcript. Local theme generation sends the selected provider only the host theme as user content. Runtime judge failure preserves classic scoring.
 - Choosing classic or manual play sends no transcript and awards no AI bonus.
 
 Browser support for guaranteed on-device speech recognition is limited. AI grading is therefore an enhancement, not a requirement. See [AI and Privacy](docs/AI_AND_PRIVACY.md) for the exact data flow.
@@ -75,10 +86,22 @@ With a Cloudflare Workers Free account, Node.js 22+, and Wrangler authentication
 ```sh
 npm ci
 npx wrangler login
+npm run db:create
+# copy the returned database UUID into wrangler.jsonc
+npm run db:migrate:remote
+npx wrangler secret put ANALYTICS_ADMIN_TOKEN
+npx wrangler secret put ROOM_FACT_HASH_KEY
 npm run deploy
 ```
 
-No Docker engine, Container subscription, or static build-output setting is required. The public routes include `/`, `/practice`, `/progress`, and `/room/ABC123`; the Durable Object binding is internal and has no separate public URL. Coaching pages are static SPA routes and never put coaching summaries, recordings, or transcripts into the room object. See [Cloudflare Deployment](docs/CLOUDFLARE_DEPLOYMENT.md) for the free-tier limits, dashboard settings, local Worker development, and custom-domain routing.
+External topic generation needs no secret in the default `offline`/`off` configuration. Direct GLM-4.7 and Gemma escalation need their matching Wrangler secret; Workers AI GLM-5.3 uses the declared `AI` binding and no vendor API key:
+
+```sh
+npx wrangler secret put ZAI_API_KEY       # TOPIC_ROUTINE_PROVIDER=glm
+npx wrangler secret put GEMINI_API_KEY    # TOPIC_ESCALATION_PROVIDER=gemma31
+```
+
+No Docker engine, Container subscription, or static build-output setting is required. The public routes include `/`, `/practice`, `/progress`, and `/room/ABC234`; the Durable Object binding is internal and has no separate public URL. Coaching never puts summaries, recordings, or transcripts into a room object. The optional platform API stores only compact summaries in D1; recordings and captured transcript text remain local. See [Cloudflare Deployment](docs/CLOUDFLARE_DEPLOYMENT.md) for bindings, migrations, free-tier considerations, local Worker development, and custom-domain routing.
 
 ## Configuration
 
@@ -87,8 +110,22 @@ No Docker engine, Container subscription, or static build-output setting is requ
 | `PORT` | `8080` | Web server port. A value with or without a leading colon is accepted. |
 | `NONSTOPTALK_DATA_FILE` | `data/rooms.json` | Local JSON snapshot path. Set to `off` for memory-only rooms. |
 | `DST_DATA_FILE` | unset | Deprecated compatibility fallback used only when `NONSTOPTALK_DATA_FILE` is not set. |
-| `ANTHROPIC_API_KEY` | unset | Enables Anthropic relevance grading and topic generation. Without it, server-side offline heuristics are used. |
+| `NONSTOPTALK_AI_PROVIDER` | unset (legacy auto-selection) | Local Go provider selector: `offline`, `anthropic`, or `glm`. Unset selects Anthropic only when `ANTHROPIC_API_KEY` exists; an invalid/incomplete explicit selection warns and uses the offline heuristic. |
+| `ANTHROPIC_API_KEY` | unset | Local Go credential for explicit `anthropic` selection and the legacy unset-selector behavior. The current Anthropic adapter uses Claude Opus 4.8. |
+| `ZAI_API_KEY` | unset | Local Go credential used only with `NONSTOPTALK_AI_PROVIDER=glm`; that adapter uses GLM-4.7-Flash. The Cloudflare Worker can use the same-named value as a separate Wrangler secret. |
 | `NONSTOPTALK_TRUST_CLOUDFLARE_IP` | `false` | For the local Go server only: trust `CF-Connecting-IP` for rate limiting when an operator has placed the server behind a trusted Cloudflare proxy. |
+
+The Cloudflare Worker has a separate, modular topic-provider configuration. API keys are secrets; the provider selectors and limit are ordinary Worker variables. Leaving the selectors at their defaults and omitting provider keys keeps generation deterministic and free.
+
+| Cloudflare variable or secret | Default | Purpose |
+| --- | --- | --- |
+| `TOPIC_ROUTINE_PROVIDER` | `offline` | `offline` uses deterministic templates; `glm` selects direct Z.AI model `glm-4.7-flash` with `ZAI_API_KEY`; `glm53` selects public model `glm-5.3-flash` through Workers AI binding ID `@cf/zai-org/glm-5.3-flash`. Every external attempt still needs fresh host consent. |
+| `TOPIC_ESCALATION_PROVIDER` | `off` | `off` disables escalation; `gemma31` makes Gemini Developer API model `gemma-4-31b-it` available only when the host explicitly selects escalation and consents. |
+| `MODEL_DAILY_CALL_LIMIT` | `100` | Maximum external topic-provider attempts per UTC day, enforced with aggregate D1 usage state. |
+| `ZAI_API_KEY` | unset | Wrangler secret required only for the `glm` routine provider. |
+| `GEMINI_API_KEY` | unset | Wrangler secret required only for the `gemma31` escalation provider. |
+
+Cost snapshot, checked August 31, 2026: [Z.AI's pricing](https://docs.z.ai/guides/overview/pricing) lists direct GLM-4.7-Flash input, cached input, storage, and output as free, so the default/direct path avoids a fixed Workers Paid charge. [Cloudflare's Workers AI pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/) lists GLM-5.3-Flash at $0.15/M input, $0.03/M cached-input, and $0.50/M output tokens; [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/) lists a $5 USD/account/month Workers Paid minimum. This build's plain `AI.run()` path requires Workers Paid; prepaid AI Gateway credits would need a gateway ID and Unified billing, which are not implemented. [Google's Gemini Developer API pricing](https://ai.google.dev/gemini-api/docs/pricing#gemma-4) lists Gemma 4 input, output, and caching as free, with no paid tier, and says free-tier content is used to improve Google's products. That privacy tradeoff is why Gemma remains explicit escalation and receives only the normalized theme. Prices, quotas, and provider terms can change. Platform status can verify that `AI.run` exists, not that the account has billing entitlement; a denied first request fails closed to deterministic topics.
 
 Example memory-only local run:
 
@@ -142,11 +179,13 @@ Validate the native Cloudflare game rules and deploy bundle:
 npm run typecheck:cloudflare
 npm run test:cloudflare
 npm run test:coach
+npm run test:cloud-progress
 npm run check:cloudflare
 npm run smoke:coach
+npm run smoke:platform
 ```
 
-`test:coach` runs 21 deterministic measurement, continuity, transcript-analysis, retrieval, grounding-safety, and advice tests without a microphone. `smoke:coach` drives the Cloudflare SPA with synthetic media; it proves a default-off attempt never constructs `MediaRecorder` or creates an artifact, exercises a v1→v2 storage upgrade, verifies opted-in recording/transcript and real downloads, preserves captured text with a partial-transcript warning after a late recognition error, checks JSON artifact exclusion and two-store deletion, renders a voice/quiet timeline, moves focus after SPA navigation, cleans up canceled permission/worklet work, handles active/calibration stalls, and makes no application `/api/*` request.
+`test:coach` runs 21 deterministic measurement, continuity, transcript-analysis, retrieval, grounding-safety, and advice tests without a microphone. `smoke:coach` drives the default/off coaching path with synthetic media and asserts that path makes no coaching-data API request; it also covers local storage, artifact, lifecycle, and review behavior. `test:cloud-progress` checks the separate opt-in client's summary allowlist, merge behavior, API calls, and preference state. `smoke:platform` starts a local Wrangler/D1 instance and exercises the status, summary-backup, export, analytics, privacy, and deletion boundaries.
 
 ## Architecture
 
@@ -155,11 +194,13 @@ npm run smoke:coach
 - Official HTMX 2.0.10 vendored for server-rendered interactions
 - Vanilla JavaScript for microphone selection, Web Audio voice activity, on-device speech recognition, timers, presets, and SSE refreshes
 - In-memory Go room manager with optional periodic JSON snapshots
-- Anthropic Go SDK behind a small judge/topic-generator interface
+- Replaceable offline, Anthropic, and Z.AI GLM adapters behind small Go judge/topic-generator interfaces
 - Native TypeScript Worker, Workers Static Assets, and one SQLite-backed Durable Object per online room
 - Hibernatable WebSockets for cost-efficient online synchronization
 - Browser `AudioWorklet` (with an `AnalyserNode` compatibility fallback) for coaching signal reduction, plus deterministic analysis and local lexical coaching-card retrieval
 - Origin-scoped IndexedDB v2 for compact coaching summaries and a separate, explicitly opted-in recording/captured-transcript store; exports exclude those artifacts and local deletion clears both stores
+- An in-progress modular platform layer using D1 for queryable consented summaries and protected best-effort daily rollups, plus Analytics Engine for coarse best-effort telemetry; neither analytics path is audit or billing truth, and Durable Objects remain responsible for live rooms
+- A separate Cloudflare topic-provider adapter with deterministic default/fallback behavior, optional direct GLM-4.7 or Workers AI GLM-5.3-Flash routine generation, explicit Gemma 4 31B escalation, and aggregate D1 cost controls
 - Playwright browser smoke coverage plus Go unit and handler tests
 
 There is no frontend build step for local play.
@@ -178,7 +219,8 @@ These ideas are not presented as current features:
 - Full multiplayer-game feature parity between the local Go and free Cloudflare editions (AI judge, saved presets, import/export, microphone picker, and sound cues)
 - Validated baseline-to-unassisted-retry coaching comparisons
 - Coaching accuracy, usability, accessibility, and accent/language fairness validation across browsers and microphones
-- Guided programs, accounts, cross-device progress, educator tools, and optional semantic coaching
+- Guided programs, accounts and cross-device authentication/progress, educator tools, and optional external semantic/AI coaching
+- Queue-backed provider jobs or R2 media storage; neither is configured in the first platform slice
 
 ## Documents
 
@@ -196,4 +238,5 @@ Core references:
 - [Requirements and implementation status](docs/REQUIREMENTS.md) and [roadmap](docs/ROADMAP.md)
 - [Speech coaching prototype](docs/SPEECH_COACHING_PROTOTYPE.md) and [technical architecture](docs/TECHNICAL_ARCHITECTURE.md)
 - [AI and privacy](docs/AI_AND_PRIVACY.md) and [Cloudflare deployment](docs/CLOUDFLARE_DEPLOYMENT.md)
+- [Web platform plan](docs/WEB_PLATFORM_PLAN.md) for the central database, APIs, analytics, cost controls, and phased delivery
 - [Game design](docs/GAME_DESIGN.md), [desktop application](docs/DESKTOP_APPLICATION.md), and the [historical web version plan](docs/WEB_VERSION_PLAN.md)

@@ -47,7 +47,7 @@ The first plan treated online play, AI judging, and persistence as later upgrade
 - Browser-token reconnect
 - Optional JSON snapshots
 - Optional on-device transcription and relevance judging
-- Offline and Anthropic-backed topic generation
+- Offline, Anthropic-backed, and Z.AI GLM-backed topic generation selected through `NONSTOPTALK_AI_PROVIDER`
 - Native Workers Static Assets + SQLite-backed Durable Object deployment path
 
 ## Current request shape

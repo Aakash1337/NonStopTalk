@@ -41,7 +41,7 @@ The launcher exposes the same current feature set as the local web server:
 - Pass-and-play rooms using one or more browser windows on the same computer
 - Player, settings, topic, turn, scoring, and history screens
 - Microphone selection, local voice-activity detection, and manual timing
-- Optional on-device transcription with offline or Anthropic-backed judging
+- Optional on-device transcription with offline, Anthropic-backed, or Z.AI GLM-backed judging
 - Saved browser presets and custom-topic import/export
 
 The launcher binds only to `127.0.0.1`, so its automatically opened address is local to that computer. Use `cmd/web` or the documented online deployment for players on other devices.

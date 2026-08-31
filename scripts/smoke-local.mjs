@@ -598,7 +598,7 @@ async function runRemoteRoomScenario(browser, baseURL) {
   const code = await createRoom(host, baseURL, "Hosty");
 
   await guest.goto(baseURL);
-  await guest.getByPlaceholder("ABC123").fill(code);
+  await guest.getByPlaceholder("ABC234").fill(code);
   await guest.getByPlaceholder("Player name").fill("Remy");
   await guest.getByRole("button", { name: "Join Room" }).click();
   await guest.waitForSelector(".setup-grid");
@@ -669,6 +669,11 @@ async function main() {
   const env = { ...process.env, PORT: port, NONSTOPTALK_DATA_FILE: "off" };
   delete env.DST_DATA_FILE;
   delete env.ANTHROPIC_API_KEY;
+  delete env.NONSTOPTALK_AI_PROVIDER;
+  delete env.TOPIC_ROUTINE_PROVIDER;
+  delete env.TOPIC_ESCALATION_PROVIDER;
+  delete env.ZAI_API_KEY;
+  delete env.GEMINI_API_KEY;
   const server = spawn("go", ["run", "./cmd/web"], {
     cwd: root,
     env,

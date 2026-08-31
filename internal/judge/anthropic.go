@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
 const anthropicModel = anthropic.ModelClaudeOpus4_8
@@ -36,6 +37,12 @@ type Anthropic struct {
 
 func NewAnthropic() *Anthropic {
 	return &Anthropic{client: anthropic.NewClient()}
+}
+
+// NewAnthropicWithAPIKey creates an Anthropic provider with an explicitly
+// selected credential instead of relying on ambient SDK configuration.
+func NewAnthropicWithAPIKey(apiKey string) *Anthropic {
+	return &Anthropic{client: anthropic.NewClient(option.WithAPIKey(apiKey))}
 }
 
 func (a *Anthropic) Name() string { return "AI judge" }

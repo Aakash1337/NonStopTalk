@@ -8,7 +8,7 @@ At minute 45, you should be able to:
 - redraw the coaching and Cloudflare request paths;
 - trace a microphone sample through analysis, advice, and persistence;
 - explain exactly what the small RAG component does;
-- describe the two optional data choices and their privacy consequences;
+- describe the three independent optional data choices and their privacy consequences;
 - state what Durable Objects do and what their public route looks like; and
 - separate implemented behavior from future validation claims.
 
@@ -16,7 +16,7 @@ At minute 45, you should be able to:
 
 Environment installation is not part of the 45-minute learning clock. Do this earlier; if 45 minutes is a hard total, use an already-running local or deployed build.
 
-The coaching-capable local edition requires Node.js 22 or newer. Node 24 is the exact CI and Cloudflare build target used by this project. Check the active version first. If it prints `v20...`, install Node 24 from the [official Node.js download](https://nodejs.org/en/download), reopen the terminal, and check again. If `nvm` is already installed, this is the equivalent:
+The coaching-capable local edition supports Node.js 22 or newer. CI uses Node 24, so selecting 24 is the easiest way to match automated checks. Check the active version first. If it prints `v20...`, install Node 24 from the [official Node.js download](https://nodejs.org/en/download), reopen the terminal, and check again. If `nvm` is already installed, this is the equivalent:
 
 ```sh
 nvm install 24
@@ -30,9 +30,10 @@ node --version
 npm ci
 ```
 
-The version check should print `v24...`; do not continue with Node 20. Start a stable local presentation server:
+The version check should print `v22...` or newer; `v24...` matches CI. Do not continue with Node 20. Start a stable local presentation server:
 
 ```sh
+npm run db:migrate:local
 npm run dev -- --local --ip 127.0.0.1 --port 8787
 ```
 
@@ -70,8 +71,8 @@ Memorize this sentence:
 | Surface | Route | User job | Technical boundary |
 | --- | --- | --- | --- |
 | **Practice** | `/practice` | Rehearse one speaking goal and get evidence plus one next action | Browser Web Audio, optional strict on-device transcript analysis, local retrieval, local IndexedDB |
-| **Play** | `/` and `/room/ABC123` | Play the original speaking game alone or with remote players | Online room actions use the Worker API, WebSockets, and one Durable Object per room |
-| **Progress** | `/progress` | Review Practice attempts and download/delete locally retained data | Reads the current origin's IndexedDB; it is not a leaderboard or cloud account |
+| **Play** | `/` and `/room/ABC234` | Play the original speaking game alone or with remote players | Online room actions use the Worker API, WebSockets, and one Durable Object per room |
+| **Progress** | `/progress` | Review Practice attempts and control local/optional cloud summary data | Always reads current-origin IndexedDB; optional D1 backup is anonymous, not an account |
 
 Two distinctions matter:
 
@@ -98,7 +99,7 @@ The user loop is:
 choose one goal → calibrate → speak → review one priority → retry → compare
 ```
 
-The current prototype implements standalone attempts and local history. Explicitly paired, comparable, unassisted retries are the next measurement feature; do not claim that Progress already proves improvement.
+The current prototype implements standalone attempts and local-first history. Explicitly paired, comparable, unassisted retries are the next measurement feature; do not claim that Progress already proves improvement.
 
 Checkpoint: Point to one measured fact and explain why it supports the recommended next action. If you cannot connect them, inspect the evidence and source label again.
 
@@ -166,7 +167,7 @@ Retrieve → Assemble → Store
 | **5. Measure** | The engine aggregates observed time, coverage, speaking ratio, interior pauses, continuity, relative level, clipping, and optional transcript counts. | `CoachingAnalyzer.snapshot()` and `analyzeTranscript` in `coach-engine.js` |
 | **6. Retrieve** | The selected goal plus aggregate evidence becomes a lexical query that ranks six bundled coaching cards, keeps up to two results, and presents the top result as the primary context. | `retrieveCoachingGuidance` in `coach-engine.js` |
 | **7. Assemble** | Transparent rules choose Strength and Focus. A supported card normally contributes its unchanged drill; a safety rule can substitute a measurement-backed drill. One fixed comparison sentence is appended. | `buildAdvice` in `coach-engine.js` |
-| **8. Store** | An allowlisted compact summary is saved to IndexedDB. A separate opted-in artifact record can hold a browser-encoded recording and captured transcript. | `buildCoachingSummary`, `buildCoachingArtifact`, and `saveCoachingSession` in `app.js` |
+| **8. Store** | A compact summary is saved to IndexedDB. Separate choices may retain local artifacts or back up the narrower summary allowlist to D1. | Local helpers in `app.js` and the opt-in client in `cloud-progress.js` |
 
 ### Terms you need to explain
 
@@ -230,11 +231,12 @@ Checkpoint: Answer three questions: What is retrieved? What is generated? What p
 GET /practice or /progress
     → Workers Static Assets returns the SPA
     → coaching and IndexedDB work remain in the browser
-    → no coaching /api request
+    → default/off: no coaching-data API request
+    → explicit compact backup only: /api/v1/progress/sessions → D1
 
-GET /room/ABC123
+GET /room/ABC234
     → Workers Static Assets returns the same SPA
-    → browser calls /api/rooms/ABC123/...
+    → browser calls /api/rooms/ABC234/...
     → Worker validates and maps the room code through binding ROOMS
     → one SQLite-backed Durable Object serializes and persists that room
     → hibernatable WebSockets carry live public state
@@ -248,9 +250,18 @@ GET  /api/rooms/:code/state
 POST /api/rooms/:code/join
 POST /api/rooms/:code/action
 WS   /api/rooms/:code/socket
+
+GET/HEAD /api/v1/platform/status
+GET    /api/v1/progress/sessions
+POST   /api/v1/progress/sessions       explicit compact backup only
+DELETE /api/v1/progress/sessions
+GET    /api/v1/progress/export
+GET    /api/v1/admin/analytics         protected bearer token
 ```
 
-There is **no public Durable Object route**. The Worker selects an object with the normalized room code and forwards internally through the `ROOMS` binding. The implementation constructs an internal `https://room.internal/{state|join|action|socket}` request, but that is not a player-facing URL. The player-facing page remains `/room/ABC123`.
+The status route checks D1 readiness and reports only non-secret configured or degraded capability state. The analytics route reads best-effort operational rollups, not an audit or billing ledger.
+
+There is **no public Durable Object route**. The Worker selects an object with the normalized room code and forwards internally through the `ROOMS` binding. The implementation constructs an internal `https://room.internal/{state|join|action|socket}` request, but that is not a player-facing URL. The player-facing page remains `/room/ABC234`.
 
 `wrangler.jsonc` connects the system:
 
@@ -260,6 +271,8 @@ There is **no public Durable Object route**. The Worker selects an object with t
 - Worker-first behavior only for `/api/*`
 - `ROOMS` binding to `RoomDurableObject`
 - SQLite Durable Object migration `v1`
+- `PLATFORM_DB` binding and append-only D1 migrations
+- `PRODUCT_ANALYTICS` best-effort Analytics Engine binding
 
 This is a **Worker with Static Assets**, not a Pages-only project and not a Container.
 
@@ -267,13 +280,14 @@ This is a **Worker with Static Assets**, not a Pages-only project and not a Cont
 
 | Data | Default? | Location | Network/export/delete behavior |
 | --- | --- | --- | --- |
-| Aggregate measurements and advice | Saved after a completed attempt when IndexedDB is available | `session-summaries` in origin-local IndexedDB | No coaching upload; included in summary JSON; local delete clears it |
+| Aggregate measurements and advice | Saved after a completed attempt when IndexedDB is available | `session-summaries` in origin-local IndexedDB | Default/off makes no coaching-data API call; included in summary JSON |
 | Derived pace/filler/repetition evidence | Only after transcript-analysis consent and strict-local support | Bounded fields in the compact summary | No remote fallback; derived words can still be sensitive |
 | Captured transcript text | No | `session-artifacts` only when transcript analysis captured text **and** full-session retention was selected | Excluded from JSON; individual download; may be flagged possibly partial |
 | Attempt recording | No | Browser-encoded `MediaRecorder` `Blob` in `session-artifacts` after separate retention opt-in | Calibration excluded; no upload; excluded from JSON; individual download |
+| Compact cloud summary | No | Central D1, keyed to a hashed anonymous browser identity | Separate explicit choice; allowlisted metrics/advice and bounded derived patterns only; one device-level day-bucketed 30–31-day inactivity lease; new saves stop once 250 exist |
 | Multiplayer room state | Only for Play rooms | Private SQLite storage in the room Durable Object | Worker/DO traffic; expires after 30 days without a state change |
 
-Full-session retention starts unchecked on a fresh page. **Try again** preserves the visible setup selections so the user can review or uncheck them. The current prototype has no automatic artifact expiry, per-attempt deletion, app-level encryption, cloud backup, account sync, or cross-device Progress. IndexedDB is best-effort: clearing site data, private-browsing behavior, or storage pressure can remove records. **Delete local history** clears both app stores but cannot delete files the user already downloaded.
+Full-session retention and compact cloud backup are independent and start off. **Try again** preserves the visible setup selections so the user can review or uncheck them. Local artifacts have no automatic expiry. One UTC-day-bucketed device lease controls all of an anonymous browser's summaries, lasts at least 30 and less than 31 days after cloud use, and avoids per-summary renewal writes. The cloud cookie is not an account or recovery credential, so there is no cross-device Progress. IndexedDB remains best-effort, and deleting history cannot remove files already downloaded.
 
 ### Two editions that can both run locally
 
@@ -292,16 +306,17 @@ Checkpoint: Trace one Practice attempt and one Play action. Name exactly where e
 - sparse live acoustic cues and deterministic post-attempt advice;
 - six-card local lexical retrieval with grounding status;
 - optional strict on-device transcript-derived metrics;
-- origin-local summaries, export, two-store deletion, and opted-in artifact downloads;
+- local-first summaries, export, two-store deletion, opted-in artifact downloads, and optional compact D1 backup;
 - Worker-with-Assets deployment and Durable Object multiplayer rooms;
-- 21 deterministic coaching-engine tests plus browser smoke, Worker tests, typechecking, Go checks, and Wrangler dry-run validation.
+- 21 deterministic coaching-engine tests plus coaching/platform browser smoke, Worker tests, typechecking, Go checks, and Wrangler dry-run validation.
 
 ### Not proven or not implemented
 
 - no validated learning outcome or paired baseline-to-unassisted-retry feature yet;
 - no universal speaker-quality, confidence, emotion, honesty, accent, health, or professionalism score;
 - no guarantee across microphones, rooms, browsers, languages, accents, or disabilities;
-- no account, cloud coaching history, cross-device sync, curriculum, or production semantic/LLM RAG;
+- no account, cross-device authentication/sync, curriculum, or production external semantic/LLM coaching;
+- no Queue-backed provider processing or R2 media storage;
 - no formal accessibility, security, privacy, clinical, or fairness certification; and
 - no claim that this replaces a speech-language professional or human coach.
 
@@ -309,7 +324,7 @@ Tests show that the implementation follows its defined rules and privacy boundar
 
 The future primary outcome is the distribution of paired, goal-specific change between a baseline and a comparable unassisted retry. Do not choose a numeric success target until a pilot establishes measurement quality and a baseline distribution.
 
-The prototype sends no product analytics today. A pilot would need explicit consent and either summary exports plus participant/facilitator ratings or a separately consented study logger. That collection design is future work, not a hidden current data flow.
+The in-progress platform attempts only coarse room/summary-save/delete/consent aggregates for operations and funnel health. D1 rollups and Analytics Engine writes are both best-effort and can miss events. They do not copy coaching measurements into telemetry or measure learning outcomes. A pilot would still need explicit consent and a separate study design with paired outcomes and participant/facilitator ratings.
 
 Checkpoint: Say one implemented claim and one limitation in the same answer. Example: “The prototype deterministically reports device-relative timing evidence; it has not yet validated that its thresholds work equally well across devices or users.”
 
@@ -319,10 +334,10 @@ Open the [Presentation cheat sheet](PRESENTATION_CHEAT_SHEET.md), set a five-min
 
 During the rehearsal, make sure you say all of these:
 
-- Practice is coaching; Play is the game; Progress is local Practice history.
+- Practice is coaching; Play is the game; Progress is local-first Practice history.
 - Coaching goes from microphone reduction to measurement, local retrieval, deterministic advice, and IndexedDB.
 - The RAG component has no LLM, embeddings, vector database, or network call.
-- The two optional data choices are independent, and coaching data does not enter Durable Objects.
+- Transcript analysis, local artifact retention, and compact cloud backup are independent; coaching data never enters room Durable Objects.
 - The prototype proves an engineering loop, not learning outcomes or a universal measure of speaking quality.
 
 If you finish early, answer the five questions below. If you run long, shorten the mechanics before removing the limitation and next-step statement.
@@ -348,7 +363,7 @@ If any answer feels weak, reread only that section.
 | Confidence score | Signal or measurement confidence, never speaker confidence |
 | Loudness in dB | Device-relative RMS and peak amplitude |
 | Silence means a pause | Interior measured quiet with voice on both sides; unknown is not silence |
-| Cloudflare stores coaching data | Origin-local IndexedDB stores coaching data |
+| Cloudflare stores the full coaching session | IndexedDB stores local summaries and all artifacts; explicit backup may send only the compact summary to D1 |
 | Durable Object endpoint | Public Worker API routed through an internal Durable Object binding |
 | Pages deployment | Worker with Static Assets and a Durable Object |
 | Progress proves improvement | Progress shows descriptive standalone history; paired validation is next |

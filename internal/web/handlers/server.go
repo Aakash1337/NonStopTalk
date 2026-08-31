@@ -128,7 +128,7 @@ func NewServer(templatePattern string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newServer(tmpl, http.Dir("web/static")), nil
+	return newServer(tmpl, http.Dir("web/static"))
 }
 
 // NewServerFromFS builds a server from a filesystem containing the repository
@@ -143,7 +143,7 @@ func NewServerFromFS(assets fs.FS) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newServer(tmpl, http.FS(staticFiles)), nil
+	return newServer(tmpl, http.FS(staticFiles))
 }
 
 func templateFunctions() template.FuncMap {
@@ -160,18 +160,14 @@ func templateFunctions() template.FuncMap {
 	}
 }
 
-func newServer(tmpl *template.Template, staticFiles http.FileSystem) *Server {
-	// The Claude judge and topic generator are used when credentials are
-	// configured; otherwise transparent offline fallbacks keep both features
-	// playable and testable.
-	var relevanceJudge judge.Provider = judge.Heuristic{}
-	var generator judge.TopicGenerator = judge.Heuristic{}
-	externalProvider := false
-	if os.Getenv("ANTHROPIC_API_KEY") != "" {
-		claude := judge.NewAnthropic()
-		relevanceJudge = claude
-		generator = claude
-		externalProvider = true
+func newServer(tmpl *template.Template, staticFiles http.FileSystem) (*Server, error) {
+	relevanceJudge, generator, externalProvider, providerWarning := selectAIProvider(
+		os.Getenv("NONSTOPTALK_AI_PROVIDER"),
+		os.Getenv("ANTHROPIC_API_KEY"),
+		os.Getenv("ZAI_API_KEY"),
+	)
+	if providerWarning != nil {
+		log.Printf("AI provider configuration is unavailable; using the offline judge: %v", providerWarning)
 	}
 	return &Server{
 		rooms:             room.NewManager(),
@@ -186,6 +182,47 @@ func newServer(tmpl *template.Template, staticFiles http.FileSystem) *Server {
 		eventSlots:        make(chan struct{}, maxLiveEventStreams),
 		trustCloudflareIP: strings.EqualFold(os.Getenv("NONSTOPTALK_TRUST_CLOUDFLARE_IP"), "true"),
 		hostClaimGrace:    30 * time.Second,
+	}, nil
+}
+
+func selectAIProvider(
+	selected string,
+	anthropicKey string,
+	zaiKey string,
+) (judge.Provider, judge.TopicGenerator, bool, error) {
+	heuristic := judge.Heuristic{}
+	selected = strings.ToLower(strings.TrimSpace(selected))
+	anthropicKey = strings.TrimSpace(anthropicKey)
+	zaiKey = strings.TrimSpace(zaiKey)
+
+	switch selected {
+	case "":
+		// Preserve the original zero-configuration behavior: an Anthropic key
+		// opts into Claude, while every other unset configuration stays offline.
+		if anthropicKey == "" {
+			return heuristic, heuristic, false, nil
+		}
+		claude := judge.NewAnthropicWithAPIKey(anthropicKey)
+		return claude, claude, true, nil
+	case "offline":
+		return heuristic, heuristic, false, nil
+	case "anthropic":
+		if anthropicKey == "" {
+			return heuristic, heuristic, false, errors.New("the selected Anthropic provider has no API key")
+		}
+		claude := judge.NewAnthropicWithAPIKey(anthropicKey)
+		return claude, claude, true, nil
+	case "glm":
+		if zaiKey == "" {
+			return heuristic, heuristic, false, errors.New("the selected GLM provider has no API key")
+		}
+		provider, err := judge.NewGLM(zaiKey)
+		if err != nil {
+			return heuristic, heuristic, false, errors.New("could not configure the selected GLM provider")
+		}
+		return provider, provider, true, nil
+	default:
+		return heuristic, heuristic, false, errors.New("the selected AI provider is not supported")
 	}
 }
 
@@ -1175,8 +1212,8 @@ func (s *Server) clientKey(r *http.Request) string {
 }
 
 // allowProviderCall is a process-wide spend ceiling that cannot be bypassed by
-// rotating browser cookies or spoofing client-IP headers. Operators who do not
-// configure ANTHROPIC_API_KEY use the free offline provider regardless.
+// rotating browser cookies or spoofing client-IP headers. When no external
+// provider is successfully selected, requests stay on the free offline provider.
 func (s *Server) allowProviderCall() bool {
 	if !s.externalProvider {
 		return true
