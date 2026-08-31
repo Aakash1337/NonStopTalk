@@ -7,13 +7,18 @@
   },
   "scripts": {
     "check:cloudflare": "wrangler deploy --dry-run",
+    "db:create": "wrangler d1 create nonstoptalk-platform",
+    "db:migrate:local": "wrangler d1 migrations apply PLATFORM_DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply PLATFORM_DB --remote",
     "test:coach": "node --test cloudflare/public/coach-engine.test.js",
+    "test:cloud-progress": "node --test cloudflare/public/cloud-progress.test.js",
     "test:cloudflare": "tsx --test cloudflare/*.test.ts",
     "typecheck:cloudflare": "tsc -p cloudflare/tsconfig.json",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "smoke": "node scripts/smoke-local.mjs",
-    "smoke:coach": "node scripts/smoke-coach.mjs"
+    "smoke:coach": "node scripts/smoke-coach.mjs",
+    "smoke:platform": "node scripts/smoke-platform.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20260804.1",

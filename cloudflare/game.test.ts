@@ -7,6 +7,8 @@ import {
 	MAX_PLAYERS,
 	TOPIC_PACKS,
 	applyAction,
+	authorizeTopicGeneration,
+	beginTopicGeneration,
 	createRoomState,
 	joinRoom,
 	publicRoomState,
@@ -35,6 +37,60 @@ test("joins once per browser identity and protects host actions", () => {
 	assert.throws(
 		() => applyAction(room, guest, { type: "settings", duration: 10 }, 400),
 		(error: unknown) => error instanceof GameError && error.status === 403,
+	);
+});
+
+test("topic generation preflight is host-only and setup-only", () => {
+	const room = createRoomState("ABC234", host, "Alice", 100);
+	joinRoom(room, guest, "Bob", 200);
+	authorizeTopicGeneration(room, host);
+	assert.throws(
+		() => authorizeTopicGeneration(room, guest),
+		(error: unknown) => error instanceof GameError && error.status === 403,
+	);
+	applyAction(room, host, { type: "start-game" }, 300);
+	assert.throws(
+		() => authorizeTopicGeneration(room, host),
+		(error: unknown) => error instanceof GameError && error.status === 409,
+	);
+});
+
+test("newer topic generations and manual edits invalidate stale drafts", () => {
+	const room = createRoomState("ABC234", host, "Alice", 100);
+	const first = beginTopicGeneration(room, host, 200);
+	const second = beginTopicGeneration(room, host, 300);
+	assert.equal(first, 1);
+	assert.equal(second, 2);
+	assert.throws(
+		() => applyAction(room, host, {
+			type: "custom-topics",
+			topics: ["Old generated topic"],
+			topicGeneration: first,
+		}, 400),
+		(error: unknown) => error instanceof GameError && error.status === 409,
+	);
+	applyAction(room, host, {
+		type: "custom-topics",
+		topics: ["Newest generated topic"],
+		topicGeneration: second,
+	}, 500);
+	assert.deepEqual(room.topics, ["Newest generated topic"]);
+	assert.throws(
+		() => applyAction(room, host, {
+			type: "custom-topics",
+			topics: ["Replayed generated topic"],
+			topicGeneration: second,
+		}, 550),
+		(error: unknown) => error instanceof GameError && error.status === 409,
+	);
+	applyAction(room, host, { type: "custom-topics", topics: ["Manual topic"] }, 600);
+	assert.throws(
+		() => applyAction(room, host, {
+			type: "custom-topics",
+			topics: ["Late generated topic"],
+			topicGeneration: second,
+		}, 700),
+		(error: unknown) => error instanceof GameError && error.status === 409,
 	);
 });
 

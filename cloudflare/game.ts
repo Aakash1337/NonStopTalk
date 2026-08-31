@@ -44,6 +44,7 @@ export interface RoomState {
 	hostDisconnectedAt: number | null;
 	createdAt: number;
 	updatedAt: number;
+	topicGeneration: number;
 	nextPlayer: number;
 	nextTurn: number;
 	players: Player[];
@@ -171,6 +172,7 @@ export function createRoomState(
 		hostDisconnectedAt: now,
 		createdAt: now,
 		updatedAt: now,
+		topicGeneration: 0,
 		nextPlayer: 1,
 		nextTurn: 1,
 		players: [],
@@ -200,6 +202,20 @@ export function joinRoom(room: RoomState, token: string, name: string, now = Dat
 	const player = addPlayer(room, token, name);
 	touch(room, now);
 	return player;
+}
+
+/** Authorize the read-only preflight that gates optional topic generation. */
+export function authorizeTopicGeneration(room: RoomState, token: string): void {
+	if (room.hostToken !== token) throw new GameError("Only the host can generate room topics.", 403);
+	requireSetup(room);
+}
+
+/** Reserve a generation number so newer requests/manual edits can invalidate an older result. */
+export function beginTopicGeneration(room: RoomState, token: string, now = Date.now()): number {
+	authorizeTopicGeneration(room, token);
+	room.topicGeneration = currentTopicGeneration(room) + 1;
+	touch(room, now);
+	return room.topicGeneration;
 }
 
 export function applyAction(
@@ -266,6 +282,7 @@ export function applyAction(
 			const packId = text(action.topicPack);
 			const pack = TOPIC_PACKS.find((candidate) => candidate.id === packId);
 			if (pack) {
+				room.topicGeneration = currentTopicGeneration(room) + 1;
 				room.settings.topicPack = pack.id;
 				room.topics = [...pack.topics];
 				resetDeck(room);
@@ -280,6 +297,15 @@ export function applyAction(
 				: text(action.topics).replaceAll("\r\n", "\n").split("\n");
 			const cleaned = cleanTopics(topics);
 			if (!cleaned.length) throw new GameError("Choose at least one topic.");
+			if (action.topicGeneration !== undefined) {
+				if (integer(action.topicGeneration, -1) !== currentTopicGeneration(room)) {
+					throw new GameError("That generated topic draft is stale.", 409);
+				}
+			}
+			// Both a generated apply and a manual edit consume/invalidate the
+			// current draft number. A delayed or replayed generated response can
+			// therefore never overwrite the accepted list.
+			room.topicGeneration = currentTopicGeneration(room) + 1;
 			room.topics = cleaned;
 			room.settings.topicPack = "custom";
 			resetDeck(room);
@@ -586,6 +612,12 @@ function shuffleDeck(room: RoomState): void {
 function resetDeck(room: RoomState): void {
 	room.deck = [];
 	room.deckCursor = 0;
+}
+
+function currentTopicGeneration(room: RoomState): number {
+	return Number.isSafeInteger(room.topicGeneration) && room.topicGeneration >= 0
+		? room.topicGeneration
+		: 0;
 }
 
 function cleanTopics(values: string[]): string[] {

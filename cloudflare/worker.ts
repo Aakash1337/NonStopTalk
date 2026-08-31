@@ -3,6 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 import {
 	GameError,
 	applyAction,
+	beginTopicGeneration,
 	createRoomState,
 	joinRoom,
 	publicRoomState,
@@ -10,6 +11,17 @@ import {
 	type Action,
 	type RoomState,
 } from "./game";
+import {
+	handlePlatformRoute,
+	recordRoomMilestone,
+	runPlatformCleanup,
+	type PlatformBindings,
+} from "./platform-routes";
+import {
+	handleModelRoute,
+	modelAuthorizationErrorForStatus,
+	type ModelRouteBindings,
+} from "./model-routes";
 import { parseRoomRoute } from "./routes";
 
 const TOKEN_COOKIE = "nonstoptalk_token";
@@ -19,11 +31,15 @@ const MAX_ROOM_SOCKETS = 64;
 const MAX_SOCKETS_PER_TOKEN = 4;
 const ROOM_IDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const HOST_HTTP_PRESENCE_BUCKET_MS = 15_000;
+const ROOM_MILESTONES_HEADER = "X-NonStopTalk-Room-Milestones";
+const MODEL_TOPICS_ROUTE = "/api/v1/models/topics";
 
-interface Env {
+interface Env extends PlatformBindings, ModelRouteBindings {
 	ROOMS: DurableObjectNamespace<RoomDurableObject>;
 	ASSETS: Fetcher;
 	ROOM_CREATION_RATE_LIMITER: RateLimit;
+	API_RATE_LIMITER: RateLimit;
+	MODEL_RATE_LIMITER: RateLimit;
 }
 
 interface SocketAttachment {
@@ -33,6 +49,7 @@ interface SocketAttachment {
 interface TokenIdentity {
 	token: string;
 	created: boolean;
+	migratedLegacy: boolean;
 }
 
 export class RoomDurableObject extends DurableObject<Env> {
@@ -64,31 +81,58 @@ export class RoomDurableObject extends DurableObject<Env> {
 				this.initializeSchema();
 				const created = createRoomState(text(body.code), token, text(body.name));
 				this.save(created);
-				return json({ room: publicRoomState(created, token, this.onlineTokens()) }, 201);
+				return withRoomMilestones(
+					json({ room: publicRoomState(created, token, this.onlineTokens()) }, 201),
+					["created"],
+				);
 			}
 
 			if (request.method === "POST" && url.pathname === "/join") {
 				const body = await readJson(request);
 				const room = this.load();
 				if (!room) return json({ error: "Room not found." }, 404);
+				const memberBefore = room.members[token];
 				joinRoom(room, token, text(body.name));
 				this.save(room);
 				this.broadcast(room);
-				return json({ room: publicRoomState(room, token, this.onlineTokens()) });
+				const response = json({ room: publicRoomState(room, token, this.onlineTokens()) });
+				return memberBefore || !room.members[token] ? response : withRoomMilestones(response, ["joined"]);
 			}
 
 			if (request.method === "POST" && url.pathname === "/action") {
 				const action = (await readJson(request)) as Action;
 				const room = this.load();
 				if (!room) return json({ error: "Room not found." }, 404);
+				const priorPhase = room.phase;
+				const priorCompletedTurns = room.completedTurns.length;
 				applyAction(room, token, action, Date.now(), this.onlineTokens());
 				this.save(room);
 				this.broadcast(room);
-				return json({ room: publicRoomState(room, token, this.onlineTokens()) });
+				const milestones: Array<"game-started" | "turn-completed" | "game-finished" | "reset"> = [];
+				if (action.type === "start-game" && priorPhase !== "playing" && room.phase === "playing") {
+					milestones.push("game-started");
+				}
+				if (action.type === "submit-turn" && room.completedTurns.length > priorCompletedTurns) {
+					milestones.push("turn-completed");
+					if (room.phase === "finished") milestones.push("game-finished");
+				}
+				if (action.type === "reset" && priorPhase !== "setup" && room.phase === "setup") {
+					milestones.push("reset");
+				}
+				return withRoomMilestones(
+					json({ room: publicRoomState(room, token, this.onlineTokens()) }),
+					milestones,
+				);
 			}
 
 			const room = this.load();
 			if (!room) return json({ error: "Room not found." }, 404);
+
+			if (request.method === "POST" && url.pathname === "/authorize-topic-generation") {
+				const topicGeneration = beginTopicGeneration(room, token);
+				this.save(room);
+				return json({ authorized: true, topicGeneration });
+			}
 
 			if (request.method === "GET" && url.pathname === "/state") {
 				const now = Date.now();
@@ -122,7 +166,7 @@ export class RoomDurableObject extends DurableObject<Env> {
 			return json({ error: "Not found." }, 404);
 		} catch (error) {
 			if (error instanceof GameError) return json({ error: error.message }, error.status);
-			console.error("room request failed", error);
+			console.error("room request failed", { error: safeWorkerErrorName(error) });
 			return json({ error: "The room could not process that request." }, 500);
 		}
 	}
@@ -204,7 +248,9 @@ export class RoomDurableObject extends DurableObject<Env> {
 		this.ctx.waitUntil(
 			this.ctx.storage
 				.setAlarm(room.updatedAt + ROOM_IDLE_TTL_MS)
-				.catch((error: unknown) => console.error("could not schedule room expiry", error)),
+				.catch((error: unknown) => console.error("could not schedule room expiry", {
+					error: safeWorkerErrorName(error),
+				})),
 		);
 	}
 
@@ -289,28 +335,100 @@ function refreshHTTPHostPresence(
 }
 
 export default {
-	async fetch(request: Request, env: Env): Promise<Response> {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 		if (!url.pathname.startsWith("/api/")) return env.ASSETS.fetch(request);
+		const requestId = crypto.randomUUID();
 
-		if (!sameOrigin(request)) return json({ error: "Cross-origin request rejected." }, 403);
+		if (!sameOrigin(request)) {
+			return withRequestId(json({ error: "Cross-origin request rejected." }, 403), requestId);
+		}
 		const identity = ensureToken(request);
+		if (url.pathname.startsWith("/api/v1/")) {
+			const limited = await rateLimit(
+				env.API_RATE_LIMITER,
+				await rateLimitKey(request, identity.token, "platform"),
+				requestId,
+			);
+			if (limited) {
+				return withIdentityCookie(
+					limited,
+					identity,
+					request,
+					url.pathname.startsWith("/api/v1/progress/"),
+				);
+			}
+		}
+		if (url.pathname === MODEL_TOPICS_ROUTE) {
+			const limited = await rateLimit(
+				env.MODEL_RATE_LIMITER,
+				await rateLimitKey(request, identity.token, "model-topics"),
+				requestId,
+			);
+			if (limited) return withIdentityCookie(limited, identity, request, true);
+		}
+		const model = await handleModelRoute(request, env, identity.token, requestId, {
+			authorizeHost: async (code, token) => {
+				let response: Response;
+				try {
+					response = await roomFetch(
+						env,
+						code,
+						request,
+						token,
+						"/authorize-topic-generation",
+						{},
+					);
+				} catch {
+					throw modelAuthorizationErrorForStatus(503);
+				}
+				if (!response.ok) {
+					await response.body?.cancel().catch(() => undefined);
+					throw modelAuthorizationErrorForStatus(response.status);
+				}
+				let authorization: { topicGeneration?: unknown };
+				try {
+					authorization = await response.json() as { topicGeneration?: unknown };
+				} catch {
+					throw modelAuthorizationErrorForStatus(503);
+				}
+				if (!Number.isSafeInteger(authorization.topicGeneration) || Number(authorization.topicGeneration) < 1) {
+					throw modelAuthorizationErrorForStatus(503);
+				}
+				return { topicGeneration: Number(authorization.topicGeneration) };
+			},
+		});
+		if (model) {
+			return model.refreshIdentity
+				? withIdentityCookie(model.response, identity, request, true)
+				: model.response;
+		}
+		const platform = await handlePlatformRoute(request, env, identity.token, requestId);
+		if (platform) {
+			return platform.refreshIdentity
+				? withIdentityCookie(platform.response, identity, request, true)
+				: platform.response;
+		}
 
 		if (request.method === "POST" && url.pathname === "/api/rooms") {
-			const actor = request.headers.get("CF-Connecting-IP")?.trim() || identity.token;
-			const { success } = await env.ROOM_CREATION_RATE_LIMITER.limit({ key: `room-create:${actor}` });
+			const { success } = await env.ROOM_CREATION_RATE_LIMITER.limit({
+				key: await rateLimitKey(request, identity.token, "room-create"),
+			});
 			if (!success) {
 				console.warn("Room creation rate limit rejected a request.");
 				const response = json({ error: "Too many rooms were created from this connection. Try again shortly." }, 429);
 				response.headers.set("Retry-After", "60");
-				return withIdentityCookie(response, identity, request);
+				return withRequestId(withIdentityCookie(response, identity, request), requestId);
 			}
 			let body: Record<string, unknown>;
 			try {
 				body = await readJson(request);
 			} catch (error) {
 				if (error instanceof GameError) {
-					return withIdentityCookie(json({ error: error.message }, error.status), identity, request);
+					return withRequestId(
+						withIdentityCookie(json({ error: error.message }, error.status), identity, request),
+						requestId,
+					);
 				}
 				throw error;
 			}
@@ -321,23 +439,59 @@ export default {
 					name: text(body.name),
 				});
 				if (response.status === 409) continue;
-				return withIdentityCookie(response, identity, request);
+				scheduleRoomMilestones(ctx, env, response);
+				return withRequestId(
+					withIdentityCookie(withoutRoomMilestones(response), identity, request),
+					requestId,
+				);
 			}
-			return withIdentityCookie(json({ error: "Could not reserve a room code. Try again." }, 503), identity, request);
+			return withRequestId(
+				withIdentityCookie(json({ error: "Could not reserve a room code. Try again." }, 503), identity, request),
+				requestId,
+			);
 		}
 
 		const route = parseRoomRoute(url.pathname);
-		if (!route) return withIdentityCookie(json({ error: "Not found." }, 404), identity, request);
+		if (!route) {
+			return withRequestId(withIdentityCookie(json({ error: "Not found." }, 404), identity, request), requestId);
+		}
 		const { code, endpoint } = route;
+		if (request.method === "POST" || endpoint === "state" || endpoint === "socket") {
+			const scope = request.method === "POST"
+				? "room-mutate"
+				: endpoint === "socket"
+					? "room-connect"
+					: "room-read";
+			const limited = await rateLimit(
+				env.API_RATE_LIMITER,
+				await rateLimitKey(request, identity.token, scope),
+				requestId,
+			);
+			if (limited) return withIdentityCookie(limited, identity, request);
+		}
 
 		if (endpoint === "socket" && identity.created) {
-			return json({ error: "Load the room once before opening its live connection." }, 401);
+			return withRequestId(json({ error: "Load the room once before opening its live connection." }, 401), requestId);
 		}
 
 		const response = await roomFetch(env, code, request, identity.token, `/${endpoint}`);
-		return endpoint === "socket" ? response : withIdentityCookie(response, identity, request);
+		if (endpoint !== "socket") scheduleRoomMilestones(ctx, env, response);
+		return endpoint === "socket"
+			? response
+			: withRequestId(withIdentityCookie(withoutRoomMilestones(response), identity, request), requestId);
+	},
+	async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+		ctx.waitUntil(
+			runPlatformCleanup(env).catch((error: unknown) => {
+				console.error("platform retention cleanup failed", { error: safeWorkerErrorName(error) });
+			}),
+		);
 	},
 };
+
+function safeWorkerErrorName(error: unknown): string {
+	return error instanceof Error && error.name ? error.name : "UnknownError";
+}
 
 async function roomFetch(
 	env: Env,
@@ -366,25 +520,103 @@ async function roomFetch(
 function ensureToken(request: Request): TokenIdentity {
 	const cookies = parseCookies(request.headers.get("Cookie") ?? "");
 	const current = cookies[TOKEN_COOKIE];
-	if (validToken(current)) return { token: current, created: false };
+	if (validToken(current)) return { token: current, created: false, migratedLegacy: false };
 	const legacy = cookies[LEGACY_TOKEN_COOKIE];
-	if (validToken(legacy)) return { token: legacy, created: true };
+	if (validToken(legacy)) return { token: legacy, created: true, migratedLegacy: true };
 	const bytes = crypto.getRandomValues(new Uint8Array(32));
 	return {
 		token: Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""),
 		created: true,
+		migratedLegacy: false,
 	};
 }
 
-function withIdentityCookie(response: Response, identity: TokenIdentity, request: Request): Response {
-	if (!identity.created) return response;
+function withIdentityCookie(
+	response: Response,
+	identity: TokenIdentity,
+	request: Request,
+	refresh = false,
+): Response {
+	if (!identity.created && !refresh) return response;
 	const headers = new Headers(response.headers);
 	const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
 	headers.append(
 		"Set-Cookie",
 		`${TOKEN_COOKIE}=${identity.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${secure}`,
 	);
+	if (identity.migratedLegacy) {
+		headers.append("Set-Cookie", `${LEGACY_TOKEN_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`);
+	}
 	return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function withRequestId(response: Response, requestId: string): Response {
+	const headers = new Headers(response.headers);
+	headers.set("X-Request-ID", requestId);
+	return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function withRoomMilestones(response: Response, milestones: string[]): Response {
+	if (milestones.length) response.headers.set(ROOM_MILESTONES_HEADER, milestones.join(","));
+	return response;
+}
+
+function withoutRoomMilestones(response: Response): Response {
+	if (!response.headers.has(ROOM_MILESTONES_HEADER)) return response;
+	const headers = new Headers(response.headers);
+	headers.delete(ROOM_MILESTONES_HEADER);
+	return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function scheduleRoomMilestones(ctx: ExecutionContext, env: Env, response: Response): void {
+	const milestones = response.headers
+		.get(ROOM_MILESTONES_HEADER)
+		?.split(",")
+		.map((value) => value.trim())
+		.filter(Boolean) ?? [];
+	if (!milestones.length || !response.ok) return;
+	const snapshot = response.clone();
+	ctx.waitUntil(
+		(async () => {
+			const payload = (await snapshot.json()) as { room?: { serverNow?: unknown } };
+			if (!payload.room) return;
+			const serverNow = payload.room.serverNow;
+			if (typeof serverNow !== "number" || !Number.isFinite(serverNow)) {
+				throw new Error("room milestone is missing its server timestamp");
+			}
+			const observedAt = new Date(serverNow);
+			for (const milestone of milestones) {
+				await recordRoomMilestone(
+					env,
+					payload.room,
+					milestone as Parameters<typeof recordRoomMilestone>[2],
+					observedAt,
+				);
+			}
+		})().catch((error: unknown) => {
+			console.warn("room milestone analytics failed", { error: error instanceof Error ? error.name : "UnknownError" });
+		}),
+	);
+}
+
+async function rateLimit(limiter: RateLimit, key: string, requestId: string): Promise<Response | null> {
+	const { success } = await limiter.limit({ key });
+	if (success) return null;
+	const response = withRequestId(json({ error: "Too many requests. Try again shortly." }, 429), requestId);
+	response.headers.set("Retry-After", "60");
+	return response;
+}
+
+/** Keep raw connection addresses and browser tokens out of limiter dimensions. */
+async function rateLimitKey(request: Request, token: string, scope: string): Promise<string> {
+	const connectingAddress = request.headers.get("CF-Connecting-IP")?.trim();
+	const subject = connectingAddress ? `address:${connectingAddress}` : `device:${token}`;
+	const digest = await crypto.subtle.digest(
+		"SHA-256",
+		new TextEncoder().encode(`nonstoptalk-rate-limit:v1:${subject}`),
+	);
+	const key = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+	return `${scope}:${key}`;
 }
 
 function parseCookies(header: string): Record<string, string> {

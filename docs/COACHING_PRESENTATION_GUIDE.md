@@ -4,7 +4,7 @@ This guide turns the prototype into a clear product story. It is written for a f
 
 **Short preparation path:** Follow [Learn NonStopTalk in 45 minutes](LEARN_IN_45_MINUTES.md), then keep the [presentation cheat sheet](PRESENTATION_CHEAT_SHEET.md) beside the live demo. This document remains the canonical long-form narrative and Q&A reference.
 
-> **Prototype status:** The coaching experience is an early, browser-only prototype in the native Cloudflare SPA. It demonstrates objective audio analysis, optional strict on-device transcription, deterministic retrieval/template advice, origin-local progress, and separately opted-in recording/captured-transcript retention. It is not a medical tool, a speech-language assessment, or a finished AI coach.
+> **Prototype status:** The coaching experience is an early, local-first prototype in the native Cloudflare SPA. It demonstrates objective browser analysis, optional strict on-device transcription, deterministic retrieval/template advice, local progress, separately opted-in recording/captured-transcript retention, and an independent compact-summary backup. It is not a medical tool, a speech-language assessment, or a finished AI coach.
 
 ## The one-sentence pitch
 
@@ -35,19 +35,20 @@ The prototype was designed around constraints that materially change the solutio
 | Cognitive load | The user is already planning what to say. Too many live warnings would make speaking harder instead of helping. |
 | Explainability | Advice must connect to an observable measurement and a concrete next attempt. A single opaque “speech quality” score would hide both uncertainty and tradeoffs. |
 | Fairness | Accent and dialect are not defects. The prototype must not infer confidence, emotion, honesty, personality, health, or identity from voice. |
-| Cost and deployment | The demonstrator must run locally and on Workers Free without a paid speech or AI service. |
+| Cost and deployment | The demonstrator must run locally and on low-cost/free Cloudflare primitives without a paid speech or AI service. |
 | Time | This is a presentation prototype, so it proves the core loop before accounts, synchronization, curriculum, or production validation. |
 
 ### 3. Design
 
-The resulting design has six layers:
+The resulting design has seven layers:
 
 1. **Private signal extraction.** An `AudioWorklet` receives microphone sample frames on the browser's audio rendering thread and reduces them to objective measurements such as level, clipping, speech time, and pauses. Raw frames are not stored or sent to the application server.
 2. **Optional local words.** If the browser can guarantee `SpeechRecognition.processLocally`, the user may opt into transcript analysis for pace and word-pattern estimates. Bounded derived filler/repetition patterns stay with the summary; captured transcript text is discarded by default. If strict local recognition is unavailable, the audio-only coach still works.
 3. **Small local retrieval.** The selected goal and measured evidence form a query over a curated set of coaching cards shipped with the application. Lexical retrieval selects relevant context; there are no embeddings, vector database, model, or network request.
 4. **Sparse, traceable coaching.** Transparent rules produce sparse live acoustic tips and separately choose review strength/focus. Normally the highest-ranked card supplies the intact base drill. If the measurements do not support that card's advice, a safety rule keeps the measurement-backed drill and labels the card as retrieved context instead of used guidance. A fixed template appends what to compare, and cooldowns prevent a wall of live warnings. The same inputs produce the same result.
 5. **Local progress.** The browser stores compact summaries—including consented derived patterns—in origin-scoped IndexedDB for `/progress`. JSON export contains those summaries, not retained audio or captured transcript text.
-6. **Separate artifact choice.** An unchecked `MediaRecorder` option can retain the active-attempt recording and any available captured transcript in a second local store. Recognition gets up to two seconds to finish; if it times out or errors after returning text, Review and Progress warn that the retained transcript may be partial. Progress downloads artifacts individually, confirmed deletion clears both stores, and nothing is uploaded.
+6. **Separate artifact choice.** An unchecked `MediaRecorder` option can retain the active-attempt recording and any available captured transcript in a second local store. Recognition gets up to two seconds to finish; if it times out or errors after returning text, Review and Progress warn that the retained transcript may be partial. These artifacts never upload.
+7. **Separate compact backup choice.** A third unchecked control may send only allowlisted measurements/advice and bounded derived word-pattern fields to central D1. One UTC-day-bucketed device lease controls this anonymous browser's summaries and lasts at least 30 and less than 31 days after cloud use. New saves stop when 250 summaries already exist; migration does not forcibly delete valid unexpired legacy rows. It is not an account or cross-device credential.
 
 This is **retrieval-augmented deterministic generation**: a retrieved card normally supplies an unchanged base drill, then bounded template assembly appends one prewritten metric-comparison sentence. Evidence-safety rules can substitute a supported drill and leave the card as context only. It is a small local RAG pattern, not the common “vector database + LLM” stack. It was chosen because it is private, no-cost, fast, inspectable, and testable card by card. A production LLM-backed RAG layer could retrieve richer curriculum passages and generate contextual language, but it would add model/version behavior, embeddings or another search index, latency, cost, privacy/consent boundaries, source governance, prompt-injection defenses, and substantially more evaluation.
 
@@ -66,7 +67,7 @@ The product should be evaluated as a deliberate-practice tool, not by maximizing
 
 The current prototype records standalone session summaries and always enables its normal live-tip policy. A valid unassisted-retry KPI therefore requires a future loop ID, comparable scenario/goal/duration fields, and a retry mode with live tips disabled. Until repeated pilot data establishes normal measurement noise, the team should report raw paired deltas and confidence/availability, not declare a universal pass threshold.
 
-The prototype sends no product analytics. An initial study must use explicitly consented summary exports and facilitator/user ratings, or add a separately consented local study logger. Review pilot results at the attempt-pair level; do not treat every browser event as an independent person.
+The platform's in-progress analytics attempt only coarse room/summary-save/delete/consent aggregates, including bounded timing/count values. D1 rollups and Analytics Engine delivery are both best-effort and can miss events; neither is an audit log. They do not contain speaking ratios, word patterns, advice, or evidence that establishes learning outcomes. An initial study still needs separately consented paired attempt data and facilitator/user ratings. Do not treat every browser event as an independent person.
 
 #### Drivers
 
@@ -120,7 +121,7 @@ Use careful language:
 
 ### 2:25–3:30 — Explain the technical design
 
-> “The microphone feeds an AudioWorklet, which reduces sample blocks into RMS and peak measurements. The page aggregates those into speech time and pauses. After the attempt, the goal and evidence query a small local card library. A card normally supplies the drill, but a safety rule keeps measurement-backed advice when a card is not supported, and the screen says which happened. Optional on-device recognition adds pace and word-pattern estimates. A compact summary stays in this browser; retaining the recording or captured transcript requires a second, unchecked choice.”
+> “The microphone feeds an AudioWorklet, which reduces sample blocks into RMS and peak measurements. The page aggregates those into speech time and pauses. After the attempt, the goal and evidence query a small local card library. Optional on-device recognition adds pace and word-pattern estimates. The compact summary stays local unless I separately select online backup; recordings and captured transcripts always stay in this browser.”
 
 Show the architecture diagram in [Speech Coaching Prototype](SPEECH_COACHING_PROTOTYPE.md#architecture-and-data-flow).
 
@@ -140,18 +141,20 @@ Name the guardrails: false tips, distraction, hardware and local-transcription a
 
 ### Before the presentation
 
-The coaching-capable edition requires Node.js 22 or newer. Node 24 is the exact CI and Cloudflare build target. If `node --version` prints `v20...`, install Node 24 from the [official Node.js download](https://nodejs.org/en/download), reopen the terminal, and check again. If `nvm` is already installed, run `nvm install 24` and `nvm use 24`. Then, from the repository root:
+The coaching-capable edition supports Node.js 22 or newer. CI uses Node 24, so selecting 24 gives the closest parity. If `node --version` prints `v20...`, install Node 24 from the [official Node.js download](https://nodejs.org/en/download), reopen the terminal, and check again. If `nvm` is already installed, run `nvm install 24` and `nvm use 24`. Then, from the repository root:
 
 ```sh
 node --version
 npm ci
 npx playwright install chromium
 npm run test:coach
+npm run test:cloud-progress
 npm run smoke:coach
+npm run db:migrate:local
 npm run dev -- --local --ip 127.0.0.1 --port 8787
 ```
 
-Confirm that `node --version` prints `v24...`; do not continue with Node 20. The smoke check launches and stops its own Wrangler process, so run it before the stable presentation server. If port 8787 is occupied, omit the explicit port and use the exact URL Wrangler prints.
+Confirm that `node --version` prints `v22...` or newer; `v24...` matches CI. Do not continue with Node 20. The smoke check launches and stops its own Wrangler process, so run it before the stable presentation server. If port 8787 is occupied, omit the explicit port and use the exact URL Wrangler prints.
 
 Then:
 
@@ -169,7 +172,7 @@ Use headphones if the presentation is remote to reduce echo cancellation and fee
 
 1. Show the landing page and choose **Practice**.
 2. Explain the two independent options. Transcript analysis may retain bounded derived patterns; full-session recording/captured-transcript retention is separate and starts off.
-3. Start a short attempt with both optional boxes off for the safest primary demo.
+3. Start a short attempt with all optional choices off for the safest primary demo.
 4. Speak, pause for about one second, resume speaking, then finish. A measured pause needs voice on both sides; ending on silence is intentionally treated as trailing quiet, not a completed pause.
 5. Explain the analysis, deterministic recommendation, and the Local RAG label that distinguishes used guidance from retrieved context.
 6. Open **Progress** to show the compact summary.
@@ -202,7 +205,7 @@ That choice makes tomorrow's prototype private, free, low-latency, auditable, an
 
 ### “Does my voice go to Cloudflare?”
 
-No. The Cloudflare deployment serves the application files and continues to coordinate multiplayer game rooms. In coaching mode, microphone frames, summaries, recordings, and transcript text remain in the browser; the coaching code does not send them to the Worker. Compact summaries are written to origin-scoped IndexedDB. An encoded attempt recording and available captured transcript are stored only when the separate full-session-retention box is selected.
+No audio, recording, or captured transcript goes to Cloudflare. Compact summaries are written locally to IndexedDB. If the user explicitly selects online backup, only an allowlisted summary goes to the NonStopTalk Worker/D1 platform; with backup off, coaching makes no coaching-data API request. Room Durable Objects never receive coaching data.
 
 ### “What is stored by default?”
 
@@ -210,7 +213,7 @@ Every successfully saved attempt gets a compact local summary with aggregate mea
 
 ### “Can I keep or download the recording and transcript?”
 
-The separate unchecked full-session-retention option records the active attempt. It keeps a captured transcript only when the experimental transcript-analysis option was also enabled, strict local recognition returned text, and retention was selected. Progress then shows the download controls supported by that attempt. Recordings and captured transcripts live in a separate origin-local artifact store and are excluded from JSON export. At finish the browser waits up to two seconds for recognition; if it errors or times out after returning text, the app preserves the text but warns in Review and Progress that it may be partial. **Delete local history** clears both browser stores, but it cannot delete files already downloaded to the device. The prototype has no automatic artifact expiration or per-attempt deletion yet.
+The separate unchecked full-session-retention option records the active attempt. It keeps a captured transcript only when transcript analysis also returned text. Recordings and captured transcripts live in a separate origin-local artifact store, never enter cloud backup, and are excluded from JSON export. A finalization error/timeout is visibly marked possibly partial. Local artifacts have no automatic expiration or per-attempt deletion, and deleting app history cannot delete downloaded files.
 
 ### “How does it know when I am speaking?”
 
@@ -222,7 +225,7 @@ AudioWorklet processing runs with the browser's audio rendering work instead of 
 
 ### “What proves these boundaries work?”
 
-Twenty-one deterministic engine tests cover calibration, segmentation—including an attempt with zero callbacks and zero coverage—observed/unknown time, continuity confidence, tips, transcript analysis, retrieval, grounding safety, template assembly, and advice. The browser smoke test proves that a default-off attempt constructs no recorder/artifact, v1 history upgrades to the v2 stores, opted-in audio/transcript persist, a late recognition error preserves text with a partial warning, real downloads contain data, JSON export excludes retained artifacts, both stores delete, route focus moves correctly, canceled permission/worklet work releases resources, stalled active input reaches its wall-clock review without inventing speech, stalled calibration fails cleanly, and no coaching `/api/*` request occurs. These are strong implementation checks, not real-device accuracy, accessibility, privacy-certification, or fairness studies.
+Twenty-one deterministic engine tests cover calibration, segmentation, confidence, tips, transcript analysis, retrieval, grounding safety, template assembly, and advice. The browser smoke covers local storage/artifact/lifecycle behavior and asserts that the default/off path makes no coaching-data API request. Separate cloud-progress and platform tests cover the summary allowlist, versioned APIs, anonymous ownership/expiry, and aggregate analytics. These are implementation checks, not real-device accuracy, accessibility, privacy certification, or fairness studies.
 
 ### “Why not send audio to a more accurate model?”
 

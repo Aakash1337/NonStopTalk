@@ -86,7 +86,7 @@ This is lightweight coordination for a social game, not adversarial anti-cheat.
 The current packs are Everyday Sparks, Story Time, Absurd Arguments, Fast Debate, and Instant Expert. Hosts can paste or edit a custom list in either edition. The Go edition additionally lets hosts:
 
 - Import/export custom topics as plain text.
-- Generate ten prompts from a theme through server templates or Anthropic.
+- Generate ten prompts from a theme through server templates, Anthropic, or Z.AI GLM according to `NONSTOPTALK_AI_PROVIDER`.
 - Save settings plus custom topics as a browser-local preset.
 
 Each room retains summaries of its last 20 finished games. Summaries contain standings and turn count, not transcripts.

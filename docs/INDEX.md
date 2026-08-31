@@ -12,7 +12,7 @@ If you have about 45 minutes:
 
 At the end, you should be able to explain:
 
-- why **Practice** is the coaching mode, **Play** is the multiplayer game, and **Progress** is browser-local coaching history;
+- why **Practice** is the coaching mode, **Play** is the multiplayer game, and **Progress** is local-first coaching history with an optional compact-summary backup;
 - how microphone samples become measurements and one next action;
 - why the project calls its small retrieval layer **retrieval-augmented deterministic generation**;
 - what stays in the browser, what is optional, and what reaches Cloudflare;
@@ -23,19 +23,27 @@ At the end, you should be able to explain:
 
 ```text
 Practice /practice                                      Progress /progress
-browser coaching                                       browser history
+browser coaching                                       local-first history
 Web Audio + optional                                          │
 on-device transcript analysis                                 │ reads
           │ writes                                             ▼
           └──────────────────> IndexedDB v2 <──────────────────┘
                                ├─ session-summaries
                                └─ session-artifacts (opt-in)
+                                        │
+                     explicit summary backup only
+                                        ▼
+                               Worker API → central D1
 
-Play / + /room/ABC123
+Play / + /room/ABC234
 social multiplayer ── /api + WebSocket ──> Worker ──> room Durable Object
 
+coarse server events ──> D1 daily rollups + Analytics Engine (both best-effort)
+
 Cloudflare serves the online files for all three surfaces.
-Only Play room traffic enters the Worker API and Durable Objects.
+Default/off coaching makes no coaching-data API call. Opted-in backup sends only an
+allowlisted compact summary to D1; audio, recordings, and captured transcripts stay local.
+Coaching data never enters a room Durable Object.
 ```
 
 The shortest memory aid is: **Practice coaches. Play motivates. Progress makes practice visible.** Game points are not coaching scores.
@@ -51,6 +59,7 @@ The shortest memory aid is: **Practice coaches. Play motivates. Progress makes p
 | Understand both runtime editions | [Technical architecture](TECHNICAL_ARCHITECTURE.md) | Go application, Cloudflare SPA, Worker, Durable Objects, and browser boundaries |
 | Explain privacy and retention | [AI and privacy](AI_AND_PRIVACY.md) | Consent choices, exact data flows, storage, deletion, and responsible-use limits |
 | Deploy or diagnose Cloudflare | [Cloudflare deployment](CLOUDFLARE_DEPLOYMENT.md) | Node requirements, Workers Builds settings, routes, costs, and the original build-error fix |
+| Build the hosted data platform | [Web platform plan](WEB_PLATFORM_PLAN.md) | Modular D1, API, analytics, retention, cost controls, and phased identity/provider work |
 | Check whether a feature exists | [Requirements and implementation status](REQUIREMENTS.md) | Implemented behavior, acceptance baseline, and explicit backlog |
 | Discuss what comes next | [Roadmap](ROADMAP.md) | Implemented prototype, hardening work, and future product lanes |
 | Explain Play rules | [Game design](GAME_DESIGN.md) | Room roles, turn flow, scoring, topics, and local/online differences |
@@ -70,6 +79,7 @@ Use this table when two documents discuss the same topic. Code and tests are the
 | Whole-system and runtime boundaries | [Technical architecture](TECHNICAL_ARCHITECTURE.md) |
 | Consent, storage, retention, and AI-provider boundaries | [AI and privacy](AI_AND_PRIVACY.md) |
 | Cloudflare setup, routes, free-plan design, and troubleshooting | [Cloudflare deployment](CLOUDFLARE_DEPLOYMENT.md) |
+| Hosted database/API/analytics direction | [Web platform plan](WEB_PLATFORM_PLAN.md) |
 | Presentation narrative, demo, measurement, and Q&A | [Coaching presentation guide](COACHING_PRESENTATION_GUIDE.md) |
 | Multiplayer rules and scoring | [Game design](GAME_DESIGN.md) |
 | Product and interface intent | [Product](../PRODUCT.md) and [Design](../DESIGN.md) |
@@ -83,12 +93,12 @@ Use this table when two documents discuss the same topic. Code and tests are the
 | Avoid saying | Say instead |
 | --- | --- |
 | “The coaching tab” without naming it | “Practice is the coaching mode.” |
-| “Cloudflare stores the coaching session” | “The current browser origin stores coaching summaries and opted-in artifacts in IndexedDB.” |
+| “Cloudflare stores the coaching session” | “IndexedDB stores the local summary and opted-in artifacts; a separate explicit choice may back up only the compact summary to D1.” |
 | “The Durable Object URL” | “The public Worker API routes Play room traffic through an internal Durable Object binding.” |
 | “Raw audio is retained” | “The optional artifact is a browser-encoded `MediaRecorder` recording; raw sample frames are reduced and not retained.” |
 | “LLM RAG” or “vector search” | “Local lexical retrieval plus deterministic template assembly, with no LLM, embeddings, vector database, or network call.” |
 | “Speaker confidence score” | “Signal or measurement confidence; the app does not infer a person's confidence.” |
-| “Progress proves improvement” | “Progress shows standalone local attempts; comparable baseline-to-retry validation is future work.” |
+| “Progress proves improvement” | “Progress shows standalone local-first attempts; comparable baseline-to-retry validation is future work.” |
 | “The local app” | Specify either “the Wrangler Cloudflare edition” or “the separate Go edition.” |
 
 ## Maintaining these docs

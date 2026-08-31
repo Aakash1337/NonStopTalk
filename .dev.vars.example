@@ -1,0 +1,13 @@
+# Copy to .dev.vars for local platform testing. Never commit real secrets.
+ANALYTICS_ADMIN_TOKEN=replace-with-at-least-24-random-characters
+ROOM_FACT_HASH_KEY=replace-with-at-least-32-random-characters
+
+# External topic generation is disabled by default. `glm` uses the free
+# GLM-4.7-Flash Z.AI API and needs ZAI_API_KEY. `glm53` uses the configured
+# Workers AI binding and requires Workers Paid access but no vendor API-key
+# secret. Production API keys must be Wrangler secrets.
+TOPIC_ROUTINE_PROVIDER=offline
+TOPIC_ESCALATION_PROVIDER=off
+MODEL_DAILY_CALL_LIMIT=100
+# ZAI_API_KEY=replace-with-a-real-z-ai-key-only-when-glm-is-enabled
+# GEMINI_API_KEY=replace-with-a-real-gemini-key-only-when-gemma31-is-enabled

@@ -12,11 +12,16 @@ local/self-hosted browser
   └─ optional on-device SpeechRecognition transcript┘       │
                                                              ├─ game/room state in memory
                                                              ├─ optional JSON snapshots
-                                                             └─ offline judge or Anthropic
+                                                             └─ offline, Anthropic, or Z.AI GLM judge
 
 online browser SPA
   ├─ static HTML/CSS/JS ───────────────────────> Workers Static Assets
   ├─ JSON actions ─────────────────────────────> Worker /api/* router
+  ├─ host theme + one-request consent ─────────> topic-provider adapter
+  │                                                ├─ deterministic templates
+  │                                                ├─ direct GLM-4.7-Flash (routine, optional)
+  │                                                ├─ Workers AI GLM-5.3-Flash (routine, optional)
+  │                                                └─ Gemma 4 31B (explicit escalation, optional)
   └─ hibernatable WebSocket updates ───────────> room Durable Object
                                                         └─ private SQLite state
 
@@ -30,7 +35,14 @@ online browser coaching path (/practice and /progress)
                                └─ IndexedDB v2 ─────────────────────┘
                                   ├─ session-summaries
                                   └─ session-artifacts (opt-in)
-       (no coaching API, Durable Object, audio upload, or transcript upload)
+                                  │
+                     optional compact-summary backup
+                                  ▼
+                     Worker /api/v1 → central D1
+       (default/off: no coaching-data API; never audio/transcript upload or room DO)
+
+server-authoritative milestones → best-effort D1 daily rollups + Analytics Engine
+external topic attempts ────────> aggregate D1 daily usage budget/counters
 ```
 
 There are two runtime editions. The richer local/self-hosted game edition is one Go application shared by the normal web and desktop-style launchers. The free online edition is a native TypeScript Worker with a separately tested implementation of the core classic-game rules. Its static SPA also contains the browser-only coaching prototype; that prototype is not currently served by the Go application.
@@ -46,15 +58,16 @@ There are two runtime editions. The richer local/self-hosted game edition is one
 - Optional local recording retention: browser `MediaRecorder`, behind a separate unchecked consent control
 - Real-time updates: Server-Sent Events, followed by HTMX partial fetches
 - State: in-memory rooms and optional periodic JSON snapshots
-- External AI: Anthropic Go SDK behind judge and topic-generator interfaces
+- External AI: provider-neutral local Go judge/topic-generator interfaces; separate disabled-by-default Cloudflare topic-provider adapters for direct GLM-4.7 or Workers AI GLM-5.3-Flash routine generation and explicit Gemma 4 31B escalation
 - Tests: Go unit/handler/race/vet checks and Playwright browser smoke flows
 - Free online runtime: Workers Static Assets, a TypeScript fetch router, SQLite-backed Durable Objects, and hibernatable WebSockets
+- In-progress web platform: versioned Worker APIs, central D1 repositories/migrations, scheduled anonymous-data expiry, coarse D1/Analytics Engine event aggregation, and aggregate D1 model-usage budgeting
 - Cloudflare rule tests: Node's test runner through `tsx`, plus a Wrangler deploy dry run
 - Coaching state: ephemeral browser objects plus IndexedDB v2 summary and opt-in artifact stores
 - Coaching knowledge: curated in-app cards with local lexical retrieval and deterministic template assembly; no LLM, open-ended prose synthesis, embeddings, or vector database
-- Coaching verification: 21 Node tests for the deterministic engine and a Playwright SPA smoke flow with synthetic media, no-`/api` assertion, default-off/opted-in storage, v1→v2 migration, partial-transcript warnings, real downloads/export, focus checks, cancellation races, and stalled-input handling
+- Coaching verification: 21 Node tests for the deterministic engine, a Playwright SPA smoke flow asserting no coaching-data API request on the default/off path, and separate cloud-progress/platform tests for the allowlist, APIs, ownership, retention, and analytics
 
-There is no SPA framework, frontend bundler, account system, server-side coaching service, or server-side audio pipeline. The online edition uses browser-native modules and Durable Object SQLite/WebSockets; the Go edition does not.
+There is no SPA framework, frontend bundler, account system, server-side coaching analysis service, or server-side audio pipeline. The online edition uses browser-native modules, Durable Object SQLite/WebSockets for live rooms, and an in-progress D1/Analytics Engine platform layer; the Go edition does not.
 
 ## Repository layout
 
@@ -63,7 +76,7 @@ assets.go                         embedded template/static filesystem
 cmd/web/                          normal HTTP server entry point
 cmd/desktop/                      loopback server + default-browser launcher
 internal/game/                    session, turn deck/progression, scoring, history
-internal/judge/                   offline and Anthropic grading/topic generation
+internal/judge/                   offline, Anthropic, and Z.AI GLM grading/topic generation
 internal/room/                    synchronized rooms, identity, presence, SSE signals,
                                   server clock, persistence
 internal/topics/                  built-in topic packs
@@ -73,10 +86,12 @@ web/static/css/                   UI styles
 web/static/js/                    HTMX and focused browser modules
 scripts/smoke-local.mjs           Playwright end-to-end smoke suite
 cloudflare/game.ts                native online classic-game rules
-cloudflare/worker.ts              Worker router + SQLite-backed room object
+cloudflare/worker.ts              Worker composition + SQLite-backed room object
 cloudflare/routes.ts              public API route parser
 cloudflare/public/app.js          online SPA routing, game UI, coaching lifecycle,
                                   IndexedDB summaries/artifacts, downloads, and review
+cloudflare/public/cloud-progress.js
+                                  allowlisted opt-in compact-summary API client
 cloudflare/public/app.css         shared Play, Practice, and Progress visual system
 cloudflare/public/coach-engine.js deterministic audio aggregation, tips, transcript
                                   counts, curated-card retrieval, grounding, advice,
@@ -86,8 +101,18 @@ cloudflare/public/coach-audio-worklet.js
 cloudflare/public/coach-engine.test.js
                                   deterministic coaching-engine coverage
 cloudflare/*.test.ts              native Worker rule/route tests
+cloudflare/platform.ts            anonymous identity, D1 repositories, retention,
+                                  room facts, and aggregate analytics
+cloudflare/platform-routes.ts     versioned APIs, admin guard, telemetry fan-out,
+                                  request IDs, and scheduled cleanup adapter
+cloudflare/model-provider.ts      offline, direct GLM-4.7, Workers AI GLM-5.3,
+                                  and Gemma 4 31B topic adapters
+                                  adapters plus bounded output normalization
+cloudflare/model-routes.ts        host/setup authorization, one-request consent,
+                                  D1 budget reservation/reconciliation, fallback
+cloudflare/migrations/            append-only D1 schema migrations
 scripts/smoke-coach.mjs           synthetic-microphone coaching browser flow
-wrangler.jsonc                    Static Assets and Durable Object configuration
+wrangler.jsonc                    Assets, Durable Object, D1, analytics, limits, cron
 ```
 
 ## Domain boundaries
@@ -131,7 +156,7 @@ Handler code reads or mutates a session through room locking helpers. Mutations 
 - Input parsing, normalization, body limits, origin checks, and request quotas
 - Remote time-claim capping
 - Asynchronous judge dispatch
-- Selection of an offline or Anthropic provider
+- Selection of an offline, Anthropic, or Z.AI GLM provider, with invalid or incomplete selections warned and failed closed to offline behavior
 
 Templates receive a view model containing room identity, authorization flags, presence, clock state, and game state.
 
@@ -150,7 +175,17 @@ The server remains authoritative for room state and remote score caps. Browser t
 
 `cloudflare/worker.ts` routes public `/api/rooms/{code}` requests to one Durable Object selected by the normalized room code. The object serializes actions, stores the complete classic-game state in its private SQLite database, and broadcasts per-viewer public state through hibernatable WebSockets. `cloudflare/game.ts` owns the online rule implementation; identity tokens never appear in public state.
 
-Static navigation paths such as `/`, `/practice`, `/progress`, and `/room/ABC123` are served by Workers Static Assets with SPA fallback. The online multiplayer game performs microphone voice-activity analysis locally and remains classic-only. The separate coaching route can create an explicitly consented transcript only through strict on-device browser recognition; it never calls Anthropic or sends that text, a recording, or its summaries to the Worker. Captured-transcript/recording retention is a second local-only consent boundary.
+Static navigation paths such as `/`, `/practice`, `/progress`, and `/room/ABC234` are served by Workers Static Assets with SPA fallback. The online multiplayer game performs microphone voice-activity analysis locally and remains classic-only for scoring. During setup, its host-only `/api/v1/models/topics` boundary can produce an editable topic draft from a theme capped at 200 characters. Routine generation is deterministic unless `TOPIC_ROUTINE_PROVIDER=glm` selects direct Z.AI GLM-4.7-Flash or `TOPIC_ROUTINE_PROVIDER=glm53` selects Workers AI GLM-5.3-Flash through the `AI` binding. Gemma 4 31B is available only when `TOPIC_ESCALATION_PROVIDER=gemma31` and the host explicitly selects escalation. Every external path also requires fresh consent for that generation attempt. The separate coaching route can create an explicitly consented transcript only through strict on-device browser recognition; it never uses the topic providers or sends captured transcript text or a recording to the Worker. Compact summary backup is an independent, off-by-default API boundary; captured-transcript/recording retention remains local-only.
+
+### Web platform foundation (in progress)
+
+The platform slice keeps composition in `cloudflare/worker.ts` and separates live room coordination, relational storage, coaching backup, identity, analytics, and model providers behind small modules. D1 is the central queryable store for anonymous device expiry, consented compact summaries, consent records, HMAC-pseudonymous room facts, best-effort daily analytics counters, and aggregate model-usage budget state. The room-fact HMAC uses a separate Worker secret because a plain hash of the short code space would be enumerable; raw codes and the key never enter D1. Analytics Engine receives the same coarse event vocabulary best-effort. D1 analytics increments also fail open, and room-triggered writes run through the Durable Object's `waitUntil`; either sink can miss events and neither is audit, billing, or user-visible truth. Durable Objects remain authoritative for concurrent room actions and WebSocket broadcasts.
+
+The topic-provider adapter is intentionally narrower than a general coaching model. The browser submits the room code for host/setup authorization, a routine/escalated tier, per-request consent, and the theme. The normalized theme is the only host or room content sent externally; the adapter strips room authorization data before the provider call, while fixed instructions and model settings accompany the theme. `ZAI_API_KEY` and `GEMINI_API_KEY` are Worker secrets; Workers AI GLM-5.3 uses the `AI` binding and needs no vendor key. `TOPIC_ROUTINE_PROVIDER=offline|glm|glm53` and `TOPIC_ESCALATION_PROVIDER=off|gemma31` independently enable the routine and escalation tiers, while `MODEL_DAILY_CALL_LIMIT` defaults to 100 external attempts per UTC day. D1 usage rows aggregate reservations/completions, successes/failures, provider/model/task, input/output/total/cached-input/reasoning token totals, and total latency without themes, generated topics, identities, or room/member/authentication tokens. A configured external request without consent is rejected before reservation or contact. A missing key or binding, invalid selector, or budget/database/provider/output failure returns deterministic topics; status marks invalid or incomplete configuration as degraded. There is no automatic escalation, retry, or Queue in this slice.
+
+Anonymous progress ownership is the SHA-256 digest of the existing high-entropy HTTP-only browser token. The raw token is never stored in D1; IP address, user agent, names, and room-member tokens are excluded from platform records. Cloud use refreshes one device-level UTC-day-bucketed lease for all summaries; it lasts at least 30 and less than 31 days and does not require per-summary renewal writes. New saves are rejected once 250 summaries exist, but valid unexpired legacy rows are not forcibly deleted. Scheduled cleanup deletes bounded batches and leaves excess backlog for a later cron run. This bootstrap identity is not an account, recovery credential, or cross-device authentication system.
+
+The versioned platform API exposes `GET`/`HEAD` status, compact-summary create/list/delete/export, and separate aggregate product-analytics and model-usage readouts protected by `ANALYTICS_ADMIN_TOKEN`. The model-usage readout returns global and per-day provider aggregates for calls, outcomes, model tokens, and latency, never content or identity. Status checks D1 and reports non-secret configured or degraded capabilities, including optional analytics, keyed-room-fact configuration, and topic-provider readiness. Same-origin checks protect mutations and responses are non-cacheable with request IDs. The browser allowlist omits artifact metadata; the Worker validates the current v2 shape and strips any artifact metadata before storage, return, or export. Raw audio/transcript/sample/segment keys hard-fail, and arbitrary extra properties are rejected.
 
 ### Browser coaching prototype
 
@@ -161,7 +196,7 @@ setup → microphone permission → quiet calibration → voice calibration
       → active attempt → finishing → review
 ```
 
-Setup chooses one of three scenarios, one focus goal, a 30/45/60/90-second duration, optional local transcript analysis, and optional full-session retention. Both options start unchecked on a fresh page load and are independent: transcript analysis controls derived pace/word-pattern evidence; full-session retention controls an encoded attempt recording and whatever captured transcript is available. **Try again** preserves the visible setup selections for the next attempt, so the user can review or uncheck them. The retention control is disabled without `MediaRecorder`. Calibration collects approximately two seconds of quiet frames and two seconds of normal-speaking frames. It derives a session-specific threshold instead of treating one absolute amplitude as universal.
+Setup chooses one of three scenarios, one focus goal, a 30/45/60/90-second duration, optional local transcript analysis, optional full-session retention, and optional compact cloud backup. All three choices start unchecked and are independent: transcript analysis controls derived pace/word-pattern evidence; full-session retention controls an encoded attempt recording and whatever captured transcript is available; cloud backup controls only the allowlisted summary API call. **Try again** preserves the visible selections for review. The retention control is disabled without `MediaRecorder`. Calibration collects approximately two seconds of quiet frames and two seconds of normal-speaking frames. It derives a session-specific threshold instead of treating one absolute amplitude as universal.
 
 The preferred signal path is:
 
@@ -182,7 +217,9 @@ Optional transcript assistance creates `SpeechRecognition`, requires its `proces
 
 Finishing writes to IndexedDB database `nonstoptalk-coaching`, version 2. Every completed saved attempt puts an allowlisted record in `session-summaries`: schema version, ID/time, scenario, goal, target duration, observed/unknown/coverage measurements, other aggregate measurements, optional transcript counts/patterns, normalized advice, and artifact metadata including `transcriptMayBePartial`. It excludes segments, per-frame values, grounding details, audio payloads, and captured transcript text. If full-session retention was selected and a recording or transcript was captured, the same read/write transaction also puts an ID-linked record in `session-artifacts` containing the encoded audio `Blob`, MIME type, captured transcript, partial-text flag, and creation time.
 
-`/progress` reads only summaries for its history view and displays the partial-text warning from artifact metadata. JSON export serializes the summary store—including derived word patterns and artifact-presence metadata—but never the artifact `Blob` or captured transcript text. Per-attempt buttons read the artifact store and download the recording in its supported media extension or the transcript as UTF-8 text. Confirmed deletion clears both object stores. There is no automatic artifact expiration or per-attempt deletion in this prototype.
+After the local save, an explicitly selected cloud backup passes the summary through the narrower `cloud-progress.js` allowlist and posts it to D1. Artifact metadata is not included. Failure leaves the local summary usable; no Queue or provider retry system is part of this slice.
+
+`/progress` reads local summaries and, after this browser has opted into cloud backup, merges its reachable D1 summaries by session ID; the local record wins so artifact download metadata remains available. JSON export never includes an artifact `Blob` or captured transcript text. Per-attempt buttons read the local artifact store only. Confirmed deletion clears both local object stores and, when enabled and reachable, this anonymous browser's cloud summaries. Local artifacts have no automatic expiration or per-attempt deletion.
 
 The version-2 upgrade preserves an existing version-1 `session-summaries` store and creates `session-artifacts` when missing. The browser smoke suite constructs a v1 database and verifies that both stores exist after Progress opens it.
 
@@ -219,12 +256,13 @@ An AI response cannot be applied twice or to a later turn. Pending judge work ca
 
 The microphone stream stays in the browser. Web Audio analyzes it without uploading it in both game and coaching paths. Coaching can optionally copy the active-attempt stream into a local `MediaRecorder` artifact after separate consent; calibration is not part of that recording.
 
-The coaching path calls no server-side judge. Goal/evidence queries retrieve a curated card locally; deterministic assembly normally combines its unchanged drill with a metric-specific comparison sentence, while an evidence-safety rule can substitute a supported priority drill and label the card context only. Separate rules select review strength/focus. Optional transcript analysis saves aggregate counts and derived filler/repetition patterns in the summary. Captured text is cleared by default or stored only in the separate local artifact store after the second consent, with a partial-text flag when finalization did not finish cleanly.
+The coaching path calls no server-side judge. Goal/evidence queries retrieve a curated card locally; deterministic assembly normally combines its unchanged drill with a metric-specific comparison sentence, while an evidence-safety rule can substitute a supported priority drill and label the card context only. Optional transcript analysis saves aggregate counts and derived filler/repetition patterns in the summary. Captured text is cleared by default or stored only after the artifact-retention choice. The independent cloud choice may back up the compact summary, including bounded derived pattern fields, but never captured text or media.
 
-In the local Go game's separate AI-judge path, transcription starts only after per-turn consent and only when the browser exposes `processLocally` and accepts the selected live audio track. The server receives text, not audio.
+The Cloudflare game's topic-generation path is separate from both coaching and the Go judge. A room host must consent for each external attempt. The routine tier can call direct GLM-4.7-Flash or Workers AI GLM-5.3-Flash only when the corresponding selector is enabled; the escalated tier can call Gemma 4 31B only when independently enabled and explicitly chosen. The normalized theme, capped at 200 characters, is the only host or room content sent to a provider—never audio, transcript text, player/room names, room codes or member/authentication tokens, game history, or coaching summaries. Fixed instructions and model settings accompany it; NonStopTalk request IDs do not. Generated topics are validated and returned as an editable custom-topic draft. Deterministic generation is the default and the fallback for missing credentials/bindings, invalid configuration, budget unavailability/exhaustion, and remote provider/output failures. Authorization, input, and missing-consent errors remain explicit rather than being disguised as successful generation; invalid deployment configuration is reported by platform status while generation fails closed to offline topics. The status check can establish that `AI.run` exists but not that the account has GLM-5.3 billing entitlement. Provider output is materialized before its 64 KiB validation bound, and an upstream request may still finish or bill after the local timeout if it ignores cancellation.
 
-- No `ANTHROPIC_API_KEY`: the server grades topic/transcript overlap locally and generates themes from templates.
-- Key configured: Anthropic receives topic + transcript for grading or the theme alone for topic generation.
+In the local Go game's separate AI-judge path, transcription starts only after per-turn consent and only when the browser exposes `processLocally` and accepts the selected live audio track. The server receives text, not audio. `NONSTOPTALK_AI_PROVIDER=offline|anthropic|glm` selects the provider for both judging and local theme generation; explicit `offline` overrides any keys. With the selector unset, `ANTHROPIC_API_KEY` preserves legacy Anthropic auto-selection; otherwise the server stays offline, and `ZAI_API_KEY` alone does not opt in. Explicit `anthropic` requires `ANTHROPIC_API_KEY`, while explicit `glm` requires `ZAI_API_KEY` and uses GLM-4.7-Flash. Invalid selectors and selected providers without their credential emit an operator warning and fail closed to the offline heuristic. The local Go runtime does not use the Cloudflare-only `glm53` selector.
+
+After the existing per-turn consent, an external judge receives the assigned topic and size-capped transcript, not audio or room metadata. A runtime judge failure preserves classic scoring. For local theme generation, the theme is the selected external provider's only user content; the offline path uses fixed templates, and an external runtime failure is returned to the host instead of silently switching providers.
 
 The game session model does not contain transcripts, so they are absent from score history and persisted room snapshots. The coaching summary schema likewise excludes captured transcript text; opted-in captured text can exist only in the separate browser artifact store and may carry a partial warning. See [AI and Privacy](AI_AND_PRIVACY.md).
 
@@ -245,7 +283,7 @@ Rooms are memory-resident and guarded within one process.
 
 The Cloudflare edition stores each room in its own SQLite-backed Durable Object. State survives hibernation, Worker restarts, and deployments. A per-room alarm deletes storage after 30 days without a state change. Hibernatable WebSockets preserve live connections without holding JavaScript memory active while idle.
 
-Coaching history is independent of both server persistence systems. It uses best-effort IndexedDB scoped to the current site origin and browser profile. The in-app action clears that origin's summary and artifact stores; site-data deletion, private browsing, or storage pressure may also remove them. Full artifacts otherwise have no prototype expiration timer. There is no automatic server retention, account sync, or cloud backup.
+Local coaching history remains independent of both room persistence systems. It uses best-effort IndexedDB scoped to the current site origin and browser profile; full local artifacts have no automatic expiration. The optional D1 backup is a separate compact-summary store controlled by one device-level, UTC-day-bucketed anonymous inactivity lease and a new-save guard once 250 summaries exist. There is no account adoption, recovery, or cross-device sync yet.
 
 ## Embedded assets
 
@@ -255,9 +293,9 @@ Handler tests can still construct a server from filesystem templates for focused
 
 ## Online deployment
 
-`wrangler.jsonc` declares `cloudflare/worker.ts`, the `cloudflare/public` asset directory, SPA fallback, the `ROOMS` binding, a room-creation rate limiter, and a `new_sqlite_classes` migration. This is a Worker-with-Assets deployment supported by Workers Free; it is not a Container and not a Pages-only static project.
+`wrangler.jsonc` declares `cloudflare/worker.ts`, the `cloudflare/public` asset directory, SPA fallback, the `ROOMS` binding, D1 and Analytics Engine bindings, room-creation/general-API/model rate-limit bindings, and a `new_sqlite_classes` migration. This is a Worker-with-Assets deployment designed around free/low-cost Cloudflare primitives; it is not a Container and not a Pages-only static project.
 
-Public routes include `/practice`, `/progress`, and rooms of the form `/room/ABC123`. Durable Objects have no separately exposed route: `/api/*` reaches the Worker, which forwards room operations through its internal binding. Practice and Progress navigation uses the static SPA fallback and does not invoke a coaching API. See [Cloudflare Deployment](CLOUDFLARE_DEPLOYMENT.md) and Cloudflare's [SPA routing documentation](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/).
+Public routes include `/practice`, `/progress`, and rooms of the form `/room/ABC234`. Durable Objects have no separately exposed route. Practice and Progress navigation uses the static SPA fallback; only explicit compact-summary backup uses the versioned coaching API. See [Cloudflare Deployment](CLOUDFLARE_DEPLOYMENT.md), the [Web platform plan](WEB_PLATFORM_PLAN.md), and Cloudflare's [SPA routing documentation](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/).
 
 ## Limits and safeguards
 
@@ -273,8 +311,10 @@ Current controls include:
 - Turn-generation IDs and next-turn replay guards for stale and duplicate actions
 - Member-only SSE, per-member/per-room/process stream caps, and automatic gone-room handling in the Go edition
 - Three-hour local room lifetime and 30-day Durable Object room retention
-- Same-origin JSON mutations and WebSocket upgrades, 64 KiB bodies, per-source room-creation throttling, per-member socket caps, and private identity state online
-- Explicit microphone, transcript-analysis, and full-artifact-retention boundaries; route-scoped media/recorder cleanup; no coaching `fetch` path; allowlisted summary and separate artifact schemas; and confirmed two-store deletion
+- Same-origin JSON mutations and WebSocket upgrades, 64 KiB bodies, per-source room-creation throttling, a general 60-requests-per-minute scoped API limiter, a dedicated five-topic-requests-per-minute `MODEL_RATE_LIMITER`, per-member socket caps, and private identity state online
+- Host/setup authorization, per-generation external consent, a 200-character theme cap, independent routine/escalation enablement, and an aggregate D1 daily provider limit of 100 by default
+- At most one external topic call per request, with no automatic escalation, provider retry, or Queue and a deterministic fallback on every unavailable/error path
+- Explicit microphone, transcript-analysis, artifact-retention, and compact-backup boundaries; route-scoped media/recorder cleanup; no coaching-data request on the default/off path; dual-sided summary allowlists; and separate local artifact storage
 
 These are sensible work-in-progress controls, not a formal security, privacy, measurement-validity, or fairness guarantee.
 
@@ -290,11 +330,12 @@ npm run smoke
 npm run typecheck:cloudflare
 npm run test:cloudflare
 npm run test:coach
+npm run test:cloud-progress
 npm run check:cloudflare
 npm run smoke:coach
 ```
 
-The local Playwright suite covers manual fallback with reload/resume, mocked microphone completion, two-browser SSE play, offline AI judging with a selected local audio track, and fail-closed classic play when local recognition is unavailable. Go unit tests cover game/scoring/topic behavior, room concurrency/persistence, provider parsing, and HTTP authorization/flows. Cloudflare tests cover the mirrored classic-game rules, replay protection, persistence-safe state, public-state redaction, and API route parsing. The 21 coaching unit tests cover deterministic calibration, segmentation—including zero-callback attempts with zero coverage—observed/unknown time, continuity confidence, metrics, tip selection, transcript aggregation, lexical card retrieval/grounding safety, deterministic drill assembly, and advice. The coaching smoke uses synthetic media to verify a default-off attempt creates no recorder/artifact, v1 history upgrades to both v2 stores, an opted-in `Blob`/transcript persists, a late recognition error preserves text with a partial warning, actual recording/transcript downloads contain data, JSON export excludes retained artifacts, Progress survives reload, focus moves, both stores delete, permission/worklet cancellation cleans up, active/calibration stalls fail safely, and no application `/api` request occurs. Wrangler validates the deploy bundle.
+The local Playwright suite covers manual fallback with reload/resume, mocked microphone completion, two-browser SSE play, offline AI judging, and fail-closed classic play. Cloudflare tests cover game rules, persistence/public-state boundaries, platform routing, D1 validation/ownership/retention, and aggregate analytics. The 21 coaching unit tests cover the deterministic signal/retrieval engine. The coaching smoke verifies local storage/artifact behavior and that the default/off path makes no coaching-data API request; cloud-progress tests separately exercise the opt-in client and allowlist. Wrangler validates the deploy bundle.
 
 ## Architectural backlog
 
@@ -304,6 +345,8 @@ The local Playwright suite covers manual fallback with reload/resume, mocked mic
 - Explicit baseline-to-unassisted-retry pairing and goal-specific progress comparison
 - Coaching parity or a shared client strategy for the local Go edition
 - User-controlled prompts/goals, stronger calibration diagnostics, a larger validated card library, and optional production semantic/LLM RAG adapters
+- Accounts, cross-device authentication/progress, anonymous-record adoption, and account deletion
+- Queue-backed provider execution and R2 media storage, only if later features justify their cost and consent boundaries
 - Native desktop wrapper
 - Party-vote domain and UI
 - Profiles and content-filter policy

@@ -25,16 +25,18 @@ It does not prove that the current thresholds work equally well across microphon
 
 ## Try it locally
 
-The coaching prototype is part of the Worker-with-Assets edition and requires Node.js 22 or newer. Node 24 is the exact CI and Cloudflare build target. If `node --version` prints `v20...`, install Node 24 from the [official Node.js download](https://nodejs.org/en/download), reopen the terminal, and check again. If `nvm` is already installed, run `nvm install 24` followed by `nvm use 24`. Then:
+The coaching prototype is part of the Worker-with-Assets edition and supports Node.js 22 or newer. CI uses Node 24, so selecting 24 gives the closest parity. If `node --version` prints `v20...`, install Node 24 from the [official Node.js download](https://nodejs.org/en/download), reopen the terminal, and check again. If `nvm` is already installed, run `nvm install 24` followed by `nvm use 24`. Then:
 
 ```sh
 node --version
 npm ci
 npm run test:coach
+npm run test:cloud-progress
+npm run db:migrate:local
 npm run dev -- --local --ip 127.0.0.1 --port 8787
 ```
 
-Confirm that the version check prints `v24...`; Wrangler does not support the Node 20 runtime currently active on some older development machines.
+Confirm that the version check prints `v22...` or newer; `v24...` matches CI. Do not continue with Node 20.
 
 Open:
 
@@ -65,7 +67,7 @@ The setup asks for:
 
 Choosing one goal limits the amount of advice and makes a later retry interpretable. The three prompts are fixed prototype content, not a curriculum or generated AI content.
 
-The two optional data choices do different jobs. Transcript analysis adds pace/count/pattern evidence and, when it captures text, stores bounded derived filler/repetition patterns in the compact summary. Full-session retention records the active attempt and can keep captured transcript text only if transcript analysis was also enabled and returned text. Neither checkbox silently enables the other.
+The three optional data choices do different jobs. Transcript analysis adds pace/count/pattern evidence and bounded derived patterns to the summary. Full-session retention records the active attempt and can keep captured transcript text locally. Compact cloud backup sends only the narrower allowlisted summary to D1. None silently enables another, and all start off.
 
 ### 2. Consent and calibrate
 
@@ -110,13 +112,13 @@ The review contains:
 
 The timeline exists only in the in-memory review. It is intentionally excluded from the stored summary.
 
-### 5. Retry or review local progress
+### 5. Retry or review local-first progress
 
 **Try again** returns to setup with the same selections. The prototype does not yet link two attempts as a baseline/retry pair or claim that the second attempt improved.
 
-`/progress` reads summaries for the current site origin in the current browser profile. It shows attempt count, average speaking ratio, the latest raw speaking-ratio change, and individual attempt summaries. The latest change is descriptive, not a quality judgment: a higher speaking ratio is not always better, especially when the selected goal is purposeful pauses.
+`/progress` always reads summaries for the current site origin and browser profile. After this browser has opted into compact backup, it also reads reachable D1 summaries and merges them by session ID; local records win so local-only artifact controls survive. This anonymous cookie is not an account or cross-device credential. One device-level UTC-day-bucketed lease controls all of its cloud summaries and lasts at least 30 and less than 31 days after cloud use. New saves stop when 250 summaries already exist; valid unexpired legacy rows remain available rather than being forcibly deleted.
 
-The user can export summary JSON. When a completed attempt has separately retained artifacts, Progress shows individual **Download recording** and/or **Download transcript** controls and repeats any partial-transcript warning. JSON export never includes those retained artifacts. **Delete local history** clears both coaching stores for that origin after confirmation. Another domain, scheme, port, or browser profile has separate IndexedDB storage; for example, `127.0.0.1:8787` and a different Wrangler port do not share history.
+The user can export merged summary JSON. When a completed attempt has separately retained artifacts, Progress shows local download controls and repeats any partial-transcript warning. JSON never includes retained artifacts. Confirmed deletion clears both local stores and, when backup is enabled and reachable, this anonymous browser's cloud summaries. Another domain, scheme, port, or browser profile has separate IndexedDB and cookie scope.
 
 ## Architecture and data flow
 
@@ -124,7 +126,7 @@ The user can export summary JSON. When a completed attempt has separately retain
 Workers Static Assets
   └─ index.html + app.css + browser modules
        │
-       ├─ /room/ABC123 ── JSON/WebSocket ──> Worker ──> room Durable Object
+       ├─ /room/ABC234 ── JSON/WebSocket ──> Worker ──> room Durable Object
        │                                         (multiplayer game only)
        │
        └─ /practice
@@ -159,13 +161,17 @@ Workers Static Assets
                   └─ IndexedDB v2 → /progress
                        ├─ session-summaries (every saved attempt)
                        └─ session-artifacts (only after separate opt-in)
+                              │
+                 optional compact-summary allowlist
+                              ▼
+                  Worker /api/v1/progress/sessions → D1
 
-No coaching fetch/API path
-No audio or transcript upload
-No Durable Object or external model in the coaching path
+Default/off: no coaching-data API request
+No audio, recording, or captured-transcript upload
+No room Durable Object or external model in the coaching path
 ```
 
-Cloudflare's [SPA asset routing](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/) serves `index.html` for `/practice` and `/progress`. The same browser module reads the path and renders the appropriate surface. The Worker and Durable Object remain responsible for `/api/*` multiplayer state, not coaching media.
+Cloudflare's [SPA asset routing](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/) serves `index.html` for `/practice` and `/progress`. The Worker/Durable Object remain responsible for multiplayer; the separate versioned platform API can store only compact summaries in central D1. It never receives coaching media or captured transcript text.
 
 ## Audio signal processing
 
@@ -554,6 +560,8 @@ Conceptual full-artifact record, created only after the separate retention choic
 
 The full in-memory review also contains speech/pause segments and local-retrieval grounding (retrieved cards, `usedCardId`, source, score, and matched terms). `buildCoachingSummary` deliberately excludes segments, grounding metadata, raw frames, raw audio, and captured transcript text, while retaining the allowlisted aggregate metrics, derived word patterns, advice, and artifact-presence metadata—including `transcriptMayBePartial`. If an artifact exists, the summary and artifact are written in one IndexedDB transaction.
 
+The cloud allowlist is narrower again: it keeps schema/ID/time, scenario/goal/target duration, aggregate metrics, optional bounded derived word patterns, and normalized advice. It strips the complete `artifacts` object as well as arbitrary extra fields before the Worker validates the payload again. Raw samples, recordings, captured transcript text, and artifact-presence metadata therefore remain local.
+
 JSON export reads only `session-summaries` and adds product/export schema metadata. It therefore includes consented derived pattern labels and artifact-presence metadata—including the partial-text flag—but never the audio `Blob` or captured transcript text. The visible card source remains available only in the immediate review, not historical `/progress` records. Artifact download buttons read one `session-artifacts` record at a time; recording extensions follow its MIME type, and transcripts download as UTF-8 `.txt` files.
 
 ## Privacy and consent checklist
@@ -568,11 +576,13 @@ JSON export reads only `session-summaries` and adds product/export schema metada
 | Transcript finalization | Waits up to two seconds after `stop()`; preserves returned text on error/timeout, warns that it may be partial, and never retains error payloads |
 | Full-session retention | Independent, unchecked opt-in; stores attempt audio and any available captured transcript in `session-artifacts` |
 | Stored summary | Aggregate metrics, consented derived patterns, normalized advice, and artifact-presence metadata—including `transcriptMayBePartial`—in origin-scoped IndexedDB |
+| Compact cloud backup | Independent, unchecked opt-in; sends only the narrower summary allowlist to D1 under a hashed anonymous browser identity; one device-level day-bucketed 30–31-day inactivity lease; new saves stop once 250 exist |
 | Export | Summary store only; excludes audio `Blob` and captured transcript text |
 | Individual download | Reads the opted-in artifact and creates a recording file or UTF-8 transcript file |
 | Delete | Clears `session-summaries` and `session-artifacts` after confirmation; previously downloaded files are outside its scope |
 | Navigation/cancel | Stops recognition/recorder, discards unsaved chunks, stops microphone tracks/worklet/intervals/context, and rejects delayed permission/worklet activation |
 | Cloudflare Durable Object | Multiplayer room state only; receives no coaching data |
+| Central D1 | Explicitly backed-up compact summaries, consent, anonymous expiry, and aggregate platform facts; never media/captured transcripts |
 | External model | None in the coaching prototype |
 
 See [AI and Privacy](AI_AND_PRIVACY.md) for how this differs from the local Go game's optional AI judge.
@@ -582,12 +592,12 @@ See [AI and Privacy](AI_AND_PRIVACY.md) for how this differs from the local Go g
 Read the implementation in this order:
 
 1. **`cloudflare/public/index.html`** — the persistent document shell and primary navigation.
-2. **`cloudflare/public/app.js`** — start at `freshPracticeState`, then follow `renderPractice`, `beginCoachingSession`, `ingestCoachingFrame`, `startArtifactRecorder`, `finishCoachingSession`, the two IndexedDB stores/download helpers, and `renderProgress`.
-3. **`cloudflare/public/coach-audio-worklet.js`** — the small sample-to-RMS/peak processor.
-4. **`cloudflare/public/coach-engine.js`** — calibration, segmentation, metrics, transcript counts, curated coaching cards, lexical retrieval, live-tip policy, grounding, and final advice.
-5. **`cloudflare/public/coach-engine.test.js`** — executable examples of expected formulas, retrieval/ranking, grounding, and boundary behavior.
-6. **`cloudflare/public/app.css`** — Practice, live attempt, review, timeline, and Progress layouts in the shared graphite/acid-lime system.
-7. **`scripts/smoke-coach.mjs`** — browser-level proof using synthetic media, two IndexedDB stores, accessibility focus, lifecycle-race, and network assertions.
+2. **`cloudflare/public/app.js`** — the Practice/Progress lifecycle, local stores, and opt-in handoff.
+3. **`cloudflare/public/cloud-progress.js`** — the narrow cloud-summary allowlist and versioned API client.
+4. **`cloudflare/public/coach-audio-worklet.js`** — the small sample-to-RMS/peak processor.
+5. **`cloudflare/public/coach-engine.js`** — calibration, metrics, retrieval, tips, grounding, and advice.
+6. **`cloudflare/platform.ts`** — Worker-side validation, anonymous ownership, D1 retention, and aggregate analytics.
+7. **`scripts/smoke-coach.mjs`** — browser-level proof using synthetic media, local stores, lifecycle races, and default/off network assertions.
 8. **`wrangler.jsonc`** — Static Assets SPA fallback plus Worker/Durable Object bindings for the separate multiplayer API.
 
 ## How to explain the implementation
@@ -601,7 +611,7 @@ Use this sequence instead of starting with file names:
 5. **Measure:** Segment durations and voiced levels produce inspectable aggregate metrics.
 6. **Retrieve:** The selected goal and measured evidence rank curated local coaching cards.
 7. **Assemble advice:** The top retrieved card normally supplies the intact base drill; an evidence-safety rule can keep the measured priority's drill instead. Deterministic rules append one metric-specific comparison sentence, select strength/focus, and record whether the card was used.
-8. **Store by consent:** The default path clears live media/captured text and writes an allowlisted summary; the separate retention choice additionally writes a linked audio/transcript artifact and any partial-text warning metadata.
+8. **Store by consent:** The default path clears live media/captured text and writes a local summary. Separate choices may write a linked local artifact or send the narrower compact-summary allowlist to D1.
 
 This makes the privacy boundary and the coaching mechanism understandable without calling every calculation “AI.”
 
@@ -612,6 +622,7 @@ Run the focused checks:
 ```sh
 npm ci
 npm run test:coach
+npm run test:cloud-progress
 npm run smoke:coach
 npm run typecheck:cloudflare
 npm run check:cloudflare
@@ -623,15 +634,22 @@ Run the complete repository baseline before release:
 go test ./...
 go test -race ./...
 go vet ./...
-npm run smoke
+npm run test:coach
+npm run test:cloud-progress
 npm run typecheck:cloudflare
 npm run test:cloudflare
+npm run check:cloudflare
+npm run smoke:platform
+npm run smoke:coach
+npm run smoke
 ```
 
 What each coaching check demonstrates:
 
 - `test:coach` runs 21 tests that feed controlled frames/transcripts into the pure engine and check calibration, segmentation (including zero callbacks → zero coverage), observed/unknown time, continuity confidence, metrics, tips, retrieval, card-use grounding safety, deterministic drill assembly, and advice.
-- `smoke:coach` drives `/practice` with synthetic audio/transcription. It proves a default-off attempt constructs no recorder/artifact, upgrades a synthetic v1 database to both v2 stores, verifies an opted-in non-empty recording `Blob` and transcript, preserves captured text and partial-warning metadata after a late recognition error, reads real recording/transcript downloads, parses JSON export and confirms artifact exclusion, checks Progress reload and route-heading focus, clears both stores, handles canceled permission/worklet loading and active/calibration stalls without leaked intervals/tracks, and makes no application `/api/*` request.
+- `smoke:coach` drives `/practice` with synthetic media, covers local storage/artifact/lifecycle behavior, and asserts that the default/off path makes no coaching-data API request.
+- `test:cloud-progress` checks the separate opt-in allowlist, merged-history behavior, API calls, and preference state; platform tests cover Worker validation, identity, expiry, and analytics.
+- `smoke:platform` starts an isolated local Wrangler/D1 environment and exercises status, backup, export, aggregate analytics, privacy rejection, and cloud deletion.
 - `check:cloudflare` confirms that the Worker and all Static Assets, including the coaching modules, form a valid deploy bundle.
 
 These tests do not replace real-device, accessibility, security, or fairness validation.
@@ -650,7 +668,8 @@ These tests do not replace real-device, accessibility, security, or fairness val
 - The local coaching-card library is intentionally small; retrieval is lexical rather than semantic and still requires relevance/fairness evaluation.
 - Derived filler/repetition labels may contain sensitive words even though they are not captured transcript text.
 - Retained artifacts have no automatic expiration, per-attempt deletion, quota dashboard, or app-level encryption; anyone with access to the unlocked browser profile may reach them.
-- No accounts, sync, retention policy across devices, educator view, or shared report exists.
+- No accounts, recovery, cross-device authentication/sync, educator view, or shared report exists. Anonymous D1 backup is tied to one browser identity.
+- No external coaching AI, Queue-backed provider work, or R2 media storage exists.
 - No formal WCAG, security, privacy, microphone/device, learning-outcome, or subgroup-fairness study has been completed.
 - The coaching feature is absent from the local Go edition.
 - The tool does not diagnose or treat a communication disorder.
@@ -692,8 +711,9 @@ Do not set adoption or improvement targets until the event definitions, measurem
 | WPM | Words per minute: transcript word count divided by analyzed minutes. It inherits transcription errors. |
 | IndexedDB | Best-effort structured browser storage scoped to one site origin and browser profile. It is not a server database or automatic cloud backup, and storage pressure may remove it. |
 | SPA | Single-page application: one HTML shell changes the visible page in JavaScript as the URL changes. |
-| Worker | Cloudflare's server-side JavaScript runtime. It handles multiplayer `/api/*` requests but does not receive coaching audio/transcripts. |
+| Worker | Cloudflare's server-side JavaScript runtime. It handles multiplayer APIs and the opt-in compact-summary platform API, but never receives coaching audio/recordings/captured transcripts. |
 | Durable Object | A Cloudflare object that coordinates and stores one multiplayer room. It is not used for coaching analysis/history. |
+| D1 | The central relational store for explicitly backed-up compact summaries and aggregate platform records. It is not used for coaching media or live room authority. |
 | RAG | Retrieval-augmented generation: retrieve relevant context, then use it to shape an output. This prototype uses lexical retrieval plus deterministic templates locally—no LLM, embeddings, vector database, or network. |
 | Baseline | A first, unassisted attempt used as the comparison point for a specific goal. |
 | Unassisted retry | A comparable second attempt made without depending on live coaching prompts; the intended evidence of learned change. |

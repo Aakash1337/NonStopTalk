@@ -1,0 +1,583 @@
+import {
+	ANONYMOUS_DATA_RETENTION_MS,
+	CLOUD_SUMMARY_POLICY_VERSION,
+	MAX_ACTIVE_COACHING_SUMMARIES,
+	PlatformError,
+	analyticsEventFromRoomMilestone,
+	cleanupExpiredData,
+	createPlatformStore,
+	mapAnalyticsEvent,
+	mapPublicRoomStateToFact,
+	type AnalyticsEventInput,
+	type RoomMilestone,
+} from "./platform";
+import {
+	describeTopicProvider,
+	type TopicModelTier,
+	type TopicProviderBindings,
+} from "./model-provider";
+
+const MAX_PLATFORM_BODY_BYTES = 66 * 1024;
+const DEFAULT_ANALYTICS_DAYS = 30;
+const MAX_ANALYTICS_DAYS = 180;
+const PLATFORM_STATUS_CACHE_MS = 60_000;
+const MAX_CLEANUP_BATCHES_PER_RUN = 20;
+const PLATFORM_SCHEMA_VERSION = 3;
+const databaseReadiness = new WeakMap<D1Database, number>();
+
+export interface PlatformBindings extends TopicProviderBindings {
+	PLATFORM_DB: D1Database;
+	PRODUCT_ANALYTICS?: AnalyticsEngineDataset;
+	ANALYTICS_ADMIN_TOKEN?: string;
+	ROOM_FACT_HASH_KEY?: string;
+}
+
+export interface PlatformRouteResult {
+	response: Response;
+	refreshIdentity: boolean;
+}
+
+/**
+ * Handle only the versioned central-platform surface. Returning null leaves
+ * the existing room router in charge, so this module can evolve independently.
+ */
+export async function handlePlatformRoute(
+	request: Request,
+	env: PlatformBindings,
+	browserToken: string,
+	requestId: string,
+): Promise<PlatformRouteResult | null> {
+	const url = new URL(request.url);
+	if (!url.pathname.startsWith("/api/v1/")) return null;
+
+	try {
+		if (url.pathname === "/api/v1/platform/status") {
+			if (request.method !== "GET" && request.method !== "HEAD") {
+				return result(methodNotAllowed(requestId, "GET, HEAD"), false);
+			}
+			await assertDatabaseReady(env.PLATFORM_DB);
+			const roomFactsReady = isSecureRoomFactKey(env.ROOM_FACT_HASH_KEY);
+			const adminAnalyticsReady = isSecureAdminToken(env.ANALYTICS_ADMIN_TOKEN);
+			const topicGeneration = topicGenerationCapability(env);
+			const degradedCapabilities = [
+				...(roomFactsReady ? [] : ["roomFacts"]),
+				...(adminAnalyticsReady ? [] : ["adminAnalytics"]),
+				...(topicGeneration.status === "degraded" ? ["topicGeneration"] : []),
+			];
+			return result(
+				platformJson(
+					{
+						status: degradedCapabilities.length === 0 ? "ok" : "degraded",
+						apiVersion: "v1",
+						schemaVersion: PLATFORM_SCHEMA_VERSION,
+						capabilities: {
+							cloudProgress: {
+								status: "ready",
+								retentionDays: ANONYMOUS_DATA_RETENTION_MS / (24 * 60 * 60 * 1_000),
+								newSaveLimit: MAX_ACTIVE_COACHING_SUMMARIES,
+							},
+							roomFacts: { status: roomFactsReady ? "ready" : "disabled" },
+							topicGeneration,
+							aggregateAnalytics: {
+								status: adminAnalyticsReady ? "ready" : "write-only",
+								delivery: "best-effort",
+								adminRead: adminAnalyticsReady,
+								analyticsEngine: env.PRODUCT_ANALYTICS ? "enabled" : "disabled",
+							},
+						},
+						degradedCapabilities,
+						requestId,
+					},
+					200,
+					requestId,
+				),
+				false,
+			);
+		}
+
+		if (url.pathname === "/api/v1/progress/sessions") {
+			const store = createPlatformStore(env.PLATFORM_DB);
+			if (request.method === "GET") {
+				const limit = parsePositiveInteger(url.searchParams.get("limit"), 50, 100);
+				const page = await store.listCoachingSummaries(browserToken, {
+					limit,
+					cursor: url.searchParams.get("cursor"),
+				});
+				return result(platformJson({ ...page, requestId }, 200, requestId), true);
+			}
+			if (request.method === "POST") {
+				requireExactMutationOrigin(request);
+				const body = await readPlatformJson(request);
+				assertExactBodyKeys(body, ["session"]);
+				const saved = await store.saveConsentedCoachingSummary(
+					browserToken,
+					body.session,
+					CLOUD_SUMMARY_POLICY_VERSION,
+				);
+				if (saved.consentGranted) {
+					await recordProductEvent(env, { type: "cloud_consent_granted" });
+				}
+				if (saved.created) {
+					await recordProductEvent(
+						env,
+						{ type: "coaching_summary_saved", durationMs: saved.summary.metrics.durationMs },
+					);
+				}
+				return result(
+					platformJson({ created: saved.created, session: saved.summary, requestId }, saved.created ? 201 : 200, requestId),
+					true,
+				);
+			}
+			if (request.method === "DELETE") {
+				requireExactMutationOrigin(request);
+				const deleted = await store.clearCoachingSummaries(browserToken);
+				if (deleted.deletedCount > 0) {
+					await recordProductEvent(env, {
+						type: "coaching_summary_deleted",
+						deletedCount: deleted.deletedCount,
+					});
+				}
+				if (deleted.consentRevoked) {
+					await recordProductEvent(env, { type: "cloud_consent_revoked" });
+				}
+				return result(platformJson({ ...deleted, requestId }, 200, requestId), true);
+			}
+			return result(methodNotAllowed(requestId, "GET, POST, DELETE"), true);
+		}
+
+		if (url.pathname === "/api/v1/progress/export") {
+			if (request.method !== "GET") return result(methodNotAllowed(requestId, "GET"), true);
+			const exported = await createPlatformStore(env.PLATFORM_DB).exportCoachingSummaries(browserToken);
+			return result(platformJson({ ...exported, requestId }, 200, requestId), true);
+		}
+
+		if (url.pathname === "/api/v1/admin/analytics") {
+			if (request.method !== "GET") return result(methodNotAllowed(requestId, "GET"), false);
+			await requireAdmin(request, env.ANALYTICS_ADMIN_TOKEN);
+			const days = parsePositiveInteger(url.searchParams.get("days"), DEFAULT_ANALYTICS_DAYS, MAX_ANALYTICS_DAYS);
+			const through = startOfUTCDay(new Date());
+			const from = new Date(through.getTime() - (days - 1) * 24 * 60 * 60 * 1000);
+			const rows = await createPlatformStore(env.PLATFORM_DB).listDailyAnalytics(
+				from.toISOString().slice(0, 10),
+				through.toISOString().slice(0, 10),
+			);
+			const totals: Record<string, { events: number; value: number }> = {};
+			for (const row of rows) {
+				const current = totals[row.metric] ?? { events: 0, value: 0 };
+				current.events += row.eventCount;
+				current.value += row.valueSum;
+				totals[row.metric] = current;
+			}
+			return result(
+				platformJson(
+					{
+						window: { from: from.toISOString(), through: through.toISOString(), days },
+						totals,
+						daily: rows,
+						privacy: "Aggregate product events only; no names, IPs, browser tokens, audio, or transcript text.",
+						requestId,
+					},
+					200,
+					requestId,
+				),
+				false,
+			);
+		}
+
+		if (url.pathname === "/api/v1/admin/model-usage") {
+			if (request.method !== "GET") return result(methodNotAllowed(requestId, "GET"), false);
+			await requireAdmin(request, env.ANALYTICS_ADMIN_TOKEN);
+			await assertDatabaseReady(env.PLATFORM_DB);
+			const days = parsePositiveInteger(url.searchParams.get("days"), DEFAULT_ANALYTICS_DAYS, MAX_ANALYTICS_DAYS);
+			const through = startOfUTCDay(new Date());
+			const from = new Date(through.getTime() - (days - 1) * 24 * 60 * 60 * 1000);
+			const query = await env.PLATFORM_DB
+				.prepare(`SELECT
+					day, scope, provider, model, task,
+					reserved_calls AS reservedCalls,
+					completed_calls AS completedCalls,
+					success_count AS successCount,
+					failure_count AS failureCount,
+					input_tokens AS inputTokens,
+					output_tokens AS outputTokens,
+					total_tokens AS totalTokens,
+					cached_input_tokens AS cachedInputTokens,
+					reasoning_tokens AS reasoningTokens,
+					latency_ms_total AS latencyMsTotal,
+					updated_at AS updatedAt
+				FROM model_usage_daily
+				WHERE day >= ? AND day <= ?
+				ORDER BY day DESC, scope, provider, model`)
+				.bind(from.toISOString().slice(0, 10), through.toISOString().slice(0, 10))
+				.all<ModelUsageDailyRow>();
+			const rows = query.results ?? [];
+			return result(
+				platformJson(
+					{
+						window: { from: from.toISOString(), through: through.toISOString(), days },
+						totals: summarizeModelUsage(rows.filter((row) => row.scope === "global")),
+						daily: rows,
+						privacy: "Aggregate model operations only; no themes, generated topics, room codes, identities, audio, or transcript text.",
+						requestId,
+					},
+					200,
+					requestId,
+				),
+				false,
+			);
+		}
+
+		return result(platformErrorResponse(new PlatformError("NOT_FOUND", "API route not found."), requestId), false);
+	} catch (error) {
+		return result(platformErrorResponse(error, requestId), url.pathname.startsWith("/api/v1/progress/"));
+	}
+}
+
+export interface TopicGenerationCapability {
+	status: "ready" | "degraded";
+	routine: TopicTierCapability;
+	escalated: TopicTierCapability;
+}
+
+interface ModelUsageDailyRow {
+	day: string;
+	scope: "global" | "provider";
+	provider: string;
+	model: string;
+	task: string;
+	reservedCalls: number;
+	completedCalls: number;
+	successCount: number;
+	failureCount: number;
+	inputTokens: number;
+	outputTokens: number;
+	totalTokens: number;
+	cachedInputTokens: number;
+	reasoningTokens: number;
+	latencyMsTotal: number;
+	updatedAt: string;
+}
+
+interface ModelUsageTotals {
+	reservedCalls: number;
+	completedCalls: number;
+	successCount: number;
+	failureCount: number;
+	inputTokens: number;
+	outputTokens: number;
+	totalTokens: number;
+	cachedInputTokens: number;
+	reasoningTokens: number;
+	latencyMsTotal: number;
+}
+
+interface TopicTierCapability {
+	status: "offline" | "ready" | "degraded";
+	provider: "offline" | "glm" | "glm53" | "gemma31";
+	model: string | null;
+	externalAvailable: boolean;
+}
+
+/** Expose deployment readiness without returning keys or arbitrary selector values. */
+export function topicGenerationCapability(env: TopicProviderBindings): TopicGenerationCapability {
+	const routine = topicTierCapability(env, "routine");
+	const escalated = topicTierCapability(env, "escalated");
+	return {
+		status: routine.status === "degraded" || escalated.status === "degraded" ? "degraded" : "ready",
+		routine,
+		escalated,
+	};
+}
+
+function topicTierCapability(env: TopicProviderBindings, tier: TopicModelTier): TopicTierCapability {
+	try {
+		const description = describeTopicProvider(env, tier);
+		if (!description.remote) {
+			return { status: "offline", provider: "offline", model: null, externalAvailable: false };
+		}
+		return {
+			status: description.configured ? "ready" : "degraded",
+			provider: description.provider,
+			model: description.model,
+			externalAvailable: description.configured,
+		};
+	} catch {
+		return { status: "degraded", provider: "offline", model: null, externalAvailable: false };
+	}
+}
+
+function summarizeModelUsage(rows: ModelUsageDailyRow[]): ModelUsageTotals {
+	return rows.reduce<ModelUsageTotals>((total, row) => ({
+		reservedCalls: total.reservedCalls + row.reservedCalls,
+		completedCalls: total.completedCalls + row.completedCalls,
+		successCount: total.successCount + row.successCount,
+		failureCount: total.failureCount + row.failureCount,
+		inputTokens: total.inputTokens + row.inputTokens,
+		outputTokens: total.outputTokens + row.outputTokens,
+		totalTokens: total.totalTokens + row.totalTokens,
+		cachedInputTokens: total.cachedInputTokens + row.cachedInputTokens,
+		reasoningTokens: total.reasoningTokens + row.reasoningTokens,
+		latencyMsTotal: total.latencyMsTotal + row.latencyMsTotal,
+	}), {
+		reservedCalls: 0,
+		completedCalls: 0,
+		successCount: 0,
+		failureCount: 0,
+		inputTokens: 0,
+		outputTokens: 0,
+		totalTokens: 0,
+		cachedInputTokens: 0,
+		reasoningTokens: 0,
+		latencyMsTotal: 0,
+	});
+}
+
+/** Record a real room transition, never a page view or presence heartbeat. */
+export async function recordRoomMilestone(
+	env: PlatformBindings,
+	publicRoomState: unknown,
+	milestone: RoomMilestone,
+	observedAt = new Date(),
+): Promise<void> {
+	const store = createPlatformStore(env.PLATFORM_DB, { roomHashKey: env.ROOM_FACT_HASH_KEY });
+	const fact = mapPublicRoomStateToFact(publicRoomState, milestone, observedAt);
+	try {
+		await store.upsertRoomFact(publicRoomState, milestone, observedAt);
+	} catch (error) {
+		console.warn("room fact was not written", { milestone, error: safeErrorName(error) });
+	}
+	const event = analyticsEventFromRoomMilestone(fact);
+	if (event) await recordProductEvent(env, event, observedAt);
+}
+
+/** Both low-volume D1 rollups and Analytics Engine delivery are best-effort. */
+export async function recordProductEvent(
+	env: PlatformBindings,
+	event: AnalyticsEventInput,
+	occurredAt = new Date(),
+): Promise<void> {
+	let delta;
+	try {
+		delta = mapAnalyticsEvent(event, occurredAt);
+	} catch (error) {
+		console.warn("invalid internal product analytics event was ignored", {
+			metric: typeof event?.type === "string" ? event.type : "unknown",
+			error: safeErrorName(error),
+		});
+		return;
+	}
+	try {
+		await createPlatformStore(env.PLATFORM_DB).recordAnalyticsEvent(event, occurredAt);
+	} catch (error) {
+		console.warn("daily product analytics rollup was not written", {
+			metric: delta.metric,
+			error: safeErrorName(error),
+		});
+	}
+	try {
+		env.PRODUCT_ANALYTICS?.writeDataPoint({
+			indexes: [`event:${delta.metric}`],
+			blobs: [delta.metric, "v1", "cloudflare"],
+			doubles: [delta.eventCount, delta.valueSum],
+		});
+	} catch (error) {
+		console.warn("product analytics event was not written", {
+			metric: delta.metric,
+			error: safeErrorName(error),
+		});
+	}
+}
+
+export async function runPlatformCleanup(env: PlatformBindings, now = new Date()): Promise<void> {
+	const deleted = { coachingSessions: 0, consentRecords: 0, devices: 0, roomFacts: 0 };
+	let hasMore = false;
+	let batches = 0;
+	while (batches < MAX_CLEANUP_BATCHES_PER_RUN) {
+		const chunk = await cleanupExpiredData(env.PLATFORM_DB, now);
+		batches += 1;
+		deleted.coachingSessions += chunk.coachingSessions;
+		deleted.consentRecords += chunk.consentRecords;
+		deleted.devices += chunk.devices;
+		deleted.roomFacts += chunk.roomFacts;
+		hasMore = chunk.hasMore;
+		if (!hasMore) break;
+	}
+	console.log("platform retention cleanup completed", { ...deleted, batches, hasMore });
+	if (hasMore) console.warn("platform retention cleanup reached its per-run budget; the next cron will continue");
+}
+
+function result(response: Response, refreshIdentity: boolean): PlatformRouteResult {
+	return { response, refreshIdentity };
+}
+
+function platformJson(value: unknown, status: number, requestId: string): Response {
+	return Response.json(value, {
+		status,
+		headers: {
+			"Cache-Control": "no-store",
+			"Content-Type": "application/json; charset=utf-8",
+			"X-Content-Type-Options": "nosniff",
+			"X-Request-ID": requestId,
+		},
+	});
+}
+
+function platformErrorResponse(error: unknown, requestId: string): Response {
+	const known = error instanceof PlatformError
+		? error
+		: new PlatformError("DATABASE_UNAVAILABLE", "The platform data service is temporarily unavailable.", {
+			cause: error,
+		});
+	if (!(error instanceof PlatformError)) {
+		console.error("platform API failed", { requestId, error: safeErrorName(error) });
+	}
+	const response = platformJson(
+		{
+			error: { code: known.code, message: known.message },
+			requestId,
+		},
+		known.status,
+		requestId,
+	);
+	if (known.status === 401) response.headers.set("WWW-Authenticate", 'Bearer realm="NonStopTalk analytics"');
+	if (known.status === 503) response.headers.set("Retry-After", "30");
+	return response;
+}
+
+function methodNotAllowed(requestId: string, allow: string): Response {
+	const response = platformErrorResponse(
+		new PlatformError("INVALID_INPUT", "Method not allowed.", { status: 405 }),
+		requestId,
+	);
+	response.headers.set("Allow", allow);
+	return response;
+}
+
+async function assertDatabaseReady(database: D1Database): Promise<void> {
+	const now = Date.now();
+	if ((databaseReadiness.get(database) ?? 0) > now) return;
+	try {
+		const marker = await database
+			.prepare("SELECT schema_version FROM platform_meta WHERE id = 1")
+			.first<{ schema_version: number }>();
+		if (!marker || marker.schema_version !== PLATFORM_SCHEMA_VERSION) {
+			throw new Error("platform schema marker is missing or unsupported");
+		}
+		databaseReadiness.set(database, now + PLATFORM_STATUS_CACHE_MS);
+	} catch (error) {
+		throw new PlatformError("DATABASE_UNAVAILABLE", "The platform database has not been initialized.", {
+			cause: error,
+		});
+	}
+}
+
+async function readPlatformJson(request: Request): Promise<Record<string, unknown>> {
+	const contentType = request.headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase();
+	if (contentType !== "application/json") {
+		throw new PlatformError("INVALID_INPUT", "Content-Type must be application/json.");
+	}
+	const length = Number(request.headers.get("Content-Length") ?? 0);
+	if (Number.isFinite(length) && length > MAX_PLATFORM_BODY_BYTES) {
+		throw new PlatformError("PAYLOAD_TOO_LARGE", "The platform request body is too large.");
+	}
+	const reader = request.body?.getReader();
+	if (!reader) return {};
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		total += value.byteLength;
+		if (total > MAX_PLATFORM_BODY_BYTES) {
+			await reader.cancel("request body too large");
+			throw new PlatformError("PAYLOAD_TOO_LARGE", "The platform request body is too large.");
+		}
+		chunks.push(value);
+	}
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	try {
+		const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+		return parsed as Record<string, unknown>;
+	} catch (error) {
+		throw new PlatformError("INVALID_INPUT", "Could not read platform request data.", { cause: error });
+	}
+}
+
+function assertExactBodyKeys(body: Record<string, unknown>, allowed: string[]): void {
+	const allowedSet = new Set(allowed);
+	for (const key of Object.keys(body)) {
+		if (!allowedSet.has(key)) throw new PlatformError("INVALID_INPUT", `Unexpected request field: ${key}.`);
+	}
+	for (const key of allowed) {
+		if (!(key in body)) throw new PlatformError("INVALID_INPUT", `Missing request field: ${key}.`);
+	}
+}
+
+function requireExactMutationOrigin(request: Request): void {
+	const expected = new URL(request.url).origin;
+	if (request.headers.get("Origin") !== expected) {
+		throw new PlatformError("INVALID_IDENTITY", "Cross-origin request rejected.", { status: 403 });
+	}
+}
+
+async function requireAdmin(request: Request, expectedToken: string | undefined): Promise<void> {
+	if (!isSecureAdminToken(expectedToken)) {
+		throw new PlatformError("DATABASE_UNAVAILABLE", "Analytics administration is not configured.");
+	}
+	const authorization = request.headers.get("Authorization") ?? "";
+	const presented = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+	if (!(await constantTimeTextEqual(presented, expectedToken))) {
+		throw new PlatformError("INVALID_IDENTITY", "Administrator authentication is required.", { status: 401 });
+	}
+}
+
+function isSecureAdminToken(value: string | undefined): value is string {
+	if (typeof value !== "string") return false;
+	const bytes = new TextEncoder().encode(value).byteLength;
+	return bytes >= 24 && bytes <= 1_024;
+}
+
+function isSecureRoomFactKey(value: string | undefined): value is string {
+	if (typeof value !== "string") return false;
+	const bytes = new TextEncoder().encode(value).byteLength;
+	return bytes >= 32 && bytes <= 1_024;
+}
+
+async function constantTimeTextEqual(left: string, right: string): Promise<boolean> {
+	const encoder = new TextEncoder();
+	const [leftHash, rightHash] = await Promise.all([
+		crypto.subtle.digest("SHA-256", encoder.encode(left)),
+		crypto.subtle.digest("SHA-256", encoder.encode(right)),
+	]);
+	const a = new Uint8Array(leftHash);
+	const b = new Uint8Array(rightHash);
+	let difference = a.length ^ b.length;
+	for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+		difference |= (a[index] ?? 0) ^ (b[index] ?? 0);
+	}
+	return difference === 0 && left.length === right.length;
+}
+
+function parsePositiveInteger(value: string | null, fallback: number, maximum: number): number {
+	if (value === null || value === "") return fallback;
+	if (!/^\d{1,4}$/u.test(value)) throw new PlatformError("INVALID_INPUT", "A positive integer was expected.");
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) {
+		throw new PlatformError("INVALID_INPUT", `The value must be between 1 and ${maximum}.`);
+	}
+	return parsed;
+}
+
+function startOfUTCDay(value: Date): Date {
+	return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()));
+}
+
+function safeErrorName(error: unknown): string {
+	return error instanceof Error ? error.name : "UnknownError";
+}

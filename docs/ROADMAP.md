@@ -9,7 +9,7 @@ Status labels in this document are explicit:
 
 ## 1. Speech coaching — Implemented prototype
 
-The native Cloudflare SPA now has a private individual-practice path at `/practice` and origin-local browser history at `/progress`.
+The native Cloudflare SPA now has a private individual-practice path at `/practice` and local-first browser history at `/progress`.
 
 Implemented prototype scope:
 
@@ -22,8 +22,8 @@ Implemented prototype scope:
 - Deterministic, sparse acoustic live tips, rule-selected review evidence/focus, and a post-attempt instruction normally assembled from the top retrieved card's prewritten drill plus a metric-specific comparison sentence; an evidence-safety rule can supply the drill instead, and the review labels the card as used or context only
 - Compact session summaries in origin-scoped IndexedDB in the current browser profile, including consented derived filler/repetition patterns
 - Separate, off-by-default retention of the attempt recording and available captured transcript in an origin-local artifact store, with individual downloads; finalization errors/timeouts mark retained text as possibly partial in Review and Progress, and artifacts are excluded from summary JSON export
-- No coaching audio or transcript upload; confirmed deletion clears both local coaching stores
-- Twenty-one deterministic coaching-engine tests and a strengthened browser smoke flow covering grounding safety, default-off and opted-in storage, v1→v2 migration, real downloads/export, partial-transcript warnings, observed/unknown timing, timeline rendering, focus, cancellation/stall cleanup, and no coaching API request
+- No coaching audio or captured-transcript upload; the independent compact-summary backup boundary is described in the platform section below
+- Twenty-one deterministic coaching-engine tests and a browser smoke flow that covers local behavior and asserts no coaching-data API request when backup is off
 
 This prototype demonstrates the technical and interaction loop. It does not yet establish measurement accuracy across devices, learning outcomes, clinical value, accessibility conformance, or accent/language fairness.
 
@@ -63,10 +63,27 @@ The game loop is playable. Formal accessibility and broad hardware/browser valid
 
 The supplied native Cloudflare edition runs on Workers Free. Each room has one SQLite-backed Durable Object, so room state survives hibernation, restarts, and deployments until its 30-day idle expiry.
 
-## 4. Content, sharing, and retention — Implemented locally
+## 4. Central web platform — In progress
+
+The first incremental platform slice is being built without replacing the playable app:
+
+- Versioned Worker APIs and a central D1 database for explicitly backed-up compact coaching summaries, versioned consent, anonymous expiry, HMAC-pseudonymous room facts, and best-effort daily aggregate counters
+- An off-by-default browser allowlist that excludes raw samples, audio/recordings, captured transcript text, and artifact metadata from cloud backup
+- Anonymous browser ownership stored as a token digest, with one UTC-day-bucketed device lease lasting at least 30 and less than 31 days after cloud use, a new-save guard once 250 summaries exist, preservation of valid unexpired legacy rows, and bounded cleanup that can continue a backlog on later cron runs
+- Coarse privacy-safe product events attempted best-effort in both D1 daily rollups and Analytics Engine; D1 supplies protected aggregate product-analytics and model-usage operational readouts, not audit or billing truth
+- Server-authoritative room milestones plus coarse summary-save/delete/consent timing/count values; no page-view, presence-tick, per-person, speaking-ratio, transcript-pattern, or advice telemetry
+- A modular Cloudflare theme-to-topics boundary: deterministic/offline by default; direct Z.AI GLM-4.7-Flash as the strict-free routine option; Workers AI GLM-5.3-Flash as the preferred cheap Workers Paid routine option; and independently enabled Gemma 4 31B only for explicit host escalation
+- Per-generation host consent; a normalized theme capped at 200 characters as the only host or room content sent externally; aggregate D1 daily usage budgeting (100 calls by default); and deterministic fallback without provider retry or Queue delivery
+- Modular separation among Durable Object room authority, D1 repositories, identity, coaching backup, analytics, and topic providers
+- Local coaching and gameplay that continue to work when D1 or analytics is unavailable
+
+This phase remains free-or-cheap by default: it uses existing Cloudflare primitives, keeps routine generation offline unless enabled, makes the larger model an explicit escalation, and caps aggregate external calls. Accounts, cross-device authentication/progress, external coaching AI, Queue-backed work, and R2 media storage remain later phases. See the [Web platform plan](WEB_PLATFORM_PLAN.md).
+
+## 5. Content, sharing, and retention — Implemented locally
 
 - Preset packs with difficulty labels
-- Offline or Anthropic-assisted theme generation
+- Offline, Anthropic-assisted, or Z.AI GLM-assisted theme generation in the local Go edition, selected with `NONSTOPTALK_AI_PROVIDER`; invalid or incomplete selections warn and fail closed to offline templates
+- Editable Cloudflare topic drafts from deterministic templates, optional direct GLM-4.7 or Workers AI GLM-5.3-Flash routine generation, or explicitly selected Gemma 4 31B escalation
 - Browser-local saved presets
 - Plain-text custom-topic import/export
 - Per-room history for the last 20 completed games
@@ -74,12 +91,12 @@ The supplied native Cloudflare edition runs on Workers Free. Each room has one S
 
 Profiles and server-side custom-pack libraries are not part of this phase's implemented scope.
 
-## 5. Optional AI judge — Implemented locally
+## 6. Optional AI judge — Implemented locally
 
 - Host opt-in plus per-speaker, per-turn consent
 - Fail-closed on-device `SpeechRecognition` requirement
 - No microphone-audio upload by NonStopTalk
-- Anthropic relevance grading when configured
+- Anthropic or Z.AI GLM relevance grading when explicitly selected; an unset selector preserves legacy Anthropic auto-selection only when its key exists
 - Transparent server-side offline heuristic without an API key
 - Asynchronous, capped relevance bonus with confidence and short feedback
 - Classic-score preservation on missing transcript, timeout, provider failure, or interrupted restore
@@ -87,7 +104,7 @@ Profiles and server-side custom-pack libraries are not part of this phase's impl
 
 Because strict local-recognition support is not widely available, classic/manual play remains the primary compatibility path.
 
-## 6. Deployment and hardening — In progress
+## 7. Deployment and hardening — In progress
 
 Implemented work includes:
 
@@ -102,6 +119,8 @@ Implemented work includes:
 - Go unit, handler, race, vet, and Playwright smoke validation
 - TypeScript game/route tests and a Wrangler deploy dry run
 - Deterministic coaching-engine tests and a Cloudflare-SPA coaching smoke flow
+- D1 migrations, platform API/repository tests, compact-summary client tests, configured/degraded capability status, and bounded scheduled anonymous-data cleanup
+- Host-authorized Cloudflare topic generation with separate provider adapters, per-attempt consent, aggregate daily cost controls, and deterministic failure fallback
 
 Remaining hardening:
 
@@ -111,7 +130,7 @@ Remaining hardening:
 - Observability and production operations guidance
 - Formal security and accessibility reviews
 
-## 7. Explicit product backlog
+## 8. Explicit product backlog
 
 These are future ideas, not current features:
 
@@ -123,6 +142,7 @@ These are future ideas, not current features:
 - Family/content filters
 - Post-turn AI summaries
 - Validated baseline/retry coaching programs and progress comparisons
-- Accounts, cross-device coaching sync, educator assignments, and shared reports
+- Accounts, cross-device authentication/coaching sync, educator assignments, and shared reports
 - Semantic structure, relevance, concision, and answer-completeness coaching
-- Server-side or external coaching analysis; any such path requires separate consent and privacy design
+- Server-side or external coaching analysis beyond the implemented theme-only topic adapters; any such path requires separate consent and privacy design
+- Queue-backed provider jobs and R2 media storage; neither is part of the first platform slice

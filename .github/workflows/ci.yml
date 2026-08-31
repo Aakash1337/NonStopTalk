@@ -30,9 +30,11 @@ jobs:
       - run: go test -race ./...
       - run: go vet ./...
       - run: npm run test:coach
+      - run: npm run test:cloud-progress
       - run: npm run typecheck:cloudflare
       - run: npm run test:cloudflare
       - run: npm run check:cloudflare
+      - run: npm run smoke:platform
       - run: npx playwright install --with-deps chromium
       - run: npm run smoke:coach
       - run: npm run smoke
