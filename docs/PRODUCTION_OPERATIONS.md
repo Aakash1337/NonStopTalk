@@ -39,6 +39,7 @@ npm run test:cloud-progress
 npm run test:admin
 npm run test:production-monitor
 npm run test:deployment-contract
+npm run test:smoke-support
 npm run check:cloudflare-types
 npm run typecheck:cloudflare
 npm run test:cloudflare
@@ -47,6 +48,7 @@ npm run check:cloudflare
 npm run check:cloudflare-staging
 npm run check:cloudflare-startup
 npm run smoke:platform
+npm run smoke:multiplayer
 npm run smoke:accessibility
 npm run smoke:coach
 npm run smoke:admin

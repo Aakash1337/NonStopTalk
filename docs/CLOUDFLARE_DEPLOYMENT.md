@@ -73,6 +73,8 @@ npm run check:cloudflare
 npm run check:cloudflare-staging
 npm run check:cloudflare-startup
 npm run smoke:platform
+npx playwright install chromium
+npm run smoke:multiplayer
 npx wrangler login
 npm run db:create
 # copy the returned database UUID into wrangler.jsonc once per environment

@@ -124,6 +124,9 @@ Implemented work includes:
 - Atomic host authorization, external-provider ceilings, connection caps, and replay-safe turn transitions
 - Go unit, handler, race, vet, and Playwright smoke validation
 - TypeScript game/route tests and a Wrangler deploy dry run
+- A hermetic two-browser Cloudflare smoke flow covering isolated identities,
+  live WebSocket state, host-only authorization, scoring, reconnect persistence,
+  and a finished game
 - Deterministic coaching-engine tests and a Cloudflare-SPA coaching smoke flow
 - Automated axe-core WCAG rule scans across the public landing, practice,
   progress, room-lobby, ready, active-turn, and coaching review states, plus
