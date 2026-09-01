@@ -4,6 +4,7 @@ const configuredOrigin = process.argv[2]
   || process.env.NONSTOPTALK_PRODUCTION_ORIGIN
   || "https://dontstoptalking.org";
 const origin = new URL(configuredOrigin);
+const WEB_ANALYTICS_ORIGIN = "https://static.cloudflareinsights.com";
 if (!/^https:$/.test(origin.protocol) || origin.pathname !== "/") {
   throw new Error("NONSTOPTALK_PRODUCTION_ORIGIN must be an HTTPS origin without a path.");
 }
@@ -18,6 +19,18 @@ function contentSecurityPolicySources(policy, directiveName) {
     .map((item) => item.trim().split(/\s+/u))
     .find(([name]) => name === directiveName);
   return directive ? directive.slice(1) : [];
+}
+
+function hasScriptFromOrigin(html, documentURL, expectedOrigin) {
+  const sources = [...String(html).matchAll(/<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/giu)]
+    .map((match) => match[1]);
+  return sources.some((source) => {
+    try {
+      return new URL(source, documentURL).origin === expectedOrigin;
+    } catch {
+      return false;
+    }
+  });
 }
 
 async function get(pathname, accept) {
@@ -57,7 +70,7 @@ for (const pathname of ["/", "/practice", "/progress"]) {
   const scriptSources = contentSecurityPolicySources(contentSecurityPolicy, "script-src");
   assert(scriptSources.length === 2
     && scriptSources[0] === "'self'"
-    && scriptSources[1] === "https://static.cloudflareinsights.com",
+    && scriptSources[1] === WEB_ANALYTICS_ORIGIN,
     `${pathname} must permit only same-origin scripts and the configured Cloudflare Web Analytics beacon origin`);
 }
 
@@ -69,7 +82,7 @@ assert(adminDocument.includes("<title>Operator analytics · NonStopTalk</title>"
   "/admin/analytics did not return its dedicated document");
 assert(adminDocument.includes("/admin-analytics-page.js") && !adminDocument.includes('src="/app.js"'),
   "/admin/analytics is not isolated from the public SPA");
-assert(!adminDocument.includes("static.cloudflareinsights.com"),
+assert(!hasScriptFromOrigin(adminDocument, new URL("/admin/analytics", origin), WEB_ANALYTICS_ORIGIN),
   "/admin/analytics contains an injected Web Analytics beacon");
 assert(adminDocumentResponse.headers.get("cache-control") === "public, max-age=0, must-revalidate, no-transform",
   "/admin/analytics must disable edge payload transforms");
@@ -80,8 +93,9 @@ for (const directive of [
 ]) {
   assert(adminCsp.includes(directive), `/admin/analytics CSP is missing ${directive}`);
 }
-assert(!adminCsp.includes("static.cloudflareinsights.com"),
-  "/admin/analytics CSP permits Web Analytics");
+const adminScriptSources = contentSecurityPolicySources(adminCsp, "script-src");
+assert(adminScriptSources.length === 1 && adminScriptSources[0] === "'self'",
+  "/admin/analytics CSP must permit only same-origin scripts");
 assert(adminDocumentResponse.headers.get("referrer-policy") === "no-referrer",
   "/admin/analytics must not send referrers");
 assert(adminDocumentResponse.headers.get("x-robots-tag") === "noindex, nofollow, noarchive",
@@ -89,7 +103,11 @@ assert(adminDocumentResponse.headers.get("x-robots-tag") === "noindex, nofollow,
 const directAdminAsset = await get("/admin/analytics/index.html", "text/html");
 assert(directAdminAsset.headers.get("content-security-policy") === adminCsp,
   "the direct admin asset path bypasses the isolated document policy");
-assert(!(await directAdminAsset.text()).includes("static.cloudflareinsights.com"),
+assert(!hasScriptFromOrigin(
+  await directAdminAsset.text(),
+  new URL("/admin/analytics/index.html", origin),
+  WEB_ANALYTICS_ORIGIN,
+),
   "the direct admin asset path contains an injected Web Analytics beacon");
 
 const statusResponse = await get("/api/v1/platform/status", "application/json");

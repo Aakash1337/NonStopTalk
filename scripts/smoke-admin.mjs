@@ -9,9 +9,30 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const WEB_ANALYTICS_ORIGIN = "https://static.cloudflareinsights.com";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+function contentSecurityPolicySources(policy, directiveName) {
+  const directive = String(policy)
+    .split(";")
+    .map((item) => item.trim().split(/\s+/u))
+    .find(([name]) => name === directiveName);
+  return directive ? directive.slice(1) : [];
+}
+
+function hasScriptFromOrigin(html, documentURL, expectedOrigin) {
+  const sources = [...String(html).matchAll(/<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/giu)]
+    .map((match) => match[1]);
+  return sources.some((source) => {
+    try {
+      return new URL(source, documentURL).origin === expectedOrigin;
+    } catch {
+      return false;
+    }
+  });
 }
 
 async function getFreePort() {
@@ -161,13 +182,16 @@ try {
     "default-src 'none'", "script-src 'self'", "script-src-attr 'none'", "style-src 'self'",
     "style-src-attr 'none'", "connect-src 'self'", "form-action 'none'", "frame-ancestors 'none'", "worker-src 'none'",
   ]) assert(csp.includes(directive), `Admin CSP is missing ${directive}`);
-  assert(!csp.includes("cloudflareinsights"), "Admin CSP must exclude Cloudflare Web Analytics");
+  const adminScriptSources = contentSecurityPolicySources(csp, "script-src");
+  assert(adminScriptSources.length === 1 && adminScriptSources[0] === "'self'",
+    "Admin CSP must permit only same-origin scripts");
   assert(documentResponse.headers["referrer-policy"] === "no-referrer", "Admin document must suppress referrers");
   assert(documentResponse.headers["x-robots-tag"] === "noindex, nofollow, noarchive", "Admin document must be noindex");
   assert(documentResponse.body.includes("Operator analytics · NonStopTalk"), "Admin route did not return its dedicated shell");
   assert(documentResponse.body.includes("/admin-analytics-page.js"), "Admin shell is missing its isolated module");
   assert(!documentResponse.body.includes("/app.js"), "Admin shell must not load the public SPA");
-  assert(!documentResponse.body.includes("static.cloudflareinsights.com"), "Admin shell contains an analytics beacon");
+  assert(!hasScriptFromOrigin(documentResponse.body, `${origin}/admin/analytics`, WEB_ANALYTICS_ORIGIN),
+    "Admin shell contains an analytics beacon");
 
   const trailingResponse = await readURL(`${origin}/admin/analytics/`);
   assert(trailingResponse.status === 200 && trailingResponse.headers["content-security-policy"] === csp,
@@ -175,13 +199,19 @@ try {
   const directAssetResponse = await readURL(`${origin}/admin/analytics/index.html`);
   assert(directAssetResponse.status === 200 && directAssetResponse.headers["content-security-policy"] === csp,
     "Direct admin asset path must not bypass the isolated document policy");
-  assert(!directAssetResponse.body.includes("static.cloudflareinsights.com"),
+  assert(!hasScriptFromOrigin(directAssetResponse.body, `${origin}/admin/analytics/index.html`, WEB_ANALYTICS_ORIGIN),
     "Direct admin asset path contains an analytics beacon");
   const unknownAdminResponse = await readURL(`${origin}/admin/analytics/not-a-route`);
   assert(unknownAdminResponse.status === 404 && unknownAdminResponse.headers["content-security-policy"] === csp,
     "Unknown admin subpaths must fail under the same isolated policy");
   const publicResponse = await readURL(`${origin}/`);
-  assert((publicResponse.headers["content-security-policy"] || "").includes("static.cloudflareinsights.com"),
+  const publicScriptSources = contentSecurityPolicySources(
+    publicResponse.headers["content-security-policy"] || "",
+    "script-src",
+  );
+  assert(publicScriptSources.length === 2
+    && publicScriptSources[0] === "'self'"
+    && publicScriptSources[1] === WEB_ANALYTICS_ORIGIN,
     "Admin isolation must not remove analytics from the public site");
 
   browser = await launchBrowser();
