@@ -506,6 +506,28 @@ test("platform status preserves the schema-5 capability shape for compatible mar
 	}
 });
 
+test("the rollback bridge never claims durable production from configuration alone", async () => {
+	for (const mode of ["outbox", undefined, "", "best-effort", "unknown", "OUTBOX", " outbox "] as const) {
+		const handled = await handlePlatformRoute(
+			new Request("https://nonstoptalk.test/api/v1/platform/status"),
+			{
+				PLATFORM_DB: new FakeStatusD1(6) as unknown as D1Database,
+				ROOM_MILESTONE_DELIVERY_MODE: mode,
+			},
+			"3".repeat(64),
+			`delivery-mode-${mode ?? "missing"}`,
+			noDeferredTasks,
+		);
+
+		assert(handled);
+		assert.equal(handled.response.status, 200);
+		const body = await handled.response.json() as {
+			capabilities: { aggregateAnalytics: { delivery: string } };
+		};
+		assert.equal(body.capabilities.aggregateAnalytics.delivery, "best-effort", mode);
+	}
+});
+
 test("platform status rejects markers outside its compatibility window and fractional markers", async () => {
 	for (const schemaVersion of [2, 3, 4, 4.5, 5.5, 6.5, 7]) {
 		const handled = await handlePlatformRoute(

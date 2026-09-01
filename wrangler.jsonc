@@ -33,6 +33,10 @@
 	// them in version control prevents a deploy from silently discarding values
 	// that were set only in the dashboard. API credentials remain secrets.
 	"vars": {
+		// This first rollout remains on the existing header + waitUntil path.
+		// The Worker still drains any durable rows left by a newer deployment,
+		// which makes this version a safe rollback bridge after outbox activation.
+		"ROOM_MILESTONE_DELIVERY_MODE": "best-effort",
 		"TOPIC_ROUTINE_PROVIDER": "offline",
 		"TOPIC_ESCALATION_PROVIDER": "off",
 		"MODEL_DAILY_CALL_LIMIT": "100"
@@ -126,6 +130,7 @@
 				"binding": "CF_VERSION_METADATA"
 			},
 			"vars": {
+				"ROOM_MILESTONE_DELIVERY_MODE": "best-effort",
 				"TOPIC_ROUTINE_PROVIDER": "offline",
 				"TOPIC_ESCALATION_PROVIDER": "off",
 				"MODEL_DAILY_CALL_LIMIT": "25"
