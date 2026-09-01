@@ -16,6 +16,7 @@ import {
 	type TopicModelTier,
 	type TopicProviderBindings,
 } from "./model-provider";
+import { logWorkerEvent } from "./observability";
 
 const MAX_PLATFORM_BODY_BYTES = 66 * 1024;
 const DEFAULT_ANALYTICS_DAYS = 30;
@@ -344,7 +345,7 @@ export async function recordRoomMilestone(
 	try {
 		await store.upsertRoomFact(publicRoomState, milestone, observedAt);
 	} catch (error) {
-		console.warn("room fact was not written", { milestone, error: safeErrorName(error) });
+		logWorkerEvent("warn", "room_fact_write_failed", { milestone, error: safeErrorName(error) });
 	}
 	const event = analyticsEventFromRoomMilestone(fact);
 	if (event) await recordProductEvent(env, event, observedAt);
@@ -360,7 +361,7 @@ export async function recordProductEvent(
 	try {
 		delta = mapAnalyticsEvent(event, occurredAt);
 	} catch (error) {
-		console.warn("invalid internal product analytics event was ignored", {
+		logWorkerEvent("warn", "product_analytics_event_rejected", {
 			metric: typeof event?.type === "string" ? event.type : "unknown",
 			error: safeErrorName(error),
 		});
@@ -369,7 +370,7 @@ export async function recordProductEvent(
 	try {
 		await createPlatformStore(env.PLATFORM_DB).recordAnalyticsEvent(event, occurredAt);
 	} catch (error) {
-		console.warn("daily product analytics rollup was not written", {
+		logWorkerEvent("warn", "product_analytics_rollup_failed", {
 			metric: delta.metric,
 			error: safeErrorName(error),
 		});
@@ -381,7 +382,7 @@ export async function recordProductEvent(
 			doubles: [delta.eventCount, delta.valueSum],
 		});
 	} catch (error) {
-		console.warn("product analytics event was not written", {
+		logWorkerEvent("warn", "analytics_engine_write_failed", {
 			metric: delta.metric,
 			error: safeErrorName(error),
 		});
@@ -402,8 +403,8 @@ export async function runPlatformCleanup(env: PlatformBindings, now = new Date()
 		hasMore = chunk.hasMore;
 		if (!hasMore) break;
 	}
-	console.log("platform retention cleanup completed", { ...deleted, batches, hasMore });
-	if (hasMore) console.warn("platform retention cleanup reached its per-run budget; the next cron will continue");
+	logWorkerEvent("info", "platform_cleanup_completed", { ...deleted, batches, hasMore });
+	if (hasMore) logWorkerEvent("warn", "platform_cleanup_budget_exhausted", { batches });
 }
 
 function result(response: Response, refreshIdentity: boolean): PlatformRouteResult {
@@ -429,7 +430,7 @@ function platformErrorResponse(error: unknown, requestId: string): Response {
 			cause: error,
 		});
 	if (!(error instanceof PlatformError)) {
-		console.error("platform API failed", { requestId, error: safeErrorName(error) });
+		logWorkerEvent("error", "platform_api_failed", { requestId, error: safeErrorName(error) });
 	}
 	const response = platformJson(
 		{
@@ -555,13 +556,19 @@ async function constantTimeTextEqual(left: string, right: string): Promise<boole
 		crypto.subtle.digest("SHA-256", encoder.encode(left)),
 		crypto.subtle.digest("SHA-256", encoder.encode(right)),
 	]);
-	const a = new Uint8Array(leftHash);
-	const b = new Uint8Array(rightHash);
-	let difference = a.length ^ b.length;
-	for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
-		difference |= (a[index] ?? 0) ^ (b[index] ?? 0);
+	if (typeof crypto.subtle.timingSafeEqual === "function") {
+		return crypto.subtle.timingSafeEqual(leftHash, rightHash);
 	}
-	return difference === 0 && left.length === right.length;
+	// Node's Web Crypto test runtime does not yet expose Workers'
+	// timingSafeEqual extension. Both SHA-256 digests have a fixed length, so a
+	// full fallback pass preserves the same comparison semantics in tests.
+	const leftBytes = new Uint8Array(leftHash);
+	const rightBytes = new Uint8Array(rightHash);
+	let difference = 0;
+	for (let index = 0; index < leftBytes.length; index += 1) {
+		difference |= leftBytes[index] ^ rightBytes[index];
+	}
+	return difference === 0;
 }
 
 function parsePositiveInteger(value: string | null, fallback: number, maximum: number): number {

@@ -15,6 +15,10 @@ test("cloud summary allowlist excludes raw media and captured transcript text", 
     scenario: "interview",
     goal: "pauses",
     targetDurationMs: 45_000,
+    practiceLoopId: "loop-1",
+    baselineAttemptId: "attempt-1",
+    attemptRole: "baseline",
+    feedbackMode: "review-only",
     metrics: {
       durationMs: 44_000,
       speakingRatio: 0.72,
@@ -32,10 +36,36 @@ test("cloud summary allowlist excludes raw media and captured transcript text", 
   assert.equal(summary.metrics.speakingRatio, 0.72);
   assert.deepEqual(summary.metrics.transcriptMetrics.fillerOccurrences, [{ phrase: "um", count: 2 }]);
   assert.equal(summary.advice.focus, "Pause once.");
+  assert.deepEqual({
+    practiceLoopId: summary.practiceLoopId,
+    baselineAttemptId: summary.baselineAttemptId,
+    attemptRole: summary.attemptRole,
+    feedbackMode: summary.feedbackMode,
+  }, {
+    practiceLoopId: "loop-1",
+    baselineAttemptId: "attempt-1",
+    attemptRole: "baseline",
+    feedbackMode: "review-only",
+  });
   assert.equal(JSON.stringify(summary).includes("must not leave"), false);
   assert.equal("artifacts" in summary, false);
   assert.equal("samples" in summary.metrics, false);
   assert.equal("hiddenPrompt" in summary.advice, false);
+});
+
+test("legacy cloud summaries remain relationship-free", () => {
+  const summary = sanitizeCloudSummary({
+    analysisSchemaVersion: 2,
+    id: "legacy",
+    createdAt: "2026-08-30T12:00:00.000Z",
+    scenario: "interview",
+    goal: "pauses",
+    targetDurationMs: 45_000,
+    metrics: {},
+    advice: {},
+  });
+  assert.equal("practiceLoopId" in summary, false);
+  assert.equal("attemptRole" in summary, false);
 });
 
 test("cloud client is opt-in and sends only the sanitized summary", async () => {

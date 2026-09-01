@@ -5,6 +5,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -13,27 +17,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
 
       - run: npm clean-install
+      - run: npm run audit:dependencies
       - run: go test ./...
       - run: go test -race ./...
       - run: go vet ./...
       - run: npm run test:coach
       - run: npm run test:cloud-progress
+      - run: npm run check:cloudflare-types
       - run: npm run typecheck:cloudflare
       - run: npm run test:cloudflare
+      - run: npm run test:cloudflare-runtime
       - run: npm run check:cloudflare
+      - run: npm run check:cloudflare-staging
+      - run: npm run check:cloudflare-startup
       - run: npm run smoke:platform
       - run: npx playwright install --with-deps chromium
       - run: npm run smoke:coach

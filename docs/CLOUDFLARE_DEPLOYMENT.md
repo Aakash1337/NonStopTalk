@@ -27,6 +27,8 @@ https://nonstoptalk.<account-subdomain>.workers.dev/room/ABC234
 
 Cloudflare makes SQLite-backed Durable Objects available on Workers Free. As checked August 31, 2026, its published Durable Object daily allocation includes 100,000 requests and 13,000 GB-seconds of duration, plus 5 million SQLite rows read and 100,000 rows written per day and 5 GB of stored data. The separate D1 Free allocation includes 5 million rows read and 100,000 rows written per day plus 5 GB of storage. Workers Free also has a 100,000-request daily Worker limit, Static Asset requests are free and unlimited, and Analytics Engine's published Free allocation includes 100,000 data points written and 10,000 queries per day. Cloudflare says Analytics Engine billing is not active yet; its published prices are advance guidance.
 
+Workers Logs is also included: as checked September 1, 2026, [Cloudflare publishes][workers-logs] 200,000 log events per day with three-day retention on Workers Free, or 20 million events per month with seven-day retention on Workers Paid and $0.60 per additional million. Invocation logs and each custom log, error, or uncaught exception are events, so log-event volume can exceed request volume. The current pilot configuration keeps 100% head-sampled logs and 1% traces for production and staging while traffic is low. [Trace spans][workers-traces] are free during the current beta but begin sharing the Workers Logs event allowance and pricing on October 1, 2026. The production runbook defines the cheap-first monitoring and sampling step-down policy; recheck these terms before launch because they can change.
+
 This small party game is designed to stay inside those allocations: inactive objects do not accrue duration, and the WebSocket Hibernation API lets an idle room sleep without disconnecting its players. The platform also avoids D1 writes for page views and presence ticks, uses one day-bucketed retention lease per anonymous browser, rejects new saves once 250 summaries exist, uses small daily aggregate rows, and treats both D1 rollups and Analytics Engine writes as best-effort. Workers Free does not silently begin paid overage billing. If a daily allocation is exhausted, affected operations may fail until the allocation resets.
 
 Cloudflare's general [Workers limits][worker-limits] documentation describes Error 1027 after the Free-plan daily Worker request limit is exhausted, with fail-open or fail-closed behavior configurable for zone Routes. Its [Static Assets billing][assets-billing] documentation defines the more specific rule used here: requests matching `run_worker_first` receive `429 Too Many Requests` instead of falling back to asset serving. Because this project applies `run_worker_first` only to `/api/*`, those API requests receive 429 while asset-only routes continue to be served without invoking the Worker. Zone Route fail modes are therefore separate from this `workers.dev` behavior. Confirm the current [Durable Objects][do-pricing], [D1][d1-pricing], and [Analytics Engine][analytics-pricing] pricing plus [Worker routing options][worker-routing] before deployment because allowances can change.
@@ -57,11 +59,15 @@ From the repository root:
 
 ```sh
 npm clean-install
+npm run audit:dependencies
 npm run typecheck:cloudflare
 npm run test:cloudflare
+npm run test:cloudflare-runtime
 npm run test:coach
 npm run test:cloud-progress
 npm run check:cloudflare
+npm run check:cloudflare-staging
+npm run check:cloudflare-startup
 npm run smoke:platform
 npx wrangler login
 npm run db:create
@@ -79,13 +85,23 @@ npx wrangler secret put ZAI_API_KEY       # routine GLM-4.7-Flash
 npx wrangler secret put GEMINI_API_KEY    # optional Gemma 4 31B escalation
 ```
 
-Set `TOPIC_ROUTINE_PROVIDER`, `TOPIC_ESCALATION_PROVIDER`, and `MODEL_DAILY_CALL_LIMIT` as non-secret environment variables in the Worker dashboard or deployment configuration. Their defaults are `offline`, `off`, and `100` respectively. The routine selector accepts `offline`, `glm`, or `glm53`; `wrangler.jsonc` already declares the `AI` binding used by `glm53` with binding model ID `@cf/zai-org/glm-5.3-flash`.
+`TOPIC_ROUTINE_PROVIDER`, `TOPIC_ESCALATION_PROVIDER`, and `MODEL_DAILY_CALL_LIMIT` are non-secret deployment policy in `wrangler.jsonc`. Their production defaults are `offline`, `off`, and `100` respectively. Change and review them in source control rather than only in the dashboard, because Wrangler configuration is the deployment source of truth. The routine selector accepts `offline`, `glm`, or `glm53`; `wrangler.jsonc` already declares the `AI` binding used by `glm53` with binding model ID `@cf/zai-org/glm-5.3-flash`.
 
-`npm run deploy` prints the resulting `workers.dev` URL. The configured Worker name is `nonstoptalk`.
+`npm run deploy` applies pending production D1 migrations, deploys in Wrangler strict mode, and probes `https://dontstoptalking.org`. The configured Worker name is `nonstoptalk`; its Workers.dev route remains available as a diagnostic fallback.
 
-`npm run check:cloudflare` performs a Wrangler dry run. It validates the TypeScript bundle, assets, and declared bindings without changing a Cloudflare account. `db:create` is a one-time environment step; D1 migrations are append-only and should run before deploying code that depends on them.
+`npm run check:cloudflare` performs a strict Wrangler dry run. It validates the TypeScript bundle, assets, and declared bindings without changing a Cloudflare account. `db:create` is a one-time environment step; D1 migrations are append-only and run before code in both deployment scripts.
 
-`wrangler.jsonc` assigns account-local namespace IDs `6677867` (room creation), `6677868` (general platform/room requests), and `6677869` (topic-model requests). If another Worker in the same account already uses any value, choose independent positive integers.
+`wrangler.jsonc` assigns account-local production namespace IDs `6677867`–`6677869` and separate staging IDs `6677870`–`6677872` for room creation, general API work, and topic-model requests. If another Worker in the same account already uses any value, choose independent positive integers.
+
+### Promote to isolated staging
+
+The named `staging` environment uses a separate Worker, D1 database, Analytics Engine dataset, rate-limit namespaces, secrets, cron, and Workers.dev hostname. It has no custom-domain route. After setting its two required secrets once, deploy and exercise both read and write paths with:
+
+```sh
+npm run deploy:staging
+```
+
+The post-deploy probe writes one synthetic compact baseline summary, verifies its explicit relationship metadata, and deletes that browser-scoped staging history. It refuses to run against the production domain. Version preview URLs are disabled in both environments because they would share the selected environment's stateful bindings.
 
 ## Deploy with Workers Builds
 
@@ -94,7 +110,7 @@ For the repository-connected flow in the Cloudflare dashboard:
 1. Create or connect a **Worker** project, not a Pages-only static project.
 2. Use the repository root (`/`) as the root directory.
 3. Use Node.js 22 or newer (Node.js 24 is also supported).
-4. Use `npm run typecheck:cloudflare && npm run test:cloudflare && npm run test:coach && npm run test:cloud-progress` as the build command.
+4. Use the repository CI workflow as the full verification gate; if Workers Builds also runs a build command, include typecheck, Worker/unit/runtime tests, coaching tests, and the strict dry run.
 5. Provision the environment's D1 database once, commit/configure its UUID, apply remote migrations, and add `ANALYTICS_ADMIN_TOKEN` plus `ROOM_FACT_HASH_KEY` as dashboard secrets before the first platform deploy; do not create a database on every build. If topic providers are enabled, set the provider variables, add `ZAI_API_KEY` or `GEMINI_API_KEY` only for its matching selector, and ensure Workers Paid access for `glm53`.
 6. Use `npm run deploy` as the deploy command.
 7. Keep the Worker name aligned with `name` in `wrangler.jsonc` (`nonstoptalk` by default).
@@ -155,18 +171,18 @@ The browser coaching prototype is a separate path, not game-feature parity. Inde
 
 ## Custom domain
 
-The easiest custom-domain layout is a whole subdomain because the app uses root-relative `/api`, `/room`, and asset paths. Add a Custom Domain in the dashboard, or add a route like this to `wrangler.jsonc`:
+Production declares the apex Custom Domain directly in `wrangler.jsonc`, so a Git deployment preserves it as code-reviewed configuration:
 
 ```json
 "routes": [
   {
-    "pattern": "talk.example.com",
+    "pattern": "dontstoptalking.org",
     "custom_domain": true
   }
 ]
 ```
 
-The player URL then becomes `https://talk.example.com/room/ABC234`. Hosting it below a prefix such as `example.com/nonstoptalk/*` requires application path changes and is not currently supported.
+The player URL is therefore `https://dontstoptalking.org/room/ABC234`. A whole alternate domain or subdomain also works because the app uses root-relative `/api`, `/room`, and asset paths. Hosting below a prefix such as `example.com/nonstoptalk/*` requires application path changes and is not currently supported.
 
 ## Why the original deployment failed
 
@@ -184,7 +200,7 @@ The `v1` migration creates `RoomDurableObject` with the SQLite backend required 
 
 ## D1 migrations and platform secrets
 
-Files in `cloudflare/migrations` are append-only. Apply them locally with `npm run db:migrate:local` and remotely with `npm run db:migrate:remote`. Migration `0003_model_usage.sql` advances the platform schema to version 3 and adds the aggregate-only `model_usage_daily` reservation/reconciliation table; deploy it before enabling either external topic tier. Production also needs the created D1 UUID in `wrangler.jsonc`; set the protected bearer value with `npx wrangler secret put ANALYTICS_ADMIN_TOKEN` and a separate random room-fact key with `npx wrangler secret put ROOM_FACT_HASH_KEY`, never in source control. A suitable key can be generated locally with `openssl rand -hex 32`. Optional Z.AI and Gemini keys are likewise Wrangler secrets and are required only for their enabled topic tier. Without the room key, coarse room-event totals continue best-effort but linkable D1 room facts are deliberately skipped. `GET` or `HEAD` on `/api/v1/platform/status` checks D1 and reports non-secret configured or degraded capabilities, including admin analytics, keyed room facts, and routine/escalated topic-provider readiness.
+Files in `cloudflare/migrations` are append-only. Apply them locally with `npm run db:migrate:local` and remotely with `npm run db:migrate:remote`. Migration `0003_model_usage.sql` advances the platform schema to version 3 and adds the aggregate-only `model_usage_daily` reservation/reconciliation table; deploy it before enabling either external topic tier. Production also needs the created D1 UUID in `wrangler.jsonc`; set the protected bearer value with `npx wrangler secret put ANALYTICS_ADMIN_TOKEN` and a separate random room-fact key with `npx wrangler secret put ROOM_FACT_HASH_KEY`, never in source control. Numeric-only secrets work: generate each independently with a password manager's cryptographic numeric generator or, on Linux, `LC_ALL=C tr -dc '0-9' </dev/urandom | head -c 64`, then paste the 64 digits into Wrangler's hidden prompt. Optional Z.AI and Gemini keys are likewise Wrangler secrets and are required only for their enabled topic tier. Without the room key, coarse room-event totals continue best-effort but linkable D1 room facts are deliberately skipped. `GET` or `HEAD` on `/api/v1/platform/status` checks D1 and reports non-secret configured or degraded capabilities, including admin analytics, keyed room facts, and routine/escalated topic-provider readiness.
 
 The `17 3 * * *` cron invokes retention cleanup daily at 03:17 UTC. One device-level UTC-day-bucketed lease keeps anonymous detail active for at least 30 and less than 31 days after cloud use; summary rows do not need per-read lease rewrites. The v2 migration preserves every valid v1 summary whose own expiry and device lease are still active, even when an identity has more than 250 rows, and excludes already-expired v1 detail. The 250 threshold blocks only new saves; it does not force-delete preserved history. HMAC-pseudonymous room facts expire after 90 days. Cleanup deletes bounded batches, continues through a capped number of batches in one invocation, and leaves any remaining backlog for the next cron. Aggregate daily analytics rows are retained, but their event delivery is best-effort rather than a durable ledger. Separate aggregate daily model-usage rows enforce the topic-provider budget and retain only provider/model/task dimensions, call outcomes, model token aggregates, latency, and timestamps—not theme or generated-topic text, room/member/authentication tokens, identities, audio, or transcripts.
 
@@ -202,3 +218,5 @@ D1 is authoritative for successfully stored consented summaries, consent records
 [assets-billing]: https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/
 [worker-routing]: https://developers.cloudflare.com/workers/configuration/routing/
 [rate-limit-binding]: https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
+[workers-logs]: https://developers.cloudflare.com/workers/observability/logs/workers-logs/
+[workers-traces]: https://developers.cloudflare.com/workers/observability/traces/

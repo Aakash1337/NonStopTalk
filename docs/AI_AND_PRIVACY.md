@@ -58,6 +58,8 @@ D1 stores aggregate UTC-day provider usage needed to enforce `MODEL_DAILY_CALL_L
 
 Opening `/practice` does not start the microphone. The setup explains that analysis is on-device, and the browser asks for microphone permission only after the user starts calibration. Permission remains controlled by the browser and can be revoked.
 
+The recommended baseline/retry format also limits feedback as a privacy- and measurement-preserving product rule: both attempts are `review-only`. While speaking, the page shows the prompt, goal, timer, and microphone-connected state but does not mount the live meter, live statistics, or coaching-tip surface. The alternative single coached format uses sparse live cues and is stored as a standalone attempt. This distinction is local application state; it does not introduce another network or model boundary.
+
 The user can opt into experimental transcript analysis. That checkbox is enabled only when the browser exposes a `SpeechRecognition` object with the mandatory-local-processing property. NonStopTalk then:
 
 1. Creates recognition for the current microphone track.
@@ -71,7 +73,7 @@ If recognition is absent, cannot be initialized, rejects the track, or captures 
 
 Full-session retention is an independent checkbox and starts unchecked on a fresh page load. It is enabled only when `MediaRecorder` exists. If selected, recording begins after calibration when the attempt starts. On completion, the application saves the encoded attempt recording when recording succeeds and any captured transcript that is available to a separate local artifact store. A transcript-only artifact can still be saved if recording fails after transcript analysis returned text. Selecting recording retention does not silently enable transcription; selecting transcript analysis does not silently retain captured transcript text. **Try again** preserves the visible setup selections so the user can review or uncheck them before the next attempt. Canceling or navigating away before completion stops the recorder and discards its unsaved chunks.
 
-Compact cloud backup is a third, independent choice and also starts off. Selecting it for an attempt sends only a strictly allowlisted summary: scenario/goal/time, aggregate measurements, deterministic advice, and any bounded derived word-pattern fields already permitted in the summary. It excludes raw samples, measurement frames, segments, recordings, captured transcript text, artifact metadata, names, room identity, and account data. The API ties the backup to the existing high-entropy HTTP-only browser token and stores only its SHA-256 digest in D1. This is not an account or a recovery credential: clearing the cookie can make the records unreachable, there is no cross-device access, and one device-level inactivity lease controls all of this browser's cloud summaries. The lease is bucketed to a UTC day, lasts at least 30 and less than 31 days after cloud use, and does not require each summary to be rewritten on ordinary reads. New saves are rejected once 250 summaries exist; valid unexpired legacy rows are preserved rather than forcibly deleted.
+Compact cloud backup is a third, independent choice and also starts off. Selecting it for an attempt sends only a strictly allowlisted summary: scenario/goal/time, aggregate measurements, deterministic advice, any bounded derived word-pattern fields already permitted in the summary, and the explicit practice relationship (`practiceLoopId`, `baselineAttemptId`, `attemptRole`, and `feedbackMode`) when present. These opaque relationship fields contain no media or captured words. It excludes raw samples, measurement frames, segments, recordings, captured transcript text, artifact metadata, names, room identity, and account data. The API ties the backup to the existing high-entropy HTTP-only browser token and stores only its SHA-256 digest in D1. This is not an account or a recovery credential: clearing the cookie can make the records unreachable, there is no cross-device access, and one device-level inactivity lease controls all of this browser's cloud summaries. The lease is bucketed to a UTC day, lasts at least 30 and less than 31 days after cloud use, and does not require each summary to be rewritten on ordinary reads. New saves are rejected once 250 summaries exist; valid unexpired legacy rows are preserved rather than forcibly deleted.
 
 This is intentionally stricter than detecting a generic `SpeechRecognition` API, whose default processing location may be chosen by the browser. MDN documents the [`processLocally` contract and on-device language-pack behavior](https://developer.mozilla.org/en-US/docs/Web/API/Web_Speech_API/Using_the_Web_Speech_API#on-device_speech_recognition). Availability is browser-, version-, language-, and device-dependent.
 
@@ -85,7 +87,8 @@ microphone MediaStream
   → AudioWorklet (preferred) or AnalyserNode compatibility path
   → short-lived RMS + peak frames
   → browser coaching analyzer
-  → live cue + post-attempt metrics/advice
+  → review-only paired attempt or sparse live cue in single-coached mode
+  → post-attempt metrics/advice
   → compact summary in this site's IndexedDB in the current browser profile
   → optional allowlisted-summary backup to Worker API → D1
 ```
@@ -147,6 +150,7 @@ The automated coaching smoke test watches the default/off flow and asserts that 
 
 - A random record ID and creation time
 - Scenario, selected goal, and target duration
+- Explicit opaque practice-loop/baseline IDs, attempt role, and feedback mode for new records; legacy records may omit them
 - Aggregate duration, speech/pause, level consistency, clipping, and confidence measurements
 - Optional transcript counts, rates, and bounded filler/repeated-word patterns
 - The rule-selected strength/focus and deterministically assembled drill text
@@ -160,9 +164,9 @@ It does not contain:
 - The in-memory local-retrieval score, matched terms, or source metadata
 - Names, email addresses, room identities, or account identifiers
 
-The separate `session-artifacts` store is empty unless full-session retention was selected and at least one artifact was captured. Each record can contain the session ID/time, audio `Blob`, MIME type, captured transcript text, and `transcriptMayBePartial`. `/progress` reads an artifact only for an individual download and uses summary metadata to show any partial-text warning. **Export JSON** reads only `session-summaries`: it includes derived patterns and artifact-presence metadata, but excludes the recording and captured transcript text. **Delete local history** clears both stores after confirmation. A downloaded recording/transcript becomes an ordinary file outside browser storage and is not removed by the in-app delete action.
+The separate `session-artifacts` store is empty unless full-session retention was selected and at least one artifact was captured. Each record can contain the session ID/time, audio `Blob`, MIME type, captured transcript text, and `transcriptMayBePartial`. `/progress` reads an artifact only for an individual download and uses summary metadata to show any partial-text warning. **Export JSON** reads only `session-summaries`: it includes relationship metadata, derived patterns, and artifact-presence metadata, but excludes the recording and captured transcript text. **Delete saved artifacts** removes one attempt's artifact and resets that summary's artifact metadata in one transaction while preserving the compact attempt and pair. **Delete local history** clears both stores after confirmation. A downloaded recording/transcript becomes an ordinary file outside browser storage and is not removed by either in-app delete action.
 
-IndexedDB is scoped to a site origin (scheme, host, and port) within a browser profile. Records are best-effort browser storage: site-data deletion, private browsing behavior, or storage pressure may remove them. Local artifacts have no automatic expiration, so they may remain until the user deletes local history or site data. A custom domain, `workers.dev`, `127.0.0.1:8787`, and another local port each have separate local history.
+IndexedDB is scoped to a site origin (scheme, host, and port) within a browser profile. Records are best-effort browser storage: site-data deletion, private browsing behavior, or storage pressure may remove them. Local artifacts have no automatic expiration, so they may remain until the user deletes that attempt's artifacts, all local history, or site data. A custom domain, `workers.dev`, `127.0.0.1:8787`, and another local port each have separate local history.
 
 The in-progress cloud store is separate. It keeps only explicitly backed-up compact summaries and versioned consent records in D1, keyed by a hashed anonymous browser identity. Cloud use refreshes one UTC-day-bucketed device lease; scheduled cleanup removes expired anonymous detail in bounded batches and leaves any remaining backlog for a later cron run. The Progress delete control clears local stores and, when cloud backup is enabled and reachable, the current anonymous browser's D1 summaries. There is still no account, recovery flow, app-level encryption, or cross-device synchronization.
 
@@ -244,10 +248,10 @@ The prototype therefore shows availability and signal confidence, keeps transcri
 
 ## Future, not implemented
 
-- Automatic baseline-to-unassisted-retry pairing and goal-specific comparison
+- Validated learning-outcome or universal-improvement interpretation for the implemented explicit baseline-to-unassisted-retry comparisons
 - Validated learning-outcome or fairness targets
 - Accounts, cross-device authentication/progress, educator assignments, or shared coaching reports
-- Per-attempt artifact deletion, automatic local expiration, storage-quota controls, or app-level encryption
+- Automatic local artifact expiration, storage-quota controls, or app-level encryption; per-attempt artifact deletion is implemented
 - Semantic analysis of structure, relevance, concision, examples, or answer completeness
 - Production semantic/LLM RAG, local-model, self-hosted, bring-your-own-key, or paid-provider coaching adapters
 - Queue-backed provider work or R2 storage for coaching media

@@ -6,28 +6,40 @@
     "node": ">=22.0.0"
   },
   "scripts": {
-    "check:cloudflare": "wrangler deploy --dry-run",
+    "audit:dependencies": "npm audit --audit-level=high",
+    "check:cloudflare": "wrangler deploy --dry-run --strict --env=",
+    "check:cloudflare-staging": "wrangler deploy --dry-run --strict --env staging",
+    "check:cloudflare-startup": "wrangler check startup --outfile /tmp/nonstoptalk-worker-startup.cpuprofile",
+    "check:cloudflare-types": "wrangler types cloudflare/worker-configuration.d.ts --include-runtime false --check",
     "db:create": "wrangler d1 create nonstoptalk-platform",
     "db:migrate:local": "wrangler d1 migrations apply PLATFORM_DB --local",
-    "db:migrate:remote": "wrangler d1 migrations apply PLATFORM_DB --remote",
-    "test:coach": "node --test cloudflare/public/coach-engine.test.js",
+    "db:migrate:remote": "wrangler d1 migrations apply PLATFORM_DB --remote --env=",
+    "db:migrate:staging": "wrangler d1 migrations apply PLATFORM_DB --remote --env staging",
+    "test:coach": "node --test cloudflare/public/coach-engine.test.js cloudflare/public/coach-loop.test.js",
     "test:cloud-progress": "node --test cloudflare/public/cloud-progress.test.js",
     "test:cloudflare": "tsx --test cloudflare/*.test.ts",
+    "test:cloudflare-runtime": "tsc -p cloudflare/runtime-tests/tsconfig.json && vitest run --config vitest.worker.config.ts",
+    "types:cloudflare": "wrangler types cloudflare/worker-configuration.d.ts --include-runtime false",
     "typecheck:cloudflare": "tsc -p cloudflare/tsconfig.json",
-    "deploy": "wrangler deploy",
+    "deploy": "npm run db:migrate:remote && wrangler deploy --strict --env= && npm run smoke:production",
+    "deploy:staging": "npm run db:migrate:staging && wrangler deploy --strict --env staging && npm run smoke:staging",
     "dev": "wrangler dev",
     "smoke": "node scripts/smoke-local.mjs",
     "smoke:coach": "node scripts/smoke-coach.mjs",
-    "smoke:platform": "node scripts/smoke-platform.mjs"
+    "smoke:platform": "node scripts/smoke-platform.mjs",
+    "smoke:production": "node scripts/smoke-production.mjs",
+    "smoke:staging": "node scripts/smoke-production.mjs https://nonstoptalk-staging.aakashplays656.workers.dev && node scripts/smoke-staging.mjs https://nonstoptalk-staging.aakashplays656.workers.dev"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "5.20260804.1",
+    "@cloudflare/vitest-plugin": "1.1.2",
+    "@cloudflare/workers-types": "5.20260901.1",
     "@types/node": "24.13.3",
     "htmx.org": "2.0.10",
     "playwright": "1.60.0",
     "tsx": "4.23.5",
     "typescript": "7.0.2",
-    "wrangler": "4.118.0"
+    "vitest": "4.1.11",
+    "wrangler": "4.127.1"
   },
   "overrides": {
     "undici": "7.29.0"

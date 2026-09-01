@@ -15,13 +15,14 @@ It currently supports:
 - 30, 45, 60, or 90 second attempts
 - A four-second, session-specific microphone calibration
 - Browser-side acoustic analysis through `AudioWorklet`, with an `AnalyserNode` compatibility path
-- Sparse deterministic live cues
+- A recommended review-only baseline → review → unassisted-retry format, plus an alternative standalone format with sparse deterministic live cues
 - A post-attempt strength, highest-value focus, evidence, and retry drill
+- Explicit safe grouping and selected-goal baseline/retry measurements with limited-evidence guardrails and no improvement verdict
 - Optional transcript-derived pace/filler/repetition evidence through strict on-device browser recognition; consented derived word patterns remain in the compact summary
 - Aggregate session summaries in IndexedDB, plus JSON export
-- Separate, off-by-default local retention of the attempt recording and available captured transcript, with partial-text warnings, per-attempt downloads, and confirmed two-store deletion
+- Separate, off-by-default local retention of the attempt recording and available captured transcript, with partial-text warnings, per-attempt downloads, artifact-only deletion that preserves the summary/pair, and confirmed two-store history deletion
 
-It does not prove that the current thresholds work equally well across microphones, rooms, languages, accents, disabilities, or browsers. It does not yet pair a baseline with an unassisted retry or establish a learning outcome.
+It does not prove that the current thresholds work equally well across microphones, rooms, languages, accents, disabilities, or browsers. The explicit pair and descriptive comparison are implemented, but they do not establish a learning outcome or prove that the retry improved.
 
 ## Try it locally
 
@@ -59,11 +60,13 @@ go run ./cmd/web
 
 The setup asks for:
 
+- **Practice format:** Baseline + unassisted retry (recommended) or Single coached attempt
 - **Scenario:** Interview answer, Presentation opening, or Impromptu response
 - **Goal:** Intentional pace, Purposeful pauses, or Steady delivery
 - **Length:** 30, 45, 60, or 90 seconds
 - **Optional transcript:** A separate checkbox that is enabled only when the browser exposes mandatory local-processing support
 - **Optional full-session retention:** An independent, unchecked checkbox that is enabled only when the browser exposes `MediaRecorder`
+- **Optional compact cloud backup:** An independent, unchecked checkbox that sends only the compact allowlisted summary
 
 Choosing one goal limits the amount of advice and makes a later retry interpretable. The three prompts are fixed prototype content, not a curriculum or generated AI content.
 
@@ -80,9 +83,11 @@ Calibration lasts four seconds:
 
 The analyzer derives a threshold between those observations. This is more resilient than one global amplitude cutoff, but it is still sensitive to sudden noise, distance changes, automatic device processing, and a user who speaks during the quiet phase.
 
-### 3. Speak with sparse live feedback
+### 3. Speak in review-only or single-coached mode
 
-The live page keeps the prompt and selected focus dominant. It shows:
+The recommended baseline/retry format deliberately withholds live coaching. Both attempts show the prompt, selected focus, remaining time, and a microphone-connected state, but they do not mount the live level meter, live statistics, or coaching-tip surface. Measurements appear only after speaking, so the retry does not depend on live help.
+
+The alternative **Single coached attempt** keeps the prior sparse-live-cue behavior. Its live page shows:
 
 - Seconds remaining
 - Normalized microphone level
@@ -112,13 +117,25 @@ The review contains:
 
 The timeline exists only in the in-memory review. It is intentionally excluded from the stored summary.
 
-### 5. Retry or review local-first progress
+### 5. Complete or resume the explicit practice loop
 
-**Try again** returns to setup with the same selections. The prototype does not yet link two attempts as a baseline/retry pair or claim that the second attempt improved.
+After a review-only baseline, **Prepare unassisted retry** opens a setup that locks the scenario, goal, and target duration to the baseline. The optional transcript, artifact-retention, and compact-backup controls remain visible and independently controllable. If the user leaves after the baseline, Progress shows **Complete unassisted retry**; resuming from there restores the locked comparison setup after reload and starts all three optional data controls unchecked. A single coached review instead offers **Try again** and remains an independent attempt.
+
+The compact summaries store a secure opaque loop ID, the exact baseline attempt ID, an attempt role (`baseline`, `retry`, or `standalone`), and a feedback mode (`review-only` or `live-cues`). A baseline points to itself; a retry points to that exact baseline. Pre-loop analysis-schema-v2 summaries are treated as legacy standalone attempts.
+
+Progress never pairs by timestamp. It compares only a valid explicit relationship with matching supported scenario, goal, target duration, and analysis schema. Duplicate baselines, malformed relationships, missing baselines, and setup mismatches remain visible as unpaired records.
+
+For a valid pair, Progress and retry Review display raw baseline → retry values and descriptive deltas for only the selected goal:
+
+- **Intentional pace:** eligible estimated WPM when both attempts contain at least 15 analyzed seconds and 25 recognized words, plus longest speaking run and median measured pause.
+- **Purposeful pauses:** measured pauses per observed minute, median measured pause, and longest speaking run.
+- **Steady delivery:** level consistency and clipping-frame percentage.
+
+The comparison is labeled **Limited evidence** when either attempt contains less than 15 analyzed seconds, less than 75% signal coverage, low/unknown signal confidence, or no shared measurement for the selected goal. It still exposes the raw available values and explains the limitation. The UI explicitly says that slower/faster, more/fewer pauses, or another numerical direction is not automatically better, that input-level measures also reflect microphone/setup conditions, and that the pair is not a universal speaking score.
 
 `/progress` always reads summaries for the current site origin and browser profile. After this browser has opted into compact backup, it also reads reachable D1 summaries and merges them by session ID; local records win so local-only artifact controls survive. This anonymous cookie is not an account or cross-device credential. One device-level UTC-day-bucketed lease controls all of its cloud summaries and lasts at least 30 and less than 31 days after cloud use. New saves stop when 250 summaries already exist; valid unexpired legacy rows remain available rather than being forcibly deleted.
 
-The user can export merged summary JSON. When a completed attempt has separately retained artifacts, Progress shows local download controls and repeats any partial-transcript warning. JSON never includes retained artifacts. Confirmed deletion clears both local stores and, when backup is enabled and reachable, this anonymous browser's cloud summaries. Another domain, scheme, port, or browser profile has separate IndexedDB and cookie scope.
+The user can export merged summary JSON. When a completed attempt has separately retained artifacts, Progress shows local download and **Delete saved artifacts** controls and repeats any partial-transcript warning. Artifact-only deletion removes that attempt's artifact record and resets its artifact metadata in one IndexedDB transaction while preserving the compact summary and loop comparison. JSON never includes retained artifacts. Confirmed full-history deletion clears both local stores and, when backup is enabled and reachable, this anonymous browser's cloud summaries. Another domain, scheme, port, or browser profile has separate IndexedDB and cookie scope.
 
 ## Architecture and data flow
 
@@ -142,7 +159,8 @@ Workers Static Assets
             │    calibration → speech/pause segments → aggregate metrics
             │
             ├─ CoachingTipPolicy
-            │    snapshots → deterministic sparse cue
+            │    standalone snapshots → deterministic sparse cue
+            │    review-only pair → policy disabled; no live cue/meter/stats
             │
             ├─ optional SpeechRecognition(processLocally = true)
             │    text → aggregate counts + bounded derived word patterns
@@ -158,7 +176,8 @@ Workers Static Assets
             └─ rule-selected strength/focus
                  + supported drill + fixed comparison sentence → review
                   ├─ card labeled used guidance or retrieved context
-                  └─ IndexedDB v2 → /progress
+                  ├─ explicit loop/baseline/role/feedback relationship
+                  └─ IndexedDB v2 → safe relationship grouping → /progress
                        ├─ session-summaries (every saved attempt)
                        └─ session-artifacts (only after separate opt-in)
                               │
@@ -345,7 +364,7 @@ The Web Speech on-device APIs are experimental and browser-dependent. MDN docume
 
 ## Optional full-session artifacts
 
-Attempt-recording/captured-transcript retention is independent from transcript analysis and starts unchecked on a fresh page load. **Try again** preserves the visible setup selections so the user can review or uncheck them before the next attempt. If `MediaRecorder` is unavailable, the setup disables this option and compact summaries still work.
+Attempt-recording/captured-transcript retention is independent from transcript analysis and starts unchecked on a fresh page load. The standalone **Try again** and direct baseline-to-retry setup preserve visible selections so the user can review or uncheck them; resuming an unfinished retry from Progress resets transcript analysis, artifact retention, and compact backup to unchecked. If `MediaRecorder` is unavailable, the setup disables retention and compact summaries still work.
 
 When selected:
 
@@ -356,6 +375,8 @@ When selected:
 5. The application saves that encoded `Blob` and any captured transcript to `session-artifacts`, linked to the summary by ID.
 
 Recording retention does not enable transcription. If transcript analysis was off or produced no text, the artifact may contain audio only. If the recorder failed but captured transcript text exists, a transcript-only artifact can be saved. Canceling or navigating away stops the recorder, clears pending chunks, and saves no unfinished artifact.
+
+Progress can delete one attempt's saved recording/captured transcript without deleting its compact summary. The summary metadata is reset and the artifact record is removed in one transaction, so an explicit baseline/retry relationship and its measurement comparison remain available. Local artifacts still have no automatic expiration, quota dashboard, or app-level encryption, and downloaded files remain outside application control.
 
 ## Small local RAG, deterministic tips, and advice
 
@@ -501,6 +522,10 @@ Conceptual summary record:
   scenario,
   goal,
   targetDurationMs,
+  practiceLoopId,       // null for standalone
+  baselineAttemptId,    // null for standalone; self ID for a baseline
+  attemptRole,          // standalone | baseline | retry
+  feedbackMode,         // live-cues | review-only
   metrics: {
     durationMs,
     observedDurationMs,
@@ -560,9 +585,9 @@ Conceptual full-artifact record, created only after the separate retention choic
 
 The full in-memory review also contains speech/pause segments and local-retrieval grounding (retrieved cards, `usedCardId`, source, score, and matched terms). `buildCoachingSummary` deliberately excludes segments, grounding metadata, raw frames, raw audio, and captured transcript text, while retaining the allowlisted aggregate metrics, derived word patterns, advice, and artifact-presence metadata—including `transcriptMayBePartial`. If an artifact exists, the summary and artifact are written in one IndexedDB transaction.
 
-The cloud allowlist is narrower again: it keeps schema/ID/time, scenario/goal/target duration, aggregate metrics, optional bounded derived word patterns, and normalized advice. It strips the complete `artifacts` object as well as arbitrary extra fields before the Worker validates the payload again. Raw samples, recordings, captured transcript text, and artifact-presence metadata therefore remain local.
+The cloud allowlist is narrower again: it keeps schema/ID/time, scenario/goal/target duration, the four explicit relationship fields when present, aggregate metrics, optional bounded derived word patterns, and normalized advice. It strips the complete `artifacts` object as well as arbitrary extra fields before the Worker validates the payload again. Raw samples, recordings, captured transcript text, and artifact-presence metadata therefore remain local. D1 also populates its reserved `practice_loop_id`, `baseline_attempt_id`, and `attempt_role` columns; `feedbackMode` remains in validated summary JSON.
 
-JSON export reads only `session-summaries` and adds product/export schema metadata. It therefore includes consented derived pattern labels and artifact-presence metadata—including the partial-text flag—but never the audio `Blob` or captured transcript text. The visible card source remains available only in the immediate review, not historical `/progress` records. Artifact download buttons read one `session-artifacts` record at a time; recording extensions follow its MIME type, and transcripts download as UTF-8 `.txt` files.
+JSON export reads only `session-summaries` and adds product/export schema metadata. It therefore includes explicit loop relationships, consented derived pattern labels, and artifact-presence metadata—including the partial-text flag—but never the audio `Blob` or captured transcript text. The visible card source remains available only in the immediate review, not historical `/progress` records. Artifact download/delete buttons address one `session-artifacts` record at a time; recording extensions follow its MIME type, and transcripts download as UTF-8 `.txt` files.
 
 ## Privacy and consent checklist
 
@@ -576,10 +601,12 @@ JSON export reads only `session-summaries` and adds product/export schema metada
 | Transcript finalization | Waits up to two seconds after `stop()`; preserves returned text on error/timeout, warns that it may be partial, and never retains error payloads |
 | Full-session retention | Independent, unchecked opt-in; stores attempt audio and any available captured transcript in `session-artifacts` |
 | Stored summary | Aggregate metrics, consented derived patterns, normalized advice, and artifact-presence metadata—including `transcriptMayBePartial`—in origin-scoped IndexedDB |
+| Practice relationship | Secure opaque loop and baseline IDs plus fixed attempt-role/feedback-mode enums; contains no media or captured transcript text |
 | Compact cloud backup | Independent, unchecked opt-in; sends only the narrower summary allowlist to D1 under a hashed anonymous browser identity; one device-level day-bucketed 30–31-day inactivity lease; new saves stop once 250 exist |
 | Export | Summary store only; excludes audio `Blob` and captured transcript text |
 | Individual download | Reads the opted-in artifact and creates a recording file or UTF-8 transcript file |
-| Delete | Clears `session-summaries` and `session-artifacts` after confirmation; previously downloaded files are outside its scope |
+| Delete one artifact | Removes one `session-artifacts` record and resets that summary's artifact metadata in one transaction; the compact summary/pair remains |
+| Delete all history | Clears `session-summaries` and `session-artifacts` after confirmation; previously downloaded files are outside its scope |
 | Navigation/cancel | Stops recognition/recorder, discards unsaved chunks, stops microphone tracks/worklet/intervals/context, and rejects delayed permission/worklet activation |
 | Cloudflare Durable Object | Multiplayer room state only; receives no coaching data |
 | Central D1 | Explicitly backed-up compact summaries, consent, anonymous expiry, and aggregate platform facts; never media/captured transcripts |
@@ -593,12 +620,13 @@ Read the implementation in this order:
 
 1. **`cloudflare/public/index.html`** — the persistent document shell and primary navigation.
 2. **`cloudflare/public/app.js`** — the Practice/Progress lifecycle, local stores, and opt-in handoff.
-3. **`cloudflare/public/cloud-progress.js`** — the narrow cloud-summary allowlist and versioned API client.
-4. **`cloudflare/public/coach-audio-worklet.js`** — the small sample-to-RMS/peak processor.
-5. **`cloudflare/public/coach-engine.js`** — calibration, metrics, retrieval, tips, grounding, and advice.
-6. **`cloudflare/platform.ts`** — Worker-side validation, anonymous ownership, D1 retention, and aggregate analytics.
-7. **`scripts/smoke-coach.mjs`** — browser-level proof using synthetic media, local stores, lifecycle races, and default/off network assertions.
-8. **`wrangler.jsonc`** — Static Assets SPA fallback plus Worker/Durable Object bindings for the separate multiplayer API.
+3. **`cloudflare/public/coach-loop.js`** — pure relationship validation, safe grouping, and descriptive selected-goal comparison guardrails.
+4. **`cloudflare/public/cloud-progress.js`** — the narrow cloud-summary allowlist and versioned API client.
+5. **`cloudflare/public/coach-audio-worklet.js`** — the small sample-to-RMS/peak processor.
+6. **`cloudflare/public/coach-engine.js`** — calibration, metrics, retrieval, tips, grounding, and advice.
+7. **`cloudflare/platform.ts`** — Worker-side validation, anonymous ownership, relationship columns, D1 retention, and aggregate analytics.
+8. **`scripts/smoke-coach.mjs`** — browser-level proof using synthetic media, the complete pair/resume flow, local stores, lifecycle races, and default/off network assertions.
+9. **`wrangler.jsonc`** — Static Assets SPA fallback plus Worker/Durable Object bindings for the separate multiplayer API.
 
 ## How to explain the implementation
 
@@ -611,7 +639,7 @@ Use this sequence instead of starting with file names:
 5. **Measure:** Segment durations and voiced levels produce inspectable aggregate metrics.
 6. **Retrieve:** The selected goal and measured evidence rank curated local coaching cards.
 7. **Assemble advice:** The top retrieved card normally supplies the intact base drill; an evidence-safety rule can keep the measured priority's drill instead. Deterministic rules append one metric-specific comparison sentence, select strength/focus, and record whether the card was used.
-8. **Store by consent:** The default path clears live media/captured text and writes a local summary. Separate choices may write a linked local artifact or send the narrower compact-summary allowlist to D1.
+8. **Store and relate by consent:** The default path clears live media/captured text and writes a local summary with explicit standalone or baseline/retry metadata. Separate choices may write a linked local artifact or send the narrower compact-summary allowlist to D1. Progress validates relationships before grouping or comparing them.
 
 This makes the privacy boundary and the coaching mechanism understandable without calling every calculation “AI.”
 
@@ -646,10 +674,10 @@ npm run smoke
 
 What each coaching check demonstrates:
 
-- `test:coach` runs 21 tests that feed controlled frames/transcripts into the pure engine and check calibration, segmentation (including zero callbacks → zero coverage), observed/unknown time, continuity confidence, metrics, tips, retrieval, card-use grounding safety, deterministic drill assembly, and advice.
-- `smoke:coach` drives `/practice` with synthetic media, covers local storage/artifact/lifecycle behavior, and asserts that the default/off path makes no coaching-data API request.
-- `test:cloud-progress` checks the separate opt-in allowlist, merged-history behavior, API calls, and preference state; platform tests cover Worker validation, identity, expiry, and analytics.
-- `smoke:platform` starts an isolated local Wrangler/D1 environment and exercises status, backup, export, aggregate analytics, privacy rejection, and cloud deletion.
+- `test:coach` runs 34 tests across controlled frames/transcripts, the pure engine, legacy/explicit relationships, persistence gating, safe grouping, immutable comparisons, exact goal measures, and limited-evidence guardrails.
+- `smoke:coach` drives `/practice` with synthetic media through both the standalone live-cue path and the default baseline → Progress/reload/resume → review-only retry path. It covers local storage, comparison, artifact-only deletion, lifecycle behavior, and asserts that default/off local-first paths make no coaching-data API request.
+- `test:cloud-progress` checks the separate opt-in allowlist, relationship metadata/legacy compatibility, merged-history behavior, API calls, and preference state; platform tests cover Worker relationship validation, identity, expiry, analytics, and local-artifact stripping.
+- `smoke:platform` starts an isolated local Wrangler/D1 environment and exercises status, backup, relationship-field round trip and reserved D1 columns, export, aggregate analytics, privacy rejection, and cloud deletion.
 - `check:cloudflare` confirms that the Worker and all Static Assets, including the coaching modules, form a valid deploy bundle.
 
 These tests do not replace real-device, accessibility, security, or fairness validation.
@@ -663,11 +691,10 @@ These tests do not replace real-device, accessibility, security, or fairness val
 - Strict on-device speech recognition is experimental and uneven across browsers/languages.
 - Transcript analysis uses simple English token/rule matching, not semantic understanding.
 - Fixed prompts, fixed goals, and English UI are prototype content.
-- Progress compares standalone summaries and does not yet pair a baseline with an unassisted retry.
-- Speaking ratio change is descriptive; it is not a universal improvement direction.
+- Progress implements explicit baseline/retry pairing and descriptive selected-goal changes, but those changes have not been validated as learning outcomes or improvement directions.
 - The local coaching-card library is intentionally small; retrieval is lexical rather than semantic and still requires relevance/fairness evaluation.
 - Derived filler/repetition labels may contain sensitive words even though they are not captured transcript text.
-- Retained artifacts have no automatic expiration, per-attempt deletion, quota dashboard, or app-level encryption; anyone with access to the unlocked browser profile may reach them.
+- Retained artifacts support per-attempt deletion but have no automatic expiration, quota dashboard, or app-level encryption; anyone with access to the unlocked browser profile may reach them before deletion.
 - No accounts, recovery, cross-device authentication/sync, educator view, or shared report exists. Anonymous D1 backup is tied to one browser identity.
 - No external coaching AI, Queue-backed provider work, or R2 media storage exists.
 - No formal WCAG, security, privacy, microphone/device, learning-outcome, or subgroup-fairness study has been completed.
@@ -716,7 +743,7 @@ Do not set adoption or improvement targets until the event definitions, measurem
 | D1 | The central relational store for explicitly backed-up compact summaries and aggregate platform records. It is not used for coaching media or live room authority. |
 | RAG | Retrieval-augmented generation: retrieve relevant context, then use it to shape an output. This prototype uses lexical retrieval plus deterministic templates locally—no LLM, embeddings, vector database, or network. |
 | Baseline | A first, unassisted attempt used as the comparison point for a specific goal. |
-| Unassisted retry | A comparable second attempt made without depending on live coaching prompts; the intended evidence of learned change. |
+| Unassisted retry | A linked second attempt made with the same scenario, goal, and target duration and without live measurements or coaching cues. Its raw delta is descriptive evidence, not proof of learning or improvement. |
 | Driver metric | A measurable step that helps explain whether users can reach the desired outcome. |
 | Guardrail metric | A measurement that detects harm or a tradeoff while optimizing the main outcome. |
 

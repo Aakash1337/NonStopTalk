@@ -22,6 +22,7 @@ import {
 	modelAuthorizationErrorForStatus,
 	type ModelRouteBindings,
 } from "./model-routes";
+import { logWorkerEvent } from "./observability";
 import { parseRoomRoute } from "./routes";
 
 const TOKEN_COOKIE = "nonstoptalk_token";
@@ -30,17 +31,17 @@ const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const MAX_ROOM_SOCKETS = 64;
 const MAX_SOCKETS_PER_TOKEN = 4;
 const ROOM_IDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const ROOM_DELETE_RETRY_MS = 60 * 60 * 1000;
 const HOST_HTTP_PRESENCE_BUCKET_MS = 15_000;
 const ROOM_MILESTONES_HEADER = "X-NonStopTalk-Room-Milestones";
 const MODEL_TOPICS_ROUTE = "/api/v1/models/topics";
 
-interface Env extends PlatformBindings, ModelRouteBindings {
-	ROOMS: DurableObjectNamespace<RoomDurableObject>;
-	ASSETS: Fetcher;
-	ROOM_CREATION_RATE_LIMITER: RateLimit;
-	API_RATE_LIMITER: RateLimit;
-	MODEL_RATE_LIMITER: RateLimit;
-}
+/**
+ * Wrangler generates the declared Cloudflare bindings in
+ * worker-configuration.d.ts. The smaller module contracts add optional
+ * secrets and provider selectors that Wrangler cannot discover from config.
+ */
+type WorkerEnv = Env & PlatformBindings & ModelRouteBindings;
 
 interface SocketAttachment {
 	token: string;
@@ -52,8 +53,8 @@ interface TokenIdentity {
 	migratedLegacy: boolean;
 }
 
-export class RoomDurableObject extends DurableObject<Env> {
-	constructor(ctx: DurableObjectState, env: Env) {
+export class RoomDurableObject extends DurableObject<WorkerEnv> {
+	constructor(ctx: DurableObjectState, env: WorkerEnv) {
 		super(ctx, env);
 	}
 
@@ -67,6 +68,7 @@ export class RoomDurableObject extends DurableObject<Env> {
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		const requestId = request.headers.get("X-Request-ID") ?? undefined;
 		try {
 			const url = new URL(request.url);
 			const token = request.headers.get("X-NonStopTalk-Token") ?? "";
@@ -166,7 +168,10 @@ export class RoomDurableObject extends DurableObject<Env> {
 			return json({ error: "Not found." }, 404);
 		} catch (error) {
 			if (error instanceof GameError) return json({ error: error.message }, error.status);
-			console.error("room request failed", { error: safeWorkerErrorName(error) });
+			logWorkerEvent("error", "room_request_failed", {
+				requestId,
+				error: safeWorkerErrorName(error),
+			});
 			return json({ error: "The room could not process that request." }, 500);
 		}
 	}
@@ -216,7 +221,22 @@ export class RoomDurableObject extends DurableObject<Env> {
 				// The socket is already closed.
 			}
 		}
-		await this.ctx.storage.deleteAll();
+		try {
+			await this.ctx.storage.deleteAll();
+		} catch (error) {
+			logWorkerEvent("error", "room_expiry_delete_failed", {
+				error: safeWorkerErrorName(error),
+				retryAfterSeconds: ROOM_DELETE_RETRY_MS / 1000,
+			});
+			try {
+				await this.ctx.storage.setAlarm(Date.now() + ROOM_DELETE_RETRY_MS);
+			} catch (scheduleError) {
+				logWorkerEvent("error", "room_expiry_schedule_failed", {
+					error: safeWorkerErrorName(scheduleError),
+				});
+				throw scheduleError;
+			}
+		}
 	}
 
 	private recordDisconnect(socket: WebSocket): void {
@@ -248,9 +268,12 @@ export class RoomDurableObject extends DurableObject<Env> {
 		this.ctx.waitUntil(
 			this.ctx.storage
 				.setAlarm(room.updatedAt + ROOM_IDLE_TTL_MS)
-				.catch((error: unknown) => console.error("could not schedule room expiry", {
-					error: safeWorkerErrorName(error),
-				})),
+				.catch((error: unknown) => {
+					logWorkerEvent("error", "room_expiry_schedule_failed", {
+						error: safeWorkerErrorName(error),
+					});
+					throw error;
+				}),
 		);
 	}
 
@@ -335,10 +358,11 @@ function refreshHTTPHostPresence(
 }
 
 export default {
-	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		const url = new URL(request.url);
-		if (!url.pathname.startsWith("/api/")) return env.ASSETS.fetch(request);
+	async fetch(request: Request, env: WorkerEnv, ctx: ExecutionContext): Promise<Response> {
 		const requestId = crypto.randomUUID();
+		try {
+			const url = new URL(request.url);
+			if (!url.pathname.startsWith("/api/")) return env.ASSETS.fetch(request);
 
 		if (!sameOrigin(request)) {
 			return withRequestId(json({ error: "Cross-origin request rejected." }, 403), requestId);
@@ -376,6 +400,7 @@ export default {
 						code,
 						request,
 						token,
+						requestId,
 						"/authorize-topic-generation",
 						{},
 					);
@@ -415,7 +440,7 @@ export default {
 				key: await rateLimitKey(request, identity.token, "room-create"),
 			});
 			if (!success) {
-				console.warn("Room creation rate limit rejected a request.");
+				logWorkerEvent("warn", "room_creation_rate_limited", { requestId });
 				const response = json({ error: "Too many rooms were created from this connection. Try again shortly." }, 429);
 				response.headers.set("Retry-After", "60");
 				return withRequestId(withIdentityCookie(response, identity, request), requestId);
@@ -434,7 +459,7 @@ export default {
 			}
 			for (let attempt = 0; attempt < 8; attempt += 1) {
 				const code = randomCode();
-				const response = await roomFetch(env, code, request, identity.token, "/create", {
+				const response = await roomFetch(env, code, request, identity.token, requestId, "/create", {
 					code,
 					name: text(body.name),
 				});
@@ -474,44 +499,72 @@ export default {
 			return withRequestId(json({ error: "Load the room once before opening its live connection." }, 401), requestId);
 		}
 
-		const response = await roomFetch(env, code, request, identity.token, `/${endpoint}`);
+		const response = await roomFetch(env, code, request, identity.token, requestId, `/${endpoint}`);
 		if (endpoint !== "socket") scheduleRoomMilestones(ctx, env, response);
 		return endpoint === "socket"
 			? response
 			: withRequestId(withIdentityCookie(withoutRoomMilestones(response), identity, request), requestId);
+		} catch (error) {
+			logWorkerEvent("error", "worker_request_failed", {
+				requestId,
+				versionId: env.CF_VERSION_METADATA?.id,
+				error: safeWorkerErrorName(error),
+			});
+			const response = json({
+				error: "The service is temporarily unavailable.",
+				requestId,
+			}, 503);
+			response.headers.set("Retry-After", "5");
+			return withRequestId(response, requestId);
+		}
 	},
-	async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+	async scheduled(_controller: ScheduledController, env: WorkerEnv, ctx: ExecutionContext): Promise<void> {
 		ctx.waitUntil(
 			runPlatformCleanup(env).catch((error: unknown) => {
-				console.error("platform retention cleanup failed", { error: safeWorkerErrorName(error) });
+				logWorkerEvent("error", "platform_cleanup_failed", { error: safeWorkerErrorName(error) });
+				throw error;
 			}),
 		);
 	},
-};
+} satisfies ExportedHandler<WorkerEnv>;
 
 function safeWorkerErrorName(error: unknown): string {
 	return error instanceof Error && error.name ? error.name : "UnknownError";
 }
 
 async function roomFetch(
-	env: Env,
+	env: WorkerEnv,
 	code: string,
 	request: Request,
 	token: string,
+	requestId: string,
 	pathname: string,
 	body?: unknown,
 ): Promise<Response> {
 	const id = env.ROOMS.idFromName(code);
 	const stub = env.ROOMS.get(id);
-	const headers = new Headers(request.headers);
+	const headers = new Headers();
 	headers.set("X-NonStopTalk-Token", token);
-	headers.delete("Cookie");
+	headers.set("X-Request-ID", requestId);
+	if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+		for (const name of [
+			"Upgrade",
+			"Sec-WebSocket-Key",
+			"Sec-WebSocket-Version",
+			"Sec-WebSocket-Protocol",
+			"Sec-WebSocket-Extensions",
+		]) {
+			const value = request.headers.get(name);
+			if (value) headers.set(name, value);
+		}
+	}
 	const init: RequestInit = { method: request.method, headers };
 	if (body !== undefined) {
-		headers.delete("Content-Length");
 		headers.set("Content-Type", "application/json");
 		init.body = JSON.stringify(body);
 	} else if (request.method !== "GET" && request.method !== "HEAD") {
+		const contentType = request.headers.get("Content-Type");
+		if (contentType) headers.set("Content-Type", contentType);
 		init.body = request.body;
 	}
 	return stub.fetch(new Request(`https://room.internal${pathname}`, init));
@@ -568,7 +621,7 @@ function withoutRoomMilestones(response: Response): Response {
 	return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
-function scheduleRoomMilestones(ctx: ExecutionContext, env: Env, response: Response): void {
+function scheduleRoomMilestones(ctx: ExecutionContext, env: WorkerEnv, response: Response): void {
 	const milestones = response.headers
 		.get(ROOM_MILESTONES_HEADER)
 		?.split(",")
@@ -594,7 +647,9 @@ function scheduleRoomMilestones(ctx: ExecutionContext, env: Env, response: Respo
 				);
 			}
 		})().catch((error: unknown) => {
-			console.warn("room milestone analytics failed", { error: error instanceof Error ? error.name : "UnknownError" });
+			logWorkerEvent("warn", "room_milestone_delivery_failed", {
+				error: error instanceof Error ? error.name : "UnknownError",
+			});
 		}),
 	);
 }

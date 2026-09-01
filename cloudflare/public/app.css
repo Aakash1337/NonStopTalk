@@ -117,6 +117,15 @@ textarea { resize: vertical; line-height: 1.5; }
 .check-list { display: grid; gap: .55rem; margin: 1rem 0 0; padding: 0; list-style: none; color: var(--ink); font-size: .86rem; }
 .check-list li::before { content: "✓"; margin-right: .55rem; color: var(--acid); }
 .coach-setup { padding: clamp(1.25rem, 4vw, 2.5rem); }
+.practice-loop-notice { display: flex; align-items: center; gap: .75rem; }
+.practice-loop-notice span { color: var(--muted); }
+.practice-format { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; margin: .5rem 0; padding: 0; border: 0; }
+.practice-format legend { grid-column: 1 / -1; margin-bottom: .35rem; color: var(--muted); font-size: .78rem; }
+.format-choice { position: relative; grid-template-columns: auto 1fr; align-items: start; gap: .75rem; padding: 1rem; border: 1px solid var(--line); border-radius: .8rem; background: #131411; cursor: pointer; }
+.format-choice:has(input:checked) { border-color: #59672d; background: #1c2112; }
+.format-choice input { width: 1rem; margin-top: .2rem; accent-color: var(--acid); }
+.format-choice span { display: grid; gap: .3rem; color: var(--ink); }
+.format-choice small { color: var(--muted); line-height: 1.45; }
 .step-mark { color: var(--muted); font: 700 .75rem/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; }
 .coach-fields { display: grid; grid-template-columns: 1.2fr 1.2fr .6fr; gap: .75rem; margin: .75rem 0; }
 .consent-card { min-width: 0; margin: .5rem 0; padding: 1rem; border: 1px solid var(--line); border-radius: .8rem; }
@@ -147,6 +156,9 @@ textarea { resize: vertical; line-height: 1.5; }
 .coach-meter { position: relative; width: min(28rem, 90%); height: .85rem; margin: .5rem 0 1.5rem; overflow: hidden; border: 1px solid var(--line); border-radius: 999px; background: #0b0c0a; }
 .coach-meter span { display: block; height: 100%; min-width: 2px; background: linear-gradient(90deg, #93b72a 0, var(--acid) 72%, var(--danger) 94%); transition: width 90ms linear; }
 .coach-meter i { position: absolute; top: 0; bottom: 0; left: 92%; width: 1px; background: var(--danger); }
+.review-only-status { width: min(28rem, 100%); margin: .5rem 0 1.5rem; padding: .85rem 1rem; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: .2rem .65rem; border: 1px solid #4d5d27; border-radius: .75rem; background: #18200f; text-align: left; }
+.review-only-status > span { grid-row: span 2; color: var(--acid); text-shadow: 0 0 10px var(--acid); }
+.review-only-status small { color: var(--muted); line-height: 1.4; }
 .live-stats { display: grid; grid-template-columns: repeat(3, minmax(5rem, 1fr)); gap: .5rem; width: min(28rem, 100%); margin-bottom: 1.5rem; }
 .live-stats div { padding: .7rem; border-top: 1px solid var(--line); display: grid; }
 .live-stats span { font: 800 1.1rem/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -156,6 +168,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .coach-tip h2 { font-size: clamp(1.5rem, 3vw, 2.1rem); }
 .coach-tip p:last-child { color: var(--muted); line-height: 1.5; }
 .coach-tip.is-visible { border-color: var(--acid); background: linear-gradient(160deg, rgba(46,53,23,.95), var(--surface)); box-shadow: inset 0 0 50px rgba(213,255,79,.035); }
+.coach-tip.review-only-card { border-color: #4d5d27; min-height: 13rem; background: linear-gradient(160deg, rgba(37,43,20,.72), var(--surface)); }
 
 .review-head, .progress-hero { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 1rem; }
 .review-head h1, .progress-hero h1 { max-width: 12ch; font-size: clamp(3rem, 8vw, 6.2rem); }
@@ -194,6 +207,23 @@ textarea { resize: vertical; line-height: 1.5; }
 .grounding-evidence p:last-child { margin-bottom: 0; color: var(--muted); }
 .review-actions { padding: 1.25rem 0; }
 .review-actions p { margin: .3rem 0 0; }
+.loop-next-step { margin-bottom: 1rem; border-color: #4d5d27; }
+.loop-next-step h2 { max-width: 34rem; }
+.loop-next-step p:last-child { margin-bottom: 0; color: var(--muted); }
+.paired-comparison { margin: 0 0 1rem; padding: clamp(1.25rem, 4vw, 2.5rem); border: 1px solid #4d5d27; border-radius: 1.25rem; background: linear-gradient(145deg, rgba(37,43,20,.7), rgba(20,21,18,.97)); }
+.paired-comparison.limited { border-color: #665c2b; background: linear-gradient(145deg, rgba(42,39,19,.7), rgba(20,21,18,.97)); }
+.comparison-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .65rem; margin: 1.25rem 0; }
+.comparison-measure { min-width: 0; padding: 1rem; border: 1px solid var(--line); border-radius: .75rem; background: #11120f; display: grid; gap: .6rem; }
+.comparison-measure > span { color: var(--muted); font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; }
+.comparison-measure strong { font: 800 clamp(1rem, 2vw, 1.25rem)/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.comparison-measure strong i { color: var(--acid); font-style: normal; }
+.comparison-measure small { color: var(--muted); line-height: 1.4; }
+.comparison-reasons { padding: .85rem 1rem; border-radius: .7rem; background: rgba(102,92,43,.2); }
+.comparison-reasons ul { margin: .45rem 0 0; padding-left: 1.2rem; color: var(--muted); }
+.comparison-caveat { margin: 1rem 0 0; }
+.paired-comparison.compact { margin: 0; padding: 1rem; border-radius: .8rem; }
+.paired-comparison.compact .comparison-grid { grid-template-columns: 1fr; margin: .75rem 0; }
+.paired-comparison.compact .comparison-measure { padding: .75rem; }
 
 .progress-hero { align-items: center; }
 .progress-hero > div { max-width: 52rem; }
@@ -201,6 +231,17 @@ textarea { resize: vertical; line-height: 1.5; }
 .progress-metrics .review-metric { padding: 1.4rem; }
 .progress-history { padding: clamp(1.25rem, 4vw, 2.5rem); }
 .attempt-list { display: grid; margin-top: 1rem; }
+.practice-loop-list { gap: 1rem; }
+.practice-loop-row { padding: 1.25rem; border: 1px solid var(--line); border-radius: 1rem; background: #141512; }
+.practice-loop-row > header { display: flex; justify-content: space-between; gap: 1rem; padding-bottom: 1rem; border-bottom: 1px solid var(--line); }
+.practice-loop-row > header h3 { margin: .25rem 0; }
+.practice-loop-row > header p, .practice-loop-row > header time { color: var(--muted); font-size: .78rem; }
+.loop-role { color: var(--acid); font: 750 .68rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.loop-attempt { padding: 1rem 0; }
+.loop-attempt.retry { display: grid; grid-template-columns: minmax(14rem, .6fr) minmax(22rem, 1.4fr); gap: 1rem; border-top: 1px solid var(--line); }
+.loop-attempt .attempt-numbers { margin-top: .75rem; }
+.loop-resume { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+.loop-resume p { margin: .3rem 0 0; }
 .attempt-row { display: grid; grid-template-columns: minmax(12rem, .8fr) minmax(17rem, 1fr) minmax(13rem, .8fr); align-items: center; gap: 1.25rem; padding: 1.25rem 0; border-top: 1px solid var(--line); }
 .attempt-row time { color: var(--muted); font-size: .73rem; }
 .attempt-row h3 { margin: .35rem 0 .15rem; }
@@ -234,6 +275,7 @@ textarea { resize: vertical; line-height: 1.5; }
   .coach-hero, .practice-grid, .advice-grid { grid-template-columns: 1fr; }
   .coach-hero > div:first-child { min-height: 22rem; }
   .coach-fields { grid-template-columns: 1fr; }
+  .practice-format, .comparison-grid { grid-template-columns: 1fr; }
   .coach-start-row, .review-actions, .storage-controls, .review-head, .progress-hero, .transcript-evidence { align-items: stretch; flex-direction: column; }
   .grounding-evidence { grid-template-columns: 1fr; }
   .coach-start, .review-actions .button, .progress-hero .button { width: 100%; }
@@ -244,6 +286,8 @@ textarea { resize: vertical; line-height: 1.5; }
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .progress-metrics { grid-template-columns: 1fr; }
   .attempt-row { grid-template-columns: 1fr; }
+  .loop-attempt.retry { grid-template-columns: 1fr; }
+  .practice-loop-row > header, .loop-resume, .practice-loop-notice { align-items: stretch; flex-direction: column; }
   .attempt-numbers { justify-content: space-between; }
 }
 

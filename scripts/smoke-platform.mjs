@@ -133,8 +133,8 @@ function completeSummary(id, extra = {}) {
 
 const stateDirectory = await mkdtemp(path.join(os.tmpdir(), "nonstoptalk-platform-"));
 const upgradeStateDirectory = await mkdtemp(path.join(os.tmpdir(), "nonstoptalk-platform-upgrade-"));
-const port = await getFreePort();
-const origin = `http://127.0.0.1:${port}`;
+let port;
+let origin;
 let logs = "";
 let auxiliaryLogs = "";
 let child;
@@ -382,6 +382,8 @@ try {
   await stopAndWait(auxiliaryChild);
   auxiliaryChild = undefined;
 
+  port = await getFreePort();
+  origin = `http://127.0.0.1:${port}`;
   child = spawn(
     process.execPath,
     [
@@ -475,6 +477,10 @@ try {
   assert(forbidden.payload.error?.code === "FORBIDDEN_CLOUD_DATA", "Privacy rejection needs a stable error code");
 
   const validSummary = completeSummary("attempt-1", {
+    practiceLoopId: "smoke-loop-1",
+    baselineAttemptId: "attempt-1",
+    attemptRole: "baseline",
+    feedbackMode: "review-only",
     artifacts: {
       audioStored: true,
       audioBytes: 12345,
@@ -490,6 +496,11 @@ try {
   assert(saved.response.status === 201, `Summary save failed (${saved.response.status}): ${JSON.stringify(saved.payload)}`);
   assert(saved.response.headers.get("x-request-id"), "Platform responses must include a request ID");
   assert(!JSON.stringify(saved.payload).includes("audioBytes"), "Local artifact metadata must not be returned from cloud storage");
+  assert(saved.payload.session?.practiceLoopId === "smoke-loop-1"
+    && saved.payload.session?.baselineAttemptId === "attempt-1"
+    && saved.payload.session?.attemptRole === "baseline"
+    && saved.payload.session?.feedbackMode === "review-only",
+  "The cloud save response must preserve explicit review-only loop relationships");
 
   const retried = await request("/api/v1/progress/sessions", {
     method: "POST",
@@ -504,6 +515,31 @@ try {
   const serialized = JSON.stringify(listed.payload);
   assert(!serialized.includes("capturedTranscript"), "Captured transcript fields must never be returned");
   assert(!serialized.includes("audioBytes"), "Local artifact metadata must never be persisted");
+  assert(listed.payload.sessions[0]?.practiceLoopId === "smoke-loop-1"
+    && listed.payload.sessions[0]?.baselineAttemptId === "attempt-1"
+    && listed.payload.sessions[0]?.attemptRole === "baseline"
+    && listed.payload.sessions[0]?.feedbackMode === "review-only",
+  "Cloud list must round-trip the exact baseline relationship without synthesizing a pair");
+
+  const relationshipCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+      "--command", `SELECT practice_loop_id AS practiceLoopId,
+        baseline_attempt_id AS baselineAttemptId, attempt_role AS attemptRole
+        FROM coaching_sessions WHERE session_id = 'attempt-1'`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (relationshipCheck.status !== 0) {
+    throw new Error(`Could not verify the practice relationship D1 columns.\n${relationshipCheck.stdout}\n${relationshipCheck.stderr}`);
+  }
+  const storedRelationship = JSON.parse(relationshipCheck.stdout)[0]?.results?.[0];
+  assert(storedRelationship?.practiceLoopId === "smoke-loop-1"
+    && storedRelationship?.baselineAttemptId === "attempt-1"
+    && storedRelationship?.attemptRole === "baseline",
+  `Reserved D1 relationship columns were not populated: ${JSON.stringify(storedRelationship)}`);
 
   const roomCreated = await request("/api/rooms", { method: "POST", body: { name: "Smoke host" } });
   assert(roomCreated.response.status === 201, `Room creation failed (${roomCreated.response.status})`);

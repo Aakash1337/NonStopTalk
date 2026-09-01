@@ -28,6 +28,7 @@ export function sanitizeCloudSummary(value = {}) {
     fillerOccurrences: sanitizePatterns(transcript.fillerOccurrences, "phrase"),
     repeatedWords: sanitizePatterns(transcript.repeatedWords, "word"),
   } : null;
+  const relationship = sanitizePracticeRelationship(value);
   return {
     analysisSchemaVersion: Math.max(1, Math.trunc(Number(value.analysisSchemaVersion) || 1)),
     id: shortText(value.id, 80),
@@ -37,6 +38,7 @@ export function sanitizeCloudSummary(value = {}) {
     targetDurationMs: finiteOrNull(value.targetDurationMs),
     metrics: cleanMetrics,
     advice: Object.fromEntries(ADVICE_KEYS.map((key) => [key, shortText(advice[key], 600)])),
+    ...relationship,
   };
 }
 
@@ -116,6 +118,17 @@ function sanitizePatterns(items, key) {
     const label = shortText(item?.[key], 64);
     return label ? [{ [key]: label, count: finiteOrNull(item?.count) ?? 0 }] : [];
   });
+}
+
+function sanitizePracticeRelationship(value) {
+  const fields = ["practiceLoopId", "baselineAttemptId", "attemptRole", "feedbackMode"];
+  if (!fields.some((key) => Object.hasOwn(value || {}, key))) return {};
+  return {
+    practiceLoopId: value.practiceLoopId === null ? null : shortText(value.practiceLoopId, 128),
+    baselineAttemptId: value.baselineAttemptId === null ? null : shortText(value.baselineAttemptId, 128),
+    attemptRole: shortText(value.attemptRole, 16),
+    feedbackMode: shortText(value.feedbackMode, 20),
+  };
 }
 
 function finiteOrNull(value) {

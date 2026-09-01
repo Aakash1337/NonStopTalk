@@ -153,6 +153,73 @@ test("normalizes the exact buildCoachingSummary shape into a detached allowlist"
 	assert.notEqual(normalized.metrics, input.metrics);
 });
 
+test("normalizes paired practice relationships while preserving legacy analysis-v2 summaries", () => {
+	const legacy = normalizeCoachingSummary(coachingSummary());
+	assert.equal("attemptRole" in legacy, false);
+
+	const baselineInput = {
+		...coachingSummary(),
+		practiceLoopId: "loop-2026-09-01-1",
+		baselineAttemptId: "attempt-2026-08-30-1",
+		attemptRole: "baseline",
+		feedbackMode: "review-only",
+	};
+	const baseline = normalizeCoachingSummary(baselineInput);
+	assert.deepEqual({
+		practiceLoopId: baseline.practiceLoopId,
+		baselineAttemptId: baseline.baselineAttemptId,
+		attemptRole: baseline.attemptRole,
+		feedbackMode: baseline.feedbackMode,
+	}, {
+		practiceLoopId: "loop-2026-09-01-1",
+		baselineAttemptId: "attempt-2026-08-30-1",
+		attemptRole: "baseline",
+		feedbackMode: "review-only",
+	});
+
+	const retry = normalizeCoachingSummary({
+		...coachingSummary(),
+		id: "attempt-2026-09-01-retry",
+		practiceLoopId: "loop-2026-09-01-1",
+		baselineAttemptId: "attempt-2026-08-30-1",
+		attemptRole: "retry",
+		feedbackMode: "review-only",
+	});
+	assert.equal(retry.attemptRole, "retry");
+
+	const standalone = normalizeCoachingSummary({
+		...coachingSummary(),
+		practiceLoopId: null,
+		baselineAttemptId: null,
+		attemptRole: "standalone",
+		feedbackMode: "live-cues",
+	});
+	assert.equal(standalone.attemptRole, "standalone");
+});
+
+test("rejects incomplete, assisted, or self-referential practice relationships", () => {
+	const partial = { ...coachingSummary(), attemptRole: "baseline" };
+	expectPlatformError(() => normalizeCoachingSummary(partial), "INVALID_INPUT");
+
+	const assisted = {
+		...coachingSummary(),
+		practiceLoopId: "loop-1",
+		baselineAttemptId: "attempt-2026-08-30-1",
+		attemptRole: "baseline",
+		feedbackMode: "live-cues",
+	};
+	expectPlatformError(() => normalizeCoachingSummary(assisted), "INVALID_INPUT");
+
+	const selfRetry = {
+		...coachingSummary(),
+		practiceLoopId: "loop-1",
+		baselineAttemptId: "attempt-2026-08-30-1",
+		attemptRole: "retry",
+		feedbackMode: "review-only",
+	};
+	expectPlatformError(() => normalizeCoachingSummary(selfRetry), "INVALID_INPUT");
+});
+
 test("rejects raw transcript and audio fields instead of silently dropping them", () => {
 	for (const forbidden of [
 		{ transcript: "captured words" },
@@ -204,10 +271,18 @@ test("enforces the 64 KiB cloud payload boundary", () => {
 });
 
 test("cloud export strips browser-local artifact metadata", () => {
-	const normalized = normalizeCoachingSummary(coachingSummary());
+	const normalized = normalizeCoachingSummary({
+		...coachingSummary(),
+		practiceLoopId: "loop-1",
+		baselineAttemptId: "attempt-2026-08-30-1",
+		attemptRole: "baseline",
+		feedbackMode: "review-only",
+	});
 	const exported = withoutLocalArtifacts(normalized);
 	assert.equal("artifacts" in exported, false);
 	assert.equal(JSON.stringify(exported).includes("audio/webm"), false);
+	assert.equal(exported.practiceLoopId, "loop-1");
+	assert.equal(exported.attemptRole, "baseline");
 });
 
 test("hashes only a valid 64-hex browser token with SHA-256", async () => {

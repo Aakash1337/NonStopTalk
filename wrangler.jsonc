@@ -2,10 +2,40 @@
 	"$schema": "./node_modules/wrangler/config-schema.json",
 	"name": "nonstoptalk",
 	"main": "cloudflare/worker.ts",
-	"compatibility_date": "2026-08-04",
+	"compatibility_date": "2026-09-01",
 	"workers_dev": true,
+	// Version preview URLs would share the same Durable Object namespace and
+	// D1 bindings as their environment, so they are deliberately disabled.
+	"preview_urls": false,
+	"routes": [
+		{
+			"pattern": "dontstoptalking.org",
+			"custom_domain": true
+		}
+	],
+	"upload_source_maps": true,
+	"version_metadata": {
+		"binding": "CF_VERSION_METADATA"
+	},
 	"observability": {
-		"enabled": true
+		"enabled": true,
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1,
+			"invocation_logs": true
+		},
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 0.01
+		}
+	},
+	// Provider selection and budget are non-secret deployment policy. Keeping
+	// them in version control prevents a deploy from silently discarding values
+	// that were set only in the dashboard. API credentials remain secrets.
+	"vars": {
+		"TOPIC_ROUTINE_PROVIDER": "offline",
+		"TOPIC_ESCALATION_PROVIDER": "off",
+		"MODEL_DAILY_CALL_LIMIT": "100"
 	},
 	"triggers": {
 		"crons": [
@@ -81,5 +111,95 @@
 				"RoomDurableObject"
 			]
 		}
-	]
+	],
+	"env": {
+		"staging": {
+			"name": "nonstoptalk-staging",
+			"workers_dev": true,
+			"preview_urls": false,
+			// Never inherit or attach the production custom domain to staging.
+			"routes": [],
+			"upload_source_maps": true,
+			"version_metadata": {
+				"binding": "CF_VERSION_METADATA"
+			},
+			"vars": {
+				"TOPIC_ROUTINE_PROVIDER": "offline",
+				"TOPIC_ESCALATION_PROVIDER": "off",
+				"MODEL_DAILY_CALL_LIMIT": "25"
+			},
+			"triggers": {
+				"crons": [
+					"47 3 * * *"
+				]
+			},
+			"d1_databases": [
+				{
+					"binding": "PLATFORM_DB",
+					"database_name": "nonstoptalk-platform-staging",
+					"database_id": "f9c14523-6f11-4cbe-99a1-85853a73ba96",
+					"migrations_dir": "cloudflare/migrations"
+				}
+			],
+			"analytics_engine_datasets": [
+				{
+					"binding": "PRODUCT_ANALYTICS",
+					"dataset": "nonstoptalk_product_staging"
+				}
+			],
+			"ai": {
+				"binding": "AI"
+			},
+			"assets": {
+				"directory": "./cloudflare/public",
+				"binding": "ASSETS",
+				"not_found_handling": "single-page-application",
+				"run_worker_first": [
+					"/api/*"
+				]
+			},
+			"ratelimits": [
+				{
+					"name": "ROOM_CREATION_RATE_LIMITER",
+					"namespace_id": "6677870",
+					"simple": {
+						"limit": 10,
+						"period": 60
+					}
+				},
+				{
+					"name": "API_RATE_LIMITER",
+					"namespace_id": "6677871",
+					"simple": {
+						"limit": 60,
+						"period": 60
+					}
+				},
+				{
+					"name": "MODEL_RATE_LIMITER",
+					"namespace_id": "6677872",
+					"simple": {
+						"limit": 5,
+						"period": 60
+					}
+				}
+			],
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "ROOMS",
+						"class_name": "RoomDurableObject"
+					}
+				]
+			},
+			"migrations": [
+				{
+					"tag": "v1",
+					"new_sqlite_classes": [
+						"RoomDurableObject"
+					]
+				}
+			]
+		}
+	}
 }

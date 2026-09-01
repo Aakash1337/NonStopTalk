@@ -4,7 +4,7 @@ This guide turns the prototype into a clear product story. It is written for a f
 
 **Short preparation path:** Follow [Learn NonStopTalk in 45 minutes](LEARN_IN_45_MINUTES.md), then keep the [presentation cheat sheet](PRESENTATION_CHEAT_SHEET.md) beside the live demo. This document remains the canonical long-form narrative and Q&A reference.
 
-> **Prototype status:** The coaching experience is an early, local-first prototype in the native Cloudflare SPA. It demonstrates objective browser analysis, optional strict on-device transcription, deterministic retrieval/template advice, local progress, separately opted-in recording/captured-transcript retention, and an independent compact-summary backup. It is not a medical tool, a speech-language assessment, or a finished AI coach.
+> **Prototype status:** The coaching experience is an early, local-first prototype in the native Cloudflare SPA. It demonstrates objective browser analysis, optional strict on-device transcription, deterministic retrieval/template advice, an explicit review-only baseline → review → unassisted-retry loop, descriptive goal-specific comparison, local progress, separately opted-in recording/captured-transcript retention with per-attempt deletion, and an independent compact-summary backup. It is not a medical tool, a speech-language assessment, a validated learning intervention, or a finished AI coach.
 
 ## The one-sentence pitch
 
@@ -45,9 +45,9 @@ The resulting design has seven layers:
 1. **Private signal extraction.** An `AudioWorklet` receives microphone sample frames on the browser's audio rendering thread and reduces them to objective measurements such as level, clipping, speech time, and pauses. Raw frames are not stored or sent to the application server.
 2. **Optional local words.** If the browser can guarantee `SpeechRecognition.processLocally`, the user may opt into transcript analysis for pace and word-pattern estimates. Bounded derived filler/repetition patterns stay with the summary; captured transcript text is discarded by default. If strict local recognition is unavailable, the audio-only coach still works.
 3. **Small local retrieval.** The selected goal and measured evidence form a query over a curated set of coaching cards shipped with the application. Lexical retrieval selects relevant context; there are no embeddings, vector database, model, or network request.
-4. **Sparse, traceable coaching.** Transparent rules produce sparse live acoustic tips and separately choose review strength/focus. Normally the highest-ranked card supplies the intact base drill. If the measurements do not support that card's advice, a safety rule keeps the measurement-backed drill and labels the card as retrieved context instead of used guidance. A fixed template appends what to compare, and cooldowns prevent a wall of live warnings. The same inputs produce the same result.
-5. **Local progress.** The browser stores compact summaries—including consented derived patterns—in origin-scoped IndexedDB for `/progress`. JSON export contains those summaries, not retained audio or captured transcript text.
-6. **Separate artifact choice.** An unchecked `MediaRecorder` option can retain the active-attempt recording and any available captured transcript in a second local store. Recognition gets up to two seconds to finish; if it times out or errors after returning text, Review and Progress warn that the retained transcript may be partial. These artifacts never upload.
+4. **Review-only comparison plus optional sparse coaching.** The recommended baseline and linked retry withhold live meters, statistics, and tips until review. The alternative single coached format can show sparse live acoustic tips. Transparent rules separately choose review strength/focus. Normally the highest-ranked card supplies the intact base drill. If the measurements do not support that card's advice, a safety rule keeps the measurement-backed drill and labels the card as retrieved context instead of used guidance. A fixed template appends what to compare. The same inputs produce the same result.
+5. **Explicit, safe local progress.** The browser stores compact summaries—including consented derived patterns and opaque loop/baseline/role/feedback metadata—in origin-scoped IndexedDB for `/progress`. Progress groups only validated explicit relationships, never recency, and shows raw selected-goal deltas with limited-evidence reasons/caveats. JSON export contains those summaries, not retained audio or captured transcript text.
+6. **Separate artifact choice.** An unchecked `MediaRecorder` option can retain the active-attempt recording and any available captured transcript in a second local store. Recognition gets up to two seconds to finish; if it times out or errors after returning text, Review and Progress warn that the retained transcript may be partial. These artifacts never upload and can be deleted per attempt without deleting its compact summary or comparison.
 7. **Separate compact backup choice.** A third unchecked control may send only allowlisted measurements/advice and bounded derived word-pattern fields to central D1. One UTC-day-bucketed device lease controls this anonymous browser's summaries and lasts at least 30 and less than 31 days after cloud use. New saves stop when 250 summaries already exist; migration does not forcibly delete valid unexpired legacy rows. It is not an account or cross-device credential.
 
 This is **retrieval-augmented deterministic generation**: a retrieved card normally supplies an unchanged base drill, then bounded template assembly appends one prewritten metric-comparison sentence. Evidence-safety rules can substitute a supported drill and leave the card as context only. It is a small local RAG pattern, not the common “vector database + LLM” stack. It was chosen because it is private, no-cost, fast, inspectable, and testable card by card. A production LLM-backed RAG layer could retrieve richer curriculum passages and generate contextual language, but it would add model/version behavior, embeddings or another search index, latency, cost, privacy/consent boundaries, source governance, prompt-injection defenses, and substantially more evaluation.
@@ -63,9 +63,9 @@ The product should be evaluated as a deliberate-practice tool, not by maximizing
 | Metric | Operational definition | Decision it supports |
 | --- | --- | --- |
 | Completed deliberate-practice loop | Number of comparable practice loops in which a user completes a baseline, reviews the evidence and advice, and completes an unassisted retry, divided by loops started. | Are people reaching the part of the experience that can create learning? |
-| Unassisted retry improvement | Paired change from baseline to an unassisted retry on the one goal selected for that loop, reported as a distribution rather than a universal score. Examples include filler words per 100 transcript words or long pauses per speaking minute. | Does the loop help users improve the behavior they chose without depending on live prompts? |
+| Unassisted retry change | Paired raw change from baseline to an unassisted retry on the one goal selected for that loop, reported as a distribution rather than a universal score or automatic improvement direction. | What changes after review, and is that change distinguishable from normal measurement noise in a consented pilot? |
 
-The current prototype records standalone session summaries and always enables its normal live-tip policy. A valid unassisted-retry KPI therefore requires a future loop ID, comparable scenario/goal/duration fields, and a retry mode with live tips disabled. Until repeated pilot data establishes normal measurement noise, the team should report raw paired deltas and confidence/availability, not declare a universal pass threshold.
+The current prototype supplies secure loop IDs, exact baseline links, fixed attempt-role/feedback-mode fields, locked scenario/goal/duration on retry, and a review-only mode with live meter/stat/tip surfaces absent. It reports raw selected-goal baseline → retry values and descriptive deltas only for valid explicit pairs. Evidence is labeled limited when either attempt is under 15 analyzed seconds, under 75% coverage, low/unknown confidence, or lacks a shared measurement. Until repeated pilot data establishes normal measurement noise and interpretation, report those raw deltas and limitations—not a pass threshold, learning outcome, or better/worse verdict.
 
 The platform's in-progress analytics attempt only coarse room/summary-save/delete/consent aggregates, including bounded timing/count values. D1 rollups and Analytics Engine delivery are both best-effort and can miss events; neither is an audit log. They do not contain speaking ratios, word patterns, advice, or evidence that establishes learning outcomes. An initial study still needs separately consented paired attempt data and facilitator/user ratings. Do not treat every browser event as an independent person.
 
@@ -85,7 +85,7 @@ The platform's in-progress analytics attempt only coarse room/summary-save/delet
 | Microphone availability | Sessions with a usable input and successful calibration divided by microphone attempts, segmented by browser/device. | Improve setup, compatibility, and fallback guidance. |
 | Local-transcription availability | Sessions where the browser verifies strict on-device recognition divided by requests for transcript-assisted coaching, segmented by browser/language. | Do not make transcript metrics part of the universal experience. |
 | Privacy network violations | Automated and manual network audits that observe audio samples, audio blobs, or transcript text leaving the browser. | This is a release blocker; the expected count is zero. |
-| Retention-boundary violations | Automated checks that full retention starts unchecked, artifacts appear only after that choice, summary export excludes full artifacts, and deletion clears both local stores. | Stop release and repair consent/storage boundaries before adding more data features. |
+| Retention-boundary violations | Automated checks that full retention starts unchecked, artifacts appear only after that choice, summary export excludes full artifacts, per-attempt deletion preserves the compact pair, and full-history deletion clears both local stores. | Stop release and repair consent/storage boundaries before adding more data features. |
 | Retrieval grounding quality | Human review of whether the retrieved card matches the goal/evidence and whether the review truthfully labels it as used guidance or context only, plus the percentage of advice views that display a valid curated source. | Revise card vocabulary, ranking, evidence-safety rules, fallback, or wording before expanding the library. |
 | Subgroup fairness | Compare availability, false-tip rate, and selected-goal deltas across voluntary, sufficiently sized language/accent groups and device classes. Never infer group membership from audio. | Investigate thresholds, copy, recognition coverage, and sampling before broad claims. |
 
@@ -109,9 +109,10 @@ Open `/practice` and show the privacy explanation before granting microphone acc
 
 1. Start a short practice attempt.
 2. Speak naturally and intentionally include one observable behavior, such as a long pause or an audible filler.
-3. Point out that the live surface shows only the current signal and at most one tip, rather than a dashboard of judgments.
+3. Point out that the recommended baseline is review-only: the timer and prompt remain visible, while the live meter, statistics, and tips are deliberately absent. Mention that sparse live cues exist only in the alternative single coached format.
 4. End the attempt and open the analysis.
 5. Connect one measurement to one recommendation and its provenance: “The browser observed X, retrieved this curated product card, so the next attempt asks me to do Y.” Make clear that the source label identifies the bundled card; it is not an independent evidence rating.
+6. Show **Prepare unassisted retry** and its locked setup. For a five-minute talk, use a non-sensitive completed pair prepared on the same origin rather than spending another calibration/attempt live; show the raw selected-goal comparison and its limitation/caveat copy.
 
 Use careful language:
 
@@ -129,13 +130,13 @@ Show the architecture diagram in [Speech Coaching Prototype](SPEECH_COACHING_PRO
 
 Open `/progress`.
 
-> “Progress is intentionally not one universal grade. The product compares a user with their own prior attempts and, next, will pair a baseline with an unassisted retry. The primary product question is whether people finish that deliberate-practice loop and improve the one behavior they chose.”
+> “Progress is intentionally not one universal grade. It pairs only an explicitly linked review-only baseline and unassisted retry, then shows raw measurements for the selected goal with signal limitations and caveats. That is a descriptive comparison, not proof that the person improved.”
 
 Name the guardrails: false tips, distraction, hardware and local-transcription availability, network privacy, and subgroup fairness.
 
 ### 4:20–5:00 — Close with the boundary and next step
 
-> “This prototype proves that private, explainable coaching can coexist with the original social game and deploy on the free web stack. It does not yet prove learning outcomes, work equally on every microphone, or replace a speech-language professional. The next step is a small, consented pilot: validate signal accuracy, collect baseline-and-retry pairs, and set targets only after we have evidence.”
+> “This prototype proves that private, explainable coaching and an explicit baseline/retry measurement loop can coexist with the original social game and deploy on the free web stack. It does not prove learning outcomes, work equally on every microphone, or replace a speech-language professional. The next step is a small, consented pilot: validate repeatability and interpretation of those pairs, then set targets only after we have evidence.”
 
 ## Demo runbook
 
@@ -172,12 +173,13 @@ Use headphones if the presentation is remote to reduce echo cancellation and fee
 
 1. Show the landing page and choose **Practice**.
 2. Explain the two independent options. Transcript analysis may retain bounded derived patterns; full-session recording/captured-transcript retention is separate and starts off.
-3. Start a short attempt with all optional choices off for the safest primary demo.
+3. Keep the recommended baseline/retry format and start a short baseline with all optional choices off for the safest primary demo.
 4. Speak, pause for about one second, resume speaking, then finish. A measured pause needs voice on both sides; ending on silence is intentionally treated as trailing quiet, not a completed pause.
 5. Explain the analysis, deterministic recommendation, and the Local RAG label that distinguishes used guidance from retrieved context.
-6. Open **Progress** to show the compact summary.
-7. If your tested browser supports strict local recognition, repeat with it enabled and show pace/filler estimates as an enhancement.
-8. If artifact retention is part of the presentation, repeat with the second box explicitly enabled, then show the per-attempt recording/transcript download controls and explain that JSON export still excludes those retained artifacts.
+6. Show **Prepare unassisted retry**, the locked scenario/goal/duration, and the explicit no-live-cue promise. Complete it only when presentation time allows; otherwise use a prepared pair from this exact origin.
+7. Open **Progress** to show the grouped loop, resumable state or completed goal comparison, raw delta, and signal limitations.
+8. If your tested browser supports strict local recognition, demonstrate it separately and show pace/filler estimates as an enhancement.
+9. If artifact retention is part of the presentation, repeat with that box explicitly enabled, then show per-attempt download and deletion controls and explain that JSON export still excludes retained artifacts while deletion preserves the compact summary.
 
 ### Fallbacks
 
@@ -213,7 +215,7 @@ Every successfully saved attempt gets a compact local summary with aggregate mea
 
 ### “Can I keep or download the recording and transcript?”
 
-The separate unchecked full-session-retention option records the active attempt. It keeps a captured transcript only when transcript analysis also returned text. Recordings and captured transcripts live in a separate origin-local artifact store, never enter cloud backup, and are excluded from JSON export. A finalization error/timeout is visibly marked possibly partial. Local artifacts have no automatic expiration or per-attempt deletion, and deleting app history cannot delete downloaded files.
+The separate unchecked full-session-retention option records the active attempt. It keeps a captured transcript only when transcript analysis also returned text. Recordings and captured transcripts live in a separate origin-local artifact store, never enter cloud backup, and are excluded from JSON export. A finalization error/timeout is visibly marked possibly partial. Progress can delete one attempt's artifacts while preserving its summary/pair. Local artifacts still have no automatic expiration, and deleting browser data cannot delete downloaded files.
 
 ### “How does it know when I am speaking?”
 
@@ -225,7 +227,7 @@ AudioWorklet processing runs with the browser's audio rendering work instead of 
 
 ### “What proves these boundaries work?”
 
-Twenty-one deterministic engine tests cover calibration, segmentation, confidence, tips, transcript analysis, retrieval, grounding safety, template assembly, and advice. The browser smoke covers local storage/artifact/lifecycle behavior and asserts that the default/off path makes no coaching-data API request. Separate cloud-progress and platform tests cover the summary allowlist, versioned APIs, anonymous ownership/expiry, and aggregate analytics. These are implementation checks, not real-device accuracy, accessibility, privacy certification, or fairness studies.
+Thirty-four deterministic coaching/loop tests cover calibration, segmentation, confidence, tips, transcript analysis, retrieval, grounding safety, template assembly, relationship validation, persistence gating, safe grouping, goal-specific comparison, and advice. The browser smoke covers both feedback modes, baseline → Progress/reload/resume → retry, local storage, artifact-only deletion, lifecycle behavior, and no coaching-data API request on local-first default/off paths. Separate cloud-progress and platform tests cover relationship metadata, legacy compatibility, the summary allowlist, reserved D1 columns, versioned APIs, anonymous ownership/expiry, and aggregate analytics. These are implementation checks, not real-device accuracy, accessibility, privacy certification, fairness, usefulness, or learning-outcome studies.
 
 ### “Why not send audio to a more accurate model?”
 
@@ -245,7 +247,7 @@ No. It is a general speaking-practice tool for rehearsal. It does not diagnose o
 
 ### “How do you know it helps?”
 
-We do not claim that yet. The prototype establishes the loop and measurement plan. A pilot must measure completed baseline/retry loops, paired goal-specific change, false tips, distraction, availability, privacy, and fairness before learning-outcome claims or numeric targets are justified.
+We do not claim that yet. The prototype implements the loop and descriptive measurement, not its learning effect. A pilot must measure repeatability, completed baseline/retry loops, paired goal-specific distributions, false tips, distraction, availability, privacy, and fairness before learning-outcome claims, direction labels, or numeric targets are justified.
 
 ### “Why keep the game?”
 

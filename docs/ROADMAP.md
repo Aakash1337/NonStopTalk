@@ -20,18 +20,21 @@ Implemented prototype scope:
 - Optional pace and filler estimates only when the browser supports strict on-device speech recognition and the user opts in
 - Lexical retrieval over a curated in-app coaching-card library, with no embeddings, vector database, model, or network request
 - Deterministic, sparse acoustic live tips, rule-selected review evidence/focus, and a post-attempt instruction normally assembled from the top retrieved card's prewritten drill plus a metric-specific comparison sentence; an evidence-safety rule can supply the drill instead, and the review labels the card as used or context only
+- A recommended review-only baseline → evidence/advice review → unassisted review-only retry format. Scenario, goal, and target duration stay locked for the retry; the alternative single coached format retains sparse live acoustic cues
+- Explicit loop, baseline, and attempt-role metadata in local and optional compact cloud summaries; Progress groups only linked records, restores an unfinished retry, leaves legacy/malformed/orphan records unpaired, and never compares unrelated attempts by recency
+- Descriptive selected-goal comparisons: pace uses eligible WPM, longest speaking run, and median pause; pauses uses measured pauses per observed minute, median pause, and longest speaking run; steady delivery uses level consistency and clipping. Short, low-coverage, low-confidence, or unavailable evidence is labeled limited, and no direction is declared improvement
 - Compact session summaries in origin-scoped IndexedDB in the current browser profile, including consented derived filler/repetition patterns
-- Separate, off-by-default retention of the attempt recording and available captured transcript in an origin-local artifact store, with individual downloads; finalization errors/timeouts mark retained text as possibly partial in Review and Progress, and artifacts are excluded from summary JSON export
+- Separate, off-by-default retention of the attempt recording and available captured transcript in an origin-local artifact store, with individual downloads and per-attempt artifact-only deletion; finalization errors/timeouts mark retained text as possibly partial in Review and Progress, artifacts are excluded from summary JSON export, and deletion preserves the compact attempt/pair
 - No coaching audio or captured-transcript upload; the independent compact-summary backup boundary is described in the platform section below
-- Twenty-one deterministic coaching-engine tests and a browser smoke flow that covers local behavior and asserts no coaching-data API request when backup is off
+- Thirty-four deterministic coaching/loop tests and browser smoke flows covering the single coached format, the default baseline → Progress/reload/resume → unassisted-retry format, baseline persistence gating, safe grouping/comparison, per-attempt artifact deletion, and no coaching-data API request when backup is off
 
 This prototype demonstrates the technical and interaction loop. It does not yet establish measurement accuracy across devices, learning outcomes, clinical value, accessibility conformance, or accent/language fairness.
 
 Next coaching milestones:
 
 1. Run a consented pilot to validate audio events, false-tip rate, distraction, browser/device availability, privacy network behavior, and subgroup fairness.
-2. Add an explicit baseline → review → unassisted retry relationship and compare only the selected goal.
-3. Add user-authored prompts/goals, stronger calibration guidance, per-attempt artifact deletion/retention controls, and clearer signal-confidence explanations.
+2. Measure the implemented baseline/retry loop's repeatability and usability without turning raw paired deltas into an improvement verdict.
+3. Add user-authored prompts/goals, stronger calibration guidance, automatic local artifact expiration/quota controls, and clearer signal-confidence explanations.
 4. Build guided interview and presentation programs after the core measurements are validated.
 5. Evaluate a production semantic/LLM RAG layer, local model, self-hosted service, or bring-your-own-key coaching as separate opt-in adapters; keep the private deterministic/local-retrieval core complete without them.
 6. Decide whether to share a coaching client with the Go edition; the prototype is available only in the Cloudflare SPA today.
@@ -141,7 +144,7 @@ These are future ideas, not current features:
 - User profiles
 - Family/content filters
 - Post-turn AI summaries
-- Validated baseline/retry coaching programs and progress comparisons
+- Validated learning outcomes, repeatability, and interpretation for baseline/retry coaching programs; descriptive progress comparisons are implemented
 - Accounts, cross-device authentication/coaching sync, educator assignments, and shared reports
 - Semantic structure, relevance, concision, and answer-completeness coaching
 - Server-side or external coaching analysis beyond the implemented theme-only topic adapters; any such path requires separate consent and privacy design

@@ -1,4 +1,13 @@
 import { cloudProgress, mergeCoachingSummaries } from "./cloud-progress.js";
+import {
+  compareGoalAttempts,
+  createPracticeLoop,
+  createRetryState,
+  groupPracticeLoops,
+  hasPersistedAttempt,
+  normalizeAttemptRelationship,
+  relationshipForSummary,
+} from "./coach-loop.js";
 
 const app = document.querySelector("#app");
 const announcer = document.querySelector("#announcer");
@@ -22,6 +31,7 @@ let coachEnginePromise = null;
 let routeFocusRequested = false;
 let practice = freshPracticeState();
 let progressSessions = [];
+let pendingPracticeResume = null;
 
 const PRACTICE_SCENARIOS = [
   { id: "interview", name: "Interview answer", prompt: "Tell me about a time you solved a difficult problem." },
@@ -55,7 +65,12 @@ async function loadRoute() {
   if (/^\/practice\/?$/i.test(location.pathname)) {
     roomCode = "";
     document.title = "Practice · NonStopTalk";
-    practice = freshPracticeState(practice.setup);
+    if (pendingPracticeResume) {
+      practice = freshPracticeState(pendingPracticeResume.setup, pendingPracticeResume.loop);
+      pendingPracticeResume = null;
+    } else {
+      practice = freshPracticeState(practice.setup);
+    }
     renderPractice();
     focusRouteHeading();
     return;
@@ -117,13 +132,14 @@ function renderLanding(message = "") {
     </section>`;
 }
 
-function freshPracticeState(setup = {}) {
+function freshPracticeState(setup = {}, loop = null) {
   return {
     phase: "setup",
     setup: {
       scenario: setup.scenario || "interview",
       goal: setup.goal || "pauses",
       duration: Number(setup.duration) || 45,
+      format: setup.format === "coached" ? "coached" : "loop",
       transcriptConsent: Boolean(setup.transcriptConsent),
       retainArtifacts: Boolean(setup.retainArtifacts),
       cloudSync: Boolean(setup.cloudSync),
@@ -134,6 +150,9 @@ function freshPracticeState(setup = {}) {
     saved: false,
     transcriptUsed: false,
     live: null,
+    loop: loop ? { ...loop } : null,
+    completedSummary: null,
+    comparison: null,
   };
 }
 
@@ -157,12 +176,14 @@ function renderPracticeSetup() {
   const speech = localSpeechCapability();
   const hasMicrophone = Boolean(navigator.mediaDevices?.getUserMedia);
   const canRecord = typeof window.MediaRecorder === "function";
+  const retrySetup = practice.loop?.attemptRole === "retry";
+  const locked = retrySetup ? "disabled" : "";
   app.innerHTML = `
     <section class="coach-hero">
       <div>
         <p class="eyebrow">Private speaking lab</p>
         <h1>Practice with a signal, not a score.</h1>
-        <p class="lede">Choose one delivery goal. NonStopTalk listens for timing and vocal-level patterns, gives one useful live cue, then helps you retry.</p>
+        <p class="lede">Choose one delivery goal. Build a comparable baseline and unassisted retry, or use the single-attempt mode when you want sparse live cues.</p>
       </div>
       <div class="privacy-card">
         <span class="device-badge"><span aria-hidden="true">●</span> On device</span>
@@ -172,17 +193,29 @@ function renderPracticeSetup() {
       </div>
     </section>
     ${practice.error ? notice(practice.error, true) : ""}
+    ${retrySetup ? `<div class="notice info practice-loop-notice"><strong>Unassisted retry</strong><span>The scenario, goal, and length stay locked to the baseline. Live measurements and coaching cues remain hidden until review.</span></div>` : ""}
     <form class="coach-setup panel stack" data-coach-setup>
-      <div class="section-head"><div><p class="eyebrow">Set your session</p><h2>One goal. One attempt.</h2></div><span class="step-mark">01 / 03</span></div>
+      <div class="section-head"><div><p class="eyebrow">${retrySetup ? "Continue your loop" : "Set your session"}</p><h2>${retrySetup ? "Repeat the same attempt." : "One goal. Comparable evidence."}</h2></div><span class="step-mark">01 / 03</span></div>
+      ${retrySetup ? "" : `<fieldset class="practice-format" aria-label="Practice format">
+        <legend>Practice format</legend>
+        <label class="format-choice">
+          <input type="radio" name="format" value="loop" ${practice.setup.format !== "coached" ? "checked" : ""}>
+          <span><strong>Baseline + unassisted retry</strong><small>Recommended. Speak twice with review-only feedback between attempts; live measurements and cues stay hidden.</small></span>
+        </label>
+        <label class="format-choice">
+          <input type="radio" name="format" value="coached" ${practice.setup.format === "coached" ? "checked" : ""}>
+          <span><strong>Single coached attempt</strong><small>Keeps the current sparse live cue and stores an independent, unpaired summary.</small></span>
+        </label>
+      </fieldset>`}
       <div class="coach-fields">
         <label>Speaking scenario
-          <select name="scenario">${PRACTICE_SCENARIOS.map((item) => `<option value="${item.id}" ${practice.setup.scenario === item.id ? "selected" : ""}>${escapeHTML(item.name)}</option>`).join("")}</select>
+          <select name="scenario" ${locked}>${PRACTICE_SCENARIOS.map((item) => `<option value="${item.id}" ${practice.setup.scenario === item.id ? "selected" : ""}>${escapeHTML(item.name)}</option>`).join("")}</select>
         </label>
         <label>Coaching goal
-          <select name="goal">${PRACTICE_GOALS.map((item) => `<option value="${item.id}" ${practice.setup.goal === item.id ? "selected" : ""}>${escapeHTML(item.name)}</option>`).join("")}</select>
+          <select name="goal" ${locked}>${PRACTICE_GOALS.map((item) => `<option value="${item.id}" ${practice.setup.goal === item.id ? "selected" : ""}>${escapeHTML(item.name)}</option>`).join("")}</select>
         </label>
         <label>Attempt length
-          <select name="duration">${[30, 45, 60, 90].map((seconds) => `<option value="${seconds}" ${practice.setup.duration === seconds ? "selected" : ""}>${seconds} seconds</option>`).join("")}</select>
+          <select name="duration" ${locked}>${[30, 45, 60, 90].map((seconds) => `<option value="${seconds}" ${practice.setup.duration === seconds ? "selected" : ""}>${seconds} seconds</option>`).join("")}</select>
         </label>
       </div>
       <fieldset class="consent-card" aria-label="Optional transcript analysis" ${speech.supported ? "" : "disabled"}>
@@ -196,7 +229,7 @@ function renderPracticeSetup() {
         <legend>Optional full session retention</legend>
         <label class="choice-row">
           <input type="checkbox" name="retainArtifacts" ${practice.setup.retainArtifacts && canRecord ? "checked" : ""}>
-          <span><strong>Keep the recording and captured transcript when available</strong><small>${canRecord ? "Stores the browser-encoded attempt recording and, when local transcription is enabled and succeeds, its captured transcript for this site in this browser profile. Those artifacts are never uploaded. There is no automatic local expiry; Progress downloads them or deletes all local coaching data. Downloaded copies are yours to manage." : "This browser cannot create a local audio recording. Compact coaching summaries still work."}</small></span>
+          <span><strong>Keep the recording and captured transcript when available</strong><small>${canRecord ? "Stores the browser-encoded attempt recording and, when local transcription is enabled and succeeds, its captured transcript for this site in this browser profile. Those artifacts are never uploaded. There is no automatic local expiry; Progress downloads or deletes them per attempt and can also delete all local coaching data. Downloaded copies are yours to manage." : "This browser cannot create a local audio recording. Compact coaching summaries still work."}</small></span>
         </label>
       </fieldset>
       <fieldset class="consent-card" aria-label="Optional cloud summary backup">
@@ -208,7 +241,7 @@ function renderPracticeSetup() {
       </fieldset>
       <div class="coach-start-row">
         <div><p class="hint">Next: a four-second quiet + speaking calibration. Browser microphone permission is required.</p>${hasMicrophone ? "" : `<p class="notice error" role="alert">This browser does not expose microphone input.</p>`}</div>
-        <button class="button primary coach-start" type="submit" data-coach-start ${hasMicrophone ? "" : "disabled"}>Calibrate microphone <span aria-hidden="true">→</span></button>
+        <button class="button primary coach-start" type="submit" data-coach-start ${hasMicrophone ? "" : "disabled"}>${retrySetup ? "Calibrate for retry" : "Calibrate microphone"} <span aria-hidden="true">→</span></button>
       </div>
     </form>`;
 }
@@ -269,30 +302,32 @@ function renderPracticeLive() {
   const scenario = scenarioById(practice.setup.scenario);
   const goal = goalById(practice.setup.goal);
   const live = practice.live || {};
+  const reviewOnly = practice.loop?.feedbackMode === "review-only";
+  const attemptLabel = practice.loop?.attemptRole === "retry" ? "Unassisted retry" : "Review-only baseline";
   const remaining = Math.max(0, practice.setup.duration - Math.floor((live.elapsedMs || 0) / 1000));
   app.innerHTML = `
     <section class="practice-live" data-coach-live>
-      <div class="stage-top"><span class="device-badge" title="${practice.analysisMode === "Analyser fallback" ? "Compatibility analysis uses an AnalyserNode on this device." : "Audio is measured off the main browser thread."}"><span aria-hidden="true">●</span> On device · ${practice.analysisMode === "Analyser fallback" ? "compatibility mode" : "AudioWorklet"}</span><span class="step-mark">03 / 03</span></div>
+      <div class="stage-top"><span class="device-badge" title="${practice.analysisMode === "Analyser fallback" ? "Compatibility analysis uses an AnalyserNode on this device." : "Audio is measured off the main browser thread."}"><span aria-hidden="true">●</span> On device · ${reviewOnly ? escapeHTML(attemptLabel) : practice.analysisMode === "Analyser fallback" ? "compatibility mode" : "AudioWorklet"}</span><span class="step-mark">03 / 03</span></div>
       <div class="practice-grid">
         <div class="prompt-stage">
           <p class="eyebrow">${escapeHTML(scenario.name)}</p>
           <h1>${escapeHTML(scenario.prompt)}</h1>
           <p class="goal-line"><strong>Focus:</strong> ${escapeHTML(goal.detail)}</p>
           <div class="coach-timer" data-coach-timer aria-label="${remaining} seconds remaining">${remaining}</div>
-          <div class="coach-meter" aria-label="Live microphone level"><span data-coach-meter style="width:${Math.round((live.level || 0) * 100)}%"></span><i data-coach-threshold></i></div>
+          ${reviewOnly ? `<div class="review-only-status" role="status"><span aria-hidden="true">●</span><strong>Microphone connected</strong><small>Measurements stay hidden until review so this attempt remains unassisted.</small></div>` : `<div class="coach-meter" aria-label="Live microphone level"><span data-coach-meter style="width:${Math.round((live.level || 0) * 100)}%"></span><i data-coach-threshold></i></div>
           <div class="live-stats" aria-label="Current measurements">
             <div><span data-coach-speaking>${formatPercent(live.speakingRatio)}</span><small>speaking</small></div>
             <div><span data-coach-pauses>${live.pauseCount ?? 0}</span><small>pauses</small></div>
             <div><span data-coach-level>${levelLabel(live.level)}</span><small>input</small></div>
-          </div>
+          </div>`}
           <button class="button ghost" type="button" data-command="coach-stop" data-coach-stop>${practice.phase === "finishing" ? "Building review…" : "Finish attempt"}</button>
         </div>
         <aside class="coach-sidebar">
-          <div class="coach-tip ${live.tip ? "is-visible" : ""}" data-coach-tip role="status" aria-live="polite">
+          ${reviewOnly ? `<div class="coach-tip review-only-card"><p class="eyebrow">Review after speaking</p><h2>No live coaching cues.</h2><p>Use the prompt and timer. Your goal-specific evidence appears only after the attempt.</p></div>` : `<div class="coach-tip ${live.tip ? "is-visible" : ""}" data-coach-tip role="status" aria-live="polite">
             <p class="eyebrow">Live cue</p>
             <h2 data-coach-tip-text>${escapeHTML(live.tip?.text || "Listening for a useful pattern…")}</h2>
             <p data-coach-tip-evidence>${escapeHTML(live.tip?.evidence || "Tips appear only when the signal is consistent.")}</p>
-          </div>
+          </div>`}
           <div class="privacy-card compact"><h3>Private by design</h3><p>${practice.setup.retainArtifacts ? "You chose to keep full session artifacts only in this browser profile." : `Audio is reduced to measurements in memory. ${practice.setup.transcriptConsent ? "The captured transcript is discarded after derived word-pattern analysis." : "Transcription is off."}`} ${practice.setup.cloudSync ? "After the attempt, only the compact summary will be backed up online." : "Cloud summary backup is off."}</p></div>
         </aside>
       </div>
@@ -306,11 +341,22 @@ function renderPracticeReview() {
   const grounding = practice.advice?.grounding;
   const retainedCopy = retainedArtifactCopy(practice.savedArtifacts);
   const storageCopy = coachingReviewStorageCopy(retainedCopy);
+  const relationship = normalizeAttemptRelationship(practice.completedSummary || {});
+  const baselineReview = relationship.valid && relationship.attemptRole === "baseline";
+  const retryReview = relationship.valid && relationship.attemptRole === "retry";
+  const baselinePersisted = baselineReview && hasPersistedAttempt(practice.saved, practice.cloudSaved);
+  const primaryAction = baselineReview
+    ? baselinePersisted
+      ? `<button class="button primary" type="button" data-command="coach-retry">Prepare unassisted retry <span aria-hidden="true">→</span></button>`
+      : `<button class="button primary" type="button" data-command="coach-new-loop">Try baseline again <span aria-hidden="true">↻</span></button>`
+    : retryReview
+      ? `<button class="button primary" type="button" data-command="coach-new-loop">Start a new baseline <span aria-hidden="true">↻</span></button>`
+      : `<button class="button primary" type="button" data-command="coach-again">Try again <span aria-hidden="true">↻</span></button>`;
   app.innerHTML = `
     <section class="coach-review" data-coach-review>
       ${practice.artifactWarning ? notice(practice.artifactWarning, true) : ""}
       <div class="review-head">
-        <div><p class="eyebrow">Attempt review</p><h1>Keep this. Change one thing.</h1></div>
+        <div><p class="eyebrow">${retryReview ? "Paired retry review" : baselineReview ? "Baseline review" : "Attempt review"}</p><h1>${retryReview ? "Compare, don’t score." : "Keep this. Change one thing."}</h1></div>
         <span class="device-badge"><span aria-hidden="true">●</span> Analysis complete</span>
       </div>
       <div class="advice-grid">
@@ -318,6 +364,9 @@ function renderPracticeReview() {
         <article class="advice-card focus"><span>02 · Focus next</span><h2>${escapeHTML(advice.focus)}</h2><p>${escapeHTML(advice.focusEvidence)}</p></article>
         <article class="advice-card drill"><span>03 · Drill</span><h2>${escapeHTML(advice.drill)}</h2><p>${escapeHTML(advice.drillDetail)}</p></article>
       </div>
+      ${retryReview ? renderGoalComparison(practice.comparison) : baselineReview ? baselinePersisted
+        ? `<section class="panel loop-next-step"><p class="eyebrow">Next step</p><h2>Review one change, then repeat without live cues.</h2><p>The retry keeps this scenario, goal, and target length so the comparison stays interpretable.</p></section>`
+        : `<section class="panel loop-next-step"><p class="eyebrow">Baseline not saved</p><h2>Save a baseline before the paired retry.</h2><p>This review exists only in memory. Try the baseline again so a later retry cannot become an orphan after navigation or reload.</p></section>` : ""}
       <section class="panel evidence-panel">
         <div class="section-head"><div><p class="eyebrow">Evidence</p><h2>What the browser measured</h2></div><span>${escapeHTML(confidenceLabel(report.audioConfidence))}</span></div>
         <div class="metric-grid">
@@ -336,7 +385,7 @@ function renderPracticeReview() {
       </section>
       <div class="review-actions">
         <div><strong>${escapeHTML(storageCopy.title)}</strong><p class="hint">${escapeHTML(storageCopy.detail)}</p></div>
-        <div class="action-row"><a class="button ghost" href="/progress" data-route>View progress</a><button class="button primary" type="button" data-command="coach-again">Try again <span aria-hidden="true">↻</span></button></div>
+        <div class="action-row"><a class="button ghost" href="/progress" data-route>View progress</a>${primaryAction}</div>
       </div>
     </section>`;
 }
@@ -419,17 +468,66 @@ function reviewMetric(value, label) {
   return `<div class="review-metric"><strong>${escapeHTML(value)}</strong><span>${escapeHTML(label)}</span></div>`;
 }
 
+function renderGoalComparison(comparison = {}, compact = false) {
+  const measures = Array.isArray(comparison.measures) ? comparison.measures : [];
+  const status = comparison.status === "ready" ? "Comparable evidence" : comparison.status === "limited" ? "Limited evidence" : "Comparison unavailable";
+  const goal = goalById(comparison.goal);
+  const reasons = Array.isArray(comparison.reasons) ? comparison.reasons : [];
+  const caveats = Array.isArray(comparison.caveats) ? comparison.caveats : [];
+  return `<section class="paired-comparison ${compact ? "compact" : ""} ${comparison.status === "ready" ? "" : "limited"}" data-coach-comparison>
+    <div class="section-head"><div><p class="eyebrow">Goal-specific pair</p><h2>${escapeHTML(goal.name)}</h2></div><span>${escapeHTML(status)}</span></div>
+    ${measures.length ? `<div class="comparison-grid">${measures.map((measure) => `<article class="comparison-measure">
+      <span>${escapeHTML(measure.label)}</span>
+      ${measure.available
+        ? `<strong>${escapeHTML(formatComparisonValue(measure.baseline, measure.unit))} <i aria-hidden="true">→</i> ${escapeHTML(formatComparisonValue(measure.retry, measure.unit))}</strong><small>${escapeHTML(formatComparisonDelta(measure.delta, measure.unit))} · descriptive change</small>`
+        : `<strong>Not available</strong><small>Both attempts need this measurement.</small>`}
+    </article>`).join("")}</div>` : ""}
+    ${reasons.length ? `<div class="comparison-reasons"><strong>Why evidence is limited</strong><ul>${reasons.map((reason) => `<li>${escapeHTML(reason)}</li>`).join("")}</ul></div>` : ""}
+    ${caveats.length ? `<p class="hint comparison-caveat">${escapeHTML(caveats.join(" "))}</p>` : ""}
+  </section>`;
+}
+
+function formatComparisonValue(value, unit) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  if (unit === "ms") return formatDuration(number);
+  if (unit === "%") return `${roundDisplay(number, 1)}%`;
+  if (unit === "wpm") return `${roundDisplay(number, 1)} wpm`;
+  if (unit === "per min") return `${roundDisplay(number, 1)}/min`;
+  return String(roundDisplay(number, 1));
+}
+
+function formatComparisonDelta(value, unit) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "No paired delta";
+  const sign = number > 0 ? "+" : "";
+  if (unit === "ms") return `${sign}${roundDisplay(number / 1_000, 2)}s`;
+  if (unit === "%") return `${sign}${roundDisplay(number, 1)} points`;
+  if (unit === "wpm") return `${sign}${roundDisplay(number, 1)} wpm`;
+  if (unit === "per min") return `${sign}${roundDisplay(number, 1)}/min`;
+  return `${sign}${roundDisplay(number, 1)}`;
+}
+
+function roundDisplay(value, digits) {
+  const factor = 10 ** digits;
+  return Math.round((value + Number.EPSILON) * factor) / factor;
+}
+
 async function beginCoachingSession(values) {
   const generation = routeGeneration;
   const speech = localSpeechCapability();
+  const retryState = practice.loop?.attemptRole === "retry" ? practice.loop : null;
+  const format = retryState ? "loop" : values.format === "coached" ? "coached" : practice.setup.format === "coached" && !values.format ? "coached" : "loop";
+  const loop = retryState || (format === "loop" ? createPracticeLoop() : null);
   practice = freshPracticeState({
-    scenario: String(values.scenario || "interview"),
-    goal: String(values.goal || "pauses"),
-    duration: clamp(Number(values.duration) || 45, 15, 180),
+    scenario: String(values.scenario || practice.setup.scenario || "interview"),
+    goal: String(values.goal || practice.setup.goal || "pauses"),
+    duration: clamp(Number(values.duration || practice.setup.duration) || 45, 15, 180),
+    format,
     transcriptConsent: values.transcriptConsent === "on" && speech.supported,
     retainArtifacts: values.retainArtifacts === "on" && typeof window.MediaRecorder === "function",
     cloudSync: values.cloudSync === "on",
-  });
+  }, loop);
   practice.phase = "permission";
   renderPractice();
   const token = Symbol("coaching-run");
@@ -590,7 +688,7 @@ function ingestCoachingFrame(frame) {
   const snapshot = run.analyzer.snapshot(elapsedMs);
   const level = normalizedCoachLevel(frame.rms, run.calibration);
   const live = snapshotToLive(snapshot, elapsedMs, level, practice.live?.tip);
-  if (elapsedMs >= 5_000 && now >= run.tipUntil && now - run.lastTipAt >= 10_000) {
+  if (run.tipPolicy && elapsedMs >= 5_000 && now >= run.tipUntil && now - run.lastTipAt >= 10_000) {
     const candidate = normalizeTip(run.tipPolicy.evaluate(snapshot, elapsedMs), snapshot);
     if (candidate) {
       live.tip = candidate;
@@ -615,7 +713,9 @@ async function activateCoachingAttempt(run) {
       goal: practice.setup.goal,
       targetDurationMs: practice.setup.duration * 1000,
     });
-    run.tipPolicy = new run.engine.CoachingTipPolicy({ cooldownMs: 10_000 });
+    run.tipPolicy = practice.loop?.feedbackMode === "review-only"
+      ? null
+      : new run.engine.CoachingTipPolicy({ cooldownMs: 10_000 });
     run.startedAt = performance.now();
     run.attemptTimer = window.setTimeout(() => {
       if (run !== coachingRun || practice.phase !== "active") return;
@@ -794,6 +894,24 @@ async function finishCoachingSession(reason = "manual") {
     practice.artifactWarning ||= "No full recording or transcript artifact was available to save for this attempt.";
   }
   summary.artifacts = artifactMetadata(artifact);
+  practice.completedSummary = summary;
+  if (summary.attemptRole === "baseline") {
+    practice.loop = {
+      ...practice.loop,
+      baselineAttemptId: summary.id,
+      baselineSummary: summary,
+    };
+  } else if (summary.attemptRole === "retry") {
+    const baseline = practice.loop?.baselineSummary
+      || await readCoachingSummary(summary.baselineAttemptId).catch(() => null);
+    practice.comparison = baseline ? compareGoalAttempts(baseline, summary) : {
+      status: "invalid",
+      goal: summary.goal,
+      measures: [],
+      reasons: ["The linked baseline is unavailable in this browser."],
+      caveats: ["No unrelated attempt was substituted for the missing baseline."],
+    };
+  }
   try {
     await saveCoachingSession(summary, artifact);
     practice.saved = true;
@@ -952,9 +1070,11 @@ function normalizedAdvice(value = {}, report = {}) {
 
 function buildCoachingSummary(report, advice) {
   const normalized = normalizedAdvice(advice, report);
+  const id = crypto.randomUUID?.() || secureRandomId();
+  const relationship = relationshipForSummary(practice.loop, id);
   return {
     analysisSchemaVersion: 2,
-    id: crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    id,
     createdAt: new Date().toISOString(),
     scenario: practice.setup.scenario,
     goal: practice.setup.goal,
@@ -970,7 +1090,14 @@ function buildCoachingSummary(report, advice) {
       transcriptMetrics: sanitizeTranscriptMetrics(report.transcriptMetrics),
     },
     advice: normalized,
+    ...relationship,
   };
+}
+
+function secureRandomId() {
+  if (typeof crypto.getRandomValues !== "function") throw new Error("Secure coaching session IDs are unavailable.");
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function buildCoachingArtifact(id, createdAt, audioBlob, transcriptText, transcriptMayBePartial = false) {
@@ -1088,13 +1215,10 @@ async function renderProgress(generation = routeGeneration) {
   if (generation !== routeGeneration || !/^\/progress\/?$/i.test(location.pathname)) return;
   const summaries = mergeCoachingSummaries(localSummaries, cloudSummaries);
   progressSessions = summaries;
-  const ratios = summaries.map(progressSpeakingRatio).filter((value) => value !== null);
-  const averageRatio = ratios.length ? ratios.reduce((total, value) => total + value, 0) / ratios.length : null;
-  const latest = summaries[0];
-  const earlier = summaries[1];
-  const latestRatio = progressSpeakingRatio(latest);
-  const earlierRatio = progressSpeakingRatio(earlier);
-  const change = latestRatio !== null && earlierRatio !== null ? latestRatio - earlierRatio : null;
+  const grouped = groupPracticeLoops(summaries);
+  const completedLoops = grouped.loops.filter((loop) => loop.status === "complete").length;
+  const awaitingRetry = grouped.loops.filter((loop) => loop.status === "awaiting-retry").length;
+  const historyItems = grouped.loops.length + grouped.standalone.length + grouped.unpaired.length;
   app.innerHTML = `
     <section class="progress-page" data-coach-progress>
       <div class="progress-hero">
@@ -1105,12 +1229,12 @@ async function renderProgress(generation = routeGeneration) {
       ${cloudError ? notice(cloudError, true) : ""}
       <div class="progress-metrics">
         ${reviewMetric(String(summaries.length), `${summaries.length === 1 ? "attempt" : "attempts"} for this site`)}
-        ${reviewMetric(averageRatio === null ? "—" : formatPercent(averageRatio), "average speaking ratio")}
-        ${reviewMetric(change === null ? "—" : `${change >= 0 ? "+" : ""}${Math.round(change * 100)} pts`, "latest ratio shift")}
+        ${reviewMetric(String(completedLoops), "completed practice loops")}
+        ${reviewMetric(String(awaitingRetry), "baselines awaiting retry")}
       </div>
       <section class="panel progress-history">
-        <div class="section-head"><div><p class="eyebrow">Attempt history</p><h2>Evidence you can explain</h2></div><span>${summaries.length}</span></div>
-        ${summaries.length ? `<div class="attempt-list">${summaries.map(renderProgressItem).join("")}</div>` : `<div class="empty-progress"><h2>No attempts yet.</h2><p>Complete a practice session and its metric summary will appear here.</p><a class="button" href="/practice" data-route>Build a baseline</a></div>`}
+        <div class="section-head"><div><p class="eyebrow">Practice history</p><h2>Compare only linked attempts</h2></div><span>${historyItems}</span></div>
+        ${summaries.length ? renderProgressHistory(grouped) : `<div class="empty-progress"><h2>No attempts yet.</h2><p>Complete a practice session and its metric summary will appear here.</p><a class="button" href="/practice" data-route>Build a baseline</a></div>`}
       </section>
       <section class="storage-controls">
         <div><h2>Your data, your controls.</h2><p class="hint">JSON exports contain metrics, advice, and derived word patterns. Opted-in recordings and captured transcripts always stay in the separate local artifact store.${cloudEnabled ? " Compact online backup is enabled for summaries you choose to sync." : " Online backup is off. You can explicitly check for a prior anonymous backup if this browser's preference was cleared."}</p></div>
@@ -1119,20 +1243,36 @@ async function renderProgress(generation = routeGeneration) {
     </section>`;
 }
 
-function progressSpeakingRatio(item) {
-  const value = item?.metrics?.speakingRatio;
-  if (!(["number", "string"].includes(typeof value)) || (typeof value === "string" && !value.trim())) return null;
-  const ratio = Number(value);
-  return Number.isFinite(ratio) && ratio >= 0 && ratio <= 1 ? ratio : null;
+function renderProgressHistory(grouped) {
+  return `<div class="attempt-list practice-loop-list">
+    ${grouped.loops.map(renderProgressLoop).join("")}
+    ${grouped.standalone.map((item) => renderProgressItem(item, "Single coached attempt")).join("")}
+    ${grouped.unpaired.map(({ session, reason }) => renderProgressItem(session, `Unpaired record · ${reason}`)).join("")}
+  </div>`;
 }
 
-function renderProgressItem(item) {
+function renderProgressLoop(loop) {
+  const baseline = loop.baseline;
+  const scenario = scenarioById(baseline.scenario);
+  const goal = goalById(baseline.goal);
+  return `<article class="practice-loop-row ${loop.status}" data-practice-loop="${escapeHTML(loop.id)}">
+    <header><div><span class="loop-role">Practice loop</span><h3>${escapeHTML(scenario.name)}</h3><p>${escapeHTML(goal.name)} · ${formatDuration(baseline.targetDurationMs)} target</p></div><time datetime="${escapeHTML(baseline.createdAt)}">${escapeHTML(formatAttemptDate(baseline.createdAt))}</time></header>
+    <div class="loop-attempt"><div><span class="loop-role">Baseline</span>${renderAttemptNumbers(baseline)}${renderArtifactActions(baseline)}</div></div>
+    ${loop.retries.length ? loop.retries.map(({ session, comparison }, index) => `<div class="loop-attempt retry"><div><span class="loop-role">Unassisted retry${loop.retries.length > 1 ? ` ${index + 1}` : ""}</span>${renderAttemptNumbers(session)}${renderArtifactActions(session)}</div>${renderGoalComparison(comparison, true)}</div>`).join("") : `<div class="loop-resume"><div><strong>Baseline saved; retry still open.</strong><p class="hint">The same scenario, goal, and target length will be restored. Recording and transcript retention start unchecked.</p></div><button class="button primary" type="button" data-command="coach-resume-retry" data-session-id="${escapeHTML(baseline.id)}">Complete unassisted retry</button></div>`}
+  </article>`;
+}
+
+function renderAttemptNumbers(item) {
+  const metrics = item.metrics || {};
+  return `<div class="attempt-numbers"><span><strong>${formatPercent(metrics.speakingRatio)}</strong> speaking</span><span><strong>${metrics.pauseCount ?? 0}</strong> pauses</span><span><strong>${formatDuration(metrics.durationMs)}</strong> analyzed</span></div>`;
+}
+
+function renderProgressItem(item, statusLabel = "Independent attempt") {
   const scenario = scenarioById(item.scenario);
   const goal = goalById(item.goal);
-  const metrics = item.metrics || {};
   return `<article class="attempt-row">
-    <div><time datetime="${escapeHTML(item.createdAt)}">${escapeHTML(formatAttemptDate(item.createdAt))}</time><h3>${escapeHTML(scenario.name)}</h3><p>${escapeHTML(goal.name)}</p></div>
-    <div class="attempt-numbers"><span><strong>${formatPercent(metrics.speakingRatio)}</strong> speaking</span><span><strong>${metrics.pauseCount ?? 0}</strong> pauses</span><span><strong>${formatDuration(metrics.durationMs)}</strong> analyzed</span></div>
+    <div><time datetime="${escapeHTML(item.createdAt)}">${escapeHTML(formatAttemptDate(item.createdAt))}</time><h3>${escapeHTML(scenario.name)}</h3><p>${escapeHTML(goal.name)} · ${escapeHTML(statusLabel)}</p></div>
+    ${renderAttemptNumbers(item)}
     <div class="attempt-focus"><span>Next focus</span><p>${escapeHTML(item.advice?.focus || "Repeat and compare your delivery.")}</p>${renderArtifactActions(item)}</div>
   </article>`;
 }
@@ -1144,6 +1284,7 @@ function renderArtifactActions(item) {
   return `<div class="artifact-actions" aria-label="Saved full session artifacts">
     ${artifacts.audioStored ? `<button class="button ghost small" type="button" data-command="coach-download-audio" data-session-id="${id}">Download recording</button>` : ""}
     ${artifacts.transcriptStored ? `<button class="button ghost small" type="button" data-command="coach-download-transcript" data-session-id="${id}">Download transcript</button>` : ""}
+    <button class="button danger ghost small" type="button" data-command="coach-delete-artifacts" data-session-id="${id}">Delete saved artifacts</button>
     ${artifacts.transcriptMayBePartial ? `<p class="hint">Captured transcript may be partial; local recognition did not finalize cleanly.</p>` : ""}
   </div>`;
 }
@@ -1229,8 +1370,25 @@ function readCoachingSummaries() {
   return withCoachStore(COACH_STORE, "readonly", (store) => store.getAll());
 }
 
+function readCoachingSummary(id) {
+  return withCoachStore(COACH_STORE, "readonly", (store) => store.get(String(id || "")));
+}
+
 function readCoachingArtifact(id) {
   return withCoachStore(COACH_ARTIFACT_STORE, "readonly", (store) => store.get(id));
+}
+
+function deleteCoachingArtifacts(id) {
+  const sessionId = String(id || "");
+  return withCoachTransaction([COACH_STORE, COACH_ARTIFACT_STORE], "readwrite", (transaction) => {
+    const summaries = transaction.objectStore(COACH_STORE);
+    const artifacts = transaction.objectStore(COACH_ARTIFACT_STORE);
+    const request = summaries.get(sessionId);
+    request.onsuccess = () => {
+      if (request.result) summaries.put({ ...request.result, artifacts: artifactMetadata(null) });
+      artifacts.delete(sessionId);
+    };
+  });
 }
 
 async function readCoachingSummariesWithRetry() {
@@ -1653,6 +1811,23 @@ async function handleClick(event) {
       renderPractice();
     } else if (command === "coach-stop") {
       await finishCoachingSession("manual");
+    } else if (command === "coach-retry") {
+      if (!hasPersistedAttempt(practice.saved, practice.cloudSaved)) {
+        practice.artifactWarning ||= "The baseline must be saved locally or online before starting its paired retry.";
+        renderPractice();
+        announce("The baseline was not saved. Try the baseline again before starting a paired retry.");
+        return;
+      }
+      const baseline = practice.completedSummary;
+      const retry = createRetryState(baseline);
+      practice = freshPracticeState({ ...practice.setup, format: "loop" }, { ...retry, baselineSummary: baseline });
+      renderPractice();
+      document.querySelector("[data-coach-setup]")?.scrollIntoView({ block: "start" });
+      announce("Unassisted retry setup is ready. The baseline scenario, goal, and length are locked.");
+    } else if (command === "coach-new-loop") {
+      practice = freshPracticeState({ ...practice.setup, format: "loop" });
+      renderPractice();
+      document.querySelector("[data-coach-setup]")?.scrollIntoView({ block: "start" });
     } else if (command === "coach-again") {
       practice = freshPracticeState(practice.setup);
       renderPractice();
@@ -1663,6 +1838,31 @@ async function handleClick(event) {
       await downloadCoachingArtifact(button.dataset.sessionId, "audio");
     } else if (command === "coach-download-transcript") {
       await downloadCoachingArtifact(button.dataset.sessionId, "transcript");
+    } else if (command === "coach-delete-artifacts") {
+      if (window.confirm("Delete this attempt's saved recording and captured transcript from this browser? The compact summary and paired comparison will remain.")) {
+        await deleteCoachingArtifacts(button.dataset.sessionId);
+        await renderProgress(routeGeneration);
+        showToast("Saved recording and transcript deleted; the compact summary remains.");
+      }
+    } else if (command === "coach-resume-retry") {
+      const baseline = progressSessions.find((item) => item.id === button.dataset.sessionId);
+      const relationship = normalizeAttemptRelationship(baseline || {});
+      if (!baseline || !relationship.valid || relationship.attemptRole !== "baseline") {
+        throw new Error("That baseline is unavailable for a retry.");
+      }
+      pendingPracticeResume = {
+        setup: {
+          scenario: baseline.scenario,
+          goal: baseline.goal,
+          duration: Math.max(15, Number(baseline.targetDurationMs) / 1_000),
+          format: "loop",
+          transcriptConsent: false,
+          retainArtifacts: false,
+          cloudSync: false,
+        },
+        loop: { ...createRetryState(baseline), baselineSummary: baseline },
+      };
+      navigate("/practice");
     } else if (command === "coach-check-cloud") {
       const sessions = await cloudProgress.list();
       if (sessions.length) {

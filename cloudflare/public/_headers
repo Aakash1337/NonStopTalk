@@ -3,5 +3,9 @@
   Content-Security-Policy: default-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self' blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
   Permissions-Policy: camera=(), geolocation=(), microphone=(self)
   Referrer-Policy: same-origin
+  Strict-Transport-Security: max-age=31536000
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Resource-Policy: same-origin
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
+  X-Permitted-Cross-Domain-Policies: none
