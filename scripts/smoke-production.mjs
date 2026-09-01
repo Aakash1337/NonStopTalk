@@ -7,6 +7,7 @@ const origin = new URL(configuredOrigin);
 const WEB_ANALYTICS_ORIGIN = "https://static.cloudflareinsights.com";
 const PLATFORM_STATUS_ATTEMPTS = 5;
 const PLATFORM_STATUS_RETRY_MS = 1_000;
+const SUPPORTED_PLATFORM_SCHEMA_VERSIONS = new Set([5, 6]);
 if (!/^https:$/.test(origin.protocol) || origin.pathname !== "/") {
   throw new Error("NONSTOPTALK_PRODUCTION_ORIGIN must be an HTTPS origin without a path.");
 }
@@ -137,7 +138,8 @@ assert(!hasScriptFromOrigin(
 const { response: statusResponse, status } = await getPlatformStatus();
 assert(status.status === "ok", `platform status is ${String(status.status || "unavailable")}`);
 assert(status.apiVersion === "v1", "production API version is not v1");
-assert(status.schemaVersion === 5, "production schema version is not the cleanup-heartbeat schema");
+assert(SUPPORTED_PLATFORM_SCHEMA_VERSIONS.has(status.schemaVersion),
+  "production schema version is outside the reviewed 5/6 compatibility window");
 assert(Array.isArray(status.degradedCapabilities) && status.degradedCapabilities.length === 0,
   `production reports degraded capabilities: ${JSON.stringify(status.degradedCapabilities)}`);
 assert(status.capabilities?.cloudProgress?.status === "ready", "cloud progress is not ready");

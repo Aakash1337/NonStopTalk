@@ -29,8 +29,10 @@ const PLATFORM_STATUS_CACHE_MS = 60_000;
 const MAX_CLEANUP_BATCHES_PER_RUN = 20;
 export const RETENTION_CLEANUP_STALE_MS = 36 * 60 * 60 * 1_000;
 const MAX_HEARTBEAT_CLOCK_SKEW_MS = 5 * 60 * 1_000;
+// Expand phase for migration 0006: both markers use only the schema-5 SQL
+// contract until the separately deployed schema-6 feature release.
 const MIN_PLATFORM_SCHEMA_VERSION = 5;
-const MAX_PLATFORM_SCHEMA_VERSION = 5;
+const MAX_PLATFORM_SCHEMA_VERSION = 6;
 
 interface DatabaseReadiness {
 	expiresAt: number;

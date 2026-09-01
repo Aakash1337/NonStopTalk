@@ -191,9 +191,11 @@ class FakeModelUsageD1 {
 	readonly queries: string[] = [];
 	readonly bindings: unknown[][] = [];
 	readonly rows: ModelUsageTestRow[];
+	readonly schemaVersion: number;
 
-	constructor(rows: ModelUsageTestRow[]) {
+	constructor(rows: ModelUsageTestRow[], schemaVersion = 5) {
 		this.rows = rows;
+		this.schemaVersion = schemaVersion;
 	}
 
 	prepare(query: string): D1PreparedStatement {
@@ -220,7 +222,7 @@ class FakeModelUsageStatement {
 
 	async first<T>(): Promise<T | null> {
 		assert.match(this.#query, /SELECT schema_version FROM platform_meta/u);
-		return { schema_version: 5 } as T;
+		return { schema_version: this.#database.schemaVersion } as T;
 	}
 
 	async all<T>(): Promise<D1Result<T>> {
@@ -413,8 +415,8 @@ function usageRow(overrides: Partial<ModelUsageTestRow> = {}): ModelUsageTestRow
 	};
 }
 
-test("platform status reports the cleanup-heartbeat schema", async () => {
-	for (const schemaVersion of [5]) {
+test("platform status preserves the schema-5 capability shape for compatible markers", async () => {
+	for (const schemaVersion of [5, 6]) {
 		const handled = await handlePlatformRoute(
 			new Request("https://nonstoptalk.test/api/v1/platform/status"),
 			{
@@ -429,14 +431,48 @@ test("platform status reports the cleanup-heartbeat schema", async () => {
 
 		assert(handled);
 		assert.equal(handled.response.status, 200);
-		const body = await handled.response.json() as { status: string; schemaVersion: number };
-		assert.equal(body.status, "ok");
-		assert.equal(body.schemaVersion, schemaVersion);
+		assert.deepEqual(await handled.response.json(), {
+			status: "ok",
+			apiVersion: "v1",
+			schemaVersion,
+			capabilities: {
+				cloudProgress: {
+					status: "ready",
+					retentionDays: 30,
+					newSaveLimit: 250,
+				},
+				roomFacts: { status: "ready" },
+				retentionCleanup: { status: "ready" },
+				topicGeneration: {
+					status: "ready",
+					routine: {
+						status: "offline",
+						provider: "offline",
+						model: null,
+						externalAvailable: false,
+					},
+					escalated: {
+						status: "offline",
+						provider: "offline",
+						model: null,
+						externalAvailable: false,
+					},
+				},
+				aggregateAnalytics: {
+					status: "ready",
+					delivery: "best-effort",
+					adminRead: true,
+					analyticsEngine: "disabled",
+				},
+			},
+			degradedCapabilities: [],
+			requestId: `status-schema-${schemaVersion}`,
+		});
 	}
 });
 
-test("platform status rejects schema markers outside its exact feature schema", async () => {
-	for (const schemaVersion of [2, 3, 4, 6]) {
+test("platform status rejects markers outside its compatibility window and fractional markers", async () => {
+	for (const schemaVersion of [2, 3, 4, 4.5, 5.5, 6.5, 7]) {
 		const handled = await handlePlatformRoute(
 			new Request("https://nonstoptalk.test/api/v1/platform/status"),
 			{ PLATFORM_DB: new FakeStatusD1(schemaVersion) as unknown as D1Database },
@@ -814,7 +850,7 @@ test("deferred analytics failures remain non-fatal and produce bounded warning e
 	);
 });
 
-test("admin model usage reports complete global token totals without double-counting provider rows", async () => {
+test("admin model usage preserves schema-5 SQL and totals under schema marker 6", async () => {
 	const database = new FakeModelUsageD1([
 		usageRow(),
 		usageRow({
@@ -842,7 +878,7 @@ test("admin model usage reports complete global token totals without double-coun
 			cachedInputTokens: 999,
 			reasoningTokens: 999,
 		}),
-	]);
+	], 6);
 	const adminToken = "7".repeat(64);
 	const handled = await handlePlatformRoute(
 		new Request("https://nonstoptalk.test/api/v1/admin/model-usage?days=2", {
@@ -880,7 +916,10 @@ test("admin model usage reports complete global token totals without double-coun
 	assert.equal(serialized.includes("private-browser-token-must-not-appear"), false);
 	assert.equal(database.bindings.length, 1);
 	assert.equal(database.bindings[0]?.length, 2);
-	assert.match(database.queries.at(-1) ?? "", /total_tokens AS totalTokens/u);
-	assert.match(database.queries.at(-1) ?? "", /cached_input_tokens AS cachedInputTokens/u);
-	assert.match(database.queries.at(-1) ?? "", /reasoning_tokens AS reasoningTokens/u);
+	assert.equal(database.queries.length, 2);
+	assert.match(database.queries[0] ?? "", /^SELECT schema_version FROM platform_meta WHERE id = 1$/u);
+	assert.equal(
+		(database.queries[1] ?? "").replace(/\s+/gu, " ").trim(),
+		"SELECT day, scope, provider, model, task, reserved_calls AS reservedCalls, completed_calls AS completedCalls, success_count AS successCount, failure_count AS failureCount, input_tokens AS inputTokens, output_tokens AS outputTokens, total_tokens AS totalTokens, cached_input_tokens AS cachedInputTokens, reasoning_tokens AS reasoningTokens, latency_ms_total AS latencyMsTotal, updated_at AS updatedAt FROM model_usage_daily WHERE day >= ? AND day <= ? ORDER BY day DESC, scope, provider, model",
+	);
 });

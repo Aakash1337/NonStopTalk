@@ -107,15 +107,24 @@ request.
    in the same transaction.
 3. Keep every migration compatible with the currently deployed Worker. D1 is
    migrated before code when deployment automation applies both.
-   The compatibility release accepted schema markers 4 and 5 while using only
-   the schema-v4 contract. Migration `0005_cleanup_heartbeat.sql` is additive,
-   and the matching feature Worker requires marker 5. The earlier compatibility
-   Worker remains schema/data-compatible as an emergency code rollback after
-   migration 0005, but it does not report `retentionCleanup`; the strict smoke
-   probe and twice-hourly monitor will intentionally fail during that temporary
-   loss of observability. Fix forward promptly. Before any schema 6 migration,
-   repeat the same compatibility-release sequence and explicit old/new Worker
-   tests.
+   The earlier compatibility release accepted schema markers 4 and 5 while
+   using only the schema-v4 contract. Migration `0005_cleanup_heartbeat.sql` is
+   additive, and the matching feature Worker requires marker 5. That older
+   compatibility Worker remains data-compatible after migration 0005, but it
+   does not report `retentionCleanup`; the strict smoke probe and twice-hourly
+   monitor intentionally fail during that temporary loss of observability.
+   Fix forward promptly.
+
+   The current compatibility-only release adds no migration. It accepts and
+   reports only schema markers 5 and 6 while every platform route, scheduled
+   cleanup, and model-budget operation continues to read and write only the
+   schema-v5 SQL contract. Markers below 5 or above 6 fail closed. Deploy and
+   verify this bridge on marker 5 before adding or applying migration `0006`.
+   That migration must be additive and preserve all schema-v5 tables, columns,
+   constraints, and behavior so this Worker remains a safe code rollback on
+   marker 6. Exercise the bridge against both markers and the old/new Worker
+   paths; after the schema-v6 feature release and rollback window are complete,
+   narrow the feature Worker and its probes to require exactly marker 6.
 4. Exercise a fresh database and every supported upgrade path through
    `npm run smoke:platform`.
 5. Apply production migrations with `npm run db:migrate:remote`. Wrangler asks
