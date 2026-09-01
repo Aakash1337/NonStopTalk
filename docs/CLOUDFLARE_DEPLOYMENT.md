@@ -14,6 +14,8 @@ The deployment consists of:
 
 The multiplayer game uses the Worker and Durable Objects. Speech analysis, recordings, and captured transcript text remain in the browser. Compact-summary backup is a separate, off-by-default choice: when selected, the SPA sends only allowlisted measurements/advice to the versioned Worker API and D1. With backup off, coaching makes no coaching-data API request. No coaching data enters a room Durable Object or external model. Separately, a room host can consent to one topic-generation attempt; the normalized theme, capped at 200 characters, is the only host or room content sent to the provider. The request never includes coaching data, audio, transcript text, names, or a room token.
 
+Cloudflare Web Analytics is an optional zone-level browser RUM/performance service, not the `PLATFORM_DB` D1 binding or the `PRODUCT_ANALYTICS` Analytics Engine binding. With automatic setup enabled on a proxied domain, Cloudflare injects an SRI-protected beacon from `https://static.cloudflareinsights.com/beacon.min.js`, and the beacon reports to the same-origin `/cdn-cgi/rum` endpoint. It therefore needs no manually embedded application snippet. NonStopTalk application code never supplies coaching audio, captured transcript text, or compact-summary payloads to Web Analytics. Cloudflare describes Web Analytics as free and says it does not collect or use visitors' personal data or track individuals across customers' sites; treat those as provider-policy claims subject to change, not an application-enforced privacy guarantee. See Cloudflare's [overview][web-analytics-about], [data-collection description][web-analytics-data], and [automatic-setup/SRI FAQ][web-analytics-faq].
+
 The Durable Object binding is internal. Players use the normal public Worker URL:
 
 ```text
@@ -220,3 +222,6 @@ D1 is authoritative for successfully stored consented summaries, consent records
 [rate-limit-binding]: https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
 [workers-logs]: https://developers.cloudflare.com/workers/observability/logs/workers-logs/
 [workers-traces]: https://developers.cloudflare.com/workers/observability/traces/
+[web-analytics-about]: https://developers.cloudflare.com/web-analytics/about/
+[web-analytics-data]: https://developers.cloudflare.com/web-analytics/data-metrics/data-origin-and-collection/
+[web-analytics-faq]: https://developers.cloudflare.com/web-analytics/faq/
