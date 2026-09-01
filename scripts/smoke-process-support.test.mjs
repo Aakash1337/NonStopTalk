@@ -48,7 +48,9 @@ test("isolated child environments cannot inherit deployment or provider credenti
   assert.equal(env.WRANGLER_SEND_ERROR_REPORTS, "false");
 });
 
-test("captured commands are bounded, checked, and terminated on timeout", async () => {
+test("captured commands are bounded, checked, and terminated on timeout", {
+  skip: process.platform === "win32",
+}, async () => {
   const output = await runChecked(
     process.execPath,
     ["-e", 'process.stdout.write("x".repeat(4096) + "TAIL")'],

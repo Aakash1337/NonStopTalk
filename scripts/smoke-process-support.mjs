@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import net from "node:net";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
@@ -65,10 +66,15 @@ export function captureBoundedOutput(child, limit = DEFAULT_LOG_LIMIT) {
 }
 
 export function startCaptured(command, args, options = {}) {
+  if (process.platform === "win32") {
+    throw new Error(
+      "Verified process-tree cleanup is unavailable on native Windows; run this smoke in WSL, Linux, or macOS.",
+    );
+  }
   const child = spawn(command, args, {
     cwd: options.cwd,
     env: options.env,
-    detached: process.platform !== "win32",
+    detached: true,
     shell: false,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -140,7 +146,7 @@ async function settleWithin(promise, timeoutMs) {
 }
 
 function processGroupExists(processGroupId) {
-  if (process.platform === "win32" || !Number.isSafeInteger(processGroupId)) return false;
+  if (!Number.isSafeInteger(processGroupId)) return false;
   try {
     process.kill(-processGroupId, 0);
     return true;
@@ -149,17 +155,46 @@ function processGroupExists(processGroupId) {
   }
 }
 
+function processGroupHasLiveMember(processGroupId) {
+  if (!processGroupExists(processGroupId)) return false;
+  if (process.platform !== "linux") return true;
+
+  let foundGroupMember = false;
+  try {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/u.test(entry)) continue;
+      let stat;
+      try {
+        stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+      } catch {
+        continue;
+      }
+      const close = stat.lastIndexOf(")");
+      if (close < 0) continue;
+      const fields = stat.slice(close + 2).trim().split(/\s+/u);
+      const state = fields[0];
+      const group = Number(fields[2]);
+      if (group !== processGroupId) continue;
+      foundGroupMember = true;
+      if (state !== "Z" && state !== "X") return true;
+    }
+  } catch {
+    return true;
+  }
+  return foundGroupMember ? false : processGroupExists(processGroupId);
+}
+
 async function waitForProcessGroupExit(processGroupId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!processGroupExists(processGroupId)) return true;
+    if (!processGroupHasLiveMember(processGroupId)) return true;
     await delay(25);
   }
-  return !processGroupExists(processGroupId);
+  return !processGroupHasLiveMember(processGroupId);
 }
 
 async function signalPosixProcessGroup(processGroupId, signal) {
-  if (!processGroupExists(processGroupId)) return;
+  if (!processGroupHasLiveMember(processGroupId)) return;
   try {
     process.kill(-processGroupId, signal);
   } catch (error) {
@@ -167,36 +202,10 @@ async function signalPosixProcessGroup(processGroupId, signal) {
   }
 }
 
-async function terminateWindowsProcessTree(child, graceMs) {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    const result = await settleWithin(waitForExit(child).then(() => ({ closed: true })), graceMs);
-    if (!result.closed) throw new Error("The exited Windows child did not close its output streams.");
-    return;
-  }
-  const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
-    shell: false,
-    stdio: "ignore",
-  });
-  observeChild(killer);
-  const taskkill = await waitForExit(killer);
-  if (taskkill.error || taskkill.code !== 0) {
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // The direct child may have exited while taskkill was running.
-    }
-  }
-  const result = await settleWithin(waitForExit(child).then(() => ({ exited: true })), graceMs);
-  if (!result.exited && child.exitCode === null && child.signalCode === null) {
-    throw new Error("The Windows child process tree did not exit after taskkill.");
-  }
-}
-
 export async function terminateProcessTree(child, graceMs = 5_000) {
   if (!child?.pid) return;
   if (process.platform === "win32") {
-    await terminateWindowsProcessTree(child, graceMs);
-    return;
+    throw new Error("Verified process-tree cleanup is unavailable on native Windows.");
   }
 
   const processGroupId = child.pid;
@@ -259,7 +268,7 @@ export async function runChecked(command, args, options = {}) {
     );
   }
   if (result.outcome.error) throw result.outcome.error;
-  if (process.platform !== "win32" && processGroupExists(child.pid)) {
+  if (processGroupHasLiveMember(child.pid)) {
     try {
       await terminateProcessTree(child);
     } catch (cleanupError) {
