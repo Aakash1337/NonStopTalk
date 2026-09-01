@@ -5,6 +5,8 @@ const configuredOrigin = process.argv[2]
   || "https://dontstoptalking.org";
 const origin = new URL(configuredOrigin);
 const WEB_ANALYTICS_ORIGIN = "https://static.cloudflareinsights.com";
+const PLATFORM_STATUS_ATTEMPTS = 5;
+const PLATFORM_STATUS_RETRY_MS = 1_000;
 if (!/^https:$/.test(origin.protocol) || origin.pathname !== "/") {
   throw new Error("NONSTOPTALK_PRODUCTION_ORIGIN must be an HTTPS origin without a path.");
 }
@@ -51,6 +53,28 @@ async function get(pathname, accept) {
     if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
   }
   throw lastError instanceof Error ? lastError : new Error(`${pathname} did not respond.`);
+}
+
+async function getPlatformStatus() {
+  let response;
+  let status;
+  for (let attempt = 1; attempt <= PLATFORM_STATUS_ATTEMPTS; attempt += 1) {
+    response = await get("/api/v1/platform/status", "application/json");
+    status = await response.json();
+    // A just-deployed compatibility Worker can briefly observe the migrated
+    // schema while still returning the previous status shape at another edge.
+    // Retry only that recognizable propagation state; real degraded cleanup
+    // states remain release failures without being hidden by this loop.
+    const isCompatibilityPropagation = status.schemaVersion === 5
+      && status.capabilities?.retentionCleanup === undefined;
+    if (!isCompatibilityPropagation) {
+      return { response, status };
+    }
+    if (attempt < PLATFORM_STATUS_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, PLATFORM_STATUS_RETRY_MS));
+    }
+  }
+  return { response, status };
 }
 
 for (const pathname of ["/", "/practice", "/progress"]) {
@@ -110,8 +134,7 @@ assert(!hasScriptFromOrigin(
 ),
   "the direct admin asset path contains an injected Web Analytics beacon");
 
-const statusResponse = await get("/api/v1/platform/status", "application/json");
-const status = await statusResponse.json();
+const { response: statusResponse, status } = await getPlatformStatus();
 assert(status.status === "ok", `platform status is ${String(status.status || "unavailable")}`);
 assert(status.apiVersion === "v1", "production API version is not v1");
 assert(status.schemaVersion === 5, "production schema version is not the cleanup-heartbeat schema");

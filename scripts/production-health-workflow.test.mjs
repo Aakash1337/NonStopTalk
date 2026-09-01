@@ -52,3 +52,18 @@ test("production health workflow pins its two third-party actions", () => {
     "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
   ]);
 });
+
+test("production probe bounds only deployment-propagation status retries", () => {
+  assert.match(productionProbe, /^const PLATFORM_STATUS_ATTEMPTS = 5;$/mu);
+  assert.match(productionProbe, /^const PLATFORM_STATUS_RETRY_MS = 1_000;$/mu);
+  assert.match(
+    productionProbe,
+    /const isCompatibilityPropagation = status\.schemaVersion === 5\s*&& status\.capabilities\?\.retentionCleanup === undefined;/u,
+  );
+  assert.match(productionProbe, /if \(!isCompatibilityPropagation\) \{\s*return \{ response, status \};/u);
+  assert.doesNotMatch(
+    productionProbe,
+    /status\.capabilities\?\.retentionCleanup\?\.status\s*!==\s*"ready"/u,
+    "a real stale or backlog status must not be retried as deployment propagation",
+  );
+});
