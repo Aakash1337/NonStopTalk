@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -14,11 +15,20 @@ const (
 	DefaultSilenceTimeout   = 2 * time.Second
 	DefaultRounds           = 1
 	CompletionBonus         = 25
+	MaxScoreCorrectionDelta = 100
+	// MaxTurnIDNumber is JavaScript's largest safe integer, keeping every ID in
+	// the cross-runtime JSON range exact rather than relying on sparse larger
+	// representable values.
+	MaxTurnIDNumber         int64 = 9007199254740991
+	turnIDExhaustedSentinel int64 = MaxTurnIDNumber + 1
 
 	MaxPlayerNameLength = 40
 	MaxTopicLength      = 200
 	MaxTopics           = 500
 )
+
+var ErrTopicsRequired = errors.New("choose at least one topic")
+var ErrTurnIDsExhausted = errors.New("this room has exhausted its turn IDs")
 
 type Settings struct {
 	SpeakingDurationSeconds int
@@ -165,7 +175,7 @@ type Session struct {
 	NextPlayerNumber int
 	// NextTurnNumber is likewise persisted so delayed asynchronous results can
 	// never collide with a turn created after a reset or restart.
-	NextTurnNumber int
+	NextTurnNumber int64
 }
 
 func NewSession(id string) *Session {
@@ -275,11 +285,14 @@ func (s *Session) UpdateSettings(settings Settings) {
 	s.Settings = settings.Normalize()
 }
 
-func (s *Session) SetTopics(topics []string) {
+// NormalizeTopics applies the shared custom-topic limits without changing the
+// caller's slice. Handlers can use it to validate a complete replacement
+// before entering a room mutation.
+func NormalizeTopics(topics []string) []string {
 	cleaned := make([]string, 0, len(topics))
 	seen := map[string]bool{}
 	for _, topic := range topics {
-		topic = strings.TrimSpace(topic)
+		topic = trimGameSpace(topic)
 		if topic == "" {
 			continue
 		}
@@ -294,12 +307,24 @@ func (s *Session) SetTopics(topics []string) {
 			break
 		}
 	}
+	return cleaned
+}
+
+// SetTopics replaces the complete topic collection. An empty replacement is
+// rejected before any deck or cursor state changes, so validation failures are
+// atomic for both direct callers and request handlers.
+func (s *Session) SetTopics(topics []string) error {
+	cleaned := NormalizeTopics(topics)
+	if len(cleaned) == 0 {
+		return ErrTopicsRequired
+	}
 	s.Topics = cleaned
 	s.TopicDeck = nil
 	s.TopicDeckCursor = 0
 	s.TopicCursor = 0
 	s.LastTopicIndex = 0
 	s.HasLastTopic = false
+	return nil
 }
 
 // resetTopicDeck starts a fresh shuffled cycle while remembering the most
@@ -380,8 +405,10 @@ func (s *Session) archiveFinishedGame() {
 
 // ResetForNewGame clears play state while keeping the roster, settings, and
 // topics so remote players stay bound to their seats across games.
-func (s *Session) ResetForNewGame() {
-	s.repairNextTurnNumber()
+func (s *Session) ResetForNewGame() error {
+	if err := s.repairNextTurnNumber(); err != nil {
+		return err
+	}
 	s.archiveFinishedGame()
 	s.Started = false
 	s.Finished = false
@@ -393,6 +420,7 @@ func (s *Session) ResetForNewGame() {
 	for i := range s.Players {
 		s.Players[i].Score = 0
 	}
+	return nil
 }
 
 func (s *Session) CanStart() bool {
@@ -406,7 +434,9 @@ func (s *Session) Start() error {
 	if len(s.Topics) == 0 {
 		return errors.New("choose at least one topic")
 	}
-	s.repairNextTurnNumber()
+	if err := s.repairNextTurnNumber(); err != nil {
+		return err
+	}
 	s.archiveFinishedGame()
 	s.Started = true
 	s.Finished = false
@@ -432,7 +462,11 @@ func (s *Session) StartTurn() (*Turn, error) {
 	}
 	if s.ActiveTurn != nil {
 		if s.ActiveTurn.ID == "" {
-			s.ActiveTurn.ID = s.nextTurnID()
+			id, err := s.nextTurnID()
+			if err != nil {
+				return nil, err
+			}
+			s.ActiveTurn.ID = id
 		}
 		return s.ActiveTurn, nil
 	}
@@ -440,12 +474,16 @@ func (s *Session) StartTurn() (*Turn, error) {
 		return nil, errors.New("game is not ready")
 	}
 	player := s.Players[s.CurrentPlayer]
+	turnID, err := s.nextTurnID()
+	if err != nil {
+		return nil, err
+	}
 	topicIndex, err := s.drawTopic()
 	if err != nil {
 		return nil, err
 	}
 	turn := &Turn{
-		ID:           s.nextTurnID(),
+		ID:           turnID,
 		PlayerID:     player.ID,
 		PlayerName:   player.Name,
 		Round:        s.CurrentRound,
@@ -466,6 +504,10 @@ func (s *Session) RedrawActiveTurn() (*Turn, error) {
 		return nil, errors.New("choose at least one topic")
 	}
 
+	turnID, err := s.nextTurnID()
+	if err != nil {
+		return nil, err
+	}
 	nextIndex, err := s.drawTopic()
 	if err != nil {
 		return nil, err
@@ -476,7 +518,7 @@ func (s *Session) RedrawActiveTurn() (*Turn, error) {
 	// A redraw invalidates every request rendered for the previous topic.
 	// Give the replacement its own ID so delayed begin/redraw/submit actions
 	// cannot operate on the newly displayed topic.
-	s.ActiveTurn.ID = s.nextTurnID()
+	s.ActiveTurn.ID = turnID
 	return s.ActiveTurn, nil
 }
 
@@ -492,6 +534,10 @@ func (s *Session) SubmitTurn(spokenSeconds int, completed bool, eliminated bool)
 	}
 	turn := *s.ActiveTurn
 	turn.SpokenSeconds = spokenSeconds
+	// Completion is a derived fact, not a trusted flag. A short or eliminated
+	// turn cannot retain a completion marker (or its bonus) even when a caller
+	// requests one directly through the game package.
+	completed = completed && !eliminated && spokenSeconds >= turn.Duration
 	turn.Completed = completed
 	turn.Eliminated = eliminated
 	turn.Score = Score(ScoreInput{
@@ -523,7 +569,11 @@ func (s *Session) MarkTurnAIPending() int {
 	index := len(s.CompletedTurns) - 1
 	turn := &s.CompletedTurns[index]
 	if turn.ID == "" {
-		turn.ID = s.nextTurnID()
+		id, err := s.nextTurnID()
+		if err != nil {
+			return -1
+		}
+		turn.ID = id
 	}
 	switch turn.AIStatus {
 	case "":
@@ -615,16 +665,35 @@ func (s *Session) ReconcilePendingAI() int {
 	return reconciled
 }
 
-func (s *Session) OverrideScore(playerID string, delta int) {
+func (s *Session) HasPlayer(playerID string) bool {
+	for i := range s.Players {
+		if s.Players[i].ID == playerID {
+			return true
+		}
+	}
+	return false
+}
+
+// OverrideScore applies a bounded host correction. The returned delta is the
+// bounded request (the zero-point floor may make the effective change smaller)
+// and accepted is false when the player no longer exists.
+func (s *Session) OverrideScore(playerID string, delta int) (appliedDelta int, accepted bool) {
+	if delta > MaxScoreCorrectionDelta {
+		delta = MaxScoreCorrectionDelta
+	}
+	if delta < -MaxScoreCorrectionDelta {
+		delta = -MaxScoreCorrectionDelta
+	}
 	for i := range s.Players {
 		if s.Players[i].ID == playerID {
 			s.Players[i].Score += delta
 			if s.Players[i].Score < 0 {
 				s.Players[i].Score = 0
 			}
-			return
+			return delta, true
 		}
 	}
+	return 0, false
 }
 
 func (s *Session) Standings() []Player {
@@ -654,22 +723,54 @@ func (s *Session) advance() {
 	}
 }
 
-func (s *Session) nextTurnID() string {
-	s.repairNextTurnNumber()
-	id := "t" + itoa(s.NextTurnNumber)
-	s.NextTurnNumber++
-	return id
+func (s *Session) nextTurnID() (string, error) {
+	if err := s.repairNextTurnNumber(); err != nil {
+		return "", err
+	}
+	if s.NextTurnNumber < 1 || s.NextTurnNumber > MaxTurnIDNumber {
+		return "", ErrTurnIDsExhausted
+	}
+	id := "t" + strconv.FormatInt(s.NextTurnNumber, 10)
+	if s.NextTurnNumber == MaxTurnIDNumber {
+		s.NextTurnNumber = turnIDExhaustedSentinel
+	} else {
+		s.NextTurnNumber++
+	}
+	return id, nil
 }
 
-func (s *Session) repairNextTurnNumber() {
-	maxUsed := 0
+// ValidateTurnIDs checks whether another cross-runtime-safe turn ID can ever
+// be allocated without changing the persisted counter. Request handlers use
+// it inside their authorization transaction so an exhausted room can reject
+// start/reset without creating a no-op room version.
+func (s *Session) ValidateTurnIDs() error {
+	_, err := s.repairedNextTurnNumber()
+	return err
+}
+
+func (s *Session) repairNextTurnNumber() error {
+	next, err := s.repairedNextTurnNumber()
+	if err != nil {
+		return err
+	}
+	s.NextTurnNumber = next
+	return nil
+}
+
+func (s *Session) repairedNextTurnNumber() (int64, error) {
+	maxUsed := int64(0)
 	remember := func(id string) {
-		if len(id) < 2 || id[0] != 't' {
+		if len(id) < 2 || id[0] != 't' || id[1] < '1' || id[1] > '9' {
 			return
 		}
-		number, err := strconv.Atoi(id[1:])
-		if err == nil && number > maxUsed {
-			maxUsed = number
+		for _, digit := range id[2:] {
+			if digit < '0' || digit > '9' {
+				return
+			}
+		}
+		number, err := strconv.ParseUint(id[1:], 10, 63)
+		if err == nil && number <= uint64(MaxTurnIDNumber) && int64(number) > maxUsed {
+			maxUsed = int64(number)
 		}
 	}
 	if s.ActiveTurn != nil {
@@ -678,16 +779,21 @@ func (s *Session) repairNextTurnNumber() {
 	for _, turn := range s.CompletedTurns {
 		remember(turn.ID)
 	}
-	if s.NextTurnNumber <= maxUsed {
-		s.NextTurnNumber = maxUsed + 1
+	if s.NextTurnNumber >= turnIDExhaustedSentinel || maxUsed >= MaxTurnIDNumber {
+		return 0, ErrTurnIDsExhausted
 	}
-	if s.NextTurnNumber < 1 {
-		s.NextTurnNumber = 1
+	next := s.NextTurnNumber
+	if next <= maxUsed {
+		next = maxUsed + 1
 	}
+	if next < 1 {
+		next = 1
+	}
+	return next, nil
 }
 
 func cleanName(name string) string {
-	return truncate(strings.TrimSpace(name), MaxPlayerNameLength)
+	return truncate(trimGameSpace(name), MaxPlayerNameLength)
 }
 
 func truncate(value string, max int) string {
@@ -695,7 +801,14 @@ func truncate(value string, max int) string {
 	if len(runes) <= max {
 		return value
 	}
-	return strings.TrimSpace(string(runes[:max]))
+	return trimGameSpace(string(runes[:max]))
+}
+
+func trimGameSpace(value string) string {
+	value = strings.ToValidUTF8(value, "\uFFFD")
+	return strings.TrimFunc(value, func(r rune) bool {
+		return unicode.IsSpace(r) || r == '\uFEFF'
+	})
 }
 
 func itoa(v int) string {

@@ -144,9 +144,9 @@ test("server elapsed time caps a browser-supplied score", () => {
 		{ type: "submit-turn", turnId, spokenSeconds: 60, completed: true },
 		12_000,
 	);
-	assert.equal(room.completedTurns[0].spokenSeconds, 4);
+	assert.equal(room.completedTurns[0].spokenSeconds, 3);
 	assert.equal(room.completedTurns[0].completed, false);
-	assert.equal(room.players[0].score, 4);
+	assert.equal(room.players[0].score, 3);
 });
 
 test("topic deck does not repeat within a cycle or at a cycle boundary", () => {

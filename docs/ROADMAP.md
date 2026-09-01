@@ -124,6 +124,9 @@ Implemented work includes:
 - Atomic host authorization, external-provider ceilings, connection caps, and replay-safe turn transitions
 - Go unit, handler, race, vet, and Playwright smoke validation
 - TypeScript game/route tests and a Wrangler deploy dry run
+- A versioned machine-readable contract executed by both the Go and Cloudflare
+  suites for Unicode limits, remote-clock tolerance, completion normalization,
+  score corrections, atomic topic replacement, and persisted turn-ID repair
 - A hermetic two-browser Cloudflare smoke flow covering isolated identities,
   live WebSocket state, host-only authorization, scoring, reconnect persistence,
   and a finished game
@@ -142,7 +145,7 @@ Implemented work includes:
 Remaining hardening:
 
 - Game-feature parity between the Go and Cloudflare editions
-- Stronger automated cross-edition rule-parity checks
+- Expansion of the automated cross-edition contract beyond the implemented core rules
 - Broader browser/device testing
 - Formal security and accessibility reviews
 

@@ -691,7 +691,7 @@ func TestNormalizeRemoteTurnClaim(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			spoken, completed := normalizeRemoteTurnClaim(test.claimed, test.wantsCompleted, test.elapsed, 60)
+			spoken, completed := normalizeRemoteTurnClaim(test.claimed, test.wantsCompleted, false, test.elapsed, 60)
 			if spoken != test.wantSpoken || completed != test.wantCompleted {
 				t.Fatalf("got (%d,%v), want (%d,%v)", spoken, completed, test.wantSpoken, test.wantCompleted)
 			}

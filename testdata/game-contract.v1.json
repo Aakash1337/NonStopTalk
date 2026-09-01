@@ -1,0 +1,257 @@
+{
+  "schemaVersion": 1,
+  "constants": {
+    "textLengthUnit": "unicode-code-points",
+    "maxPlayerNameCodePoints": 40,
+    "maxTopicCodePoints": 200,
+    "remoteClaimObservationToleranceSeconds": 1,
+    "remoteCompletionGraceSeconds": 2,
+    "completionBonus": 25,
+    "maxScoreCorrectionDeltaMagnitude": 100,
+    "minimumScore": 0,
+    "turnIdPrefix": "t",
+    "maxTurnIdNumber": 9007199254740991,
+    "turnIdExhaustedSentinel": 9007199254740992
+  },
+  "cases": {
+    "unicodeTruncation": [
+      {
+        "id": "player-name-astral-boundary",
+        "field": "player_name",
+        "input": { "repeat": "x", "count": 39, "suffix": "🌍Z" },
+        "expected": { "repeat": "x", "count": 39, "suffix": "🌍" },
+        "expectedCodePoints": 40
+      },
+      {
+        "id": "topic-astral-boundary",
+        "field": "topic",
+        "input": { "repeat": "y", "count": 199, "suffix": "🌍Z" },
+        "expected": { "repeat": "y", "count": 199, "suffix": "🌍" },
+        "expectedCodePoints": 200
+      },
+      {
+        "id": "ill-formed-surrogate-is-replaced",
+        "field": "player_name",
+        "input": { "repeat": "q", "count": 39, "suffixUtf16": [55296, 90] },
+        "expected": { "repeat": "q", "count": 39, "suffix": "\ufffd" },
+        "expectedCodePoints": 40
+      }
+    ],
+    "remoteTurnClaims": [
+      {
+        "id": "clock-before-start",
+        "durationSeconds": 60,
+        "claimedSpokenSeconds": 60,
+        "requestedCompleted": true,
+        "eliminated": false,
+        "serverElapsedSeconds": -1,
+        "expectedSpokenSeconds": 0,
+        "expectedCompleted": false
+      },
+      {
+        "id": "ordinary-observation-tolerance",
+        "durationSeconds": 60,
+        "claimedSpokenSeconds": 60,
+        "requestedCompleted": false,
+        "eliminated": false,
+        "serverElapsedSeconds": 2,
+        "expectedSpokenSeconds": 3,
+        "expectedCompleted": false
+      },
+      {
+        "id": "completion-before-grace",
+        "durationSeconds": 60,
+        "claimedSpokenSeconds": 60,
+        "requestedCompleted": true,
+        "eliminated": false,
+        "serverElapsedSeconds": 57,
+        "expectedSpokenSeconds": 58,
+        "expectedCompleted": false
+      },
+      {
+        "id": "completion-inside-grace",
+        "durationSeconds": 60,
+        "claimedSpokenSeconds": 58,
+        "requestedCompleted": true,
+        "eliminated": false,
+        "serverElapsedSeconds": 58,
+        "expectedSpokenSeconds": 60,
+        "expectedCompleted": true
+      },
+      {
+        "id": "elimination-suppresses-completion-grace",
+        "durationSeconds": 60,
+        "claimedSpokenSeconds": 58,
+        "requestedCompleted": true,
+        "eliminated": true,
+        "serverElapsedSeconds": 58,
+        "expectedSpokenSeconds": 58,
+        "expectedCompleted": false
+      }
+    ],
+    "turnSubmissions": [
+      {
+        "id": "short-claim-cannot-complete",
+        "durationSeconds": 60,
+        "spokenSeconds": 59,
+        "requestedCompleted": true,
+        "eliminated": false,
+        "expectedSpokenSeconds": 59,
+        "expectedCompleted": false,
+        "expectedScore": 59
+      },
+      {
+        "id": "elimination-cannot-complete",
+        "durationSeconds": 60,
+        "spokenSeconds": 60,
+        "requestedCompleted": true,
+        "eliminated": true,
+        "expectedSpokenSeconds": 60,
+        "expectedCompleted": false,
+        "expectedScore": 60
+      },
+      {
+        "id": "full-non-eliminated-completion",
+        "durationSeconds": 60,
+        "spokenSeconds": 60,
+        "requestedCompleted": true,
+        "eliminated": false,
+        "expectedSpokenSeconds": 60,
+        "expectedCompleted": true,
+        "expectedScore": 85
+      }
+    ],
+    "scoreCorrections": [
+      {
+        "id": "positive-delta-is-bounded",
+        "playerId": "p1",
+        "initialScore": 10,
+        "requestedDelta": 250,
+        "expectedAppliedDelta": 100,
+        "expectedScore": 110,
+        "expectedAccepted": true
+      },
+      {
+        "id": "negative-delta-is-bounded",
+        "playerId": "p1",
+        "initialScore": 250,
+        "requestedDelta": -500,
+        "expectedAppliedDelta": -100,
+        "expectedScore": 150,
+        "expectedAccepted": true
+      },
+      {
+        "id": "score-floor-is-zero",
+        "playerId": "p1",
+        "initialScore": 40,
+        "requestedDelta": -500,
+        "expectedAppliedDelta": -100,
+        "expectedScore": 0,
+        "expectedAccepted": true
+      },
+      {
+        "id": "unknown-player-is-rejected",
+        "playerId": "missing",
+        "initialScore": 40,
+        "requestedDelta": 10,
+        "expectedAppliedDelta": 0,
+        "expectedScore": 40,
+        "expectedAccepted": false,
+        "errorCode": "player_not_found",
+        "expectedVersionChanged": false
+      }
+    ],
+    "customTopics": [
+      {
+        "id": "empty-custom-topics-are-atomic",
+        "inputTopics": ["   ", "\t", "\u0085", "\ufeff"],
+        "initial": {
+          "topics": ["Original topic"],
+          "topicPack": "custom",
+          "deck": [0],
+          "deckCursor": 1,
+          "topicGeneration": 7,
+          "version": 11
+        },
+        "expected": {
+          "topics": ["Original topic"],
+          "topicPack": "custom",
+          "deck": [0],
+          "deckCursor": 1,
+          "topicGeneration": 7,
+          "version": 11,
+          "accepted": false,
+          "errorCode": "topics_required"
+        }
+      }
+    ],
+    "turnCounters": [
+      {
+        "id": "start-repairs-completed-turn-history",
+        "allocation": "start_turn",
+        "initialNextTurn": 0,
+        "activeTurnId": null,
+        "completedTurnIds": ["legacy", "t0", "t41", "t-7"],
+        "expectedAllocatedTurnId": "t42",
+        "expectedNextTurn": 43,
+        "expectedAccepted": true
+      },
+      {
+        "id": "redraw-repairs-active-turn-history",
+        "allocation": "redraw_turn",
+        "initialNextTurn": 2,
+        "activeTurnId": "t12",
+        "completedTurnIds": ["t7"],
+        "expectedAllocatedTurnId": "t13",
+        "expectedNextTurn": 14,
+        "expectedAccepted": true
+      },
+      {
+        "id": "noncanonical-turn-ids-are-ignored",
+        "allocation": "start_turn",
+        "initialNextTurn": 0,
+        "activeTurnId": null,
+        "completedTurnIds": ["legacy", "t0", "t-7", "t+41", "t041", "t9007199254740992"],
+        "expectedAllocatedTurnId": "t1",
+        "expectedNextTurn": 2,
+        "expectedAccepted": true
+      },
+      {
+        "id": "maximum-used-turn-id-exhausts-without-replay",
+        "allocation": "start_turn",
+        "initialNextTurn": 0,
+        "activeTurnId": null,
+        "completedTurnIds": ["t9007199254740991"],
+        "expectedAllocatedTurnId": null,
+        "expectedNextTurn": 0,
+        "expectedAccepted": false,
+        "errorCode": "turn_ids_exhausted",
+        "expectedHistoryPreserved": true,
+        "expectedVersionChanged": false
+      },
+      {
+        "id": "maximum-safe-turn-id-is-allocated-once",
+        "allocation": "start_turn",
+        "initialNextTurn": 9007199254740991,
+        "activeTurnId": null,
+        "completedTurnIds": [],
+        "expectedAllocatedTurnId": "t9007199254740991",
+        "expectedNextTurn": 9007199254740992,
+        "expectedAccepted": true
+      },
+      {
+        "id": "persisted-exhaustion-sentinel-never-wraps",
+        "allocation": "start_turn",
+        "initialNextTurn": 9007199254740992,
+        "activeTurnId": null,
+        "completedTurnIds": [],
+        "expectedAllocatedTurnId": null,
+        "expectedNextTurn": 9007199254740992,
+        "expectedAccepted": false,
+        "errorCode": "turn_ids_exhausted",
+        "expectedHistoryPreserved": true,
+        "expectedVersionChanged": false
+      }
+    ]
+  }
+}

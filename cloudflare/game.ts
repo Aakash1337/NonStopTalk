@@ -1,6 +1,15 @@
 export const MAX_PLAYERS = 12;
 export const COMPLETION_BONUS = 25;
 export const HOST_CLAIM_GRACE_MS = 30_000;
+export const MAX_PLAYER_NAME_CODE_POINTS = 40;
+export const MAX_TOPIC_CODE_POINTS = 200;
+export const MAX_SCORE_CORRECTION_DELTA_MAGNITUDE = 100;
+export const MINIMUM_SCORE = 0;
+export const REMOTE_CLAIM_OBSERVATION_TOLERANCE_SECONDS = 1;
+export const REMOTE_COMPLETION_GRACE_SECONDS = 2;
+export const TURN_ID_PREFIX = "t";
+export const MAX_TURN_ID_NUMBER = Number.MAX_SAFE_INTEGER;
+export const TURN_ID_EXHAUSTED_SENTINEL = MAX_TURN_ID_NUMBER + 1;
 
 export interface Player {
 	id: string;
@@ -318,6 +327,9 @@ export function applyAction(
 			requireSetup(room);
 			if (room.players.length < 2) throw new GameError("Add at least two players.", 409);
 			if (!room.topics.length) throw new GameError("Choose at least one topic.", 409);
+			// Repair a legacy counter before completed turn IDs are cleared. This
+			// preserves monotonic IDs without rewriting stored turn history.
+			repairNextTurn(room);
 			archiveFinishedGame(room, now);
 			room.phase = "playing";
 			room.currentPlayer = 0;
@@ -337,9 +349,12 @@ export function applyAction(
 			if (!current) throw new GameError("The current player is unavailable.", 409);
 			if (!isHost && current.id !== playerId) throw new GameError("Only the next speaker or host can start this turn.", 403);
 			if (room.activeTurn) break;
+			// Fail before advancing the topic deck when a persisted room has
+			// exhausted the cross-runtime safe turn-ID range.
+			repairNextTurn(room);
 			const topicIndex = drawTopic(room);
 			room.activeTurn = {
-				id: `t${room.nextTurn++}`,
+				id: nextTurnId(room),
 				playerId: current.id,
 				playerName: current.name,
 				round: room.currentRound,
@@ -361,8 +376,9 @@ export function applyAction(
 			const turn = requireTurn(room, text(action.turnId));
 			requireTurnDriver(isHost, playerId, turn);
 			if (turn.begunAt !== null) throw new GameError("A topic can only be redrawn before speaking begins.", 409);
+			repairNextTurn(room);
 			const topicIndex = drawTopic(room);
-			turn.id = `t${room.nextTurn++}`;
+			turn.id = nextTurnId(room);
 			turn.topicIndex = topicIndex;
 			turn.topic = room.topics[topicIndex];
 			turn.begunAt = null;
@@ -374,15 +390,26 @@ export function applyAction(
 			let spoken = clamp(integer(action.spokenSeconds, 0), 0, turn.duration);
 			const eliminated = Boolean(action.eliminated);
 			const requestedCompletion = Boolean(action.completed) && !eliminated;
-			if (!isHost && turn.begunAt !== null) {
-				const serverElapsed = Math.max(0, Math.floor((now - turn.begunAt) / 1000));
-				if (requestedCompletion && serverElapsed + 2 >= turn.duration) {
+			if (!isHost) {
+				const serverElapsed = turn.begunAt === null
+					? -1
+					: Math.floor((now - turn.begunAt) / 1000);
+				const observed = serverElapsed < 0
+					? 0
+					: Math.min(
+						turn.duration,
+						serverElapsed + REMOTE_CLAIM_OBSERVATION_TOLERANCE_SECONDS,
+					);
+				spoken = Math.min(spoken, observed);
+				if (
+					requestedCompletion &&
+					serverElapsed >= 0 &&
+					serverElapsed + REMOTE_COMPLETION_GRACE_SECONDS >= turn.duration
+				) {
+					// A completion accepted inside the grace window must normalize to
+					// the full duration so its score and completion bonus agree.
 					spoken = turn.duration;
-				} else {
-					spoken = Math.min(spoken, serverElapsed + 2);
 				}
-			} else if (!isHost) {
-				spoken = 0;
 			}
 			const completed = requestedCompletion && spoken >= turn.duration;
 			const scored: Turn = {
@@ -401,13 +428,18 @@ export function applyAction(
 		case "score": {
 			requireHost(isHost);
 			const player = findPlayer(room, text(action.playerId));
-			const delta = clamp(integer(action.delta, 0), -100, 100);
-			player.score = Math.max(0, player.score + delta);
+			const delta = clamp(
+				integer(action.delta, 0),
+				-MAX_SCORE_CORRECTION_DELTA_MAGNITUDE,
+				MAX_SCORE_CORRECTION_DELTA_MAGNITUDE,
+			);
+			player.score = Math.max(MINIMUM_SCORE, player.score + delta);
 			break;
 		}
 		case "reset": {
 			requireHost(isHost);
 			if (room.phase === "playing") throw new GameError("A running game cannot be reset.", 409);
+			repairNextTurn(room);
 			archiveFinishedGame(room, now);
 			room.phase = "setup";
 			room.currentPlayer = 0;
@@ -620,11 +652,51 @@ function currentTopicGeneration(room: RoomState): number {
 		: 0;
 }
 
+function nextTurnId(room: RoomState): string {
+	repairNextTurn(room);
+	if (!Number.isSafeInteger(room.nextTurn) || room.nextTurn < 1 || room.nextTurn > MAX_TURN_ID_NUMBER) {
+		throw new GameError("This room has exhausted its turn IDs.", 409);
+	}
+	const id = `${TURN_ID_PREFIX}${room.nextTurn}`;
+	// MAX_SAFE_INTEGER + 1 is an exact finite Number and acts only as a durable
+	// exhaustion sentinel. repairNextTurn rejects it instead of resetting it,
+	// so clearing old turn history can never make an ID reusable.
+	room.nextTurn = room.nextTurn === MAX_TURN_ID_NUMBER
+		? TURN_ID_EXHAUSTED_SENTINEL
+		: room.nextTurn + 1;
+	return id;
+}
+
+function repairNextTurn(room: RoomState): void {
+	let maxUsed = 0;
+	const remember = (id: string): void => {
+		const match = /^t([1-9][0-9]*)$/.exec(id);
+		if (!match) return;
+		const numberText = match[1];
+		const used = Number(numberText);
+		if (!Number.isSafeInteger(used) || used > MAX_TURN_ID_NUMBER) return;
+		if (used > maxUsed) maxUsed = used;
+	};
+	if (room.activeTurn) remember(room.activeTurn.id);
+	for (const turn of room.completedTurns) remember(turn.id);
+
+	if (typeof room.nextTurn === "number" && Number.isFinite(room.nextTurn) && room.nextTurn > MAX_TURN_ID_NUMBER) {
+		throw new GameError("This room has exhausted its turn IDs.", 409);
+	}
+	if (maxUsed >= MAX_TURN_ID_NUMBER) {
+		throw new GameError("This room has exhausted its turn IDs.", 409);
+	}
+	const persisted = Number.isSafeInteger(room.nextTurn) && room.nextTurn >= 1 ? room.nextTurn : 1;
+	room.nextTurn = Math.max(persisted, maxUsed + 1);
+}
+
 function cleanTopics(values: string[]): string[] {
 	const topics: string[] = [];
 	const seen = new Set<string>();
 	for (const value of values) {
-		const topic = String(value).trim().slice(0, 200).trim();
+		const topic = trimGameSpace(
+			truncateCodePoints(trimGameSpace(String(value)), MAX_TOPIC_CODE_POINTS),
+		);
 		const key = topic.toLocaleLowerCase();
 		if (!topic || seen.has(key)) continue;
 		seen.add(key);
@@ -635,7 +707,19 @@ function cleanTopics(values: string[]): string[] {
 }
 
 function cleanName(value: string): string {
-	return value.trim().slice(0, 40).trim();
+	return trimGameSpace(
+		truncateCodePoints(trimGameSpace(value), MAX_PLAYER_NAME_CODE_POINTS),
+	);
+}
+
+function truncateCodePoints(value: string, maximum: number): string {
+	return [...value.toWellFormed()].slice(0, maximum).join("");
+}
+
+function trimGameSpace(value: string): string {
+	// Align the Go and ECMAScript whitespace sets: Unicode White_Space plus
+	// the BOM/zero-width no-break space that browsers traditionally trim.
+	return value.replace(/^[\p{White_Space}\uFEFF]+|[\p{White_Space}\uFEFF]+$/gu, "");
 }
 
 function text(value: unknown): string {
