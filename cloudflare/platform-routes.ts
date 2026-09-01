@@ -35,6 +35,7 @@ export interface PlatformBindings extends TopicProviderBindings {
 	PRODUCT_ANALYTICS?: AnalyticsEngineDataset;
 	ANALYTICS_ADMIN_TOKEN?: string;
 	ROOM_FACT_HASH_KEY?: string;
+	ROOM_MILESTONE_DELIVERY_MODE?: string;
 }
 
 export interface PlatformRouteResult {
@@ -91,7 +92,9 @@ export async function handlePlatformRoute(
 							topicGeneration,
 							aggregateAnalytics: {
 								status: adminAnalyticsReady ? "ready" : "write-only",
-								delivery: "best-effort",
+								delivery: env.ROOM_MILESTONE_DELIVERY_MODE === "outbox"
+									? "durable-outbox"
+									: "best-effort",
 								adminRead: adminAnalyticsReady,
 								analyticsEngine: env.PRODUCT_ANALYTICS ? "enabled" : "disabled",
 							},

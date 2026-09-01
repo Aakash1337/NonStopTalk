@@ -506,6 +506,36 @@ test("platform status preserves the schema-5 capability shape for compatible mar
 	}
 });
 
+test("platform status reports durable outbox delivery only for the exact outbox mode", async () => {
+	for (const testCase of [
+		{ mode: "outbox", expected: "durable-outbox" },
+		{ mode: undefined, expected: "best-effort" },
+		{ mode: "", expected: "best-effort" },
+		{ mode: "best-effort", expected: "best-effort" },
+		{ mode: "unknown", expected: "best-effort" },
+		{ mode: "OUTBOX", expected: "best-effort" },
+		{ mode: " outbox ", expected: "best-effort" },
+	] as const) {
+		const handled = await handlePlatformRoute(
+			new Request("https://nonstoptalk.test/api/v1/platform/status"),
+			{
+				PLATFORM_DB: new FakeStatusD1(6) as unknown as D1Database,
+				ROOM_MILESTONE_DELIVERY_MODE: testCase.mode,
+			},
+			"3".repeat(64),
+			`delivery-mode-${testCase.mode ?? "missing"}`,
+			noDeferredTasks,
+		);
+
+		assert(handled);
+		assert.equal(handled.response.status, 200);
+		const body = await handled.response.json() as {
+			capabilities: { aggregateAnalytics: { delivery: string } };
+		};
+		assert.equal(body.capabilities.aggregateAnalytics.delivery, testCase.expected, testCase.mode);
+	}
+});
+
 test("platform status rejects markers outside its compatibility window and fractional markers", async () => {
 	for (const schemaVersion of [2, 3, 4, 4.5, 5.5, 6.5, 7]) {
 		const handled = await handlePlatformRoute(
