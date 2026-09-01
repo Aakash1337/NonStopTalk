@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 const origin = new URL(process.argv[2] || "https://nonstoptalk-staging.aakashplays656.workers.dev").origin;
 const hostname = new URL(origin).hostname;
 const STAGING_HOSTNAME = "nonstoptalk-staging.aakashplays656.workers.dev";
+const SUPPORTED_PLATFORM_SCHEMA_VERSIONS = new Set([5, 6]);
 
 if (new URL(origin).protocol !== "https:"
   || hostname !== STAGING_HOSTNAME) {
@@ -79,7 +80,8 @@ try {
   const status = await request("/api/v1/platform/status");
   assert.equal(status.response.status, 200, "Staging status must be healthy before a write probe.");
   assert.equal(status.payload.status, "ok");
-  assert.equal(status.payload.schemaVersion, 5);
+  assert.ok(SUPPORTED_PLATFORM_SCHEMA_VERSIONS.has(status.payload.schemaVersion),
+    "Staging schema version must be inside the reviewed 5/6 compatibility window.");
   assert.equal(status.payload.capabilities?.retentionCleanup?.status, "ready");
 
   const suffix = crypto.randomBytes(12).toString("hex");

@@ -6,6 +6,7 @@ const workflowURL = new URL("../.github/workflows/production-health.yml", import
 const workflow = await readFile(workflowURL, "utf8");
 const packageJSON = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 const productionProbe = await readFile(new URL("./smoke-production.mjs", import.meta.url), "utf8");
+const stagingProbe = await readFile(new URL("./smoke-staging.mjs", import.meta.url), "utf8");
 
 test("production health workflow stays scheduled, bounded, and manually runnable", () => {
   assert.match(workflow, /^  schedule:\n    - cron: "17,47 \* \* \* \*"$/mu);
@@ -51,6 +52,17 @@ test("production health workflow pins its two third-party actions", () => {
     "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
     "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
   ]);
+});
+
+test("production and staging probes accept only the reviewed schema window", () => {
+  for (const probe of [productionProbe, stagingProbe]) {
+    assert.match(probe,
+      /^const SUPPORTED_PLATFORM_SCHEMA_VERSIONS = new Set\(\[5, 6\]\);$/mu);
+  }
+  assert.match(productionProbe,
+    /assert\(SUPPORTED_PLATFORM_SCHEMA_VERSIONS\.has\(status\.schemaVersion\),/u);
+  assert.match(stagingProbe,
+    /assert\.ok\(SUPPORTED_PLATFORM_SCHEMA_VERSIONS\.has\(status\.payload\.schemaVersion\),/u);
 });
 
 test("production probe bounds only deployment-propagation status retries", () => {

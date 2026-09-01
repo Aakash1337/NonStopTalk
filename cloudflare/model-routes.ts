@@ -9,6 +9,7 @@ import {
 	type TopicProviderDescription,
 } from "./model-provider";
 import { logWorkerEvent } from "./observability";
+import { requireSupportedPlatformSchema } from "./platform-schema";
 
 const TOPIC_ROUTE = "/api/v1/models/topics";
 const MAX_MODEL_BODY_BYTES = 16 * 1024;
@@ -263,6 +264,7 @@ export async function handleModelRoute(
 		const reservationDay = utcDay(reservationTime);
 		let reserved: boolean;
 		try {
+			await requireSupportedPlatformSchema(env.PLATFORM_DB);
 			reserved = await reserveDailyCall(
 				env.PLATFORM_DB,
 				reservationDay,
@@ -492,6 +494,10 @@ async function safelyReconcileUsage(
 	const success = usage.succeeded ? 1 : 0;
 	const failure = usage.succeeded ? 0 : 1;
 	try {
+		// Provider calls can outlive a schema transition. Revalidate immediately
+		// before the reconciliation batch so an old isolate cannot issue schema-5
+		// SQL after the compatibility window has closed.
+		await requireSupportedPlatformSchema(database);
 		await database.batch([
 			database
 				.prepare(RECONCILE_GLOBAL_USAGE_SQL)

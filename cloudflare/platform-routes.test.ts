@@ -5,6 +5,8 @@ import {
 	RETENTION_CLEANUP_STALE_MS,
 	classifyRetentionCleanupStatus,
 	handlePlatformRoute,
+	recordProductEvent,
+	recordRoomMilestone,
 	runPlatformCleanup,
 } from "./platform-routes.ts";
 import { recordCleanupHeartbeat } from "./platform.ts";
@@ -87,6 +89,7 @@ interface FakeProgressOptions {
 	deletedCount?: number;
 	consentRevoked?: boolean;
 	failAnalytics?: boolean;
+	schemaVersion?: number;
 }
 
 class FakeProgressD1 {
@@ -94,12 +97,14 @@ class FakeProgressD1 {
 	readonly analyticsRelease = deferred<void>();
 	readonly analyticsBindings: unknown[][] = [];
 	readonly options: FakeProgressOptions;
+	readonly queries: string[] = [];
 
 	constructor(options: FakeProgressOptions) {
 		this.options = options;
 	}
 
 	prepare(query: string): D1PreparedStatement {
+		this.queries.push(query);
 		return new FakeProgressStatement(this, query) as unknown as D1PreparedStatement;
 	}
 
@@ -149,6 +154,9 @@ class FakeProgressStatement {
 	}
 
 	async first<T>(): Promise<T | null> {
+		if (/SELECT schema_version FROM platform_meta/u.test(this.query)) {
+			return { schema_version: this.database.options.schemaVersion ?? 5 } as T;
+		}
 		if (/SELECT 1 AS found FROM devices/u.test(this.query)) return { found: 1 } as T;
 		if (/FROM coaching_sessions/u.test(this.query)) {
 			return { summary_json: JSON.stringify(coachingSummary()) } as T;
@@ -191,9 +199,11 @@ class FakeModelUsageD1 {
 	readonly queries: string[] = [];
 	readonly bindings: unknown[][] = [];
 	readonly rows: ModelUsageTestRow[];
+	readonly schemaVersion: number;
 
-	constructor(rows: ModelUsageTestRow[]) {
+	constructor(rows: ModelUsageTestRow[], schemaVersion = 5) {
 		this.rows = rows;
+		this.schemaVersion = schemaVersion;
 	}
 
 	prepare(query: string): D1PreparedStatement {
@@ -220,7 +230,7 @@ class FakeModelUsageStatement {
 
 	async first<T>(): Promise<T | null> {
 		assert.match(this.#query, /SELECT schema_version FROM platform_meta/u);
-		return { schema_version: 5 } as T;
+		return { schema_version: this.#database.schemaVersion } as T;
 	}
 
 	async all<T>(): Promise<D1Result<T>> {
@@ -234,7 +244,8 @@ class FakeModelUsageStatement {
 }
 
 class FakeStatusD1 {
-	readonly schemaVersion: number;
+	schemaVersion: number;
+	markerReads = 0;
 	readonly heartbeat: { scheduledAt: string | null; completedAt: string | null; backlog: boolean };
 
 	constructor(
@@ -266,6 +277,7 @@ class FakeStatusStatement {
 
 	async first<T>(): Promise<T | null> {
 		if (/SELECT schema_version FROM platform_meta/u.test(this.query)) {
+			this.database.markerReads += 1;
 			return { schema_version: this.database.schemaVersion } as T;
 		}
 		if (/FROM platform_maintenance WHERE id = 1/u.test(this.query)) {
@@ -285,6 +297,9 @@ class FakeCleanupD1 {
 	readonly backlogAfterBudget: boolean;
 	readonly failBacklogCheck: boolean;
 	readonly failHeartbeat: boolean;
+	readonly schemaVersion: unknown;
+	readonly schemaVersions: readonly unknown[];
+	markerReads = 0;
 	cleanupBatches = 0;
 	backlogChecks = 0;
 	heartbeatAttempts = 0;
@@ -298,18 +313,24 @@ class FakeCleanupD1 {
 		backlogAfterBudget = true,
 		failBacklogCheck = false,
 		failHeartbeat = false,
+		schemaVersion = 5,
+		schemaVersions = [],
 	}: {
 		failCleanup?: boolean;
 		cleanupChanges?: number;
 		backlogAfterBudget?: boolean;
 		failBacklogCheck?: boolean;
 		failHeartbeat?: boolean;
+		schemaVersion?: unknown;
+		schemaVersions?: readonly unknown[];
 	} = {}) {
 		this.failCleanup = failCleanup;
 		this.cleanupChanges = cleanupChanges;
 		this.backlogAfterBudget = backlogAfterBudget;
 		this.failBacklogCheck = failBacklogCheck;
 		this.failHeartbeat = failHeartbeat;
+		this.schemaVersion = schemaVersion;
+		this.schemaVersions = schemaVersions;
 	}
 
 	prepare(query: string): D1PreparedStatement {
@@ -384,6 +405,13 @@ class FakeCleanupStatement {
 	}
 
 	async first<T>(): Promise<T | null> {
+		if (/SELECT schema_version FROM platform_meta/u.test(this.query)) {
+			const schemaVersion = this.database.markerReads < this.database.schemaVersions.length
+				? this.database.schemaVersions[this.database.markerReads]
+				: this.database.schemaVersion;
+			this.database.markerReads += 1;
+			return { schema_version: schemaVersion } as T;
+		}
 		assert.match(this.query, /AS has_more/u);
 		this.database.backlogChecks += 1;
 		if (this.database.failBacklogCheck) throw new Error("backlog check unavailable");
@@ -413,8 +441,8 @@ function usageRow(overrides: Partial<ModelUsageTestRow> = {}): ModelUsageTestRow
 	};
 }
 
-test("platform status reports the cleanup-heartbeat schema", async () => {
-	for (const schemaVersion of [5]) {
+test("platform status preserves the schema-5 capability shape for compatible markers", async () => {
+	for (const schemaVersion of [5, 6]) {
 		const handled = await handlePlatformRoute(
 			new Request("https://nonstoptalk.test/api/v1/platform/status"),
 			{
@@ -429,14 +457,48 @@ test("platform status reports the cleanup-heartbeat schema", async () => {
 
 		assert(handled);
 		assert.equal(handled.response.status, 200);
-		const body = await handled.response.json() as { status: string; schemaVersion: number };
-		assert.equal(body.status, "ok");
-		assert.equal(body.schemaVersion, schemaVersion);
+		assert.deepEqual(await handled.response.json(), {
+			status: "ok",
+			apiVersion: "v1",
+			schemaVersion,
+			capabilities: {
+				cloudProgress: {
+					status: "ready",
+					retentionDays: 30,
+					newSaveLimit: 250,
+				},
+				roomFacts: { status: "ready" },
+				retentionCleanup: { status: "ready" },
+				topicGeneration: {
+					status: "ready",
+					routine: {
+						status: "offline",
+						provider: "offline",
+						model: null,
+						externalAvailable: false,
+					},
+					escalated: {
+						status: "offline",
+						provider: "offline",
+						model: null,
+						externalAvailable: false,
+					},
+				},
+				aggregateAnalytics: {
+					status: "ready",
+					delivery: "best-effort",
+					adminRead: true,
+					analyticsEngine: "disabled",
+				},
+			},
+			degradedCapabilities: [],
+			requestId: `status-schema-${schemaVersion}`,
+		});
 	}
 });
 
-test("platform status rejects schema markers outside its exact feature schema", async () => {
-	for (const schemaVersion of [2, 3, 4, 6]) {
+test("platform status rejects markers outside its compatibility window and fractional markers", async () => {
+	for (const schemaVersion of [2, 3, 4, 4.5, 5.5, 6.5, 7]) {
 		const handled = await handlePlatformRoute(
 			new Request("https://nonstoptalk.test/api/v1/platform/status"),
 			{ PLATFORM_DB: new FakeStatusD1(schemaVersion) as unknown as D1Database },
@@ -451,6 +513,107 @@ test("platform status rejects schema markers outside its exact feature schema", 
 		const body = await handled.response.json() as { error: { code: string } };
 		assert.equal(body.error.code, "DATABASE_UNAVAILABLE");
 	}
+});
+
+test("platform status observes same-binding marker transitions immediately", async () => {
+	const database = new FakeStatusD1(5);
+	const binding = database as unknown as D1Database;
+	const request = () => new Request("https://nonstoptalk.test/api/v1/platform/status");
+	const readStatus = async (requestId: string): Promise<{ status: number; schemaVersion?: number }> => {
+		const handled = await handlePlatformRoute(
+			request(),
+			{ PLATFORM_DB: binding },
+			"4".repeat(64),
+			requestId,
+			noDeferredTasks,
+		);
+		assert(handled);
+		const body = await handled.response.json() as { schemaVersion?: number };
+		return { status: handled.response.status, schemaVersion: body.schemaVersion };
+	};
+
+	assert.deepEqual(await readStatus("same-binding-5"), { status: 200, schemaVersion: 5 });
+	database.schemaVersion = 6;
+	assert.deepEqual(await readStatus("same-binding-6"), { status: 200, schemaVersion: 6 });
+	database.schemaVersion = 7;
+	assert.deepEqual(await readStatus("same-binding-7"), { status: 503, schemaVersion: undefined });
+	database.schemaVersion = 5;
+	assert.deepEqual(await readStatus("same-binding-recovery"), { status: 200, schemaVersion: 5 });
+	assert.equal(database.markerReads, 4);
+});
+
+test("unsupported markers block every platform-route D1 consumer before business SQL", async () => {
+	const adminToken = "7".repeat(64);
+	const cases: Array<{ name: string; request: () => Request }> = [
+		{
+			name: "progress list",
+			request: () => new Request("https://nonstoptalk.test/api/v1/progress/sessions"),
+		},
+		{ name: "progress save", request: () => progressRequest("POST") },
+		{ name: "progress delete", request: () => progressRequest("DELETE") },
+		{
+			name: "progress export",
+			request: () => new Request("https://nonstoptalk.test/api/v1/progress/export"),
+		},
+		{
+			name: "admin analytics",
+			request: () => new Request("https://nonstoptalk.test/api/v1/admin/analytics", {
+				headers: { Authorization: `Bearer ${adminToken}` },
+			}),
+		},
+		{
+			name: "admin model usage",
+			request: () => new Request("https://nonstoptalk.test/api/v1/admin/model-usage", {
+				headers: { Authorization: `Bearer ${adminToken}` },
+			}),
+		},
+	];
+
+	for (const testCase of cases) {
+		const database = new FakeProgressD1({ schemaVersion: 7 });
+		const handled = await handlePlatformRoute(
+			testCase.request(),
+			{
+				PLATFORM_DB: database as unknown as D1Database,
+				ANALYTICS_ADMIN_TOKEN: adminToken,
+			},
+			"4".repeat(64),
+			`unsupported-${testCase.name}`,
+			noDeferredTasks,
+		);
+		assert(handled);
+		assert.equal(handled.response.status, 503, testCase.name);
+		assert.deepEqual(
+			database.queries,
+			["SELECT schema_version FROM platform_meta WHERE id = 1"],
+			testCase.name,
+		);
+	}
+});
+
+test("request validation and authorization still precede the schema gate", async () => {
+	const database = new FakeProgressD1({ schemaVersion: 7 });
+	const binding = database as unknown as D1Database;
+	const adminToken = "7".repeat(64);
+
+	const method = await handlePlatformRoute(
+		new Request("https://nonstoptalk.test/api/v1/progress/sessions", { method: "PUT" }),
+		{ PLATFORM_DB: binding },
+		"4".repeat(64),
+		"method-before-schema",
+		noDeferredTasks,
+	);
+	assert.equal(method?.response.status, 405);
+
+	const authorization = await handlePlatformRoute(
+		new Request("https://nonstoptalk.test/api/v1/admin/analytics"),
+		{ PLATFORM_DB: binding, ANALYTICS_ADMIN_TOKEN: adminToken },
+		"4".repeat(64),
+		"auth-before-schema",
+		noDeferredTasks,
+	);
+	assert.equal(authorization?.response.status, 401);
+	assert.deepEqual(database.queries, []);
 });
 
 test("cleanup heartbeat classification covers never, current, stale, backlog, and clock corruption", () => {
@@ -486,6 +649,111 @@ test("cleanup heartbeat classification covers never, current, stale, backlog, an
 		completedAt: "2026-09-01T12:06:00.000Z",
 		backlog: false,
 	}, now), "stale");
+});
+
+test("unsupported schemas block cleanup before any deletion or heartbeat write", async () => {
+	const database = new FakeCleanupD1({ schemaVersion: 7 });
+	await assert.rejects(
+		runPlatformCleanup({ PLATFORM_DB: database as unknown as D1Database }),
+		(error: unknown) => error instanceof Error && error.name === "PlatformError",
+	);
+	assert.equal(database.cleanupBatches, 0);
+	assert.equal(database.backlogChecks, 0);
+	assert.equal(database.heartbeatAttempts, 0);
+	assert.equal(database.heartbeatWrites, 0);
+});
+
+test("cleanup revalidates the schema before every later D1 step", async (t) => {
+	await t.test("next cleanup batch", async () => {
+		const database = new FakeCleanupD1({ cleanupChanges: 500, schemaVersions: [5, 7] });
+		await assert.rejects(
+			runPlatformCleanup({ PLATFORM_DB: database as unknown as D1Database }),
+			(error: unknown) => error instanceof Error && error.name === "PlatformError",
+		);
+		assert.equal(database.markerReads, 2);
+		assert.equal(database.cleanupBatches, 1);
+		assert.equal(database.backlogChecks, 0);
+		assert.equal(database.heartbeatAttempts, 0);
+	});
+
+	await t.test("final backlog probe", async () => {
+		const database = new FakeCleanupD1({
+			cleanupChanges: 500,
+			schemaVersions: [...Array.from({ length: 20 }, () => 5), 7],
+		});
+		await assert.rejects(
+			runPlatformCleanup({ PLATFORM_DB: database as unknown as D1Database }),
+			(error: unknown) => error instanceof Error && error.name === "PlatformError",
+		);
+		assert.equal(database.markerReads, 21);
+		assert.equal(database.cleanupBatches, 20);
+		assert.equal(database.backlogChecks, 0);
+		assert.equal(database.heartbeatAttempts, 0);
+	});
+
+	await t.test("heartbeat write", async () => {
+		const database = new FakeCleanupD1({ schemaVersions: [5, 7] });
+		await assert.rejects(
+			runPlatformCleanup({ PLATFORM_DB: database as unknown as D1Database }),
+			(error: unknown) => error instanceof Error && error.name === "PlatformError",
+		);
+		assert.equal(database.markerReads, 2);
+		assert.equal(database.cleanupBatches, 1);
+		assert.equal(database.backlogChecks, 0);
+		assert.equal(database.heartbeatAttempts, 0);
+	});
+});
+
+test("unsupported schemas skip D1 analytics while preserving best-effort Analytics Engine delivery", async () => {
+	const database = new FakeProgressD1({ schemaVersion: 7 });
+	const points: AnalyticsEngineDataPoint[] = [];
+	await recordProductEvent(
+		{
+			PLATFORM_DB: database as unknown as D1Database,
+			PRODUCT_ANALYTICS: {
+				writeDataPoint(point: AnalyticsEngineDataPoint): void {
+					points.push(point);
+				},
+			} as AnalyticsEngineDataset,
+		},
+		{ type: "room_created" },
+		new Date("2026-09-01T12:00:00.000Z"),
+	);
+	assert.deepEqual(database.queries, ["SELECT schema_version FROM platform_meta WHERE id = 1"]);
+	assert.equal(points.length, 1);
+});
+
+test("unsupported schemas block room facts and their D1 rollup before business SQL", async () => {
+	const database = new FakeProgressD1({ schemaVersion: 7 });
+	const points: AnalyticsEngineDataPoint[] = [];
+	await recordRoomMilestone(
+		{
+			PLATFORM_DB: database as unknown as D1Database,
+			ROOM_FACT_HASH_KEY: "8".repeat(64),
+			PRODUCT_ANALYTICS: {
+				writeDataPoint(point: AnalyticsEngineDataPoint): void {
+					points.push(point);
+				},
+			} as AnalyticsEngineDataset,
+		},
+		{
+			code: "ABC234",
+			version: 1,
+			phase: "setup",
+			players: [{ score: 0, online: true }],
+			settings: { duration: 60, rounds: 1, topicPack: "everyday" },
+			completedTurns: [],
+			history: [],
+			lastTurn: null,
+		},
+		"created",
+		new Date("2026-09-01T12:00:00.000Z"),
+	);
+	assert.deepEqual(database.queries, [
+		"SELECT schema_version FROM platform_meta WHERE id = 1",
+		"SELECT schema_version FROM platform_meta WHERE id = 1",
+	]);
+	assert.equal(points.length, 1);
 });
 
 test("platform status exposes only cleanup health and degrades for stale or backlogged work", async () => {
@@ -814,7 +1082,7 @@ test("deferred analytics failures remain non-fatal and produce bounded warning e
 	);
 });
 
-test("admin model usage reports complete global token totals without double-counting provider rows", async () => {
+test("admin model usage preserves schema-5 SQL and totals under schema marker 6", async () => {
 	const database = new FakeModelUsageD1([
 		usageRow(),
 		usageRow({
@@ -842,7 +1110,7 @@ test("admin model usage reports complete global token totals without double-coun
 			cachedInputTokens: 999,
 			reasoningTokens: 999,
 		}),
-	]);
+	], 6);
 	const adminToken = "7".repeat(64);
 	const handled = await handlePlatformRoute(
 		new Request("https://nonstoptalk.test/api/v1/admin/model-usage?days=2", {
@@ -880,7 +1148,10 @@ test("admin model usage reports complete global token totals without double-coun
 	assert.equal(serialized.includes("private-browser-token-must-not-appear"), false);
 	assert.equal(database.bindings.length, 1);
 	assert.equal(database.bindings[0]?.length, 2);
-	assert.match(database.queries.at(-1) ?? "", /total_tokens AS totalTokens/u);
-	assert.match(database.queries.at(-1) ?? "", /cached_input_tokens AS cachedInputTokens/u);
-	assert.match(database.queries.at(-1) ?? "", /reasoning_tokens AS reasoningTokens/u);
+	assert.equal(database.queries.length, 2);
+	assert.match(database.queries[0] ?? "", /^SELECT schema_version FROM platform_meta WHERE id = 1$/u);
+	assert.equal(
+		(database.queries[1] ?? "").replace(/\s+/gu, " ").trim(),
+		"SELECT day, scope, provider, model, task, reserved_calls AS reservedCalls, completed_calls AS completedCalls, success_count AS successCount, failure_count AS failureCount, input_tokens AS inputTokens, output_tokens AS outputTokens, total_tokens AS totalTokens, cached_input_tokens AS cachedInputTokens, reasoning_tokens AS reasoningTokens, latency_ms_total AS latencyMsTotal, updated_at AS updatedAt FROM model_usage_daily WHERE day >= ? AND day <= ? ORDER BY day DESC, scope, provider, model",
+	);
 });

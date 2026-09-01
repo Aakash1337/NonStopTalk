@@ -736,6 +736,36 @@ try {
     throw new Error(`Could not seed expired D1 rows.\n${seed.stdout}\n${seed.stderr}`);
   }
 
+  // Exercise the compatibility Worker against the next schema marker without
+  // introducing any schema-6 tables or columns. The exact fresh-head check
+  // above must remain at 5 until migration 0006 exists.
+  const compatibilityMarkerBump = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+      "--command", "UPDATE platform_meta SET schema_version = 6 WHERE id = 1 AND schema_version = 5;",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (compatibilityMarkerBump.status !== 0) {
+    throw new Error(`Could not advance the synthetic compatibility marker from 5 to 6.\n${compatibilityMarkerBump.stdout}\n${compatibilityMarkerBump.stderr}`);
+  }
+  const compatibilityMarkerCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+      "--command", "SELECT schema_version AS schemaVersion FROM platform_meta WHERE id = 1;",
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (compatibilityMarkerCheck.status !== 0) {
+    throw new Error(`Could not verify the synthetic schema-6 compatibility marker.\n${compatibilityMarkerCheck.stdout}\n${compatibilityMarkerCheck.stderr}`);
+  }
+  const compatibilityMarker = JSON.parse(compatibilityMarkerCheck.stdout)[0]?.results?.[0];
+  assert(compatibilityMarker?.schemaVersion === 6,
+    `Synthetic compatibility marker must advance exactly from schema 5 to 6: ${JSON.stringify(compatibilityMarker)}`);
+
   const degradedPort = await getFreePort();
   auxiliaryChild = spawn(
     process.execPath,
@@ -762,6 +792,8 @@ try {
   );
   const degradedPayload = await degradedStatus.json();
   assert(degradedStatus.ok && degradedPayload.status === "degraded", "Missing optional secrets must produce a usable degraded status");
+  assert(degradedPayload.schemaVersion === 6,
+    "The degraded compatibility Worker must report the synthetic schema-6 marker");
   assert(degradedPayload.degradedCapabilities?.includes("roomFacts"), "Status must report missing room-fact hashing");
   assert(degradedPayload.degradedCapabilities?.includes("adminAnalytics"), "Status must report missing admin analytics auth");
   await stopAndWait(auxiliaryChild);
@@ -814,7 +846,8 @@ try {
   const status = await request("/api/v1/platform/status");
   assert(status.response.ok, `Platform status failed (${status.response.status})`);
   assert(status.payload.status === "ok", "Configured platform status should be ok");
-  assert(status.payload.schemaVersion === 5, "Platform status should report the cleanup-heartbeat D1 schema");
+  assert(status.payload.schemaVersion === 6,
+    "Platform status should report the synthetic schema-6 compatibility marker");
   assert(status.payload.capabilities?.retentionCleanup?.status === "ready",
     "Platform status should report a current, backlog-free retention cleanup heartbeat");
   assert(status.payload.capabilities?.cloudProgress?.newSaveLimit === 250, "Platform status should report the anonymous new-save cap");
@@ -823,6 +856,55 @@ try {
   assert(status.payload.capabilities?.topicGeneration?.escalated?.externalAvailable === false,
     "Platform status should disclose that Gemma escalation is unavailable by default");
   assert(status.payload.capabilities?.aggregateAnalytics?.delivery === "best-effort", "Platform status must not overstate analytics delivery");
+
+  const setLiveSchemaMarker = (from, to) => {
+    const update = spawnSync(
+      process.execPath,
+      [
+        wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+        "--command", `UPDATE platform_meta SET schema_version = ${to} WHERE id = 1 AND schema_version = ${from};`,
+      ],
+      { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+    );
+    if (update.status !== 0) {
+      throw new Error(`Could not change the live compatibility marker ${from}->${to}.\n${update.stdout}\n${update.stderr}`);
+    }
+  };
+
+  // Keep the same Wrangler process and D1 binding alive across this transition
+  // so a process-global readiness cache would be caught. Unsupported marker 7
+  // must reject both reads and mutations before any schema-5 business SQL.
+  setLiveSchemaMarker(6, 7);
+  const unsupportedStatus = await request("/api/v1/platform/status");
+  assert(unsupportedStatus.response.status === 503
+    && unsupportedStatus.payload.error?.code === "DATABASE_UNAVAILABLE",
+  `A running Worker must reject marker 7 immediately: ${JSON.stringify(unsupportedStatus.payload)}`);
+  const blockedSaveID = "unsupported-schema-save";
+  const blockedSave = await request("/api/v1/progress/sessions", {
+    method: "POST",
+    body: { session: completeSummary(blockedSaveID) },
+  });
+  assert(blockedSave.response.status === 503
+    && blockedSave.payload.error?.code === "DATABASE_UNAVAILABLE",
+  `Marker 7 must block progress writes: ${JSON.stringify(blockedSave.payload)}`);
+  const blockedSaveCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+      "--command", `SELECT COUNT(*) AS rows FROM coaching_sessions WHERE session_id = '${blockedSaveID}';`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (blockedSaveCheck.status !== 0) {
+    throw new Error(`Could not verify the blocked marker-7 write.\n${blockedSaveCheck.stdout}\n${blockedSaveCheck.stderr}`);
+  }
+  const blockedRows = JSON.parse(blockedSaveCheck.stdout)[0]?.results?.[0]?.rows;
+  assert(blockedRows === 0, `Marker 7 wrote a coaching row: ${JSON.stringify(blockedRows)}`);
+  setLiveSchemaMarker(7, 6);
+  const recoveredStatus = await request("/api/v1/platform/status");
+  assert(recoveredStatus.response.ok && recoveredStatus.payload.schemaVersion === 6,
+    `The same Worker must recover immediately after restoring marker 6: ${JSON.stringify(recoveredStatus.payload)}`);
 
   const concurrentToken = "c".repeat(64);
   const concurrentDeviceKey = createHash("sha256").update(concurrentToken).digest("hex");
