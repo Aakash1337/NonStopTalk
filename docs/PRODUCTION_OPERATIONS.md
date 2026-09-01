@@ -92,6 +92,11 @@ candidate with:
 npm run deploy:staging
 ```
 
+For any migration PR, run this staging promotion and verify it before merging.
+The repository-connected production build runs `npm run deploy`, so merging to
+`main` can apply the production migration automatically; a post-merge staging
+test would be too late to preserve staging-first order.
+
 That command applies only staging migrations, deploys with strict mode, checks
 the public pages and status API, writes one synthetic compact baseline summary,
 verifies its reviewed schema-5/6 cleanup-heartbeat contract, profile-foundation, and relationship round-trips, and
@@ -115,18 +120,23 @@ request.
    monitor intentionally fail during that temporary loss of observability.
    Fix forward promptly.
 
-   The current compatibility-only release adds no migration. It accepts and
-   reports only schema markers 5 and 6 while every platform route, scheduled
-   cleanup, and model-budget operation continues to read and write only the
-   schema-v5 SQL contract. Each logical D1 operation performs an uncached
-   singleton marker read first, so unsupported markers fail closed immediately
-   without a Worker restart. Deploy and
-   verify this bridge on marker 5 before adding or applying migration `0006`.
-   That migration must be additive and preserve all schema-v5 tables, columns,
-   constraints, and behavior so this Worker remains a safe code rollback on
-   marker 6. Exercise the bridge against both markers and the old/new Worker
-   paths; after the schema-v6 feature release and rollback window are complete,
-   narrow the feature Worker and its probes to require exactly marker 6.
+   The schema-5/6 bridge was deployed and verified on marker 5 before
+   `0006_room_milestone_receipts.sql` was added. Migration 0006 is additive and
+   schema-only: it creates an empty, privacy-minimal receipt table, advances the
+   marker to 6, and preserves all schema-v5 tables, columns, constraints, queries,
+   and records. Every platform route, scheduled cleanup, and model-budget
+   operation in the bridge continues to use only the schema-v5 SQL contract.
+   Each logical D1 operation performs an uncached singleton marker read first, so
+   unsupported markers fail closed immediately without a Worker restart.
+
+   The receipt table is dormant in this release: no receiver, Durable Object
+   outbox, retry loop, receipt cleanup, or durable/exact-delivery claim is active.
+   It permits only opaque lowercase 256-bit IDs/hashes and canonical UTC
+   receipt/application/exact-90-day-expiry timestamps. After applying migration
+   0006, roll code back only to the reviewed schema-5/6 bridge—not an older Worker
+   that requires exact marker 5. Keep probes compatible with both markers until
+   the receiver/outbox rollout and rollback window finish, then contract to exact
+   marker 6.
 4. Exercise a fresh database and every supported upgrade path through
    `npm run smoke:platform`.
 5. Apply production migrations with `npm run db:migrate:remote`. Wrangler asks
@@ -364,7 +374,9 @@ npx wrangler rollback <VERSION_ID>
 Rollback is appropriate for a code or asset regression. D1 migrations are
 forward-only: after a schema change, choose a Worker version compatible with the
 new schema or fix forward. Do not delete a D1 database, Durable Object namespace,
-or migration record during incident response.
+or migration record during incident response. On schema 6, the reviewed
+schema-5/6 bridge is the rollback floor; do not roll back to a Worker that
+requires exact marker 5.
 
 ## Retention checks
 
@@ -386,6 +398,11 @@ If status reports `backlog`, confirm the next cron clears it. If it reports
 redeploy does not invoke `scheduled()`, and the local Wrangler test URL is not a
 production trigger. Deploy any required fix, verify the configured Cron Trigger,
 wait for its next scheduled run, and then rerun `npm run smoke:production`.
+
+Schema v6 also defines `room_milestone_receipts`, but the migration-only release
+leaves it empty and the bridge never reads or writes it. Receipt cleanup is
+therefore intentionally inactive. The exact-90-day receiver and bounded cleanup
+must be deployed before any receipt row is accepted.
 
 Quarterly, verify:
 

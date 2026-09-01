@@ -539,6 +539,39 @@ try {
     throw new Error(`Could not clean the profile-cascade fixture.\n${profileCascade.stdout}\n${profileCascade.stderr}`);
   }
 
+  const rejectedOutOfOrderReceiptMigration = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--file", path.join(root, "cloudflare", "migrations", "0006_room_milestone_receipts.sql"),
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  assert(rejectedOutOfOrderReceiptMigration.status !== 0,
+    "The milestone-receipt migration must reject a schema-v4 database");
+  const rejectedReceiptCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--command", `SELECT
+        schema_version AS schemaVersion,
+        (SELECT COUNT(*) FROM sqlite_master
+          WHERE type IN ('table', 'index') AND name IN (
+            'room_milestone_receipts', 'room_milestone_receipts_expires_at_idx',
+            '_migration_0006_schema_guard'
+          )) AS receiptObjects
+      FROM platform_meta WHERE id = 1`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (rejectedReceiptCheck.status !== 0) {
+    throw new Error(`Could not verify the rejected out-of-order receipt migration.\n${rejectedReceiptCheck.stdout}\n${rejectedReceiptCheck.stderr}`);
+  }
+  const rejectedReceipt = JSON.parse(rejectedReceiptCheck.stdout)[0]?.results?.[0];
+  assert(rejectedReceipt?.schemaVersion === 4 && rejectedReceipt?.receiptObjects === 0,
+    `The rejected receipt migration must leave schema v4 untouched: ${JSON.stringify(rejectedReceipt)}`);
+
   const heartbeatUpgrade = spawnSync(
     process.execPath,
     [
@@ -587,6 +620,125 @@ try {
     && heartbeatUpgradeResult?.migrationScratchTables === 0,
   `Schema v5 must add only one initialized cleanup heartbeat without changing user data: ${JSON.stringify(heartbeatUpgradeResult)}`);
 
+  const v5SchemaSnapshot = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--command", `SELECT type, name, tbl_name AS tableName, sql
+        FROM sqlite_schema
+        WHERE name NOT LIKE 'sqlite_%'
+        ORDER BY type, name`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (v5SchemaSnapshot.status !== 0) {
+    throw new Error(`Could not capture the schema-v5 compatibility contract.\n${v5SchemaSnapshot.stdout}\n${v5SchemaSnapshot.stderr}`);
+  }
+  const v5SchemaObjects = JSON.parse(v5SchemaSnapshot.stdout)[0]?.results;
+  assert(Array.isArray(v5SchemaObjects) && v5SchemaObjects.length > 0,
+    "The schema-v5 compatibility snapshot must contain named objects");
+
+  const receiptUpgrade = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--file", path.join(root, "cloudflare", "migrations", "0006_room_milestone_receipts.sql"),
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (receiptUpgrade.status !== 0) {
+    throw new Error(`The v5-to-v6 milestone-receipt migration failed.\n${receiptUpgrade.stdout}\n${receiptUpgrade.stderr}`);
+  }
+  const receiptUpgradeCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--command", `SELECT
+        schema_version AS schemaVersion,
+        (SELECT COUNT(*) FROM room_milestone_receipts) AS receiptRows,
+        (SELECT COUNT(*) FROM pragma_table_info('room_milestone_receipts')) AS receiptColumns,
+        (SELECT COUNT(*) FROM pragma_table_info('room_milestone_receipts')
+          WHERE name = 'event_id' AND type = 'TEXT' AND "notnull" = 1 AND pk = 1) AS eventIdColumns,
+        (SELECT COUNT(*) FROM pragma_table_info('room_milestone_receipts')
+          WHERE name = 'payload_hash' AND type = 'TEXT' AND "notnull" = 1 AND pk = 0) AS payloadHashColumns,
+        (SELECT COUNT(*) FROM pragma_table_info('room_milestone_receipts')
+          WHERE name = 'received_at' AND type = 'TEXT' AND "notnull" = 1 AND pk = 0) AS receivedAtColumns,
+        (SELECT COUNT(*) FROM pragma_table_info('room_milestone_receipts')
+          WHERE name = 'applied_at' AND type = 'TEXT' AND "notnull" = 0 AND pk = 0) AS appliedAtColumns,
+        (SELECT COUNT(*) FROM pragma_table_info('room_milestone_receipts')
+          WHERE name = 'expires_at' AND type = 'TEXT' AND "notnull" = 1 AND pk = 0) AS expiresAtColumns,
+        (SELECT COUNT(*) FROM pragma_index_list('room_milestone_receipts')
+          WHERE name = 'room_milestone_receipts_expires_at_idx'
+            AND "unique" = 0 AND origin = 'c') AS expiryIndexes,
+        (SELECT COUNT(*) FROM pragma_index_info('room_milestone_receipts_expires_at_idx')
+          WHERE seqno = 0 AND name = 'expires_at') AS expiryIndexColumns,
+        (SELECT COUNT(*) FROM pragma_index_info('room_milestone_receipts_expires_at_idx')) AS expiryIndexColumnCount,
+        (SELECT COUNT(*) FROM sqlite_master
+          WHERE name = '_migration_0006_schema_guard') AS migrationScratchObjects,
+        (SELECT COUNT(*) FROM devices) AS devices,
+        (SELECT COUNT(*) FROM consent_records) AS consents,
+        (SELECT COUNT(*) FROM coaching_sessions) AS summaries,
+        (SELECT COUNT(*) FROM sync_profiles) AS profiles,
+        (SELECT COUNT(*) FROM sync_profile_devices) AS memberships,
+        (SELECT COUNT(*) FROM platform_maintenance WHERE id = 1) AS heartbeatRows,
+        (SELECT cleanup_backlog FROM platform_maintenance WHERE id = 1) AS cleanupBacklog,
+        (SELECT COUNT(*) FROM pragma_foreign_key_check) AS foreignKeyViolations
+      FROM platform_meta WHERE id = 1`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (receiptUpgradeCheck.status !== 0) {
+    throw new Error(`Could not verify the v5-to-v6 milestone-receipt migration.\n${receiptUpgradeCheck.stdout}\n${receiptUpgradeCheck.stderr}`);
+  }
+  const receiptUpgradeResult = JSON.parse(receiptUpgradeCheck.stdout)[0]?.results?.[0];
+  assert(receiptUpgradeResult?.schemaVersion === 6
+    && receiptUpgradeResult?.receiptRows === 0
+    && receiptUpgradeResult?.receiptColumns === 5
+    && receiptUpgradeResult?.eventIdColumns === 1
+    && receiptUpgradeResult?.payloadHashColumns === 1
+    && receiptUpgradeResult?.receivedAtColumns === 1
+    && receiptUpgradeResult?.appliedAtColumns === 1
+    && receiptUpgradeResult?.expiresAtColumns === 1
+    && receiptUpgradeResult?.expiryIndexes === 1
+    && receiptUpgradeResult?.expiryIndexColumns === 1
+    && receiptUpgradeResult?.expiryIndexColumnCount === 1
+    && receiptUpgradeResult?.migrationScratchObjects === 0,
+  `Schema v6 must add exactly the empty receipt contract: ${JSON.stringify(receiptUpgradeResult)}`);
+  assert(receiptUpgradeResult?.devices === 2
+    && receiptUpgradeResult?.consents === 1
+    && receiptUpgradeResult?.summaries === 251
+    && receiptUpgradeResult?.profiles === 2
+    && receiptUpgradeResult?.memberships === 2
+    && receiptUpgradeResult?.heartbeatRows === 1
+    && receiptUpgradeResult?.cleanupBacklog === 0
+    && receiptUpgradeResult?.foreignKeyViolations === 0,
+  `Schema v6 must preserve every existing v5 record and relationship: ${JSON.stringify(receiptUpgradeResult)}`);
+
+  const v6ExistingSchemaSnapshot = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--command", `SELECT type, name, tbl_name AS tableName, sql
+        FROM sqlite_schema
+        WHERE name NOT LIKE 'sqlite_%'
+          AND name NOT IN (
+            'room_milestone_receipts',
+            'room_milestone_receipts_expires_at_idx'
+          )
+        ORDER BY type, name`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (v6ExistingSchemaSnapshot.status !== 0) {
+    throw new Error(`Could not verify the preserved schema-v5 contract.\n${v6ExistingSchemaSnapshot.stdout}\n${v6ExistingSchemaSnapshot.stderr}`);
+  }
+  const v6ExistingSchemaObjects = JSON.parse(v6ExistingSchemaSnapshot.stdout)[0]?.results;
+  assert(JSON.stringify(v6ExistingSchemaObjects) === JSON.stringify(v5SchemaObjects),
+    "The schema-v6 expansion must not alter any schema-v5 table, index, or trigger");
+
   const migration = spawnSync(
     process.execPath,
     [wrangler, "d1", "migrations", "apply", "PLATFORM_DB", "--local", "--persist-to", stateDirectory],
@@ -594,6 +746,15 @@ try {
   );
   if (migration.status !== 0) {
     throw new Error(`Local D1 migration failed.\n${migration.stdout}\n${migration.stderr}`);
+  }
+
+  const repeatedMigration = spawnSync(
+    process.execPath,
+    [wrangler, "d1", "migrations", "apply", "PLATFORM_DB", "--local", "--persist-to", stateDirectory],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (repeatedMigration.status !== 0) {
+    throw new Error(`Reapplying an already-current D1 migration set failed.\n${repeatedMigration.stdout}\n${repeatedMigration.stderr}`);
   }
 
   const initialHeartbeatCheck = spawnSync(
@@ -604,7 +765,15 @@ try {
         meta.schema_version AS schemaVersion,
         maintenance.cleanup_scheduled_at AS cleanupScheduledAt,
         maintenance.cleanup_completed_at AS cleanupCompletedAt,
-        maintenance.cleanup_backlog AS cleanupBacklog
+        maintenance.cleanup_backlog AS cleanupBacklog,
+        (SELECT COUNT(*) FROM room_milestone_receipts) AS receiptRows,
+        (SELECT COUNT(*) FROM pragma_table_info('room_milestone_receipts')) AS receiptColumns,
+        (SELECT COUNT(*) FROM pragma_index_list('room_milestone_receipts')
+          WHERE name = 'room_milestone_receipts_expires_at_idx') AS expiryIndexes,
+        (SELECT COUNT(*) FROM sqlite_master
+          WHERE name = '_migration_0006_schema_guard') AS migrationScratchObjects,
+        (SELECT COUNT(*) FROM d1_migrations
+          WHERE name = '0006_room_milestone_receipts.sql') AS receiptMigrationRows
       FROM platform_meta AS meta
       JOIN platform_maintenance AS maintenance ON maintenance.id = meta.id
       WHERE meta.id = 1`,
@@ -616,11 +785,16 @@ try {
     throw new Error(`Could not verify the fresh cleanup heartbeat.\n${initialHeartbeatCheck.stdout}\n${initialHeartbeatCheck.stderr}`);
   }
   const initialHeartbeat = JSON.parse(initialHeartbeatCheck.stdout)[0]?.results?.[0];
-  assert(initialHeartbeat?.schemaVersion === 5
+  assert(initialHeartbeat?.schemaVersion === 6
     && typeof initialHeartbeat?.cleanupScheduledAt === "string"
     && typeof initialHeartbeat?.cleanupCompletedAt === "string"
-    && initialHeartbeat?.cleanupBacklog === 0,
-  `Fresh schema v5 must start inside its first-cron grace window: ${JSON.stringify(initialHeartbeat)}`);
+    && initialHeartbeat?.cleanupBacklog === 0
+    && initialHeartbeat?.receiptRows === 0
+    && initialHeartbeat?.receiptColumns === 5
+    && initialHeartbeat?.expiryIndexes === 1
+    && initialHeartbeat?.migrationScratchObjects === 0
+    && initialHeartbeat?.receiptMigrationRows === 1,
+  `Fresh schema v6 must be current, additive, empty, and inside its first-cron grace window: ${JSON.stringify(initialHeartbeat)}`);
   const malformedHeartbeat = spawnSync(
     process.execPath,
     [
@@ -631,7 +805,120 @@ try {
     { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
   );
   assert(malformedHeartbeat.status !== 0,
-    "Schema v5 must reject a non-canonical heartbeat timestamp before it can block monotonic repair");
+    "The retained heartbeat constraint must reject a non-canonical timestamp before it can block monotonic repair");
+
+  const validPendingReceiptId = "0".repeat(64);
+  const validAppliedReceiptId = "1".repeat(64);
+  const validReceiptInsert = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+      "--command", `INSERT INTO room_milestone_receipts (
+          event_id, payload_hash, received_at, applied_at, expires_at
+        ) VALUES
+          ('${validPendingReceiptId}', '${"a".repeat(64)}',
+            '2026-01-01T00:00:00.000Z', NULL, '2026-04-01T00:00:00.000Z'),
+          ('${validAppliedReceiptId}', '${"b".repeat(64)}',
+            '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.001Z',
+            '2026-04-01T00:00:00.000Z');`,
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (validReceiptInsert.status !== 0) {
+    throw new Error(`Schema v6 rejected valid pending/applied receipts.\n${validReceiptInsert.stdout}\n${validReceiptInsert.stderr}`);
+  }
+
+  const invalidReceiptCommands = [
+    ["a short event ID", `INSERT INTO room_milestone_receipts VALUES (
+      '${"2".repeat(63)}', '${"c".repeat(64)}',
+      '2026-01-01T00:00:00.000Z', NULL, '2026-04-01T00:00:00.000Z')`],
+    ["an uppercase event ID", `INSERT INTO room_milestone_receipts VALUES (
+      '${"A".repeat(64)}', '${"c".repeat(64)}',
+      '2026-01-01T00:00:00.000Z', NULL, '2026-04-01T00:00:00.000Z')`],
+    ["a non-hex payload hash", `INSERT INTO room_milestone_receipts VALUES (
+      '${"2".repeat(64)}', '${"g".repeat(64)}',
+      '2026-01-01T00:00:00.000Z', NULL, '2026-04-01T00:00:00.000Z')`],
+    ["a short payload hash", `INSERT INTO room_milestone_receipts VALUES (
+      '${"9".repeat(64)}', '${"c".repeat(63)}',
+      '2026-01-01T00:00:00.000Z', NULL, '2026-04-01T00:00:00.000Z')`],
+    ["an uppercase payload hash", `INSERT INTO room_milestone_receipts VALUES (
+      '${"a".repeat(64)}', '${"C".repeat(64)}',
+      '2026-01-01T00:00:00.000Z', NULL, '2026-04-01T00:00:00.000Z')`],
+    ["a normalized invalid calendar date", `INSERT INTO room_milestone_receipts VALUES (
+      '${"3".repeat(64)}', '${"c".repeat(64)}',
+      '2026-02-31T00:00:00.000Z', NULL, '2026-06-01T00:00:00.000Z')`],
+    ["a non-canonical 24-hour timestamp", `INSERT INTO room_milestone_receipts VALUES (
+      '${"4".repeat(64)}', '${"c".repeat(64)}',
+      '2026-09-01T24:00:00.000Z', NULL, '2026-12-01T00:00:00.000Z')`],
+    ["a malformed applied timestamp", `INSERT INTO room_milestone_receipts VALUES (
+      '${"5".repeat(64)}', '${"c".repeat(64)}',
+      '2026-01-01T00:00:00.000Z', '2026-01-01T24:00:00.000Z',
+      '2026-04-01T00:00:00.000Z')`],
+    ["a non-90-day expiry", `INSERT INTO room_milestone_receipts VALUES (
+      '${"6".repeat(64)}', '${"c".repeat(64)}',
+      '2026-01-01T00:00:00.000Z', NULL, '2026-04-02T00:00:00.000Z')`],
+    ["an application time before receipt", `INSERT INTO room_milestone_receipts VALUES (
+      '${"7".repeat(64)}', '${"c".repeat(64)}',
+      '2026-01-01T00:00:00.000Z', '2025-12-31T23:59:59.999Z',
+      '2026-04-01T00:00:00.000Z')`],
+    ["an application time at expiry", `INSERT INTO room_milestone_receipts VALUES (
+      '${"8".repeat(64)}', '${"c".repeat(64)}',
+      '2026-01-01T00:00:00.000Z', '2026-04-01T00:00:00.000Z',
+      '2026-04-01T00:00:00.000Z')`],
+    ["a duplicate event ID", `INSERT INTO room_milestone_receipts VALUES (
+      '${validPendingReceiptId}', '${"d".repeat(64)}',
+      '2026-01-01T00:00:00.000Z', NULL, '2026-04-01T00:00:00.000Z')`],
+  ];
+  for (const [description, command] of invalidReceiptCommands) {
+    const rejectedReceiptInsert = spawnSync(
+      process.execPath,
+      [
+        wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+        "--command", command,
+      ],
+      { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+    );
+    assert(rejectedReceiptInsert.error === undefined
+      && Number.isInteger(rejectedReceiptInsert.status)
+      && rejectedReceiptInsert.status !== 0,
+      `Schema v6 must reject ${description}`);
+  }
+
+  const validReceiptCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+      "--command", `SELECT
+        COUNT(*) AS receiptRows,
+        SUM(applied_at IS NULL) AS pendingRows,
+        SUM(applied_at IS NOT NULL) AS appliedRows,
+        SUM(expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', received_at, '+90 days')) AS exactExpiryRows
+      FROM room_milestone_receipts`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (validReceiptCheck.status !== 0) {
+    throw new Error(`Could not verify valid schema-v6 receipt rows.\n${validReceiptCheck.stdout}\n${validReceiptCheck.stderr}`);
+  }
+  const validReceipts = JSON.parse(validReceiptCheck.stdout)[0]?.results?.[0];
+  assert(validReceipts?.receiptRows === 2
+    && validReceipts?.pendingRows === 1
+    && validReceipts?.appliedRows === 1
+    && validReceipts?.exactExpiryRows === 2,
+  `Receipt constraints must preserve only the two valid fixtures: ${JSON.stringify(validReceipts)}`);
+
+  const clearReceiptFixtures = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+      "--command", "DELETE FROM room_milestone_receipts;",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (clearReceiptFixtures.status !== 0) {
+    throw new Error(`Could not clear schema-v6 receipt fixtures.\n${clearReceiptFixtures.stdout}\n${clearReceiptFixtures.stderr}`);
+  }
 
   const expiredDevice = "f".repeat(64);
   const expiredProfile = "9".repeat(64);
@@ -736,36 +1023,6 @@ try {
     throw new Error(`Could not seed expired D1 rows.\n${seed.stdout}\n${seed.stderr}`);
   }
 
-  // Exercise the compatibility Worker against the next schema marker without
-  // introducing any schema-6 tables or columns. The exact fresh-head check
-  // above must remain at 5 until migration 0006 exists.
-  const compatibilityMarkerBump = spawnSync(
-    process.execPath,
-    [
-      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
-      "--command", "UPDATE platform_meta SET schema_version = 6 WHERE id = 1 AND schema_version = 5;",
-    ],
-    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
-  );
-  if (compatibilityMarkerBump.status !== 0) {
-    throw new Error(`Could not advance the synthetic compatibility marker from 5 to 6.\n${compatibilityMarkerBump.stdout}\n${compatibilityMarkerBump.stderr}`);
-  }
-  const compatibilityMarkerCheck = spawnSync(
-    process.execPath,
-    [
-      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
-      "--command", "SELECT schema_version AS schemaVersion FROM platform_meta WHERE id = 1;",
-      "--json",
-    ],
-    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
-  );
-  if (compatibilityMarkerCheck.status !== 0) {
-    throw new Error(`Could not verify the synthetic schema-6 compatibility marker.\n${compatibilityMarkerCheck.stdout}\n${compatibilityMarkerCheck.stderr}`);
-  }
-  const compatibilityMarker = JSON.parse(compatibilityMarkerCheck.stdout)[0]?.results?.[0];
-  assert(compatibilityMarker?.schemaVersion === 6,
-    `Synthetic compatibility marker must advance exactly from schema 5 to 6: ${JSON.stringify(compatibilityMarker)}`);
-
   const degradedPort = await getFreePort();
   auxiliaryChild = spawn(
     process.execPath,
@@ -793,7 +1050,7 @@ try {
   const degradedPayload = await degradedStatus.json();
   assert(degradedStatus.ok && degradedPayload.status === "degraded", "Missing optional secrets must produce a usable degraded status");
   assert(degradedPayload.schemaVersion === 6,
-    "The degraded compatibility Worker must report the synthetic schema-6 marker");
+    "The degraded compatibility Worker must report the physical schema-6 marker");
   assert(degradedPayload.degradedCapabilities?.includes("roomFacts"), "Status must report missing room-fact hashing");
   assert(degradedPayload.degradedCapabilities?.includes("adminAnalytics"), "Status must report missing admin analytics auth");
   await stopAndWait(auxiliaryChild);
@@ -847,7 +1104,7 @@ try {
   assert(status.response.ok, `Platform status failed (${status.response.status})`);
   assert(status.payload.status === "ok", "Configured platform status should be ok");
   assert(status.payload.schemaVersion === 6,
-    "Platform status should report the synthetic schema-6 compatibility marker");
+    "Platform status should report the physical schema-6 compatibility marker");
   assert(status.payload.capabilities?.retentionCleanup?.status === "ready",
     "Platform status should report a current, backlog-free retention cleanup heartbeat");
   assert(status.payload.capabilities?.cloudProgress?.newSaveLimit === 250, "Platform status should report the anonymous new-save cap");
@@ -1279,7 +1536,7 @@ try {
     && cleaned.cleanupCompletedAt !== initialHeartbeat.cleanupCompletedAt,
     `Scheduled cleanup left expired rows behind: ${JSON.stringify(cleaned)}`);
 
-  console.log("Cloud platform D1/API privacy, profile-foundation, cleanup-heartbeat, and retention smoke test passed.");
+  console.log("Cloud platform D1/API privacy, profile-foundation, cleanup-heartbeat, schema-v6 receipt, and retention smoke test passed.");
 } catch (error) {
   if (logs.trim()) console.error(`Wrangler output captured before failure:\n${logs.trim()}`);
   if (auxiliaryLogs.trim()) console.error(`Auxiliary Wrangler output captured before failure:\n${auxiliaryLogs.trim()}`);

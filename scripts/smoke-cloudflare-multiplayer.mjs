@@ -424,7 +424,7 @@ async function startWorker(stateDirectory, envFile, signal) {
         started.child,
         started.output,
         (response, payload) => response.status === 200
-          && (payload.schemaVersion === 5 || payload.schemaVersion === 6)
+          && payload.schemaVersion === 6
           && payload.status === "degraded"
           && payload.capabilities?.cloudProgress?.status === "ready"
           && payload.capabilities?.retentionCleanup?.status === "ready"
