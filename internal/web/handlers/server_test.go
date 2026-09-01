@@ -569,14 +569,18 @@ func TestDuplicateStartTurnKeepsRunningClock(t *testing.T) {
 	host.do(http.MethodPost, base+"/turn/start", nil)
 	activeID := host.turnID
 	host.do(http.MethodPost, base+"/turn/begin", nil)
+	rm, err := server.rooms.Get(code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rm.Do(func() { rm.Session.NextTurnNumber = game.MaxTurnIDNumber + 1 })
 
 	res := host.do(http.MethodPost, base+"/turn/start", nil)
 	if !strings.Contains(res.Body.String(), `data-turn-id="`+activeID+`"`) {
 		t.Fatalf("expected duplicate start to keep turn %q, got %s", activeID, res.Body.String())
 	}
-	rm, err := server.rooms.Get(code)
-	if err != nil {
-		t.Fatal(err)
+	if strings.Contains(res.Body.String(), game.ErrTurnIDsExhausted.Error()) {
+		t.Fatalf("active-turn retry must take precedence over exhausted IDs: %s", res.Body.String())
 	}
 	if !rm.TurnRunning() {
 		t.Fatal("expected duplicate start to preserve the running clock")
@@ -601,6 +605,11 @@ func TestDelayedNextTurnReplayCannotStartLaterTurn(t *testing.T) {
 	staleAfter := host.afterTurnID
 	host.do(http.MethodPost, base+"/turn/start", nil)
 	host.do(http.MethodPost, base+"/turn/submit", url.Values{"spokenSeconds": {"5"}})
+	rm, err := server.rooms.Get(code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rm.Do(func() { rm.Session.NextTurnNumber = game.MaxTurnIDNumber + 1 })
 
 	form := url.Values{"afterTurnID": {staleAfter}}
 	req := httptest.NewRequest(http.MethodPost, base+"/turn/start", strings.NewReader(form.Encode()))
@@ -611,9 +620,8 @@ func TestDelayedNextTurnReplayCannotStartLaterTurn(t *testing.T) {
 	if !strings.Contains(res.Body.String(), "next-turn request is stale") {
 		t.Fatalf("expected stale replay rejection, got %s", res.Body.String())
 	}
-	rm, err := server.rooms.Get(code)
-	if err != nil {
-		t.Fatal(err)
+	if strings.Contains(res.Body.String(), game.ErrTurnIDsExhausted.Error()) {
+		t.Fatalf("stale-request error must take precedence over exhausted IDs: %s", res.Body.String())
 	}
 	rm.View(func() {
 		if rm.Session.ActiveTurn != nil {
@@ -649,11 +657,20 @@ func TestRetriedRedrawCannotRedrawReplacementTopic(t *testing.T) {
 	}
 	cursor := 0
 	rm.View(func() { cursor = rm.Session.TopicCursor })
+	rm.Do(func() { rm.Session.NextTurnNumber = game.MaxTurnIDNumber + 1 })
 
 	host.do(http.MethodPost, base+"/turn/begin", nil)
+	beforeRejectedRedrawVersion := rm.Version()
 	res := host.do(http.MethodPost, base+"/turn/redraw", nil)
 	if !strings.Contains(res.Body.String(), "only be redrawn before speaking begins") {
 		t.Fatalf("expected running-turn redraw rejection, got %s", res.Body.String())
+	}
+	if strings.Contains(res.Body.String(), game.ErrTurnIDsExhausted.Error()) {
+		t.Fatalf("running-turn error must take precedence over exhausted IDs: %s", res.Body.String())
+	}
+	if rm.Version() != beforeRejectedRedrawVersion {
+		t.Fatalf("rejected running-turn redraw changed version from %d to %d",
+			beforeRejectedRedrawVersion, rm.Version())
 	}
 	if !rm.TurnRunning() {
 		t.Fatal("rejected redraw must not clear the running clock")

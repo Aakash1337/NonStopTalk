@@ -459,14 +459,24 @@ func (r *Room) StartTurnLocked() (*game.Turn, error) {
 // RedrawActiveTurnLocked replaces the topic generation and atomically clears
 // its clock. It must be called while the room lock is held.
 func (r *Room) RedrawActiveTurnLocked() (*game.Turn, error) {
-	if !r.turnStarted.IsZero() {
-		return nil, errors.New("a topic can only be redrawn before speaking begins")
+	if err := r.ValidateRedrawActiveTurnLocked(); err != nil {
+		return nil, err
 	}
 	turn, err := r.Session.RedrawActiveTurn()
 	if err == nil {
 		r.turnStarted = time.Time{}
 	}
 	return turn, err
+}
+
+// ValidateRedrawActiveTurnLocked preflights the two conditions that can reject
+// a valid redraw before it mutates the room. It must be called from a
+// DoAuthorized authorization callback while the room lock is held.
+func (r *Room) ValidateRedrawActiveTurnLocked() error {
+	if !r.turnStarted.IsZero() {
+		return errors.New("a topic can only be redrawn before speaking begins")
+	}
+	return r.Session.ValidateTurnIDs()
 }
 
 // ClearTurnClockLocked resets the clock while the caller holds the room lock.

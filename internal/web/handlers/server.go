@@ -915,6 +915,20 @@ func (s *Server) handleStartTurn(w http.ResponseWriter, r *http.Request, rr room
 				return false
 			}
 		}
+		// Only preflight when this exact request would allocate a new ID. This
+		// preserves stale-request and game-state error precedence while keeping
+		// an exhausted room's version and idle-expiry timestamp unchanged.
+		if session.Started && !session.Finished && session.ActiveTurn == nil {
+			requestIsCurrent := len(session.CompletedTurns) == 0
+			if len(session.CompletedTurns) > 0 {
+				latest := session.CompletedTurns[len(session.CompletedTurns)-1]
+				requestIsCurrent = afterTurnID != "" && afterTurnID == latest.ID
+			}
+			if requestIsCurrent {
+				turnErr = session.ValidateTurnIDs()
+				return turnErr == nil
+			}
+		}
 		return true
 	}, func() {
 		session := rr.room.Session
@@ -935,6 +949,10 @@ func (s *Server) handleStartTurn(w http.ResponseWriter, r *http.Request, rr room
 		_, turnErr = rr.room.StartTurnLocked()
 	})
 	if !allowed {
+		if turnErr != nil {
+			s.renderRoomState(w, rr, turnErr.Error(), false)
+			return
+		}
 		s.renderRoomState(w, rr, "Waiting for the host or the next player to start the turn.", false)
 		return
 	}
@@ -968,8 +986,13 @@ func (s *Server) handleRedrawTurn(w http.ResponseWriter, r *http.Request, rr roo
 	var redrawErr error
 	allowed := rr.room.DoAuthorized(rr.token, func(isHost bool, playerID string, session *game.Session) bool {
 		turn := session.ActiveTurn
-		return turnID != "" && turn != nil && turn.ID == turnID &&
+		authorized := turnID != "" && turn != nil && turn.ID == turnID &&
 			(isHost || (playerID != "" && turn.PlayerID == playerID))
+		if !authorized {
+			return false
+		}
+		redrawErr = rr.room.ValidateRedrawActiveTurnLocked()
+		return redrawErr == nil
 	}, func() {
 		if rr.room.Session.ActiveTurn == nil || rr.room.Session.ActiveTurn.ID != turnID {
 			redrawErr = errors.New("that turn has already ended")
@@ -978,6 +1001,10 @@ func (s *Server) handleRedrawTurn(w http.ResponseWriter, r *http.Request, rr roo
 		_, redrawErr = rr.room.RedrawActiveTurnLocked()
 	})
 	if !allowed {
+		if redrawErr != nil {
+			s.renderRoomState(w, rr, redrawErr.Error(), false)
+			return
+		}
 		s.renderRoomState(w, rr, "Only the host or the current speaker can redraw the current topic.", false)
 		return
 	}

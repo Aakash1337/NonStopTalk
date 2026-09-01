@@ -237,6 +237,122 @@ func TestGameContractExhaustedTurnIDsRejectStartWithoutRoomMutation(t *testing.T
 	}
 }
 
+func TestGameContractExhaustedTurnIDsRejectTurnAllocationWithoutRoomMutation(t *testing.T) {
+	contract := loadHandlerContract(t)
+	for _, test := range contract.Cases.TurnCounters {
+		if test.ExpectedAccepted || test.ErrorCode != "turn_ids_exhausted" || test.ExpectedVersionChanged == nil {
+			continue
+		}
+		for _, endpoint := range []string{"turn/start", "turn/redraw"} {
+			t.Run(test.ID+"/"+endpoint, func(t *testing.T) {
+				server, err := NewServer("../templates/*.html")
+				if err != nil {
+					t.Fatal(err)
+				}
+				router := server.Routes()
+				host := newClient(t, router)
+				code := host.createRoom("Avery")
+				rm, err := server.rooms.Get(code)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rm.Do(func() {
+					rm.Session.AddPlayer("Blair")
+					rm.Session.Started = true
+					rm.Session.Finished = false
+					rm.Session.CurrentRound = 1
+					rm.Session.CurrentPlayer = 0
+					rm.Session.NextTurnNumber = test.InitialNextTurn
+					rm.Session.CompletedTurns = nil
+					for _, id := range test.CompletedTurnIDs {
+						rm.Session.CompletedTurns = append(rm.Session.CompletedTurns, game.Turn{ID: id})
+					}
+					if endpoint == "turn/redraw" {
+						player := rm.Session.Players[0]
+						rm.Session.ActiveTurn = &game.Turn{
+							ID: "t1", PlayerID: player.ID, PlayerName: player.Name,
+							Duration: 60, Topic: rm.Session.Topics[0], TopicIndex: 0,
+						}
+						host.turnID = "t1"
+					}
+				})
+				beforeVersion := rm.Version()
+				var beforeSession []byte
+				rm.View(func() { beforeSession, _ = json.Marshal(rm.Session) })
+
+				var form url.Values
+				if endpoint == "turn/start" && len(test.CompletedTurnIDs) > 0 {
+					form = url.Values{"afterTurnID": {test.CompletedTurnIDs[len(test.CompletedTurnIDs)-1]}}
+				}
+				res := host.do(http.MethodPost, "/room/"+code+"/"+endpoint, form)
+				if !strings.Contains(res.Body.String(), game.ErrTurnIDsExhausted.Error()) {
+					t.Fatalf("expected turn-ID exhaustion message, got %s", res.Body.String())
+				}
+				if changed := rm.Version() != beforeVersion; changed != *test.ExpectedVersionChanged {
+					t.Fatalf("version changed=%v, want %v", changed, *test.ExpectedVersionChanged)
+				}
+				var afterSession []byte
+				rm.View(func() { afterSession, _ = json.Marshal(rm.Session) })
+				if !reflect.DeepEqual(afterSession, beforeSession) {
+					t.Fatalf("rejected %s mutated session\nbefore=%s\nafter=%s", endpoint, beforeSession, afterSession)
+				}
+			})
+		}
+	}
+}
+
+func TestUnauthorizedTurnAllocationDoesNotRevealExhaustion(t *testing.T) {
+	server, err := NewServer("../templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := server.Routes()
+	host := newClient(t, router)
+	guest := newClient(t, router)
+	code := host.createRoom("Avery")
+	guest.join(code, "Blair")
+	rm, err := server.rooms.Get(code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rm.Do(func() {
+		rm.Session.Started = true
+		rm.Session.CurrentRound = 1
+		rm.Session.CurrentPlayer = 0
+		rm.Session.NextTurnNumber = game.MaxTurnIDNumber + 1
+		rm.Session.ActiveTurn = nil
+		rm.Session.CompletedTurns = nil
+	})
+
+	beforeVersion := rm.Version()
+	res := guest.do(http.MethodPost, "/room/"+code+"/turn/start", nil)
+	if !strings.Contains(res.Body.String(), "Waiting for the host or the next player") ||
+		strings.Contains(res.Body.String(), game.ErrTurnIDsExhausted.Error()) {
+		t.Fatalf("unauthorized start leaked turn-ID state: %s", res.Body.String())
+	}
+	if rm.Version() != beforeVersion {
+		t.Fatalf("unauthorized start changed version from %d to %d", beforeVersion, rm.Version())
+	}
+
+	rm.Do(func() {
+		player := rm.Session.Players[0]
+		rm.Session.ActiveTurn = &game.Turn{
+			ID: "t1", PlayerID: player.ID, PlayerName: player.Name,
+			Duration: 60, Topic: rm.Session.Topics[0], TopicIndex: 0,
+		}
+	})
+	guest.turnID = "t1"
+	beforeVersion = rm.Version()
+	res = guest.do(http.MethodPost, "/room/"+code+"/turn/redraw", nil)
+	if !strings.Contains(res.Body.String(), "Only the host or the current speaker") ||
+		strings.Contains(res.Body.String(), game.ErrTurnIDsExhausted.Error()) {
+		t.Fatalf("unauthorized redraw leaked turn-ID state: %s", res.Body.String())
+	}
+	if rm.Version() != beforeVersion {
+		t.Fatalf("unauthorized redraw changed version from %d to %d", beforeVersion, rm.Version())
+	}
+}
+
 type emptyContractGenerator struct{}
 
 func (emptyContractGenerator) GenerateTopics(context.Context, string) ([]string, error) {
