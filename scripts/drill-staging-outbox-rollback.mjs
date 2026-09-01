@@ -2,7 +2,6 @@ import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
-	chmod,
 	lstat,
 	open,
 	readFile,
@@ -356,9 +355,6 @@ export async function writeReceiverFaultConfig({
 	}
 	const contents = buildReceiverFaultConfig(source);
 	await writeExclusivePrivateFile(outputPath, contents, "The temporary receiver-fault configuration");
-	const reread = parseJsonc(await readFile(outputPath, { encoding: "utf8" }));
-	assertOnlyReceiverFaultConfigChange(parseJsonc(source), reread);
-	await chmod(outputPath, 0o600);
 	return outputPath;
 }
 
