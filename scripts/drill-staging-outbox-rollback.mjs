@@ -1002,27 +1002,40 @@ export function findFaultSeededJoinProof(documents, version, expectedProofDigest
 		));
 		const retryScheduled = outboxLogs.filter((record) => (
 			record.event === "room_milestone_outbox_retry_scheduled"
-			&& record.failure === "database-unavailable"
-			&& record.attemptCount === 1
 		));
 		if (
 			digest !== checkedDigest
 			|| outboxLogs.length !== 2
 			|| deliveryFailed.length !== 1
 			|| retryScheduled.length !== 1
+			|| retryScheduled[0].failure !== "database-unavailable"
+			|| !safeInteger(retryScheduled[0].attemptCount)
+			|| retryScheduled[0].attemptCount < 1
 		) return fail("The seeded-room first retry evidence was split, unrelated, or incomplete.");
-		retryAlarms.push({ index, durableObjectId: document.durableObjectId });
+		retryAlarms.push({
+			index,
+			durableObjectId: document.durableObjectId,
+			attemptCount: retryScheduled[0].attemptCount,
+		});
 	}
-	if (joins.length > 1 || retryAlarms.length > 1) {
+	if (joins.length > 1) {
 		return fail("The seeded-room fault proof was ambiguous.");
 	}
 	if (states.length === 0 || joins.length === 0 || retryAlarms.length === 0) return null;
+	if (
+		retryAlarms[0].attemptCount !== 1
+		|| retryAlarms.some((alarm, index) => (
+			index > 0 && alarm.attemptCount !== retryAlarms[index - 1].attemptCount + 1
+		))
+	) return fail("The seeded-room fault proof did not retain one complete sequential first-retry chain.");
 	const stateBeforeJoin = states.findLast((state) => state.index < joins[0].index);
 	if (
 		!stateBeforeJoin
 		|| stateBeforeJoin.durableObjectId !== joins[0].durableObjectId
-		|| joins[0].durableObjectId !== retryAlarms[0].durableObjectId
-		|| joins[0].index >= retryAlarms[0].index
+		|| retryAlarms.some((alarm) => (
+			joins[0].durableObjectId !== alarm.durableObjectId
+			|| joins[0].index >= alarm.index
+		))
 	) return fail("The seeded-room state, join, and first retry were not one ordered Durable Object proof.");
 	return checkedDigest;
 }
@@ -1070,27 +1083,35 @@ export function findFaultTraceProof(documents, version) {
 		));
 		const retryScheduled = outboxLogs.filter((record) => (
 			record.event === "room_milestone_outbox_retry_scheduled"
-			&& record.failure === "database-unavailable"
-			&& record.attemptCount === 1
 		));
 		if (outboxLogs.length > 0) {
 			if (
 				outboxLogs.length !== 2
 				|| deliveryFailed.length !== 1
 				|| retryScheduled.length !== 1
+				|| retryScheduled[0].failure !== "database-unavailable"
+				|| !safeInteger(retryScheduled[0].attemptCount)
+				|| retryScheduled[0].attemptCount < 1
 			) {
 				return fail("The fault retry evidence was split or incomplete.");
 			}
-			retryAlarms.push({ index, durableObjectId: document.durableObjectId });
+			retryAlarms.push({
+				index,
+				durableObjectId: document.durableObjectId,
+				attemptCount: retryScheduled[0].attemptCount,
+			});
 		}
 	}
 	if (creates.length > 1) return fail("Concurrent staging room creation made the fault proof ambiguous.");
 	if (creates.length === 0 || retryAlarms.length === 0) return null;
 	const create = creates[0];
 	if (
-		retryAlarms.length !== 1
-		|| retryAlarms[0].durableObjectId !== create.durableObjectId
-		|| retryAlarms[0].index <= create.index
+		retryAlarms[0].attemptCount !== 1
+		|| retryAlarms.some((alarm, index) => (
+			alarm.durableObjectId !== create.durableObjectId
+			|| alarm.index <= create.index
+			|| (index > 0 && alarm.attemptCount !== retryAlarms[index - 1].attemptCount + 1)
+		))
 	) return fail("The fault retry was not caused by the one created Durable Object.");
 	return durableObjectProofDigest(create.durableObjectId);
 }

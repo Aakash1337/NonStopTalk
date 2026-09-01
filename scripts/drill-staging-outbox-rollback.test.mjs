@@ -355,6 +355,20 @@ function retryAlarmTrace(overrides = {}) {
 	});
 }
 
+function retryAlarmAtAttempt(attemptCount, overrides = {}) {
+	return retryAlarmTrace({
+		logs: [
+			{ event: "room_milestone_outbox_delivery_failed" },
+			{
+				event: "room_milestone_outbox_retry_scheduled",
+				failure: "database-unavailable",
+				attemptCount,
+			},
+		],
+		...overrides,
+	});
+}
+
 function rollbackAlarmTrace(overrides = {}) {
 	return traceDocument({
 		version: ROLLBACK_VERSION,
@@ -478,6 +492,18 @@ test("deployment validation requires one exact version at 100 percent", () => {
 test("fault trace proof requires one 201 create and one same-object first retry alarm", () => {
 	const proof = findFaultTraceProof([createTrace(), retryAlarmTrace()], FAULT_VERSION);
 	assert.match(proof, /^[0-9a-f]{64}$/u);
+	assert.match(findFaultTraceProof([
+		createTrace(),
+		retryAlarmTrace(),
+		retryAlarmTrace({ logs: [
+			{ event: "room_milestone_outbox_delivery_failed" },
+			{
+				event: "room_milestone_outbox_retry_scheduled",
+				failure: "database-unavailable",
+				attemptCount: 2,
+			},
+		] }),
+	], FAULT_VERSION), /^[0-9a-f]{64}$/u);
 	assert.equal(hasRollbackTraceProof([rollbackAlarmTrace()], ROLLBACK_VERSION, proof), true);
 	assert.equal(hasRollbackTraceProof([rollbackAlarmTrace({ durableObjectId: OTHER_DO_ID })], ROLLBACK_VERSION, proof), false);
 	assert.throws(() => findFaultTraceProof([
@@ -501,6 +527,18 @@ test("fault trace proof requires one 201 create and one same-object first retry 
 		{ ...createTrace(), scriptName: "another-worker" },
 		retryAlarmTrace(),
 	], FAULT_VERSION), /incomplete or malformed/u);
+	assert.throws(() => findFaultTraceProof([
+		createTrace(),
+		retryAlarmTrace(),
+		retryAlarmTrace({ logs: [
+			{ event: "room_milestone_outbox_delivery_failed" },
+			{
+				event: "room_milestone_outbox_retry_scheduled",
+				failure: "database-unavailable",
+				attemptCount: 3,
+			},
+		] }),
+	], FAULT_VERSION), /not caused by the one created/u);
 	assert.throws(() => findFaultTraceProof([
 		createTrace(),
 		retryAlarmTrace({ logs: [
@@ -532,6 +570,19 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 		joinTrace(),
 		retryAlarmTrace(),
 	], FAULT_VERSION, seedProof), seedProof);
+	assert.equal(findFaultSeededJoinProof([
+		stateTrace(),
+		joinTrace(),
+		retryAlarmTrace(),
+		retryAlarmTrace({ logs: [
+			{ event: "room_milestone_outbox_delivery_failed" },
+			{
+				event: "room_milestone_outbox_retry_scheduled",
+				failure: "database-unavailable",
+				attemptCount: 2,
+			},
+		] }),
+	], FAULT_VERSION, seedProof), seedProof);
 	assert.equal(findCandidateSeedProof([
 		createTrace({ version: CANDIDATE_VERSION }),
 	], CANDIDATE_VERSION), null);
@@ -560,7 +611,54 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 				attemptCount: 2,
 			},
 		] }),
-	], FAULT_VERSION, seedProof), /first retry evidence/u);
+	], FAULT_VERSION, seedProof), /sequential first-retry/u);
+	assert.throws(() => findFaultSeededJoinProof([
+		stateTrace(),
+		joinTrace(),
+		retryAlarmTrace(),
+		retryAlarmTrace({ logs: [
+			{ event: "room_milestone_outbox_delivery_failed" },
+			{
+				event: "room_milestone_outbox_retry_scheduled",
+				failure: "database-unavailable",
+				attemptCount: 3,
+			},
+		] }),
+	], FAULT_VERSION, seedProof), /sequential first-retry/u);
+	assert.throws(() => findFaultSeededJoinProof([
+		stateTrace(),
+		joinTrace(),
+		retryAlarmTrace(),
+		retryAlarmAtAttempt(1),
+	], FAULT_VERSION, seedProof), /sequential first-retry/u);
+	assert.throws(() => findFaultSeededJoinProof([
+		stateTrace(),
+		joinTrace(),
+		retryAlarmTrace(),
+		retryAlarmAtAttempt(2, { durableObjectId: OTHER_DO_ID }),
+	], FAULT_VERSION, seedProof), /split, unrelated, or incomplete/u);
+	assert.throws(() => findFaultSeededJoinProof([
+		stateTrace(),
+		joinTrace(),
+		retryAlarmTrace(),
+		retryAlarmTrace({ logs: [
+			{ event: "room_milestone_outbox_delivery_failed" },
+			{
+				event: "room_milestone_outbox_retry_scheduled",
+				failure: "receiver-invariant",
+				attemptCount: 2,
+			},
+		] }),
+	], FAULT_VERSION, seedProof), /split, unrelated, or incomplete/u);
+	assert.throws(() => findFaultSeededJoinProof([
+		stateTrace(),
+		joinTrace(),
+		retryAlarmTrace(),
+		retryAlarmTrace({ logs: [
+			{ event: "room_milestone_outbox_delivery_failed" },
+			{ event: "room_milestone_outbox_dead_lettered" },
+		] }),
+	], FAULT_VERSION, seedProof), /split, unrelated, or incomplete/u);
 	assert.throws(() => findFaultSeededJoinProof([
 		stateTrace(),
 		createTrace(),

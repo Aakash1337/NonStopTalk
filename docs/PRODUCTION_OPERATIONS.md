@@ -257,10 +257,15 @@ Use this order:
    same object's successful state read, successful join, and first
    `database-unavailable` delivery failure plus attempt-1 retry schedule. The D1
    baseline must remain unchanged immediately and through the bounded observation
-   window. Those facts establish one pending local `joined` row; a timed wait or
-   a fresh random object is never accepted as proof. Sampling, truncation,
-   exceptions, terminal/unexpected outbox logs, concurrent room mutations,
-   cleanup, aggregate movement, split traffic, or a third version fails closed.
+   window. Real-time tail delivery may coalesce a later alarm before the helper
+   evaluates attempt 1; such evidence is accepted only when every additional
+   alarm belongs to the same object and is a contiguous attempt-2, attempt-3, ...
+   `database-unavailable` retry. A missing attempt 1, a duplicate or gap, another
+   object, another failure, or a terminal record fails closed. Those facts
+   establish one pending local `joined` row; a timed wait or a fresh random
+   object is never accepted as proof. Sampling, truncation, exceptions,
+   terminal/unexpected outbox logs, concurrent room mutations, cleanup,
+   aggregate movement, split traffic, or a third version fails closed.
 
    Tail data is bounded and immediately projected to proof-only fields. Request
    headers, cookies, client/TLS metadata, room data, event IDs, payloads, and
