@@ -163,15 +163,20 @@ Use this order:
    6, and its independent `ROOM_FACT_HASH_KEY` secret has 32 through 1,024 UTF-8
    bytes. The admin token and Analytics Engine binding do not gate outbox
    delivery.
-2. Record staging receipt and daily-rollup baselines, change only staging to the
-   exact `outbox` value, and perform one full-version deployment. Status must
-   report room-milestone delivery as `durable-outbox`; `degraded-outbox` is a
-   stop condition.
+2. Reserve a quiet staging window outside its 03:47 UTC cleanup and a UTC-day
+   rollover; stop other staging probes and clients. Record staging receipt and
+   daily-rollup baselines, change only staging to the exact `outbox` value, and
+   perform one full-version deployment. Status must report room-milestone
+   delivery as `durable-outbox`; `degraded-outbox` is a stop condition.
 3. Run `npm run smoke:staging-outbox`. It hard-refuses any non-staging origin,
    requires overall healthy schema-6 `durable-outbox` readiness before mutation,
    drives isolated synthetic create/join/start/two-turn finish/reset traffic,
    rejects leaked private protocol headers, and bounded-polls fixed aggregate-only
    D1 queries for seven receipts, one room fact, and the exact rollup deltas.
+   The privacy-minimal schema intentionally has no probe correlation ID, so any
+   concurrent staging write or cleanup makes this check fail closed. Discard
+   that run, restore a quiet window, and start again from a fresh baseline;
+   never loosen the exact-delta assertions to force a pass.
    Local runtime tests separately prove strict FIFO head order and an empty drained
    queue because Durable Object SQLite has no public inspection route. Confirm
    clean retry/dead-letter logs. Never dump room SQLite or canonical payloads into

@@ -51,6 +51,8 @@ export const EXPECTED_DELTAS = Object.freeze({
 
 // This statement is deliberately fixed and aggregate-only. It cannot disclose
 // room codes, device cookies, player names, event IDs, or milestone payloads.
+// That privacy boundary also means a passing activation run requires a quiet
+// staging window: any unrelated write makes the exact-delta check fail closed.
 export const D1_SNAPSHOT_SQL = `SELECT
 	(SELECT COUNT(*) FROM room_milestone_receipts) AS receipt_count,
 	(SELECT COUNT(*) FROM room_facts) AS room_fact_count,
@@ -472,7 +474,7 @@ export async function pollForExpectedDeltas({
 			return observed;
 		}
 		if (SNAPSHOT_FIELD_NAMES.some((field) => observed[field] > expected[field])) {
-			return fail("Staging aggregate counters changed by more than the isolated Release B lifecycle.");
+			return fail("Another staging write or cleanup overlapped the isolated Release B lifecycle.");
 		}
 		if (attempt < attempts) await delay(delayMs);
 	}

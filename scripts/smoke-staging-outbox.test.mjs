@@ -435,4 +435,21 @@ test("D1 polling is bounded, retries incomplete delivery, and stops on exact del
 	);
 	assert.equal(reads, 3);
 	assert.deepEqual(exhaustedDelays, [13, 13]);
+
+	reads = 0;
+	const overlapped = { ...exact, receiptCount: exact.receiptCount + 1 };
+	await assert.rejects(
+		pollForExpectedDeltas({
+			baseline,
+			readSnapshot: async () => {
+				reads += 1;
+				return overlapped;
+			},
+			delay: async () => assert.fail("An overlapped run must stop immediately."),
+			attempts: 3,
+			delayMs: 13,
+		}),
+		/overlapped the isolated Release B lifecycle/u,
+	);
+	assert.equal(reads, 1);
 });
