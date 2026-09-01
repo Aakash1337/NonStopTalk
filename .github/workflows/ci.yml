@@ -44,6 +44,7 @@ jobs:
       - run: npm run test:worker-runtime-runner
       - run: npm run test:smoke-support
       - run: npm run test:staging-outbox-smoke
+      - run: npm run test:staging-outbox-rollback-drill
       - run: npm run check:cloudflare-types
       - run: npm run typecheck:cloudflare
       - run: npm run test:cloudflare

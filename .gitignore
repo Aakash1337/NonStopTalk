@@ -6,3 +6,5 @@ data/
 !.dev.vars.example
 playwright-report/
 test-results/
+.nonstoptalk-staging-receiver-fault.jsonc
+.nonstoptalk-staging-rollback-drill-*.json

@@ -226,11 +226,9 @@ function expectArray(value, stage) {
 	return value;
 }
 
-export async function runPublicRoomLifecycle(request) {
+export async function runPublicRoomCreate(request) {
 	if (typeof request !== "function") fail("A staging request adapter is required.");
 	const host = { cookie: "" };
-	const guest = { cookie: "" };
-
 	const created = expectRoom(await request(host, "/api/rooms", {
 		method: "POST",
 		body: { name: "Release B smoke host" },
@@ -248,6 +246,13 @@ export async function runPublicRoomLifecycle(request) {
 		fail("Room creation did not return the expected public room state.");
 	}
 	if (!host.cookie) fail("Room creation did not establish the host identity.");
+	return { host, created };
+}
+
+export async function runPublicRoomLifecycle(request) {
+	if (typeof request !== "function") fail("A staging request adapter is required.");
+	const { host, created } = await runPublicRoomCreate(request);
+	const guest = { cookie: "" };
 
 	const roomPath = `/api/rooms/${created.code}`;
 	const joined = expectRoom(await request(guest, `${roomPath}/join`, {

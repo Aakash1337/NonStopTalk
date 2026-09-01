@@ -23,6 +23,7 @@
     "test:worker-runtime-runner": "node --test scripts/run-worker-vitest.test.mjs",
     "test:smoke-support": "node --test scripts/smoke-process-support.test.mjs",
     "test:staging-outbox-smoke": "node --test scripts/smoke-staging-outbox.test.mjs",
+    "test:staging-outbox-rollback-drill": "node --test scripts/drill-staging-outbox-rollback.test.mjs",
     "test:cloudflare": "tsx --test cloudflare/*.test.ts",
     "test:cloudflare-runtime": "tsc -p cloudflare/runtime-tests/tsconfig.json && node scripts/run-worker-vitest.mjs vitest.worker.config.ts",
     "test:cloudflare-runtime-outbox": "tsc -p cloudflare/outbox-runtime-tests/tsconfig.json && node scripts/run-worker-vitest.mjs vitest.outbox.config.ts",
@@ -39,7 +40,8 @@
     "smoke:platform": "node scripts/smoke-platform.mjs",
     "smoke:production": "node scripts/smoke-production.mjs",
     "smoke:staging": "node scripts/smoke-production.mjs https://nonstoptalk-staging.aakashplays656.workers.dev && node scripts/smoke-staging.mjs https://nonstoptalk-staging.aakashplays656.workers.dev",
-    "smoke:staging-outbox": "node scripts/smoke-staging-outbox.mjs"
+    "smoke:staging-outbox": "node scripts/smoke-staging-outbox.mjs",
+    "drill:staging-outbox-rollback": "node scripts/drill-staging-outbox-rollback.mjs"
   },
   "devDependencies": {
     "@axe-core/playwright": "4.13.0",

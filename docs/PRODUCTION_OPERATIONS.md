@@ -42,6 +42,7 @@ npm run test:deployment-contract
 npm run test:worker-runtime-runner
 npm run test:smoke-support
 npm run test:staging-outbox-smoke
+npm run test:staging-outbox-rollback-drill
 npm run check:cloudflare-types
 npm run typecheck:cloudflare
 npm run test:cloudflare
@@ -81,17 +82,17 @@ and FIFO one-at-a-time drain, persisted bounded retry, and privacy-minimal
 dead-letter handling for a version-1 local outbox. A failed Analytics Engine
 write remains non-fatal and is not retried.
 
-The current committed production and staging configurations explicitly remain
-`ROOM_MILESTONE_DELIVERY_MODE=best-effort`. Release B includes the exact-mode
-producer, but configuration keeps it dormant: ordinary traffic retains the
-header plus `waitUntil` path and creates no local outbox tables. Only the exact,
-case-sensitive value `outbox` selects the producer. In that mode, a
+Production remains explicitly configured
+`ROOM_MILESTONE_DELIVERY_MODE=best-effort`: ordinary production traffic retains
+the header plus `waitUntil` path and creates no local outbox tables or receipt
+rows. Staging intentionally selects the exact, case-sensitive value `outbox`
+and currently reports healthy `durable-outbox` delivery. In exact mode, a
 milestone-producing mutation commits room state, the complete canonical event
 group (or bounded all-or-drop counter), and the shared alarm atomically before
 the response or WebSocket broadcast. This release adds no D1 migration,
 Cloudflare service, binding, Queue, paid product, or separate alarm
-configuration, so the normal best-effort `npm run deploy` sequence remains
-unchanged.
+configuration. Progress/consent analytics and Analytics Engine remain
+best-effort in both environments.
 
 After deployment, run the read-only production probe:
 
@@ -136,12 +137,13 @@ against a host that is not the designated HTTPS staging Workers.dev hostname.
 It never sends audio, transcript text, user content, or an external model
 request.
 
-The staging probe does not invoke the internal room-milestone receiver and is not
-an end-to-end durable-delivery test. Before promotion, use both local runtime
-lanes above to exercise the receiver, cleanup, bridge, and exact producer. While
-staging remains on its committed best-effort value, an ordinary staging
-multiplayer smoke must create no local outbox tables, and receipt-row counts
-inspected before and after that smoke must not increase.
+The general staging probe does not invoke the internal room-milestone receiver
+and is not an end-to-end durable-delivery test. Before promotion, use both local
+runtime lanes above to exercise the receiver, cleanup, bridge, and exact
+producer. Because staging now runs exact `outbox`, follow a staging deployment
+with `npm run smoke:staging-outbox` in a quiet window and require the exact
+receipt, room-fact, and rollup deltas described below. Production's ordinary
+best-effort multiplayer path remains the no-outbox/no-receipt control.
 
 ### Room-milestone outbox activation
 
@@ -181,11 +183,84 @@ Use this order:
    queue because Durable Object SQLite has no public inspection route. Confirm
    clean retry/dead-letter logs. Never dump room SQLite or canonical payloads into
    a ticket or log.
-4. Drill rollback by deploying Release A or a newer reviewed bridge with
-   `best-effort`, then prove any locally queued exact-mode row still drains once.
-   Confirm new ordinary traffic uses the legacy path without adding outbox rows.
-   Do not select a pre-Release-A version. Restore the Release-B staging candidate
-   and repeat the exact-mode smoke.
+4. Prove the rollback bridge with the release-pinned, staging-only
+   receiver-fault drill. This drill accepts only Release B
+   `e237d4e3-f933-4b35-b618-a61ea4da14ba` and Release A
+   `3116a969-0f6f-4977-959a-97fc3643ad79`. Create the private temporary config,
+   upload it without activating it, and run the read-only resource preflight:
+
+   ```sh
+   npm run drill:staging-outbox-rollback -- make-fault-config
+   npx wrangler versions upload --strict --env staging --config .nonstoptalk-staging-receiver-fault.jsonc
+   # Record FAULT_UUID from the upload. Nothing has been activated yet.
+   npm run drill:staging-outbox-rollback -- validate-fault e237d4e3-f933-4b35-b618-a61ea4da14ba <FAULT_UUID> 3116a969-0f6f-4977-959a-97fc3643ad79
+   npx wrangler versions deploy <FAULT_UUID>@100% --env staging --message "Staging receiver-fault rollback drill" --yes
+   npm run drill:staging-outbox-rollback -- prepare e237d4e3-f933-4b35-b618-a61ea4da14ba <FAULT_UUID> 3116a969-0f6f-4977-959a-97fc3643ad79
+   ```
+
+   The generator hard-requires production `best-effort` plus staging `outbox`
+   and writes a mode-0600, Git-ignored config whose only semantic change is an
+   explicit empty `env.staging.d1_databases`. `validate-fault` requires the pinned
+   Release-B candidate alone at 100%, authenticates both reviewed script etags,
+   D1 database, Durable Object namespace, assets, secrets, and delivery modes,
+   and proves the uploaded fault version differs only by the missing staging
+   `PLATFORM_DB`. Do not activate a fault upload unless that preflight succeeds.
+
+   `prepare` repeats the version/resource checks after activation, requires the
+   exact staging hostname and Worker, one fault version at 100%, and failed D1
+   readiness. Its unsampled, version-filtered tail must causally observe exactly
+   one successful Durable Object `POST /create` and that same object's first
+   `database-unavailable` retry alarm, with complete, exception-free trace
+   metadata and no terminal/unexpected logs. The fixed D1 aggregates must remain
+   unchanged before and after the retry window. Only the same-object trace plus
+   unchanged aggregates establishes a pending local row. Tail data is bounded
+   and immediately projected to proof-only fields; request headers, client/TLS
+   metadata, room data, and unrelated logs are neither retained, printed, nor
+   written. The mode-0600 checkpoint body contains exactly seven counters. Its
+   opaque filename digests bind the reviewed versions and Durable Object without
+   exposing a room code, cookie, player, event ID, raw object ID, or payload.
+
+   Start `verify` in the first terminal **while the fault version is still at
+   100%**. It attaches and warms the pinned Release-A tail, rechecks that the
+   fault deployment and aggregate checkpoint are unchanged, and then prints
+   `{"status":"waiting","phase":"rollback-observer-ready",...}`. Only after
+   that line appears, perform the reviewed rollback in a second terminal:
+
+   ```sh
+   # Terminal 1: leave this running before rollback.
+   npm run drill:staging-outbox-rollback -- verify e237d4e3-f933-4b35-b618-a61ea4da14ba <FAULT_UUID> 3116a969-0f6f-4977-959a-97fc3643ad79
+
+   # Terminal 2: run only after Terminal 1 reports rollback-observer-ready.
+   npx wrangler rollback 3116a969-0f6f-4977-959a-97fc3643ad79 --env staging --message "Staging outbox rollback drill" --yes
+   ```
+
+   `verify` permits only the fault-to-pinned-A single-version transition. It
+   requires healthy schema-6 `best-effort` readiness, attributes an `ok` alarm
+   to the checkpointed Durable Object under the pinned A version, brackets every
+   D1 read with A-at-100% checks, and proves an exact +1 receipt, +1 room fact,
+   +1 `room_created` bridge drain. While A remains at 100%, it then creates a
+   separate ordinary legacy room and proves +1 room fact and +1 `room_created`
+   with receipt count unchanged; all other tracked counters must remain
+   unchanged in both controls. Concurrent traffic, cleanup, split traffic, a
+   third version, a counter decrease, or an overshoot fails closed. A successful
+   verify removes the checkpoint and fault config. Restore the pinned Release-B
+   candidate only after verify exits, then repeat the exact-mode smoke:
+
+   ```sh
+   npx wrangler versions deploy e237d4e3-f933-4b35-b618-a61ea4da14ba@100% --env staging --message "Restore reviewed Release-B staging candidate" --yes
+   npm run smoke:staging-outbox
+   ```
+
+   With current Wrangler, `--env staging` resolves the exact environment Worker
+   name from `wrangler.jsonc`. Do not also pass the already suffixed
+   `nonstoptalk-staging` positional name to `wrangler tail`; Wrangler would target
+   `nonstoptalk-staging-staging`. The helper therefore uses the config-resolved
+   target and independently requires every proof trace to report exact
+   `scriptName: nonstoptalk-staging`, entrypoint `RoomDurableObject`, and the
+   pinned version ID. If the drill aborts, preserve the aggregate checkpoint for
+   diagnosis, restore the reviewed Release-B candidate first, and remove only
+   the two narrowly named Git-ignored files after the result is resolved. Never
+   select a pre-Release-A version.
 5. Only after the staging activation and rollback drill pass, make a separate
    production configuration change. Reconfirm schema 6, the secure production
    room-fact key, zero pending migrations, the exact version, and recent cleanup
@@ -225,15 +300,14 @@ Treat key readiness as a hard pre-activation and ongoing operational gate.
    singleton marker read first; marker-5 cleanup never prepares receipt-table SQL,
    and unsupported markers fail closed immediately without a Worker restart.
 
-   With the currently committed production and staging value of `best-effort`,
-   normal room traffic retains its header plus `waitUntil` fan-out, initializes
-   no local outbox schema, and does not insert receipts. Release B also contains
-   a gated producer selected only by the exact `outbox` value. Its
-   milestone-producing room mutations atomically persist state, all canonical
-   events or one bounded drop decision, and the alarm. The internal receiver
-   receipt-gates one D1 application; schema-6 cleanup removes expired receipts in
-   the existing bounded cleanup lifecycle. Analytics Engine receives only one
-   best-effort post-commit opportunity for a newly applied event.
+   Production's committed `best-effort` mode retains the header plus
+   `waitUntil` fan-out, initializes no local outbox schema, and does not insert
+   receipts. Staging's committed exact `outbox` mode atomically persists each
+   milestone-producing room mutation with all canonical events or one bounded
+   drop decision and the alarm. The internal receiver receipt-gates one staging
+   D1 application; schema-6 cleanup removes expired receipts in the existing
+   bounded cleanup lifecycle. Analytics Engine receives only one best-effort
+   post-commit opportunity for a newly applied event in either environment.
 
    Release A imports the receiver and can lazily recognize an already-existing
    version-1 Durable Object outbox left by Release B or a rollback.
@@ -314,10 +388,10 @@ A healthy response has:
 - an empty `degradedCapabilities` array;
 - ready cloud progress, retention cleanup, room facts, and aggregate admin analytics;
 - Analytics Engine enabled;
-- room-milestone analytics `delivery: "best-effort"` under the currently
-  committed production and staging configuration. Release B reports
-  `durable-outbox` only when its producer is compiled, the mode is exact
-  `outbox`, the schema is exactly 6, and `ROOM_FACT_HASH_KEY` is secure. An
+- room-milestone analytics `delivery: "best-effort"` in production and
+  `delivery: "durable-outbox"` in healthy staging. Release B reports the latter
+  only when its producer is compiled, the mode is exact `outbox`, the schema is
+  exactly 6, and `ROOM_FACT_HASH_KEY` is secure. An
   exact-mode schema/key mismatch reports `degraded-outbox` and adds
   `aggregateAnalyticsDelivery` to the degraded list. Coaching/progress product
   events remain best-effort even when the room-milestone lane is durable;
@@ -500,15 +574,16 @@ new schema or fix forward. Do not delete a D1 database, Durable Object namespace
 or migration record during incident response. Marker 6 already excludes Workers
 that require exact marker 5.
 
-Before exact-mode activation, the current Release-B deployment remains on the
-same ordinary best-effort path. After any environment has produced even one
-version-1 exact-mode row, Release A becomes its minimum safe rollback floor:
-deploy Release A or a newer compatible bridge with `best-effort` so existing
-rows continue to drain while new milestones use the legacy path. The ownership
-response keeps ordinary Release-A/Release-B propagation skew safe, but avoid an
-intentional mixed-configuration rollback and never select a pre-Release-A
-Worker; it can overwrite the shared alarm and strand rows. Do not delete the namespace,
-local tables, pending rows, or dead letters as a rollback technique. Run the
+Production has not crossed the exact-mode boundary and still uses the ordinary
+best-effort path. Staging has produced version-1 exact-mode rows, so Release A is
+already its minimum safe rollback floor. After any other environment produces
+even one such row, the same floor applies there: deploy Release A or a newer
+compatible bridge with `best-effort` so existing rows continue to drain while
+new milestones use the legacy path. The ownership response keeps ordinary
+Release-A/Release-B propagation skew safe, but avoid an intentional
+mixed-configuration rollback and never select a pre-Release-A Worker; it can
+overwrite the shared alarm and strand rows. Do not delete the namespace, local
+tables, pending rows, or dead letters as a rollback technique. Complete the
 staging rollback drill above before production activation, and repeat the
 read-only status/receipt/rollup checks after any real rollback.
 
