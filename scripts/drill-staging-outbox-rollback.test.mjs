@@ -451,12 +451,13 @@ test("prepare claims pending only after causal trace proof and unchanged fault-b
 			return { result: await operation(), proofDigest: PROOF_DIGEST };
 		},
 		delay: async () => undefined,
+		faultPropagationSoakMs: 13,
 		faultObservationDelayMs: 17,
 	});
 	assert.deepEqual(result.baseline, baseline);
 	assert.equal(result.proofDigest, PROOF_DIGEST);
-	assert.equal(fetchCount, 2);
-	assert.equal(snapshotCount, 3);
+	assert.equal(fetchCount, 3);
+	assert.equal(snapshotCount, 4);
 	assert.deepEqual(result.summary, {
 		status: "ok",
 		phase: "pending-row-established",
@@ -478,6 +479,7 @@ test("prepare never claims pending without observer proof or when a counter chan
 			? versionDocument(CANDIDATE_VERSION)
 			: versionDocument(FAULT_VERSION, { database: false }),
 		delay: async () => undefined,
+		faultPropagationSoakMs: 1,
 		faultObservationDelayMs: 1,
 	};
 	await assert.rejects(prepareRollbackDrainProof({

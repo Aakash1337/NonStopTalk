@@ -39,6 +39,7 @@ const FAULT_CONFIG_PATH = fileURLToPath(new URL(`../${FAULT_CONFIG_FILENAME}`, i
 const VERSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const PROOF_DIGEST_PATTERN = /^[0-9a-f]{64}$/u;
 const DURABLE_OBJECT_ID_PATTERN = /^[0-9a-f]{64}$/u;
+const DEFAULT_FAULT_PROPAGATION_SOAK_MS = 3 * 60_000;
 const DEFAULT_FAULT_OBSERVATION_DELAY_MS = 8_000;
 const DEFAULT_DRAIN_POLL_ATTEMPTS = 120;
 const DEFAULT_DRAIN_POLL_DELAY_MS = 5_000;
@@ -1291,6 +1292,7 @@ export async function prepareRollbackDrainProof({
 	readSnapshot,
 	observeFaultRetry,
 	delay = sleep,
+	faultPropagationSoakMs = DEFAULT_FAULT_PROPAGATION_SOAK_MS,
 	faultObservationDelayMs = DEFAULT_FAULT_OBSERVATION_DELAY_MS,
 }) {
 	const coordinates = requireDrillCoordinates({
@@ -1303,6 +1305,11 @@ export async function prepareRollbackDrainProof({
 	requireAdapters({ fetchImpl, readDeployment, readVersion, readSnapshot, observeFaultRetry, delay }, [
 		"fetchImpl", "readDeployment", "readVersion", "readSnapshot", "observeFaultRetry", "delay",
 	]);
+	if (
+		!Number.isSafeInteger(faultPropagationSoakMs)
+		|| faultPropagationSoakMs < 1
+		|| faultPropagationSoakMs > 5 * 60_000
+	) return fail("The receiver-fault propagation soak is invalid.");
 	if (
 		!Number.isSafeInteger(faultObservationDelayMs)
 		|| faultObservationDelayMs < 1
@@ -1330,6 +1337,13 @@ export async function prepareRollbackDrainProof({
 		return observed;
 	};
 	const baseline = normalizedSnapshot(await readFaultSnapshot(), true);
+	// A newly deployed outer Worker can briefly reach a Durable Object still
+	// assigned to the prior version. Hold a quiet, fully faulted interval and
+	// recheck every externally visible gate before creating the proof room.
+	await delay(faultPropagationSoakMs);
+	assertSingleVersionDeployment(await readDeployment(), coordinates.faultVersion);
+	assertReceiverFaultStatus(await request(null, "/api/v1/platform/status"));
+	assertUnchangedSnapshot(baseline, await readFaultSnapshot());
 	const observedProof = await observeFaultRetry(
 		async () => runPublicRoomCreate(request),
 		coordinates.faultVersion,

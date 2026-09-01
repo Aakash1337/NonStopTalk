@@ -208,7 +208,11 @@ Use this order:
 
    `prepare` repeats the version/resource checks after activation, requires the
    exact staging hostname and Worker, one fault version at 100%, and failed D1
-   readiness. Its unsampled, version-filtered tail must causally observe exactly
+   readiness. It holds a three-minute propagation soak and requires the fault
+   deployment, failed readiness, and unchanged aggregate baseline on both sides;
+   this prevents a newly deployed outer Worker from creating the proof room in a
+   Durable Object still assigned to the prior version. Its unsampled,
+   version-filtered tail must then causally observe exactly
    one successful Durable Object `POST /create` and that same object's first
    `database-unavailable` retry alarm, with complete, exception-free trace
    metadata and no terminal/unexpected logs. The fixed D1 aggregates must remain
