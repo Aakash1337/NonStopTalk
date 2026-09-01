@@ -701,15 +701,26 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, rr roomR
 
 func (s *Server) handleCustomTopics(w http.ResponseWriter, r *http.Request, rr roomRequest) {
 	raw := strings.ReplaceAll(r.FormValue("topics"), "\r\n", "\n")
-	lines := strings.Split(raw, "\n")
-	if !rr.room.DoAsHostInSetup(rr.token, func() {
+	cleaned := game.NormalizeTopics(strings.Split(raw, "\n"))
+	callerIsHost := false
+	inSetup := false
+	allowed := rr.room.DoAuthorized(rr.token, func(isHost bool, _ string, session *game.Session) bool {
+		callerIsHost = isHost
+		inSetup = !session.Started
+		return isHost && inSetup && len(cleaned) > 0
+	}, func() {
 		rr.room.InvalidateTopicGenerationLocked()
 		session := rr.room.Session
-		session.SetTopics(lines)
+		_ = session.SetTopics(cleaned)
 		settings := session.Settings
 		settings.TopicPackID = "custom"
 		session.UpdateSettings(settings)
-	}) {
+	})
+	if !allowed {
+		if callerIsHost && inSetup && len(cleaned) == 0 {
+			s.renderRoomState(w, rr, game.ErrTopicsRequired.Error()+".", false)
+			return
+		}
 		s.renderRoomState(w, rr, "Only the host can change topics before the game starts.", false)
 		return
 	}
@@ -756,9 +767,14 @@ func (s *Server) handleGenerateTopics(w http.ResponseWriter, r *http.Request, rr
 		s.renderRoomState(w, rr, "Could not generate topics right now — try again or write your own.", false)
 		return
 	}
+	generated = game.NormalizeTopics(generated)
+	if len(generated) == 0 {
+		s.renderRoomState(w, rr, "The generator returned no usable topics — try again or write your own.", false)
+		return
+	}
 	if !rr.room.ApplyTopicGeneration(rr.token, generation, func() {
 		session := rr.room.Session
-		session.SetTopics(generated)
+		_ = session.SetTopics(generated)
 		settings := session.Settings
 		settings.TopicPackID = "custom"
 		session.UpdateSettings(settings)
@@ -774,9 +790,21 @@ func (s *Server) handleGenerateTopics(w http.ResponseWriter, r *http.Request, rr
 func (s *Server) handleApplyPreset(w http.ResponseWriter, r *http.Request, rr roomRequest) {
 	packID := r.FormValue("topicPack")
 	raw := strings.ReplaceAll(r.FormValue("topics"), "\r\n", "\n")
-	customTopics := strings.Split(raw, "\n")
+	customTopics := game.NormalizeTopics(strings.Split(raw, "\n"))
+	lookupPackID := packID
+	if strings.TrimSpace(lookupPackID) == "" {
+		lookupPackID = "everyday"
+	}
+	pack, isBuiltInPack := topics.FindPack(lookupPackID)
+	validTopics := isBuiltInPack || len(customTopics) > 0
+	callerIsHost := false
+	inSetup := false
 
-	if !rr.room.DoAsHostInSetup(rr.token, func() {
+	allowed := rr.room.DoAuthorized(rr.token, func(isHost bool, _ string, session *game.Session) bool {
+		callerIsHost = isHost
+		inSetup = !session.Started
+		return isHost && inSetup && validTopics
+	}, func() {
 		rr.room.InvalidateTopicGenerationLocked()
 		session := rr.room.Session
 		settings := game.Settings{
@@ -787,12 +815,17 @@ func (s *Server) handleApplyPreset(w http.ResponseWriter, r *http.Request, rr ro
 			AIJudgeEnabled:          r.FormValue("aiJudge") == "on",
 		}
 		session.UpdateSettings(settings)
-		if pack, ok := topics.FindPack(session.Settings.TopicPackID); ok {
-			session.SetTopics(pack.Topics)
-		} else if strings.TrimSpace(raw) != "" {
-			session.SetTopics(customTopics)
+		if isBuiltInPack {
+			_ = session.SetTopics(pack.Topics)
+		} else {
+			_ = session.SetTopics(customTopics)
 		}
-	}) {
+	})
+	if !allowed {
+		if callerIsHost && inSetup && !validTopics {
+			s.renderRoomState(w, rr, game.ErrTopicsRequired.Error()+" before applying a custom preset.", false)
+			return
+		}
 		s.renderRoomState(w, rr, "Only the host can apply presets before the game starts.", false)
 		return
 	}
@@ -803,7 +836,19 @@ func (s *Server) handleApplyPreset(w http.ResponseWriter, r *http.Request, rr ro
 
 func (s *Server) handleStartGame(w http.ResponseWriter, r *http.Request, rr roomRequest) {
 	var startErr error
-	allowed := rr.room.DoAsHost(rr.token, func() {
+	allowed := rr.room.DoAuthorized(rr.token, func(isHost bool, _ string, session *game.Session) bool {
+		if !isHost {
+			return false
+		}
+		// Preserve the existing player/topic validation precedence. Once the
+		// room is otherwise startable, reject exhausted IDs before entering a
+		// mutation so the room version and setup state remain unchanged.
+		if !session.Started && session.CanStart() {
+			startErr = session.ValidateTurnIDs()
+			return startErr == nil
+		}
+		return true
+	}, func() {
 		if rr.room.Session.Started {
 			return // an immediate duplicate is an idempotent refresh
 		}
@@ -814,6 +859,10 @@ func (s *Server) handleStartGame(w http.ResponseWriter, r *http.Request, rr room
 		_, startErr = rr.room.StartTurnLocked()
 	})
 	if !allowed {
+		if startErr != nil {
+			s.renderRoomState(w, rr, startErr.Error(), false)
+			return
+		}
 		s.renderRoomState(w, rr, "Only the host can start the game.", false)
 		return
 	}
@@ -825,14 +874,29 @@ func (s *Server) handleStartGame(w http.ResponseWriter, r *http.Request, rr room
 }
 
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request, rr roomRequest) {
+	var resetErr error
 	if !rr.room.DoAuthorized(rr.token, func(isHost bool, _ string, session *game.Session) bool {
-		return isHost && (!session.Started || session.Finished)
+		if !isHost || (session.Started && !session.Finished) {
+			return false
+		}
+		resetErr = session.ValidateTurnIDs()
+		return resetErr == nil
 	}, func() {
-		rr.room.InvalidateTopicGenerationLocked()
-		rr.room.Session.ResetForNewGame()
-		rr.room.ClearTurnClockLocked()
+		resetErr = rr.room.Session.ResetForNewGame()
+		if resetErr == nil {
+			rr.room.InvalidateTopicGenerationLocked()
+			rr.room.ClearTurnClockLocked()
+		}
 	}) {
+		if resetErr != nil {
+			s.renderRoomState(w, rr, resetErr.Error(), false)
+			return
+		}
 		s.renderRoomState(w, rr, "Only the host can reset setup or a finished game.", false)
+		return
+	}
+	if resetErr != nil {
+		s.renderRoomState(w, rr, resetErr.Error(), false)
 		return
 	}
 	s.renderRoomState(w, rr, "", false)
@@ -849,6 +913,20 @@ func (s *Server) handleStartTurn(w http.ResponseWriter, r *http.Request, rr room
 			}
 			if playerID == "" || playerID != next {
 				return false
+			}
+		}
+		// Only preflight when this exact request would allocate a new ID. This
+		// preserves stale-request and game-state error precedence while keeping
+		// an exhausted room's version and idle-expiry timestamp unchanged.
+		if session.Started && !session.Finished && session.ActiveTurn == nil {
+			requestIsCurrent := len(session.CompletedTurns) == 0
+			if len(session.CompletedTurns) > 0 {
+				latest := session.CompletedTurns[len(session.CompletedTurns)-1]
+				requestIsCurrent = afterTurnID != "" && afterTurnID == latest.ID
+			}
+			if requestIsCurrent {
+				turnErr = session.ValidateTurnIDs()
+				return turnErr == nil
 			}
 		}
 		return true
@@ -871,6 +949,10 @@ func (s *Server) handleStartTurn(w http.ResponseWriter, r *http.Request, rr room
 		_, turnErr = rr.room.StartTurnLocked()
 	})
 	if !allowed {
+		if turnErr != nil {
+			s.renderRoomState(w, rr, turnErr.Error(), false)
+			return
+		}
 		s.renderRoomState(w, rr, "Waiting for the host or the next player to start the turn.", false)
 		return
 	}
@@ -904,8 +986,13 @@ func (s *Server) handleRedrawTurn(w http.ResponseWriter, r *http.Request, rr roo
 	var redrawErr error
 	allowed := rr.room.DoAuthorized(rr.token, func(isHost bool, playerID string, session *game.Session) bool {
 		turn := session.ActiveTurn
-		return turnID != "" && turn != nil && turn.ID == turnID &&
+		authorized := turnID != "" && turn != nil && turn.ID == turnID &&
 			(isHost || (playerID != "" && turn.PlayerID == playerID))
+		if !authorized {
+			return false
+		}
+		redrawErr = rr.room.ValidateRedrawActiveTurnLocked()
+		return redrawErr == nil
 	}, func() {
 		if rr.room.Session.ActiveTurn == nil || rr.room.Session.ActiveTurn.ID != turnID {
 			redrawErr = errors.New("that turn has already ended")
@@ -914,6 +1001,10 @@ func (s *Server) handleRedrawTurn(w http.ResponseWriter, r *http.Request, rr roo
 		_, redrawErr = rr.room.RedrawActiveTurnLocked()
 	})
 	if !allowed {
+		if redrawErr != nil {
+			s.renderRoomState(w, rr, redrawErr.Error(), false)
+			return
+		}
 		s.renderRoomState(w, rr, "Only the host or the current speaker can redraw the current topic.", false)
 		return
 	}
@@ -952,14 +1043,11 @@ func (s *Server) handleSubmitTurn(w http.ResponseWriter, r *http.Request, rr roo
 				spoken = elapsed
 			}
 		}
-		completed := claimedCompleted
+		completed := claimedCompleted && !eliminated
 		if !callerIsHost {
 			spoken, completed = normalizeRemoteTurnClaim(
-				spoken, completed, elapsed, session.ActiveTurn.Duration,
+				spoken, claimedCompleted, eliminated, elapsed, session.ActiveTurn.Duration,
 			)
-		}
-		if eliminated {
-			completed = false
 		}
 		var turn game.Turn
 		turn, submitErr = session.SubmitTurn(spoken, completed, eliminated)
@@ -1029,9 +1117,20 @@ func (s *Server) gradeTurn(rm *room.Room, index int, turn game.Turn, transcript 
 }
 
 func (s *Server) handleScoreOverride(w http.ResponseWriter, r *http.Request, rr roomRequest) {
-	if !rr.room.DoAsHost(rr.token, func() {
-		rr.room.Session.OverrideScore(r.FormValue("playerID"), parseInt(r.FormValue("delta"), 0))
-	}) {
+	playerID := strings.TrimSpace(r.FormValue("playerID"))
+	delta := parseInt(r.FormValue("delta"), 0)
+	callerIsHost := false
+	allowed := rr.room.DoAuthorized(rr.token, func(isHost bool, _ string, session *game.Session) bool {
+		callerIsHost = isHost
+		return isHost && session.HasPlayer(playerID)
+	}, func() {
+		rr.room.Session.OverrideScore(playerID, delta)
+	})
+	if !allowed {
+		if callerIsHost {
+			s.renderRoomState(w, rr, "That player is no longer in this room.", false)
+			return
+		}
 		s.renderRoomState(w, rr, "Only the host can adjust scores.", false)
 		return
 	}
@@ -1151,7 +1250,7 @@ func parseInt(value string, fallback int) int {
 	return parsed
 }
 
-func normalizeRemoteTurnClaim(claimed int, wantsCompleted bool, elapsed, duration int) (int, bool) {
+func normalizeRemoteTurnClaim(claimed int, wantsCompleted, eliminated bool, elapsed, duration int) (int, bool) {
 	observed := 0
 	if elapsed >= 0 {
 		observed = elapsed + 1 // whole-second truncation tolerance
@@ -1165,7 +1264,7 @@ func normalizeRemoteTurnClaim(claimed int, wantsCompleted bool, elapsed, duratio
 	if claimed > observed {
 		claimed = observed
 	}
-	completed := wantsCompleted && elapsed >= 0 && elapsed+completionGraceSeconds >= duration
+	completed := wantsCompleted && !eliminated && elapsed >= 0 && elapsed+completionGraceSeconds >= duration
 	if completed {
 		// Accepting the browser's full-time signal within the clock-skew grace
 		// also accepts the full duration, keeping the completion flag and bonus

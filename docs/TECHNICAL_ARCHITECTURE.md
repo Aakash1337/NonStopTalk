@@ -59,7 +59,7 @@ There are two runtime editions. The richer local/self-hosted game edition is one
 - Real-time updates: Server-Sent Events, followed by HTMX partial fetches
 - State: in-memory rooms and optional periodic JSON snapshots
 - External AI: provider-neutral local Go judge/topic-generator interfaces; separate disabled-by-default Cloudflare topic-provider adapters for direct GLM-4.7 or Workers AI GLM-5.3-Flash routine generation and explicit Gemma 4 31B escalation
-- Tests: Go unit/handler/race/vet checks and Playwright browser smoke flows
+- Tests: Go unit/handler/race/vet checks, a shared Go/TypeScript game-rule contract, and Playwright browser smoke flows
 - Free online runtime: Workers Static Assets, a TypeScript fetch router, SQLite-backed Durable Objects, and hibernatable WebSockets
 - In-progress web platform: versioned Worker APIs, central D1 repositories/migrations, an internal sync-profile foundation, scheduled anonymous-data expiry, coarse D1/Analytics Engine event aggregation, and aggregate D1 model-usage budgeting
 - Cloudflare rule tests: Node's test runner through `tsx`, plus a Wrangler deploy dry run
@@ -81,6 +81,7 @@ internal/room/                    synchronized rooms, identity, presence, SSE si
                                   server clock, persistence
 internal/topics/                  built-in topic packs
 internal/web/handlers/            routing, authorization, validation, rendering
+testdata/game-contract.v1.json    versioned cross-edition core-rule fixtures
 internal/web/templates/           full-page and swappable HTML templates
 web/static/css/                   UI styles
 web/static/js/                    HTMX and focused browser modules
@@ -355,11 +356,11 @@ npm run smoke:multiplayer
 npm run smoke:coach
 ```
 
-The local Playwright suite covers manual fallback with reload/resume, mocked microphone completion, two-browser SSE play, offline AI judging, and fail-closed classic play. A separate hermetic Wrangler smoke uses two isolated browser contexts to cover the Cloudflare WebSocket room, host authorization, deterministic host scoring, Durable Object persistence across browser reconnect, and final-state convergence. Cloudflare tests also cover game rules, persistence/public-state boundaries, platform routing, D1 validation/ownership/retention, relationship metadata, and aggregate analytics. The 34 coaching tests cover the deterministic signal/retrieval engine plus relationship validation, persistence gating, safe grouping, and goal-specific comparison guardrails. The coaching smoke verifies standalone live cues, the default review-only baseline → Progress/reload/resume → retry path, local storage, artifact-only deletion, and that local-first default/off paths make no coaching-data API request; cloud-progress tests separately exercise the opt-in client and allowlist. The platform smoke confirms the relationship round trip and reserved D1 columns. Wrangler validates the deploy bundle.
+The local Playwright suite covers manual fallback with reload/resume, mocked microphone completion, two-browser SSE play, offline AI judging, and fail-closed classic play. A separate hermetic Wrangler smoke uses two isolated browser contexts to cover the Cloudflare WebSocket room, host authorization, deterministic host scoring, Durable Object persistence across browser reconnect, and final-state convergence. Go and Cloudflare adapters both execute the versioned `testdata/game-contract.v1.json` cases for six core invariant families; endpoint-level Go tests additionally verify that rejected topic and score actions do not mutate room state or version. Cloudflare tests also cover persistence/public-state boundaries, platform routing, D1 validation/ownership/retention, relationship metadata, and aggregate analytics. The 34 coaching tests cover the deterministic signal/retrieval engine plus relationship validation, persistence gating, safe grouping, and goal-specific comparison guardrails. The coaching smoke verifies standalone live cues, the default review-only baseline → Progress/reload/resume → retry path, local storage, artifact-only deletion, and that local-first default/off paths make no coaching-data API request; cloud-progress tests separately exercise the opt-in client and allowlist. The platform smoke confirms the relationship round trip and reserved D1 columns. Wrangler validates the deploy bundle.
 
 ## Architectural backlog
 
-- Shared rule generation or stronger parity checks between the Go and TypeScript editions
+- Expand the shared cross-edition contract beyond its six current core invariant families, or generate more rules from a common source
 - Cloudflare parity for AI, presets, import/export, explicit microphone selection, and sound cues
 - Validation of coaching thresholds, repeatability, false-tip rate, distraction, browser/device availability, accessibility, and accent/language fairness
 - Learning-outcome, repeatability, usability, and fairness validation for the implemented baseline-to-unassisted-retry comparison
