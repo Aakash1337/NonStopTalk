@@ -33,9 +33,9 @@
 	// them in version control prevents a deploy from silently discarding values
 	// that were set only in the dashboard. API credentials remain secrets.
 	"vars": {
-		// This first rollout remains on the existing header + waitUntil path.
-		// The Worker still drains any durable rows left by a newer deployment,
-		// which makes this version a safe rollback bridge after outbox activation.
+		// The committed rollout remains on the existing header + waitUntil path.
+		// This build produces durable rows only after the separate exact `outbox`
+		// opt-in and can still drain them in this safe rollback posture.
 		"ROOM_MILESTONE_DELIVERY_MODE": "best-effort",
 		"TOPIC_ROUTINE_PROVIDER": "offline",
 		"TOPIC_ESCALATION_PROVIDER": "off",
