@@ -841,12 +841,23 @@ function assertTraceHasNoLogs(document, message) {
 	}
 }
 
-export function findCandidateSeedProof(documents, version) {
+function candidateSeedEvidence(documents, version) {
 	assertSafeTailDocuments(documents, version);
 	const creates = [];
 	const cleanAlarms = [];
+	let candidateAttachmentTraceCount = 0;
+	let roomDurableObjectTraceCount = 0;
 	for (const [index, document] of documents.entries()) {
+		if (
+			document.executionModel === "stateless"
+			&& document.outcome === "ok"
+			&& document.event.request?.method === "HEAD"
+			&& document.event.response?.status === 200
+			&& traceLogValueCount(document) === 0
+			&& unexpectedTraceLogCount(document) === 0
+		) candidateAttachmentTraceCount += 1;
 		if (!isSuccessfulDurableObjectTrace(document)) continue;
+		roomDurableObjectTraceCount += 1;
 		const pathname = traceRequestPathname(document);
 		if (document.event.request?.method === "POST" && pathname === "/create") {
 			if (document.event.response?.status !== 201) {
@@ -867,12 +878,41 @@ export function findCandidateSeedProof(documents, version) {
 			cleanAlarms.push({ index, durableObjectId: document.durableObjectId });
 		}
 	}
+	const matchingAlarms = creates.length === 1
+		? cleanAlarms.filter((alarm) => (
+			alarm.durableObjectId === creates[0].durableObjectId && alarm.index > creates[0].index
+		))
+		: [];
+	return {
+		candidateAttachmentTraceCount,
+		cleanAlarms,
+		creates,
+		matchingAlarms,
+		roomDurableObjectTraceCount,
+	};
+}
+
+export function candidateSeedProofProgress(documents, version) {
+	const evidence = candidateSeedEvidence(documents, version);
+	return {
+		projectedTraceCount: documents.length,
+		candidateAttachmentTraceCount: evidence.candidateAttachmentTraceCount,
+		roomDurableObjectTraceCount: evidence.roomDurableObjectTraceCount,
+		successfulCreateCount: evidence.creates.length,
+		cleanAlarmCount: evidence.cleanAlarms.length,
+		matchingCleanAlarmCount: evidence.matchingAlarms.length,
+	};
+}
+
+export function hasCandidateTailAttachmentBarrier(documents, version) {
+	return candidateSeedEvidence(documents, version).candidateAttachmentTraceCount >= 1;
+}
+
+export function findCandidateSeedProof(documents, version) {
+	const { creates, matchingAlarms } = candidateSeedEvidence(documents, version);
 	if (creates.length > 1) return fail("Concurrent staging room creation made the candidate seed proof ambiguous.");
 	if (creates.length === 0) return null;
 	const create = creates[0];
-	const matchingAlarms = cleanAlarms.filter((alarm) => (
-		alarm.durableObjectId === create.durableObjectId && alarm.index > create.index
-	));
 	if (matchingAlarms.length === 0) return null;
 	if (matchingAlarms.length !== 1) return fail("The candidate seed acknowledgement proof was ambiguous.");
 	return durableObjectProofDigest(create.durableObjectId);
@@ -1148,6 +1188,8 @@ export function createStagingTailObservers({
 	onReady = () => undefined,
 	delay = sleep,
 	warmupMs = 15_000,
+	candidateAttachmentTraceWaitMs = 45_000,
+	candidateSeedTraceWaitMs = 120_000,
 	stateBarrierAttempts = 12,
 	stateBarrierTraceWaitMs = 5_000,
 	stateBarrierRetryDelayMs = 1_000,
@@ -1158,6 +1200,14 @@ export function createStagingTailObservers({
 	if (!Number.isSafeInteger(warmupMs) || warmupMs < 0 || warmupMs > 30_000) {
 		fail("The staging tail warm-up bound is invalid.");
 	}
+	if (
+		!Number.isSafeInteger(candidateAttachmentTraceWaitMs)
+		|| candidateAttachmentTraceWaitMs < 1
+		|| candidateAttachmentTraceWaitMs > 120_000
+		|| !Number.isSafeInteger(candidateSeedTraceWaitMs)
+		|| candidateSeedTraceWaitMs < 1
+		|| candidateSeedTraceWaitMs > 180_000
+	) fail("The candidate seed trace observation bound is invalid.");
 	if (
 		!Number.isSafeInteger(stateBarrierAttempts)
 		|| stateBarrierAttempts < 1
@@ -1220,15 +1270,23 @@ export function createStagingTailObservers({
 		};
 	}
 
+	function resolveWaitMessage(message) {
+		const resolved = typeof message === "function" ? message() : message;
+		if (typeof resolved !== "string" || resolved === "") {
+			return fail("A staging tail wait failure message is invalid.");
+		}
+		return resolved;
+	}
+
 	async function waitFor(tail, predicate, timeoutMs, message) {
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() <= deadline) {
 			if (tail.stderr.trim() !== "") return fail("The version-filtered staging tail emitted an error or warning.");
 			if (predicate()) return;
-			if (tail.terminal) return fail(message);
+			if (tail.terminal) return fail(resolveWaitMessage(message));
 			await delay(50);
 		}
-		return fail(message);
+		return fail(resolveWaitMessage(message));
 	}
 
 	async function waitForMaybe(tail, predicate, timeoutMs, terminalMessage) {
@@ -1276,13 +1334,35 @@ export function createStagingTailObservers({
 		}
 	}
 
-	async function observeCandidateSeed(operation, version, readyOperation = () => undefined) {
-		if (typeof operation !== "function" || typeof readyOperation !== "function") {
+	async function observeCandidateSeed(
+		operation,
+		version,
+		readyOperation = () => undefined,
+		attachmentOperation = () => undefined,
+	) {
+		if (
+			typeof operation !== "function"
+			|| typeof readyOperation !== "function"
+			|| typeof attachmentOperation !== "function"
+		) {
 			fail("A candidate seed tail operation is required.");
 		}
 		const jsonTail = await attachJsonTail("seed", version);
 		try {
 			const startIndex = jsonTail.accumulator.state().documents.length;
+			const observedDocuments = () => (
+				jsonTail.accumulator.state().documents.slice(startIndex)
+			);
+			await readyOperation();
+			await attachmentOperation();
+			await waitFor(
+				jsonTail,
+				() => hasCandidateTailAttachmentBarrier(observedDocuments(), version),
+				candidateAttachmentTraceWaitMs,
+				() => `The candidate JSON tail emitted no exact-version attachment barrier inside the bounded observation window. Safe projected progress: ${JSON.stringify(candidateSeedProofProgress(observedDocuments(), version))}`,
+			);
+			// Recheck the pinned candidate deployment and unchanged D1 snapshot
+			// after proving that the JSON stream itself receives live traces.
 			await readyOperation();
 			const result = await operation();
 			let proofDigest;
@@ -1290,13 +1370,13 @@ export function createStagingTailObservers({
 				jsonTail,
 				() => {
 					proofDigest = findCandidateSeedProof(
-						jsonTail.accumulator.state().documents.slice(startIndex),
+						observedDocuments(),
 						version,
 					);
 					return proofDigest !== null;
 				},
-				45_000,
-				"The candidate seed emitted no same-object create and clean acknowledgement proof.",
+				candidateSeedTraceWaitMs,
+				() => `The candidate seed emitted no same-object create and clean acknowledgement proof inside the bounded observation window. Safe projected progress: ${JSON.stringify(candidateSeedProofProgress(observedDocuments(), version))}`,
 			);
 			return { result, proofDigest };
 		} finally {
@@ -1704,6 +1784,14 @@ export async function prepareRollbackDrainProof({
 		async () => {
 			assertSingleVersionDeployment(await readDeployment(), coordinates.candidateVersion);
 			assertUnchangedSnapshot(beforeSeed, await readCandidateSnapshot());
+		},
+		async () => {
+			assertSingleVersionDeployment(await readDeployment(), coordinates.candidateVersion);
+			const attachment = await request(null, "/api/v1/platform/status", { method: "HEAD" });
+			if (attachment.status !== 200) {
+				return fail("The candidate JSON-tail attachment barrier did not return a successful 200 response.");
+			}
+			assertSingleVersionDeployment(await readDeployment(), coordinates.candidateVersion);
 		},
 	);
 	if (!isObject(observedSeed) || !isObject(observedSeed.result)) {

@@ -22,12 +22,14 @@ import {
 	assertReceiverFaultVersionDiff,
 	assertSingleVersionDeployment,
 	buildReceiverFaultConfig,
+	candidateSeedProofProgress,
 	checkpointFilename,
 	createStagingTailObservers,
 	createStagingWranglerReaders,
 	findCandidateSeedProof,
 	findFaultSeededJoinProof,
 	findFaultTraceProof,
+	hasCandidateTailAttachmentBarrier,
 	hasFaultStateBarrier,
 	hasRollbackTraceProof,
 	locateAggregateCheckpoint,
@@ -279,6 +281,25 @@ function seedAcknowledgementTrace(overrides = {}) {
 		version: CANDIDATE_VERSION,
 		event: { scheduledTime: 1_788_271_199_000 },
 		logs: [],
+		...overrides,
+	});
+}
+
+function candidateAttachmentTrace(overrides = {}) {
+	return traceDocument({
+		version: CANDIDATE_VERSION,
+		durableObjectId: undefined,
+		entrypoint: "fetch",
+		executionModel: "stateless",
+		event: {
+			request: {
+				method: "HEAD",
+				url: "https://example.invalid/api/v1/platform/status?private=must-not-survive-projection",
+				headers: { Cookie: "must-not-survive-projection" },
+				cf: { city: "must-not-survive-projection" },
+			},
+			response: { status: 200 },
+		},
 		...overrides,
 	});
 }
@@ -538,6 +559,39 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 	], FAULT_VERSION, seedProof), /concurrent staging room mutation/u);
 });
 
+test("candidate seed progress is aggregate-only and distinguishes attachment, create, and clean ACK", () => {
+	const attachment = parseTailTraceStream(JSON.stringify(candidateAttachmentTrace()));
+	assert.equal(hasCandidateTailAttachmentBarrier(attachment, CANDIDATE_VERSION), true);
+	assert.deepEqual(candidateSeedProofProgress([
+		...attachment,
+		createTrace({ version: CANDIDATE_VERSION }),
+	], CANDIDATE_VERSION), {
+		projectedTraceCount: 2,
+		candidateAttachmentTraceCount: 1,
+		roomDurableObjectTraceCount: 1,
+		successfulCreateCount: 1,
+		cleanAlarmCount: 0,
+		matchingCleanAlarmCount: 0,
+	});
+	const complete = candidateSeedProofProgress([
+		...attachment,
+		createTrace({ version: CANDIDATE_VERSION }),
+		seedAcknowledgementTrace(),
+	], CANDIDATE_VERSION);
+	assert.deepEqual(complete, {
+		projectedTraceCount: 3,
+		candidateAttachmentTraceCount: 1,
+		roomDurableObjectTraceCount: 2,
+		successfulCreateCount: 1,
+		cleanAlarmCount: 1,
+		matchingCleanAlarmCount: 1,
+	});
+	assert.doesNotMatch(
+		JSON.stringify({ attachment, complete }),
+		/private=|pathname|headers|Cookie|cf|city|must-not-survive-projection/u,
+	);
+});
+
 test("tail proof rejects truncation, missing metadata, overload, exceptions, and dirty A alarms", () => {
 	const proof = findFaultTraceProof([createTrace(), retryAlarmTrace()], FAULT_VERSION);
 	for (const invalid of [
@@ -639,10 +693,13 @@ test("tail observer signals before activation, safely retries state, and never r
 		},
 		delay: async () => undefined,
 		warmupMs: 0,
+		candidateAttachmentTraceWaitMs: 1,
+		candidateSeedTraceWaitMs: 1,
 		stateBarrierAttempts: 2,
 		stateBarrierTraceWaitMs: 1,
 		stateBarrierRetryDelayMs: 0,
 	});
+	let seedReadyChecks = 0;
 	const seed = await observers.observeCandidateSeed(async () => {
 		jsonChildren.get(CANDIDATE_VERSION).stdout.emit("data", [
 			JSON.stringify(createTrace({ version: CANDIDATE_VERSION })),
@@ -650,7 +707,16 @@ test("tail observer signals before activation, safely retries state, and never r
 			"",
 		].join("\n"));
 		return { privateRoom: "must-not-be-output" };
-	}, CANDIDATE_VERSION, async () => sequence.push("seed-tail-ready"));
+	}, CANDIDATE_VERSION, async () => {
+		seedReadyChecks += 1;
+		sequence.push(`seed-precheck-${seedReadyChecks}`);
+	}, async () => {
+		sequence.push("seed-attachment-request");
+		jsonChildren.get(CANDIDATE_VERSION).stdout.emit(
+			"data",
+			JSON.stringify(candidateAttachmentTrace()),
+		);
+	});
 	assert.match(seed.proofDigest, /^[0-9a-f]{64}$/u);
 	let stateAttempts = 0;
 	let joinAttempts = 0;
@@ -689,7 +755,9 @@ test("tail observer signals before activation, safely retries state, and never r
 	assert.equal(stateAttempts, 2);
 	assert.equal(joinAttempts, 1);
 	assert.deepEqual(sequence, [
-		"seed-tail-ready",
+		"seed-precheck-1",
+		"seed-attachment-request",
+		"seed-precheck-2",
 		"fault-precheck",
 		"fault-observer-ready",
 		"fault-activated",
@@ -699,6 +767,55 @@ test("tail observer signals before activation, safely retries state, and never r
 		"join",
 	]);
 	assert.doesNotMatch(JSON.stringify({ proofDigest: fault.proofDigest }), /privateRoom|privateGuest/u);
+});
+
+test("candidate seed timeout reports only bounded aggregate proof progress and never retries creation", async () => {
+	let jsonChild;
+	function spawnImpl(_executable, args) {
+		const format = args[args.indexOf("--format") + 1];
+		const stdout = new EventEmitter();
+		const stderr = new EventEmitter();
+		const child = new EventEmitter();
+		child.stdout = stdout;
+		child.stderr = stderr;
+		let stopped = false;
+		child.kill = () => {
+			if (!stopped) {
+				stopped = true;
+				child.emit("exit", 0, null);
+			}
+		};
+		if (format === "pretty") {
+			queueMicrotask(() => stdout.emit("data", `Connected to ${STAGING_WORKER}, waiting for logs...\n`));
+		} else jsonChild = child;
+		return child;
+	}
+	const observers = createStagingTailObservers({
+		spawnImpl,
+		delay: async () => undefined,
+		warmupMs: 0,
+		candidateAttachmentTraceWaitMs: 1,
+		candidateSeedTraceWaitMs: 1,
+	});
+	let createAttempts = 0;
+	await assert.rejects(observers.observeCandidateSeed(async () => {
+		createAttempts += 1;
+		jsonChild.stdout.emit("data", JSON.stringify(createTrace({ version: CANDIDATE_VERSION })));
+		return { privateRoom: "ABC234", privateCookie: HOST_TOKEN };
+	}, CANDIDATE_VERSION, async () => undefined, async () => {
+		jsonChild.stdout.emit("data", JSON.stringify(candidateAttachmentTrace()));
+	}), (error) => {
+		assert.match(error.message, /no same-object create and clean acknowledgement proof/u);
+		assert.match(error.message, /"projectedTraceCount":2/u);
+		assert.match(error.message, /"candidateAttachmentTraceCount":1/u);
+		assert.match(error.message, /"roomDurableObjectTraceCount":1/u);
+		assert.match(error.message, /"successfulCreateCount":1/u);
+		assert.match(error.message, /"cleanAlarmCount":0/u);
+		assert.match(error.message, /"matchingCleanAlarmCount":0/u);
+		assert.doesNotMatch(error.message, /ABC234|must-not-survive|aaaaaaaa|e237d4e3/u);
+		return true;
+	});
+	assert.equal(createAttempts, 1);
 });
 
 test("prepare seeds and drains under B, signals a ready fault observer, then proves one same-object join", async () => {
@@ -716,6 +833,10 @@ test("prepare seeds and drains under B, signals a ready fault observer, then pro
 		fetchImpl: async (url, init = {}) => {
 			const pathname = new URL(url).pathname;
 			if (pathname === "/api/v1/platform/status") {
+				if (init.method === "HEAD") {
+					sequence.push("seed-tail-attachment");
+					return new Response(null, { status: 200 });
+				}
 				if (activeVersion === CANDIDATE_VERSION) return healthyCandidateStatus();
 				faultStatusReads += 1;
 				return faultStatusReads === 1 ? healthyCandidateStatus() : faultStatus();
@@ -749,10 +870,13 @@ test("prepare seeds and drains under B, signals a ready fault observer, then pro
 			? versionDocument(CANDIDATE_VERSION)
 			: versionDocument(FAULT_VERSION, { database: false }),
 		readSnapshot: async () => seedCreated ? baseline : beforeSeed,
-		observeCandidateSeed: async (operation, version, readyOperation) => {
+		observeCandidateSeed: async (operation, version, readyOperation, attachmentOperation) => {
 			assert.equal(version, CANDIDATE_VERSION);
 			await readyOperation();
-			sequence.push("seed-observer-ready");
+			sequence.push("seed-precheck-1");
+			await attachmentOperation();
+			await readyOperation();
+			sequence.push("seed-precheck-2");
 			seedPrivateResult = await operation();
 			seedPrivateHost = seedPrivateResult.host;
 			return { result: seedPrivateResult, proofDigest: PROOF_DIGEST };
@@ -787,7 +911,9 @@ test("prepare seeds and drains under B, signals a ready fault observer, then pro
 	assert.equal(joinAttempts, 1);
 	assert.equal(faultStatusReads, 2);
 	assert.deepEqual(sequence, [
-		"seed-observer-ready",
+		"seed-precheck-1",
+		"seed-tail-attachment",
+		"seed-precheck-2",
 		"seed-create",
 		"guest-identity",
 		"fault-observer-ready",
@@ -828,7 +954,9 @@ test("prepare fails closed on an undrained seed or a deployment change between s
 			: createdRoomResponse(),
 		readDeployment: async () => deployment(activeVersion),
 		readSnapshot: async () => beforeSeed,
-		observeCandidateSeed: async (operation, _version, readyOperation) => {
+		observeCandidateSeed: async (operation, _version, readyOperation, attachmentOperation) => {
+			await readyOperation();
+			await attachmentOperation();
 			await readyOperation();
 			return { result: await operation(), proofDigest: PROOF_DIGEST };
 		},
@@ -855,7 +983,9 @@ test("prepare fails closed on an undrained seed or a deployment change between s
 		},
 		readDeployment: async () => deployment(activeVersion, activeDeploymentId),
 		readSnapshot: async () => seedCreated ? baseline : beforeSeed,
-		observeCandidateSeed: async (operation, _version, readyOperation) => {
+		observeCandidateSeed: async (operation, _version, readyOperation, attachmentOperation) => {
+			await readyOperation();
+			await attachmentOperation();
 			await readyOperation();
 			return { result: await operation(), proofDigest: PROOF_DIGEST };
 		},

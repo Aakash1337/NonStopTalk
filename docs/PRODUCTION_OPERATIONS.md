@@ -213,10 +213,13 @@ Use this order:
    `prepare` starts while the pinned Release-B candidate is still alone at 100%.
    It repeats the version/resource checks, requires healthy schema-6
    `durable-outbox` readiness, and brackets every aggregate read with candidate
-   deployment checks. It first attaches an unsampled candidate-version tail and
+   deployment checks. It first attaches an unsampled candidate-version JSON
+   tail, proves that exact stream is receiving traces with a read-only `HEAD`
+   status request, rechecks the deployment and unchanged baseline, and only then
    creates one seed room. The seed is accepted only after the tail observes the
    same Durable Object's successful `POST /create` and clean acknowledgement
-   alarm and D1 converges by exactly +1 receipt, +1 room fact, and +1
+   alarm within the bounded two-minute trace window and D1 converges by exactly
+   +1 receipt, +1 room fact, and +1
    `room_created`, with every other tracked counter unchanged. That post-seed
    snapshot becomes the fault and rollback baseline; the clean alarm proves the
    seed row was locally acknowledged before fault activation.
@@ -259,7 +262,10 @@ Use this order:
    ID is held only in bounded process memory long enough to correlate and hash
    the traces; it is never printed or written. The room code and guest cookie
    likewise remain only in the running `prepare` process and are discarded when
-   that operation ends. Only after the full fault proof succeeds does `prepare`
+   that operation ends. A seed timeout reports only six numeric projected-trace
+   counts so an operator can distinguish attachment, create, alarm, and
+   correlation gaps without exposing proof data. Only after the full fault proof
+   succeeds does `prepare`
    write a checkpoint: its mode-0600 body contains exactly seven aggregate
    counters, and its opaque filename digests bind the reviewed versions and
    Durable Object without exposing private values.
