@@ -326,6 +326,36 @@ test("an unsupported schema blocks remote reservation and provider delivery", as
 	assert.equal(body.fallbackCode, "MODEL_BUDGET_UNAVAILABLE");
 });
 
+test("an in-flight schema transition blocks success and failure reconciliation", async (t) => {
+	for (const outcome of ["success", "failure"] as const) {
+		await t.test(outcome, async () => {
+			const database = new FakeD1(5);
+			const handled = await handleModelRoute(
+				topicRequest({ externalConsent: true }),
+				modelEnv(database),
+				"token",
+				`request-transition-${outcome}`,
+				routeDeps({
+					describeProvider: (_env, tier) => remoteDescription(tier),
+					generateTopics: async (_env, input) => {
+						database.schemaVersion = 7;
+						if (outcome === "failure") throw new Error("provider unavailable");
+						return generatedResult(input.tier);
+					},
+				}),
+			);
+			assert(handled);
+			assert.equal(handled.response.status, 200);
+			assert.equal(database.markerReads, 2);
+			assert.equal(database.bindingLog.length, 1, "only the admitted reservation may execute");
+			const daily = database.global.get("2026-08-31");
+			assert.equal(daily?.reservedCalls, 1);
+			assert.equal(daily?.completedCalls, 0);
+			assert.equal(database.providers.size, 0);
+		});
+	}
+});
+
 test("Workers AI GLM 5.3 is accepted for consent disclosure, normalized output, and telemetry", async () => {
 	const database = new FakeD1();
 	const description: TopicProviderDescription = {

@@ -297,7 +297,9 @@ class FakeCleanupD1 {
 	readonly backlogAfterBudget: boolean;
 	readonly failBacklogCheck: boolean;
 	readonly failHeartbeat: boolean;
-	readonly schemaVersion: number;
+	readonly schemaVersion: unknown;
+	readonly schemaVersions: readonly unknown[];
+	markerReads = 0;
 	cleanupBatches = 0;
 	backlogChecks = 0;
 	heartbeatAttempts = 0;
@@ -312,13 +314,15 @@ class FakeCleanupD1 {
 		failBacklogCheck = false,
 		failHeartbeat = false,
 		schemaVersion = 5,
+		schemaVersions = [],
 	}: {
 		failCleanup?: boolean;
 		cleanupChanges?: number;
 		backlogAfterBudget?: boolean;
 		failBacklogCheck?: boolean;
 		failHeartbeat?: boolean;
-		schemaVersion?: number;
+		schemaVersion?: unknown;
+		schemaVersions?: readonly unknown[];
 	} = {}) {
 		this.failCleanup = failCleanup;
 		this.cleanupChanges = cleanupChanges;
@@ -326,6 +330,7 @@ class FakeCleanupD1 {
 		this.failBacklogCheck = failBacklogCheck;
 		this.failHeartbeat = failHeartbeat;
 		this.schemaVersion = schemaVersion;
+		this.schemaVersions = schemaVersions;
 	}
 
 	prepare(query: string): D1PreparedStatement {
@@ -401,7 +406,11 @@ class FakeCleanupStatement {
 
 	async first<T>(): Promise<T | null> {
 		if (/SELECT schema_version FROM platform_meta/u.test(this.query)) {
-			return { schema_version: this.database.schemaVersion } as T;
+			const schemaVersion = this.database.markerReads < this.database.schemaVersions.length
+				? this.database.schemaVersions[this.database.markerReads]
+				: this.database.schemaVersion;
+			this.database.markerReads += 1;
+			return { schema_version: schemaVersion } as T;
 		}
 		assert.match(this.query, /AS has_more/u);
 		this.database.backlogChecks += 1;
@@ -652,6 +661,47 @@ test("unsupported schemas block cleanup before any deletion or heartbeat write",
 	assert.equal(database.backlogChecks, 0);
 	assert.equal(database.heartbeatAttempts, 0);
 	assert.equal(database.heartbeatWrites, 0);
+});
+
+test("cleanup revalidates the schema before every later D1 step", async (t) => {
+	await t.test("next cleanup batch", async () => {
+		const database = new FakeCleanupD1({ cleanupChanges: 500, schemaVersions: [5, 7] });
+		await assert.rejects(
+			runPlatformCleanup({ PLATFORM_DB: database as unknown as D1Database }),
+			(error: unknown) => error instanceof Error && error.name === "PlatformError",
+		);
+		assert.equal(database.markerReads, 2);
+		assert.equal(database.cleanupBatches, 1);
+		assert.equal(database.backlogChecks, 0);
+		assert.equal(database.heartbeatAttempts, 0);
+	});
+
+	await t.test("final backlog probe", async () => {
+		const database = new FakeCleanupD1({
+			cleanupChanges: 500,
+			schemaVersions: [...Array.from({ length: 20 }, () => 5), 7],
+		});
+		await assert.rejects(
+			runPlatformCleanup({ PLATFORM_DB: database as unknown as D1Database }),
+			(error: unknown) => error instanceof Error && error.name === "PlatformError",
+		);
+		assert.equal(database.markerReads, 21);
+		assert.equal(database.cleanupBatches, 20);
+		assert.equal(database.backlogChecks, 0);
+		assert.equal(database.heartbeatAttempts, 0);
+	});
+
+	await t.test("heartbeat write", async () => {
+		const database = new FakeCleanupD1({ schemaVersions: [5, 7] });
+		await assert.rejects(
+			runPlatformCleanup({ PLATFORM_DB: database as unknown as D1Database }),
+			(error: unknown) => error instanceof Error && error.name === "PlatformError",
+		);
+		assert.equal(database.markerReads, 2);
+		assert.equal(database.cleanupBatches, 1);
+		assert.equal(database.backlogChecks, 0);
+		assert.equal(database.heartbeatAttempts, 0);
+	});
 });
 
 test("unsupported schemas skip D1 analytics while preserving best-effort Analytics Engine delivery", async () => {
