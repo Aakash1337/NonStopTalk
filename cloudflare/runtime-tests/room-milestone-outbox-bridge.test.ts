@@ -188,6 +188,64 @@ describe("room milestone compatibility bridge in the Workers runtime", () => {
 		});
 	});
 
+	it("replays as a duplicate when D1 commits before the local ACK transaction fails", async () => {
+		const stub = roomStub("ACKF24");
+		await createRoom(stub, "ACKF24");
+		let eventId = "";
+		let originalRow: Record<string, SqlStorageValue> | undefined;
+
+		await runInDurableObject(stub, async (instance, state) => {
+			const now = Date.now() - 1;
+			await state.storage.transaction(async (transaction) => {
+				initializeRoomMilestoneOutbox(state.storage.sql);
+				const result = enqueueRoomMilestones(
+					state.storage.sql,
+					[milestoneFact("created", 1)],
+					now,
+				);
+				if (result.outcome !== "queued") throw new Error("Expected a queued milestone.");
+				eventId = result.events[0]?.eventId ?? "";
+				await transaction.setAlarm(Date.now() + 60_000);
+			});
+			originalRow = state.storage.sql.exec<Record<string, SqlStorageValue>>(
+				"SELECT * FROM room_milestone_outbox WHERE event_id = ?",
+				eventId,
+			).one();
+			state.storage.sql.exec(`CREATE TRIGGER test_fail_room_milestone_ack
+				BEFORE DELETE ON room_milestone_outbox
+				BEGIN
+					SELECT RAISE(ABORT, 'synthetic local ACK failure');
+				END`);
+
+			await expect(instance.alarm()).rejects.toThrow("synthetic local ACK failure");
+
+			expect(state.storage.sql.exec<Record<string, SqlStorageValue>>(
+				"SELECT * FROM room_milestone_outbox WHERE event_id = ?",
+				eventId,
+			).one()).toEqual(originalRow);
+			expect(await state.storage.getAlarm()).not.toBeNull();
+			state.storage.sql.exec("DROP TRIGGER test_fail_room_milestone_ack");
+			await state.storage.setAlarm(Date.now() + 60_000);
+		});
+
+		expect(await receiptCount(eventId)).toBe(1);
+		expect(await env.PLATFORM_DB.prepare(
+			"SELECT event_count FROM analytics_daily WHERE metric = 'room_created'",
+		).first<{ event_count: number }>()).toEqual({ event_count: 1 });
+
+		expect(await runDurableObjectAlarm(stub)).toBe(true);
+		expect(await receiptCount(eventId)).toBe(1);
+		expect(await env.PLATFORM_DB.prepare(
+			"SELECT event_count FROM analytics_daily WHERE metric = 'room_created'",
+		).first<{ event_count: number }>()).toEqual({ event_count: 1 });
+		await runInDurableObject(stub, (_instance, state) => {
+			expect(state.storage.sql.exec(
+				"SELECT sequence FROM room_milestone_outbox WHERE event_id = ?",
+				eventId,
+			).toArray()).toEqual([]);
+		});
+	});
+
 	it("persists marker-5 retry state, blocks FIFO, and drains in order after marker-6 recovery", async () => {
 		const stub = roomStub("FIFO24");
 		await createRoom(stub, "FIFO24");
