@@ -23,8 +23,15 @@ const DEFAULT_ANALYTICS_DAYS = 30;
 const MAX_ANALYTICS_DAYS = 180;
 const PLATFORM_STATUS_CACHE_MS = 60_000;
 const MAX_CLEANUP_BATCHES_PER_RUN = 20;
-const PLATFORM_SCHEMA_VERSION = 3;
-const databaseReadiness = new WeakMap<D1Database, number>();
+const MIN_PLATFORM_SCHEMA_VERSION = 3;
+const MAX_PLATFORM_SCHEMA_VERSION = 4;
+
+interface DatabaseReadiness {
+	expiresAt: number;
+	schemaVersion: number;
+}
+
+const databaseReadiness = new WeakMap<D1Database, DatabaseReadiness>();
 
 export interface PlatformBindings extends TopicProviderBindings {
 	PLATFORM_DB: D1Database;
@@ -56,7 +63,7 @@ export async function handlePlatformRoute(
 			if (request.method !== "GET" && request.method !== "HEAD") {
 				return result(methodNotAllowed(requestId, "GET, HEAD"), false);
 			}
-			await assertDatabaseReady(env.PLATFORM_DB);
+			const schemaVersion = await assertDatabaseReady(env.PLATFORM_DB);
 			const roomFactsReady = isSecureRoomFactKey(env.ROOM_FACT_HASH_KEY);
 			const adminAnalyticsReady = isSecureAdminToken(env.ANALYTICS_ADMIN_TOKEN);
 			const topicGeneration = topicGenerationCapability(env);
@@ -70,7 +77,7 @@ export async function handlePlatformRoute(
 					{
 						status: degradedCapabilities.length === 0 ? "ok" : "degraded",
 						apiVersion: "v1",
-						schemaVersion: PLATFORM_SCHEMA_VERSION,
+						schemaVersion,
 						capabilities: {
 							cloudProgress: {
 								status: "ready",
@@ -454,17 +461,27 @@ function methodNotAllowed(requestId: string, allow: string): Response {
 	return response;
 }
 
-async function assertDatabaseReady(database: D1Database): Promise<void> {
+async function assertDatabaseReady(database: D1Database): Promise<number> {
 	const now = Date.now();
-	if ((databaseReadiness.get(database) ?? 0) > now) return;
+	const cached = databaseReadiness.get(database);
+	if (cached && cached.expiresAt > now) return cached.schemaVersion;
 	try {
 		const marker = await database
 			.prepare("SELECT schema_version FROM platform_meta WHERE id = 1")
 			.first<{ schema_version: number }>();
-		if (!marker || marker.schema_version !== PLATFORM_SCHEMA_VERSION) {
+		if (
+			!marker
+			|| !Number.isSafeInteger(marker.schema_version)
+			|| marker.schema_version < MIN_PLATFORM_SCHEMA_VERSION
+			|| marker.schema_version > MAX_PLATFORM_SCHEMA_VERSION
+		) {
 			throw new Error("platform schema marker is missing or unsupported");
 		}
-		databaseReadiness.set(database, now + PLATFORM_STATUS_CACHE_MS);
+		databaseReadiness.set(database, {
+			expiresAt: now + PLATFORM_STATUS_CACHE_MS,
+			schemaVersion: marker.schema_version,
+		});
+		return marker.schema_version;
 	} catch (error) {
 		throw new PlatformError("DATABASE_UNAVAILABLE", "The platform database has not been initialized.", {
 			cause: error,

@@ -68,6 +68,23 @@ class FakeModelUsageStatement {
 	}
 }
 
+class FakeStatusD1 {
+	constructor(readonly schemaVersion: number) {}
+
+	prepare(query: string): D1PreparedStatement {
+		assert.match(query, /SELECT schema_version FROM platform_meta/u);
+		return new FakeStatusStatement(this.schemaVersion) as unknown as D1PreparedStatement;
+	}
+}
+
+class FakeStatusStatement {
+	constructor(readonly schemaVersion: number) {}
+
+	async first<T>(): Promise<T | null> {
+		return { schema_version: this.schemaVersion } as T;
+	}
+}
+
 function usageRow(overrides: Partial<ModelUsageTestRow> = {}): ModelUsageTestRow {
 	return {
 		day: "2026-08-31",
@@ -89,6 +106,44 @@ function usageRow(overrides: Partial<ModelUsageTestRow> = {}): ModelUsageTestRow
 		...overrides,
 	};
 }
+
+test("platform status accepts the current and next expand schema and reports the actual marker", async () => {
+	for (const schemaVersion of [3, 4]) {
+		const handled = await handlePlatformRoute(
+			new Request("https://nonstoptalk.test/api/v1/platform/status"),
+			{
+				PLATFORM_DB: new FakeStatusD1(schemaVersion) as unknown as D1Database,
+				ANALYTICS_ADMIN_TOKEN: "1".repeat(64),
+				ROOM_FACT_HASH_KEY: "2".repeat(64),
+			},
+			"3".repeat(64),
+			`status-schema-${schemaVersion}`,
+		);
+
+		assert(handled);
+		assert.equal(handled.response.status, 200);
+		const body = await handled.response.json() as { status: string; schemaVersion: number };
+		assert.equal(body.status, "ok");
+		assert.equal(body.schemaVersion, schemaVersion);
+	}
+});
+
+test("platform status rejects schema markers outside the reviewed compatibility window", async () => {
+	for (const schemaVersion of [2, 5]) {
+		const handled = await handlePlatformRoute(
+			new Request("https://nonstoptalk.test/api/v1/platform/status"),
+			{ PLATFORM_DB: new FakeStatusD1(schemaVersion) as unknown as D1Database },
+			"4".repeat(64),
+			`unsupported-schema-${schemaVersion}`,
+		);
+
+		assert(handled);
+		assert.equal(handled.response.status, 503);
+		assert.equal(handled.response.headers.get("Retry-After"), "30");
+		const body = await handled.response.json() as { error: { code: string } };
+		assert.equal(body.error.code, "DATABASE_UNAVAILABLE");
+	}
+});
 
 test("admin model usage reports complete global token totals without double-counting provider rows", async () => {
 	const database = new FakeModelUsageD1([
