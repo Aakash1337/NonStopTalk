@@ -20,9 +20,12 @@
     "test:admin": "node --test cloudflare/public/admin-analytics.test.js",
     "test:production-monitor": "node --test scripts/production-health-workflow.test.mjs",
     "test:deployment-contract": "node --test scripts/deployment-contract.test.mjs",
+    "test:worker-runtime-runner": "node --test scripts/run-worker-vitest.test.mjs",
     "test:smoke-support": "node --test scripts/smoke-process-support.test.mjs",
+    "test:staging-outbox-smoke": "node --test scripts/smoke-staging-outbox.test.mjs",
     "test:cloudflare": "tsx --test cloudflare/*.test.ts",
-    "test:cloudflare-runtime": "tsc -p cloudflare/runtime-tests/tsconfig.json && vitest run --config vitest.worker.config.ts",
+    "test:cloudflare-runtime": "tsc -p cloudflare/runtime-tests/tsconfig.json && node scripts/run-worker-vitest.mjs vitest.worker.config.ts",
+    "test:cloudflare-runtime-outbox": "tsc -p cloudflare/outbox-runtime-tests/tsconfig.json && node scripts/run-worker-vitest.mjs vitest.outbox.config.ts",
     "types:cloudflare": "wrangler types cloudflare/worker-configuration.d.ts --include-runtime false",
     "typecheck:cloudflare": "tsc -p cloudflare/tsconfig.json",
     "deploy": "npm run db:migrate:remote && wrangler deploy --strict --env= && npm run smoke:production",
@@ -35,7 +38,8 @@
     "smoke:admin": "node scripts/smoke-admin.mjs",
     "smoke:platform": "node scripts/smoke-platform.mjs",
     "smoke:production": "node scripts/smoke-production.mjs",
-    "smoke:staging": "node scripts/smoke-production.mjs https://nonstoptalk-staging.aakashplays656.workers.dev && node scripts/smoke-staging.mjs https://nonstoptalk-staging.aakashplays656.workers.dev"
+    "smoke:staging": "node scripts/smoke-production.mjs https://nonstoptalk-staging.aakashplays656.workers.dev && node scripts/smoke-staging.mjs https://nonstoptalk-staging.aakashplays656.workers.dev",
+    "smoke:staging-outbox": "node scripts/smoke-staging-outbox.mjs"
   },
   "devDependencies": {
     "@axe-core/playwright": "4.13.0",

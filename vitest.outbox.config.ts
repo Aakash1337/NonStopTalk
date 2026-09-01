@@ -11,15 +11,17 @@ export default defineConfig(async () => {
 	return {
 		plugins: [
 			cloudflareTest({
-				// Define the runtime bindings directly so every test stays local and
-				// the production Workers AI binding never opens a remote proxy.
+				// Keep this lane entirely local while exercising the exact opt-in
+				// value used by the durable room-milestone producer.
 				main: "./cloudflare/worker.ts",
 				remoteBindings: false,
 				miniflare: {
 					compatibilityDate: "2026-09-01",
 					bindings: {
 						TEST_MIGRATIONS: migrations,
-						ROOM_MILESTONE_DELIVERY_MODE: "best-effort",
+						ROOM_MILESTONE_DELIVERY_MODE: "outbox",
+						ROOM_FACT_HASH_KEY: "7".repeat(64),
+						ANALYTICS_ADMIN_TOKEN: "8".repeat(64),
 					},
 					d1Databases: ["PLATFORM_DB"],
 					durableObjects: {
@@ -32,11 +34,9 @@ export default defineConfig(async () => {
 			}),
 		],
 		test: {
-			include: ["cloudflare/runtime-tests/**/*.test.ts"],
+			include: ["cloudflare/outbox-runtime-tests/**/*.test.ts"],
 			setupFiles: ["./cloudflare/runtime-tests/apply-d1-migrations.ts"],
-			// Cloudflare documents this single shared runtime as the supported
-			// workaround for WebSockets and shared storage. It also prevents a later
-			// file from tearing down RPC while a prior Durable Object is settling.
+			// Use Cloudflare's documented shared-runtime settings for stateful tests.
 			fileParallelism: false,
 			maxWorkers: 1,
 			isolate: false,

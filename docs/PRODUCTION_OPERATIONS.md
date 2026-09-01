@@ -39,11 +39,14 @@ npm run test:cloud-progress
 npm run test:admin
 npm run test:production-monitor
 npm run test:deployment-contract
+npm run test:worker-runtime-runner
 npm run test:smoke-support
+npm run test:staging-outbox-smoke
 npm run check:cloudflare-types
 npm run typecheck:cloudflare
 npm run test:cloudflare
 npm run test:cloudflare-runtime
+npm run test:cloudflare-runtime-outbox
 npm run check:cloudflare
 npm run check:cloudflare-staging
 npm run check:cloudflare-startup
@@ -62,23 +65,33 @@ That command applies production migrations, deploys in strict mode, then runs
 the retrying read-only production probe. Direct dashboard edits can conflict
 with strict mode and should be reconciled into `wrangler.jsonc` before retrying.
 
-For the receiver, cleanup, and Release-A outbox-consumer bridge, the green test
-gate must prove all of the following without adding a public receiver route:
+For the receiver, cleanup, compatibility bridge, and gated Release-B producer,
+the green test gate must prove all of the following without adding a public
+receiver route:
 canonical payload rejection and hashing; one first D1 application; no repeated
 D1 or Analytics Engine effect for an exact replay; conflict on event-ID reuse
 with a different payload; fail-closed receipt behavior on marker 5; marker-5
 cleanup that never prepares receipt SQL; marker-6 cleanup that deletes only
 expired receipts and includes any remainder in the bounded backlog result;
 ordinary best-effort rooms that create neither local outbox tables nor receipts;
+exact-mode room state, complete milestone group, and alarm persistence in one
+local transaction; stable lifecycle/event entropy across a transaction replay;
+all-or-drop final-turn pairs at the queue boundary; no legacy dual delivery;
 and FIFO one-at-a-time drain, persisted bounded retry, and privacy-minimal
-dead-letter handling for a pre-existing version-1 local outbox. A failed
-Analytics Engine write remains non-fatal and is not retried.
+dead-letter handling for a version-1 local outbox. A failed Analytics Engine
+write remains non-fatal and is not retried.
 
-This is a code/config compatibility release over the existing schema-6 table.
-Production and staging explicitly remain `ROOM_MILESTONE_DELIVERY_MODE=best-effort`.
-It adds no D1 migration, Cloudflare service, binding, secret, Queue, paid product,
-or separate alarm configuration, so the normal `npm run deploy` sequence remains
-unchanged. The local tables are lazy and dormant during ordinary traffic.
+The current committed production and staging configurations explicitly remain
+`ROOM_MILESTONE_DELIVERY_MODE=best-effort`. Release B includes the exact-mode
+producer, but configuration keeps it dormant: ordinary traffic retains the
+header plus `waitUntil` path and creates no local outbox tables. Only the exact,
+case-sensitive value `outbox` selects the producer. In that mode, a
+milestone-producing mutation commits room state, the complete canonical event
+group (or bounded all-or-drop counter), and the shared alarm atomically before
+the response or WebSocket broadcast. This release adds no D1 migration,
+Cloudflare service, binding, Queue, paid product, or separate alarm
+configuration, so the normal best-effort `npm run deploy` sequence remains
+unchanged.
 
 After deployment, run the read-only production probe:
 
@@ -124,11 +137,68 @@ It never sends audio, transcript text, user content, or an external model
 request.
 
 The staging probe does not invoke the internal room-milestone receiver and is not
-an end-to-end durable-delivery test. Before promotion, use the local unit/runtime
-gate above to exercise the receiver, cleanup, and compatibility consumer. An
-ordinary staging multiplayer smoke must continue to use the best-effort milestone
-path; it must create no local outbox tables, and receipt-row counts inspected
-before and after that smoke must not increase.
+an end-to-end durable-delivery test. Before promotion, use both local runtime
+lanes above to exercise the receiver, cleanup, bridge, and exact producer. While
+staging remains on its committed best-effort value, an ordinary staging
+multiplayer smoke must create no local outbox tables, and receipt-row counts
+inspected before and after that smoke must not increase.
+
+### Room-milestone outbox activation
+
+Treat exact-mode activation as a separate configuration release after the
+producer-capable Worker has already run safely in `best-effort`. An exact room
+claims ownership with a comma-only v1 sentinel in the existing private milestone
+header only after that object version owns delivery. Release A already parses
+the sentinel as an empty event list and removes the header; Release B recognizes
+it as authoritative. An older/best-effort object returns real milestone values
+for the legacy fallback. This
+covers unavoidable Cloudflare propagation skew in both directions. Still avoid
+an intentional gradual deployment, traffic split, or mixed-configuration
+rollout so activation evidence and rollback remain unambiguous. Activate and
+roll back one complete environment/version at a time.
+
+Use this order:
+
+1. Confirm staging is on the reviewed Release-B code, D1 reports schema exactly
+   6, and its independent `ROOM_FACT_HASH_KEY` secret has 32 through 1,024 UTF-8
+   bytes. The admin token and Analytics Engine binding do not gate outbox
+   delivery.
+2. Reserve a quiet staging window outside its 03:47 UTC cleanup and a UTC-day
+   rollover; stop other staging probes and clients. Record staging receipt and
+   daily-rollup baselines, change only staging to the exact `outbox` value, and
+   perform one full-version deployment. Status must report room-milestone
+   delivery as `durable-outbox`; `degraded-outbox` is a stop condition.
+3. Run `npm run smoke:staging-outbox`. It hard-refuses any non-staging origin,
+   requires overall healthy schema-6 `durable-outbox` readiness before mutation,
+   drives isolated synthetic create/join/start/two-turn finish/reset traffic,
+   rejects leaked private protocol headers, and bounded-polls fixed aggregate-only
+   D1 queries for seven receipts, one room fact, and the exact rollup deltas.
+   The privacy-minimal schema intentionally has no probe correlation ID, so any
+   concurrent staging write or cleanup makes this check fail closed. Discard
+   that run, restore a quiet window, and start again from a fresh baseline;
+   never loosen the exact-delta assertions to force a pass.
+   Local runtime tests separately prove strict FIFO head order and an empty drained
+   queue because Durable Object SQLite has no public inspection route. Confirm
+   clean retry/dead-letter logs. Never dump room SQLite or canonical payloads into
+   a ticket or log.
+4. Drill rollback by deploying Release A or a newer reviewed bridge with
+   `best-effort`, then prove any locally queued exact-mode row still drains once.
+   Confirm new ordinary traffic uses the legacy path without adding outbox rows.
+   Do not select a pre-Release-A version. Restore the Release-B staging candidate
+   and repeat the exact-mode smoke.
+5. Only after the staging activation and rollback drill pass, make a separate
+   production configuration change. Reconfirm schema 6, the secure production
+   room-fact key, zero pending migrations, the exact version, and recent cleanup
+   health; then deploy the entire production version without an intentional traffic split.
+   Compare the same bounded receipt/rollup/fact deltas and watch outbox retry,
+   dead-letter, drop, D1, and room-error events.
+
+If the room-fact key is missing or outside its byte boundary after activation,
+public status changes to `degraded-outbox`, but the receiver still applies and
+ACKs the opaque receipt and eligible daily rollup while deliberately skipping
+the keyed room fact. Restoring the key does not backfill that fact: the local row
+has been ACKed, and an exact replay is a duplicate while its receipt remains.
+Treat key readiness as a hard pre-activation and ongoing operational gate.
 
 ## Migration discipline
 
@@ -155,27 +225,30 @@ before and after that smoke must not increase.
    singleton marker read first; marker-5 cleanup never prepares receipt-table SQL,
    and unsupported markers fail closed immediately without a Worker restart.
 
-   The internal receiver is deliberately not produced to by the normal room path.
-   Normal room traffic retains its best-effort header plus `waitUntil` fan-out,
-   initializes no local outbox schema, and does not insert receipts. An explicit
-   internal invocation can receipt-gate one D1 application; schema-6 cleanup
-   removes expired receipts in the existing bounded cleanup lifecycle. Analytics
-   Engine receives only one best-effort post-commit opportunity for a newly
-   applied event.
+   With the currently committed production and staging value of `best-effort`,
+   normal room traffic retains its header plus `waitUntil` fan-out, initializes
+   no local outbox schema, and does not insert receipts. Release B also contains
+   a gated producer selected only by the exact `outbox` value. Its
+   milestone-producing room mutations atomically persist state, all canonical
+   events or one bounded drop decision, and the alarm. The internal receiver
+   receipt-gates one D1 application; schema-6 cleanup removes expired receipts in
+   the existing bounded cleanup lifecycle. Analytics Engine receives only one
+   best-effort post-commit opportunity for a newly applied event.
 
    Release A imports the receiver and can lazily recognize an already-existing
-   version-1 Durable Object outbox left by a later producer release or rollback.
+   version-1 Durable Object outbox left by Release B or a rollback.
    It drains only the FIFO head, one event per alarm, and persists bounded retry
    and privacy-minimal dead-letter state. It does not enqueue normal-room events,
-   so there is still no end-to-end durable/exact-delivery claim. The D1 receipt
+   so Release A itself makes no end-to-end durable-delivery claim. The D1 receipt
    table permits only opaque lowercase 256-bit IDs/hashes and canonical UTC
    receipt/application/exact-90-day-expiry timestamps. After applying migration
    0006, roll code back only to a reviewed marker-6-compatible bridge—not an older
-   Worker that requires exact marker 5. Once a future producer has been activated
-   and local outbox rows may exist, Release A is the minimum rollback floor;
-   pre-Release-A code cannot drain those rows. Keep probes compatible with both
-   markers until that activation and rollback window finish, then contract to
-   exact marker 6.
+   Worker that requires exact marker 5. After any exact-mode Release-B row has
+   been produced, Release A is the permanent minimum rollback floor;
+   pre-Release-A code cannot drain those rows and can overwrite their shared
+   alarm. Keep probes compatible with both markers through the activation and
+   rollback window, then contract a later release to exact marker 6 only after
+   that separate compatibility decision.
 4. Exercise a fresh database and every supported upgrade path through
    `npm run smoke:platform`.
 5. Apply production migrations with `npm run db:migrate:remote`. Wrangler asks
@@ -241,10 +314,13 @@ A healthy response has:
 - an empty `degradedCapabilities` array;
 - ready cloud progress, retention cleanup, room facts, and aggregate admin analytics;
 - Analytics Engine enabled;
-- aggregate analytics `delivery: "best-effort"`; Release A must retain this even
-  after an accidental mode edit because it has no producer, while a future
-  producer release may report `durable-outbox` only after exact `outbox` mode
-  plus schema-6/readiness gates;
+- room-milestone analytics `delivery: "best-effort"` under the currently
+  committed production and staging configuration. Release B reports
+  `durable-outbox` only when its producer is compiled, the mode is exact
+  `outbox`, the schema is exactly 6, and `ROOM_FACT_HASH_KEY` is secure. An
+  exact-mode schema/key mismatch reports `degraded-outbox` and adds
+  `aggregateAnalyticsDelivery` to the degraded list. Coaching/progress product
+  events remain best-effort even when the room-milestone lane is durable;
 - either offline or ready topic-provider tiers.
 
 The probe proves configuration and D1 readiness. It cannot prove Workers Paid
@@ -329,9 +405,10 @@ Worker code emits one JSON object per operational event. Search by the stable
 | `room_expiry_delete_failed` | An expired room could not be deleted; a retry was scheduled | Check Durable Object storage and confirm a later retry succeeds |
 | `worker_request_failed` | An unexpected edge/API dependency failed behind a request ID | Correlate request ID and Worker version; check dependent services |
 | `room_milestone_delivery_failed` | Best-effort D1/analytics milestone failed | Do not interrupt play; inspect aggregate impact |
-| `room_milestone_outbox_delivery_failed` | A pre-existing local-outbox head could not reach the internal receiver | Confirm the persisted retry is scheduled; do not expose the room or event ID |
-| `room_milestone_outbox_retry_scheduled` | The dormant consumer persisted another bounded attempt | Check D1/schema health; later FIFO events remain blocked behind the head |
-| `room_milestone_outbox_dead_lettered` | A pre-existing head reached a terminal conflict, validation failure, deadline, or attempt limit | Investigate the reason field without dumping private Durable Object storage |
+| `room_milestone_outbox_dropped` | An exact-mode event group was dropped for bounded capacity or canonicalization reasons while gameplay committed | Check only reason/count and queue health; do not dump room state or payloads |
+| `room_milestone_outbox_delivery_failed` | A local-outbox head could not reach the internal receiver | Confirm the persisted retry is scheduled; do not expose the room or event ID |
+| `room_milestone_outbox_retry_scheduled` | The bridge/consumer persisted another bounded attempt | Check D1/schema/key health; later FIFO events remain blocked behind the head |
+| `room_milestone_outbox_dead_lettered` | A head reached a terminal conflict, validation failure, deadline, or attempt limit | Investigate the reason field without dumping private Durable Object storage |
 | `product_analytics_rollup_failed` | Best-effort D1 telemetry write failed | Do not treat analytics as a ledger |
 | `analytics_engine_write_failed` | Analytics Engine delivery failed | D1 rollup may still exist |
 | `model_usage_reconciliation_failed` | A completed model attempt was not reconciled | Keep providers disabled until cost counters are understood |
@@ -423,16 +500,17 @@ new schema or fix forward. Do not delete a D1 database, Durable Object namespace
 or migration record during incident response. Marker 6 already excludes Workers
 that require exact marker 5.
 
-Before normal-room outbox production is activated, rolling Release A back to the
-earlier reviewed schema-5/6 receiver/cleanup bridge leaves ordinary rooms on the
-same best-effort path, although it removes the dormant local-queue consumer. Once
-any future deployment has produced version-1 local outbox rows, Release A becomes
-the minimum safe rollback floor: use this version or a newer compatible one so
-existing rows continue to drain even when production is switched back to
-`best-effort`. A pre-Release-A Worker can overwrite the shared alarm and strand
-those rows. Do not delete the namespace or local tables as a rollback technique,
-and do not contract the Worker or probes to exact marker 6 before the activation
-rollback window is complete.
+Before exact-mode activation, the current Release-B deployment remains on the
+same ordinary best-effort path. After any environment has produced even one
+version-1 exact-mode row, Release A becomes its minimum safe rollback floor:
+deploy Release A or a newer compatible bridge with `best-effort` so existing
+rows continue to drain while new milestones use the legacy path. The ownership
+response keeps ordinary Release-A/Release-B propagation skew safe, but avoid an
+intentional mixed-configuration rollback and never select a pre-Release-A
+Worker; it can overwrite the shared alarm and strand rows. Do not delete the namespace,
+local tables, pending rows, or dead letters as a rollback technique. Run the
+staging rollback drill above before production activation, and repeat the
+read-only status/receipt/rollup checks after any real rollback.
 
 ## Retention checks
 
@@ -458,11 +536,24 @@ wait for its next scheduled run, and then rerun `npm run smoke:production`.
 Schema v6 defines `room_milestone_receipts`, and scheduled cleanup actively
 removes expired rows from it within the same bounded run budget. The final
 backlog probe includes receipt work only on marker 6. Marker-5 cleanup never
-prepares SQL that names the table. Normal room traffic initializes no local
-outbox and creates no receipt rows; rows appear only after an explicit internal
-or test invocation, or when Release A drains a pre-existing version-1 local
-outbox from a later producer/rollback. Public cleanup status still exposes only
-the shared `ready`, `stale`, or `backlog` result, not receipt counts or timestamps.
+prepares SQL that names the table. Each receipt expires exactly 90 days after
+its first receiver timestamp; this is a bounded deduplication window, not a
+permanent delivery ledger. Normal best-effort room traffic initializes no local
+outbox and creates no receipt rows. Exact-mode Release-B delivery does create
+them, and Release A can continue creating them while draining rows during a
+rollback. Public cleanup status still exposes only the shared `ready`, `stale`,
+or `backlog` result, not receipt counts or timestamps.
+
+A local outbox event has a seven-day hard deadline and at most 16 attempts.
+Terminal events retain only bounded reason/milestone/attempt/timing metadata—no
+event ID, payload, room code, token, name, topic, audio, or transcript—in a
+256-row dead-letter table for at most 30 days. The room's 30-day privacy expiry
+outranks telemetry retention and deletes the entire Durable Object, including
+its queue, dead letters, and alarm. Because normal local rows are ACKed or
+terminal long before the 90-day D1 receipt expires, receipt cleanup does not
+cause a producer replay. Conversely, a receipt applied while the room-fact key
+is unavailable prevents an exact duplicate from backfilling the skipped fact;
+restoring the key cannot reconstruct it after the local ACK.
 
 Quarterly, verify:
 

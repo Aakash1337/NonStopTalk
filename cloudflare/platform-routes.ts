@@ -22,6 +22,10 @@ import {
 } from "./model-provider";
 import { logWorkerEvent } from "./observability";
 import { requireSupportedPlatformSchema } from "./platform-schema";
+import {
+	describeRoomMilestoneDelivery,
+	isSecureRoomFactHashKey,
+} from "./room-milestone-delivery-mode";
 
 const MAX_PLATFORM_BODY_BYTES = 66 * 1024;
 const DEFAULT_ANALYTICS_DAYS = 30;
@@ -63,8 +67,13 @@ export async function handlePlatformRoute(
 				return result(methodNotAllowed(requestId, "GET, HEAD"), false);
 			}
 			const schemaVersion = await requireSupportedPlatformSchema(env.PLATFORM_DB);
-			const roomFactsReady = isSecureRoomFactKey(env.ROOM_FACT_HASH_KEY);
+			const roomFactsReady = isSecureRoomFactHashKey(env.ROOM_FACT_HASH_KEY);
 			const adminAnalyticsReady = isSecureAdminToken(env.ANALYTICS_ADMIN_TOKEN);
+			const milestoneDelivery = describeRoomMilestoneDelivery(
+				env.ROOM_MILESTONE_DELIVERY_MODE,
+				schemaVersion,
+				env.ROOM_FACT_HASH_KEY,
+			);
 			const topicGeneration = topicGenerationCapability(env);
 			const retentionCleanupStatus = classifyRetentionCleanupStatus(
 				await readCleanupHeartbeat(env.PLATFORM_DB),
@@ -74,6 +83,7 @@ export async function handlePlatformRoute(
 				...(adminAnalyticsReady ? [] : ["adminAnalytics"]),
 				...(topicGeneration.status === "degraded" ? ["topicGeneration"] : []),
 				...(retentionCleanupStatus === "ready" ? [] : ["retentionCleanup"]),
+				...(milestoneDelivery.degraded ? ["aggregateAnalyticsDelivery"] : []),
 			];
 			return result(
 				platformJson(
@@ -92,9 +102,7 @@ export async function handlePlatformRoute(
 							topicGeneration,
 							aggregateAnalytics: {
 								status: adminAnalyticsReady ? "ready" : "write-only",
-								// Release A can drain a future outbox but does not produce one.
-								// Configuration alone must never overstate the effective path.
-								delivery: "best-effort",
+								delivery: milestoneDelivery.delivery,
 								adminRead: adminAnalyticsReady,
 								analyticsEngine: env.PRODUCT_ANALYTICS ? "enabled" : "disabled",
 							},
@@ -609,12 +617,6 @@ function isSecureAdminToken(value: string | undefined): value is string {
 	if (typeof value !== "string") return false;
 	const bytes = new TextEncoder().encode(value).byteLength;
 	return bytes >= 24 && bytes <= 1_024 && /^\d+$/u.test(value);
-}
-
-function isSecureRoomFactKey(value: string | undefined): value is string {
-	if (typeof value !== "string") return false;
-	const bytes = new TextEncoder().encode(value).byteLength;
-	return bytes >= 32 && bytes <= 1_024;
 }
 
 async function constantTimeTextEqual(left: string, right: string): Promise<boolean> {
