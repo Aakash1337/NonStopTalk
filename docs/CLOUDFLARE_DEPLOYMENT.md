@@ -73,6 +73,8 @@ npm run check:cloudflare
 npm run check:cloudflare-staging
 npm run check:cloudflare-startup
 npm run smoke:platform
+npx playwright install chromium
+npm run smoke:multiplayer
 npx wrangler login
 npm run db:create
 # copy the returned database UUID into wrangler.jsonc once per environment
@@ -88,6 +90,11 @@ The default topic configuration needs no model secret. Direct GLM-4.7 and Gemma 
 npx wrangler secret put ZAI_API_KEY       # routine GLM-4.7-Flash
 npx wrangler secret put GEMINI_API_KEY    # optional Gemma 4 31B escalation
 ```
+
+The hermetic multiplayer smoke relies on POSIX process groups so it can verify
+that Wrangler and every descendant exited before deleting temporary D1 state.
+Run that check on Linux, macOS, WSL, or the supplied Ubuntu CI job—not native
+Windows, where the script fails before spawning a child process.
 
 `TOPIC_ROUTINE_PROVIDER`, `TOPIC_ESCALATION_PROVIDER`, and `MODEL_DAILY_CALL_LIMIT` are non-secret deployment policy in `wrangler.jsonc`. Their production defaults are `offline`, `off`, and `100` respectively. Change and review them in source control rather than only in the dashboard, because Wrangler configuration is the deployment source of truth. The routine selector accepts `offline`, `glm`, or `glm53`; `wrangler.jsonc` already declares the `AI` binding used by `glm53` with binding model ID `@cf/zai-org/glm-5.3-flash`.
 
