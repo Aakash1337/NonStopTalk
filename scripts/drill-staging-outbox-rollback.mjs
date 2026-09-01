@@ -9,6 +9,7 @@ import {
 	unlink,
 } from "node:fs/promises";
 import { resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual, promisify } from "node:util";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -35,6 +36,8 @@ export const STAGING_DURABLE_OBJECT_NAMESPACE_ID = "9125b9bb4db94637ba0eaaeaa594
 
 const PROJECT_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const WRANGLER_ENTRY = fileURLToPath(new URL("../node_modules/wrangler/bin/wrangler.js", import.meta.url));
+const WRANGLER_PACKAGE_PATH = fileURLToPath(new URL("../node_modules/wrangler/package.json", import.meta.url));
+const WRANGLER_TAIL_READINESS_PRELOAD = fileURLToPath(new URL("./wrangler-tail-readiness-preload.cjs", import.meta.url));
 const SOURCE_CONFIG_PATH = fileURLToPath(new URL("../wrangler.jsonc", import.meta.url));
 const FAULT_CONFIG_PATH = fileURLToPath(new URL(`../${FAULT_CONFIG_FILENAME}`, import.meta.url));
 const VERSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -50,6 +53,9 @@ const DEFAULT_FAULT_STATUS_WAIT_DELAY_MS = 2_000;
 const MAX_WRANGLER_OUTPUT_BYTES = 1_024 * 1_024;
 const MAX_TAIL_OUTPUT_BYTES = 512 * 1_024;
 const MAX_CHECKPOINT_BYTES = 4_096;
+export const PINNED_WRANGLER_TAIL_VERSION = "4.127.1";
+export const WRANGLER_TAIL_PING_LINE = "Tail: Sending ping to tail websocket";
+export const WRANGLER_TAIL_PONG_LINE = "Tail: Received pong from tail websocket";
 const SNAPSHOT_FIELDS = Object.freeze(Object.keys(EXPECTED_DELTAS));
 const execFileAsync = promisify(execFile);
 
@@ -93,6 +99,23 @@ function isObject(value) {
 
 function safeInteger(value) {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+export function requirePinnedWranglerTailVersion(value) {
+	if (value !== PINNED_WRANGLER_TAIL_VERSION) {
+		return fail("The rollback drill's pinned Wrangler tail contract is unavailable.");
+	}
+	return value;
+}
+
+async function assertPinnedWranglerTailRuntime() {
+	let document;
+	try {
+		document = JSON.parse(await readFile(WRANGLER_PACKAGE_PATH, "utf8"));
+	} catch {
+		return fail("The rollback drill's pinned Wrangler tail contract is unavailable.");
+	}
+	requirePinnedWranglerTailVersion(document?.version);
 }
 
 export function requireStagingWorker(value) {
@@ -1104,17 +1127,28 @@ export function hasRollbackTraceProof(documents, version, expectedProofDigest) {
 	return false;
 }
 
-function createJsonDocumentAccumulator() {
+function createJsonDocumentAccumulator({ ignoredLines = [] } = {}) {
 	let pending = "";
 	let totalBytes = 0;
 	let parsingError;
 	const documents = [];
+	const ignored = new Set(ignoredLines);
 	function parseAvailable() {
 		let cursor = 0;
 		while (cursor < pending.length) {
 			while (/\s/u.test(pending[cursor] ?? "")) cursor += 1;
 			if (cursor >= pending.length) break;
 			if (pending[cursor] !== "{") {
+				const lineEnd = pending.indexOf("\n", cursor);
+				if (lineEnd < 0) {
+					pending = pending.slice(cursor);
+					return;
+				}
+				const line = pending.slice(cursor, lineEnd).replace(/\r$/u, "");
+				if (ignored.has(line)) {
+					cursor = lineEnd + 1;
+					continue;
+				}
 				parsingError = new Error("The staging tail emitted non-JSON output.");
 				return;
 			}
@@ -1174,6 +1208,52 @@ function createJsonDocumentAccumulator() {
 	};
 }
 
+export function createWranglerJsonTailAccumulator() {
+	const documents = createJsonDocumentAccumulator({
+		ignoredLines: [WRANGLER_TAIL_PING_LINE, WRANGLER_TAIL_PONG_LINE],
+	});
+	let pendingLine = "";
+	let preReadyBytes = 0;
+	let readinessError;
+	let sawPing = false;
+	let ready = false;
+
+	return {
+		append(chunk) {
+			if (readinessError) return;
+			const text = typeof chunk === "string" ? chunk : chunk?.toString?.("utf8") ?? "";
+			if (ready) {
+				documents.append(text);
+				return;
+			}
+			preReadyBytes += Buffer.byteLength(text, "utf8");
+			if (preReadyBytes > MAX_TAIL_OUTPUT_BYTES) {
+				readinessError = new Error("The staging tail readiness stream exceeded its output bound.");
+				return;
+			}
+			pendingLine += text;
+			while (!ready) {
+				const lineEnd = pendingLine.indexOf("\n");
+				if (lineEnd < 0) break;
+				const line = pendingLine.slice(0, lineEnd).replace(/\r$/u, "");
+				pendingLine = pendingLine.slice(lineEnd + 1);
+				if (line === WRANGLER_TAIL_PING_LINE) sawPing = true;
+				else if (sawPing && line === WRANGLER_TAIL_PONG_LINE) {
+					ready = true;
+					const remaining = pendingLine;
+					pendingLine = "";
+					if (remaining !== "") documents.append(remaining);
+				}
+			}
+		},
+		state() {
+			if (readinessError) throw readinessError;
+			const state = documents.state();
+			return { ...state, ready };
+		},
+	};
+}
+
 export function parseTailTraceStream(source) {
 	if (typeof source !== "string") return fail("The staging tail trace stream is malformed.");
 	const accumulator = createJsonDocumentAccumulator();
@@ -1187,8 +1267,10 @@ export function createStagingTailObservers({
 	spawnImpl = spawn,
 	onReady = () => undefined,
 	delay = sleep,
-	warmupMs = 15_000,
+	warmupMs = 250,
+	tailReadyWaitMs = 30_000,
 	candidateAttachmentTraceWaitMs = 45_000,
+	candidateAttachmentProbeWaitMs = 2_000,
 	candidateSeedTraceWaitMs = 120_000,
 	stateBarrierAttempts = 12,
 	stateBarrierTraceWaitMs = 5_000,
@@ -1200,10 +1282,16 @@ export function createStagingTailObservers({
 	if (!Number.isSafeInteger(warmupMs) || warmupMs < 0 || warmupMs > 30_000) {
 		fail("The staging tail warm-up bound is invalid.");
 	}
+	if (!Number.isSafeInteger(tailReadyWaitMs) || tailReadyWaitMs < 1 || tailReadyWaitMs > 60_000) {
+		fail("The staging tail readiness bound is invalid.");
+	}
 	if (
 		!Number.isSafeInteger(candidateAttachmentTraceWaitMs)
 		|| candidateAttachmentTraceWaitMs < 1
 		|| candidateAttachmentTraceWaitMs > 120_000
+		|| !Number.isSafeInteger(candidateAttachmentProbeWaitMs)
+		|| candidateAttachmentProbeWaitMs < 1
+		|| candidateAttachmentProbeWaitMs > 30_000
 		|| !Number.isSafeInteger(candidateSeedTraceWaitMs)
 		|| candidateSeedTraceWaitMs < 1
 		|| candidateSeedTraceWaitMs > 180_000
@@ -1223,9 +1311,25 @@ export function createStagingTailObservers({
 	function startTail(kind, version, format) {
 		let child;
 		try {
-			child = spawnImpl(process.execPath, stagingTailArguments(kind, version, format), {
+			const childArguments = stagingTailArguments(kind, version, format);
+			const childEnvironment = {
+				...process.env,
+				CI: "1",
+				NO_COLOR: "1",
+				WRANGLER_SEND_METRICS: "false",
+				WRANGLER_WRITE_LOGS: "false",
+			};
+			if (format === "json") {
+				childArguments.unshift("--require", WRANGLER_TAIL_READINESS_PRELOAD);
+				// Isolate the proof child from unreviewed inherited Node preloads and
+				// policies; the reviewed readiness preload is supplied as exact argv.
+				childEnvironment.NODE_OPTIONS = "";
+				childEnvironment.WRANGLER_LOG = "debug";
+				childEnvironment.WRANGLER_LOG_SANITIZE = "true";
+			}
+			child = spawnImpl(process.execPath, childArguments, {
 				cwd: PROJECT_ROOT,
-				env: { ...process.env, CI: "1", NO_COLOR: "1", WRANGLER_WRITE_LOGS: "false" },
+				env: childEnvironment,
 				stdio: ["ignore", "pipe", "pipe"],
 				windowsHide: true,
 				shell: false,
@@ -1241,25 +1345,38 @@ export function createStagingTailObservers({
 			|| typeof child.once !== "function"
 		) return fail("The version-filtered staging tail could not be started.");
 		let terminal = false;
-		let stderr = "";
+		let stderrBytes = 0;
+		let stderrSeen = false;
 		let text = "";
-		const accumulator = format === "json" ? createJsonDocumentAccumulator() : null;
+		const stdoutDecoder = new StringDecoder("utf8");
+		const accumulator = format === "json" ? createWranglerJsonTailAccumulator() : null;
 		child.stdout.on("data", (chunk) => {
-			if (accumulator) accumulator.append(chunk);
+			const decoded = typeof chunk === "string" ? chunk : stdoutDecoder.write(chunk);
+			if (accumulator) accumulator.append(decoded);
 			else {
-				text += typeof chunk === "string" ? chunk : chunk?.toString?.("utf8") ?? "";
+				text += decoded;
 				if (Buffer.byteLength(text, "utf8") > MAX_TAIL_OUTPUT_BYTES) child.kill("SIGINT");
 			}
 		});
+		child.stdout.on("end", () => {
+			const decoded = stdoutDecoder.end();
+			if (decoded === "") return;
+			if (accumulator) accumulator.append(decoded);
+			else text += decoded;
+		});
 		child.stderr.on("data", (chunk) => {
-			stderr += typeof chunk === "string" ? chunk : chunk?.toString?.("utf8") ?? "";
-			if (Buffer.byteLength(stderr, "utf8") > MAX_TAIL_OUTPUT_BYTES) child.kill("SIGINT");
+			stderrSeen = true;
+			stderrBytes += Buffer.byteLength(
+				typeof chunk === "string" ? chunk : chunk?.toString?.("utf8") ?? "",
+				"utf8",
+			);
+			if (stderrBytes > MAX_TAIL_OUTPUT_BYTES) child.kill("SIGINT");
 		});
 		child.once("error", () => { terminal = true; });
 		child.once("exit", () => { terminal = true; });
 		return {
 			get terminal() { return terminal; },
-			get stderr() { return stderr; },
+			get hasStderr() { return stderrSeen; },
 			get text() { return text; },
 			accumulator,
 			async stop() {
@@ -1281,7 +1398,7 @@ export function createStagingTailObservers({
 	async function waitFor(tail, predicate, timeoutMs, message) {
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() <= deadline) {
-			if (tail.stderr.trim() !== "") return fail("The version-filtered staging tail emitted an error or warning.");
+			if (tail.hasStderr) return fail("The version-filtered staging tail emitted an error or warning.");
 			if (predicate()) return;
 			if (tail.terminal) return fail(resolveWaitMessage(message));
 			await delay(50);
@@ -1292,7 +1409,7 @@ export function createStagingTailObservers({
 	async function waitForMaybe(tail, predicate, timeoutMs, terminalMessage) {
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() <= deadline) {
-			if (tail.stderr.trim() !== "") return fail("The version-filtered staging tail emitted an error or warning.");
+			if (tail.hasStderr) return fail("The version-filtered staging tail emitted an error or warning.");
 			if (predicate()) return true;
 			if (tail.terminal) return fail(terminalMessage);
 			await delay(50);
@@ -1301,27 +1418,25 @@ export function createStagingTailObservers({
 	}
 
 	async function attachJsonTail(kind, version) {
+		await assertPinnedWranglerTailRuntime();
 		const jsonTail = startTail(kind, version, "json");
-		let readyTail;
 		try {
-			// Wrangler's JSON mode intentionally has no readiness line. Start it
-			// first, then use an independently connected, identically filtered
-			// pretty tail as the attachment barrier and retain neither raw stream.
-			await delay(250);
-			if (jsonTail.terminal) fail("The version-filtered staging JSON tail stopped before attachment.");
-			readyTail = startTail(kind, version, "pretty");
+			// Pinned Wrangler emits this ordered debug ping/pong pair only from the
+			// same JSON tail process after that exact WebSocket opens. The preload
+			// suppresses every other debug record before it enters the proof pipe.
 			await waitFor(
-				readyTail,
-				() => readyTail.text.includes(`Connected to ${STAGING_WORKER}, waiting for logs...`),
-				30_000,
-				"The version-filtered staging tail did not become ready.",
+				jsonTail,
+				() => jsonTail.accumulator.state().ready,
+				tailReadyWaitMs,
+				"The version-filtered staging JSON tail did not prove its own transport readiness.",
 			);
-			await readyTail.stop();
-			readyTail = undefined;
 			await delay(warmupMs);
 			await waitFor(
 				jsonTail,
-				() => jsonTail.accumulator.state().atBoundary,
+				() => {
+					const state = jsonTail.accumulator.state();
+					return state.ready && state.atBoundary;
+				},
 				5_000,
 				"The version-filtered staging JSON tail did not reach a trace boundary.",
 			);
@@ -1329,8 +1444,6 @@ export function createStagingTailObservers({
 		} catch (error) {
 			await jsonTail.stop();
 			throw error;
-		} finally {
-			await readyTail?.stop();
 		}
 	}
 
@@ -1354,13 +1467,21 @@ export function createStagingTailObservers({
 				jsonTail.accumulator.state().documents.slice(startIndex)
 			);
 			await readyOperation();
-			await attachmentOperation();
-			await waitFor(
-				jsonTail,
-				() => hasCandidateTailAttachmentBarrier(observedDocuments(), version),
-				candidateAttachmentTraceWaitMs,
-				() => `The candidate JSON tail emitted no exact-version attachment barrier inside the bounded observation window. Safe projected progress: ${JSON.stringify(candidateSeedProofProgress(observedDocuments(), version))}`,
-			);
+			const attachmentDeadline = Date.now() + candidateAttachmentTraceWaitMs;
+			let attachmentObserved = false;
+			do {
+				await attachmentOperation();
+				const remaining = Math.max(1, attachmentDeadline - Date.now());
+				attachmentObserved = await waitForMaybe(
+					jsonTail,
+					() => hasCandidateTailAttachmentBarrier(observedDocuments(), version),
+					Math.min(candidateAttachmentProbeWaitMs, remaining),
+					"The candidate JSON tail stopped before its exact-version attachment barrier.",
+				);
+			} while (!attachmentObserved && Date.now() < attachmentDeadline);
+			if (!attachmentObserved) {
+				fail(`The candidate JSON tail emitted no exact-version attachment barrier inside the bounded observation window. Safe projected progress: ${JSON.stringify(candidateSeedProofProgress(observedDocuments(), version))}`);
+			}
 			// Recheck the pinned candidate deployment and unchanged D1 snapshot
 			// after proving that the JSON stream itself receives live traces.
 			await readyOperation();

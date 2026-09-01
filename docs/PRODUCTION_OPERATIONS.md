@@ -213,10 +213,15 @@ Use this order:
    `prepare` starts while the pinned Release-B candidate is still alone at 100%.
    It repeats the version/resource checks, requires healthy schema-6
    `durable-outbox` readiness, and brackets every aggregate read with candidate
-   deployment checks. It first attaches an unsampled candidate-version JSON
-   tail, proves that exact stream is receiving traces with a read-only `HEAD`
-   status request, rechecks the deployment and unchanged baseline, and only then
-   creates one seed room. The seed is accepted only after the tail observes the
+   deployment checks. It first starts one unsampled candidate-version JSON tail.
+   Pinned Wrangler 4.127.1 has no JSON readiness banner, so the helper requires
+   the ordered transport ping and pong emitted by that same child/WebSocket;
+   a reviewed preload keeps every other debug record out of the proof pipe. It
+   then bounded-retries only a read-only `HEAD` status canary until that exact
+   JSON stream receives a candidate-version trace, rechecks the deployment and
+   unchanged baseline, and only then creates one seed room. There is no auxiliary
+   pretty tail, and room creation is never retried. The seed is accepted only
+   after the retained JSON tail observes the
    same Durable Object's successful `POST /create` and clean acknowledgement
    alarm within the bounded two-minute trace window and D1 converges by exactly
    +1 receipt, +1 room fact, and +1
@@ -227,8 +232,9 @@ Use this order:
    The helper then obtains a distinct guest identity through a 404 path that
    reaches neither D1 nor a Durable Object. After proving that identity differs
    from the host, it clears the host cookie and retains only the seed room code
-   plus guest cookie inside the running process. It attaches and warms a tail
-   filtered to the still-inactive fault version, rechecks the candidate
+   plus guest cookie inside the running process. It attaches a JSON tail filtered
+   to the still-inactive fault version and requires that same child/WebSocket's
+   ordered transport ping and pong before rechecking the candidate
    deployment and baseline, and prints
    `{"status":"waiting","phase":"fault-observer-ready",...}`. This line is the
    authorization boundary for Terminal 2. Do not activate the fault version
@@ -271,8 +277,9 @@ Use this order:
    Durable Object without exposing private values.
 
    Start `verify` in the first terminal **while the fault version is still at
-   100%**. It attaches and warms the pinned Release-A tail, rechecks that the
-   fault deployment and aggregate checkpoint are unchanged, and then prints
+   100%**. It attaches the pinned Release-A JSON tail, requires that same
+   child/WebSocket's ordered transport ping and pong, rechecks that the fault
+   deployment and aggregate checkpoint are unchanged, and then prints
    `{"status":"waiting","phase":"rollback-observer-ready",...}`. Only after
    that line appears, perform the reviewed rollback in a second terminal:
 
@@ -304,6 +311,9 @@ Use this order:
    npm run smoke:staging-outbox
    ```
 
+   Wrangler 4.127.1 is pinned because the JSON-tail transport-readiness contract
+   is version-specific; any Wrangler update must repeat the preload, marker,
+   stream-parser, and live read-only canary review before this drill may run.
    With current Wrangler, `--env staging` resolves the exact environment Worker
    name from `wrangler.jsonc`. Do not also pass the already suffixed
    `nonstoptalk-staging` positional name to `wrangler tail`; Wrangler would target

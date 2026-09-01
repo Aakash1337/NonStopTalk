@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import {
 	CHECKPOINT_FILENAME_PREFIX,
@@ -15,9 +17,12 @@ import {
 	RELEASE_A_STAGING_VERSION,
 	RELEASE_B_SCRIPT_ETAG,
 	RELEASE_B_STAGING_VERSION,
+	PINNED_WRANGLER_TAIL_VERSION,
 	STAGING_D1_DATABASE_ID,
 	STAGING_DURABLE_OBJECT_NAMESPACE_ID,
 	STAGING_WORKER,
+	WRANGLER_TAIL_PING_LINE,
+	WRANGLER_TAIL_PONG_LINE,
 	assertOnlyReceiverFaultConfigChange,
 	assertReceiverFaultVersionDiff,
 	assertSingleVersionDeployment,
@@ -26,6 +31,7 @@ import {
 	checkpointFilename,
 	createStagingTailObservers,
 	createStagingWranglerReaders,
+	createWranglerJsonTailAccumulator,
 	findCandidateSeedProof,
 	findFaultSeededJoinProof,
 	findFaultTraceProof,
@@ -42,6 +48,7 @@ import {
 	prepareRollbackDrainProof,
 	readAggregateCheckpoint,
 	requireDrillCoordinates,
+	requirePinnedWranglerTailVersion,
 	stagingTailArguments,
 	validateFaultPreflight,
 	verifyRollbackDrainProof,
@@ -61,6 +68,7 @@ const GUEST_TOKEN = "b".repeat(64);
 const PROOF_DIGEST = "c".repeat(64);
 const CREATED_DO_ID = "a".repeat(64);
 const OTHER_DO_ID = "b".repeat(64);
+const execFileAsync = promisify(execFile);
 
 function snapshot(overrides = {}) {
 	return {
@@ -658,8 +666,73 @@ test("tail argv selects config staging, filters one version, omits duplicate nam
 	]);
 });
 
+test("pinned Wrangler JSON readiness requires ordered same-stream ping and pong", () => {
+	assert.equal(
+		requirePinnedWranglerTailVersion(PINNED_WRANGLER_TAIL_VERSION),
+		PINNED_WRANGLER_TAIL_VERSION,
+	);
+	assert.throws(
+		() => requirePinnedWranglerTailVersion("4.128.0"),
+		/pinned Wrangler tail contract/u,
+	);
+
+	const accumulator = createWranglerJsonTailAccumulator();
+	accumulator.append(`private-pre-ready-debug-must-not-survive\n${WRANGLER_TAIL_PING_LINE.slice(0, 17)}`);
+	assert.deepEqual(accumulator.state(), { documents: [], atBoundary: true, ready: false });
+	accumulator.append(`${WRANGLER_TAIL_PING_LINE.slice(17)}\n`);
+	assert.equal(accumulator.state().ready, false);
+	const firstTrace = JSON.stringify(candidateAttachmentTrace({
+		privateMarker: WRANGLER_TAIL_PING_LINE,
+		privateUnicode: "readiness-🙂",
+	}));
+	accumulator.append(`${WRANGLER_TAIL_PONG_LINE}\n${firstTrace}\n`);
+	assert.equal(accumulator.state().ready, true);
+	assert.equal(accumulator.state().documents.length, 1);
+	assert.doesNotMatch(
+		JSON.stringify(accumulator.state()),
+		/private-pre-ready|privateMarker|privateUnicode|readiness-🙂/u,
+	);
+	accumulator.append(`${WRANGLER_TAIL_PING_LINE}\n${WRANGLER_TAIL_PONG_LINE}\n`);
+	assert.equal(accumulator.state().documents.length, 1);
+	accumulator.append("Metrics dispatcher: private-device-id\n");
+	assert.throws(() => accumulator.state(), /non-JSON output/u);
+});
+
+test("Wrangler readiness preload forwards only exact markers and leaves JSON and stderr separate", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "nonstoptalk tail preload "));
+	try {
+		const sourcePath = resolve("scripts/wrangler-tail-readiness-preload.cjs");
+		const spacedPath = join(directory, "readiness preload.cjs");
+		await writeFile(spacedPath, await readFile(sourcePath));
+		const fixture = [
+			'console.debug("private-device-id");',
+			`console.debug(${JSON.stringify(WRANGLER_TAIL_PING_LINE)}, "extra");`,
+			`console.debug(new String(${JSON.stringify(WRANGLER_TAIL_PONG_LINE)}));`,
+			`console.debug(${JSON.stringify(WRANGLER_TAIL_PING_LINE)});`,
+			`console.debug(${JSON.stringify(WRANGLER_TAIL_PONG_LINE)});`,
+			'console.log(JSON.stringify({ ok: "🙂" }));',
+			'console.warn("warning-stays-on-stderr");',
+		].join("\n");
+		const { stdout, stderr } = await execFileAsync(
+			process.execPath,
+			["--require", spacedPath, "-e", fixture],
+			{ env: { ...process.env, NODE_OPTIONS: "" } },
+		);
+		assert.deepEqual(stdout.trim().split("\n"), [
+			WRANGLER_TAIL_PING_LINE,
+			WRANGLER_TAIL_PONG_LINE,
+			'{"ok":"🙂"}',
+		]);
+		assert.doesNotMatch(stdout, /private-device-id|extra/u);
+		assert.match(stderr, /warning-stays-on-stderr/u);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
 test("tail observer signals before activation, safely retries state, and never retries join", async () => {
 	const jsonChildren = new Map();
+	const spawned = [];
 	function childProcess(format, version) {
 		const stdout = new EventEmitter();
 		const stderr = new EventEmitter();
@@ -673,15 +746,21 @@ test("tail observer signals before activation, safely retries state, and never r
 				child.emit("exit", 0, null);
 			}
 		};
-		if (format === "pretty") {
-			queueMicrotask(() => stdout.emit("data", `Connected to ${STAGING_WORKER}, waiting for logs...\n`));
-		} else jsonChildren.set(version, child);
+		if (format === "json") {
+			jsonChildren.set(version, child);
+			queueMicrotask(() => stdout.emit("data", [
+				WRANGLER_TAIL_PING_LINE,
+				WRANGLER_TAIL_PONG_LINE,
+				"",
+			].join("\n")));
+		}
 		return child;
 	}
 	const sequence = [];
 	let activated = false;
 	const observers = createStagingTailObservers({
-		spawnImpl: (_executable, args) => {
+		spawnImpl: (executable, args, options) => {
+			spawned.push({ executable, args, options });
 			const format = args[args.indexOf("--format") + 1];
 			const version = args[args.indexOf("--version-id") + 1];
 			return childProcess(format, version);
@@ -693,7 +772,9 @@ test("tail observer signals before activation, safely retries state, and never r
 		},
 		delay: async () => undefined,
 		warmupMs: 0,
+		tailReadyWaitMs: 1,
 		candidateAttachmentTraceWaitMs: 1,
+		candidateAttachmentProbeWaitMs: 1,
 		candidateSeedTraceWaitMs: 1,
 		stateBarrierAttempts: 2,
 		stateBarrierTraceWaitMs: 1,
@@ -712,10 +793,12 @@ test("tail observer signals before activation, safely retries state, and never r
 		sequence.push(`seed-precheck-${seedReadyChecks}`);
 	}, async () => {
 		sequence.push("seed-attachment-request");
-		jsonChildren.get(CANDIDATE_VERSION).stdout.emit(
-			"data",
-			JSON.stringify(candidateAttachmentTrace()),
-		);
+		const trace = Buffer.from(JSON.stringify(candidateAttachmentTrace({
+			privateUnicode: "split-🙂-must-not-survive",
+		})), "utf8");
+		const unicodeOffset = trace.indexOf(Buffer.from("🙂", "utf8"));
+		jsonChildren.get(CANDIDATE_VERSION).stdout.emit("data", trace.subarray(0, unicodeOffset + 1));
+		jsonChildren.get(CANDIDATE_VERSION).stdout.emit("data", trace.subarray(unicodeOffset + 1));
 	});
 	assert.match(seed.proofDigest, /^[0-9a-f]{64}$/u);
 	let stateAttempts = 0;
@@ -767,6 +850,121 @@ test("tail observer signals before activation, safely retries state, and never r
 		"join",
 	]);
 	assert.doesNotMatch(JSON.stringify({ proofDigest: fault.proofDigest }), /privateRoom|privateGuest/u);
+	assert.equal(spawned.length, 2);
+	for (const invocation of spawned) {
+		assert.equal(invocation.executable, process.execPath);
+		assert.equal(invocation.args[0], "--require");
+		assert.match(invocation.args[1], /wrangler-tail-readiness-preload\.cjs$/u);
+		assert.equal(invocation.args.includes("pretty"), false);
+		assert.equal(invocation.args.includes("--debug"), false);
+		assert.equal(invocation.options.shell, false);
+		assert.equal(invocation.options.env.NODE_OPTIONS, "");
+		assert.equal(invocation.options.env.WRANGLER_LOG, "debug");
+		assert.equal(invocation.options.env.WRANGLER_LOG_SANITIZE, "true");
+		assert.equal(invocation.options.env.WRANGLER_SEND_METRICS, "false");
+		assert.equal(invocation.options.env.WRANGLER_WRITE_LOGS, "false");
+	}
+});
+
+test("candidate attachment retries only the read-only canary and creates once", async () => {
+	let jsonChild;
+	let stopped = false;
+	function spawnImpl() {
+		const child = new EventEmitter();
+		child.stdout = new EventEmitter();
+		child.stderr = new EventEmitter();
+		child.kill = () => {
+			if (!stopped) {
+				stopped = true;
+				child.emit("exit", 0, null);
+			}
+		};
+		jsonChild = child;
+		queueMicrotask(() => child.stdout.emit("data", [
+			WRANGLER_TAIL_PING_LINE,
+			WRANGLER_TAIL_PONG_LINE,
+			"",
+		].join("\n")));
+		return child;
+	}
+	const observers = createStagingTailObservers({
+		spawnImpl,
+		delay: async (milliseconds) => {
+			if (milliseconds > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, 1));
+		},
+		warmupMs: 0,
+		tailReadyWaitMs: 100,
+		candidateAttachmentTraceWaitMs: 100,
+		candidateAttachmentProbeWaitMs: 1,
+		candidateSeedTraceWaitMs: 100,
+	});
+	let attachmentAttempts = 0;
+	let createAttempts = 0;
+	const result = await observers.observeCandidateSeed(async () => {
+		createAttempts += 1;
+		jsonChild.stdout.emit("data", [
+			JSON.stringify(createTrace({ version: CANDIDATE_VERSION })),
+			JSON.stringify(seedAcknowledgementTrace()),
+			"",
+		].join("\n"));
+		return { privateRoom: "must-not-be-output" };
+	}, CANDIDATE_VERSION, async () => undefined, async () => {
+		attachmentAttempts += 1;
+		if (attachmentAttempts === 2) {
+			jsonChild.stdout.emit("data", `${JSON.stringify(candidateAttachmentTrace())}\n`);
+		}
+	});
+	assert.match(result.proofDigest, /^[0-9a-f]{64}$/u);
+	assert.equal(attachmentAttempts, 2);
+	assert.equal(createAttempts, 1);
+	assert.equal(stopped, true);
+});
+
+test("candidate attachment exhaustion stops the JSON tail before any create", async () => {
+	let stopped = false;
+	function spawnImpl() {
+		const child = new EventEmitter();
+		child.stdout = new EventEmitter();
+		child.stderr = new EventEmitter();
+		child.kill = () => {
+			if (!stopped) {
+				stopped = true;
+				child.emit("exit", 0, null);
+			}
+		};
+		queueMicrotask(() => child.stdout.emit("data", [
+			WRANGLER_TAIL_PING_LINE,
+			WRANGLER_TAIL_PONG_LINE,
+			"",
+		].join("\n")));
+		return child;
+	}
+	const observers = createStagingTailObservers({
+		spawnImpl,
+		delay: async (milliseconds) => {
+			if (milliseconds > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, 1));
+		},
+		warmupMs: 0,
+		tailReadyWaitMs: 100,
+		candidateAttachmentTraceWaitMs: 5,
+		candidateAttachmentProbeWaitMs: 1,
+		candidateSeedTraceWaitMs: 100,
+	});
+	let attachmentAttempts = 0;
+	let createAttempts = 0;
+	await assert.rejects(observers.observeCandidateSeed(async () => {
+		createAttempts += 1;
+	}, CANDIDATE_VERSION, async () => undefined, async () => {
+		attachmentAttempts += 1;
+	}), (error) => {
+		assert.match(error.message, /no exact-version attachment barrier/u);
+		assert.match(error.message, /"projectedTraceCount":0/u);
+		assert.doesNotMatch(error.message, /private|e237d4e3/u);
+		return true;
+	});
+	assert.ok(attachmentAttempts >= 1);
+	assert.equal(createAttempts, 0);
+	assert.equal(stopped, true);
 });
 
 test("candidate seed timeout reports only bounded aggregate proof progress and never retries creation", async () => {
@@ -785,16 +983,23 @@ test("candidate seed timeout reports only bounded aggregate proof progress and n
 				child.emit("exit", 0, null);
 			}
 		};
-		if (format === "pretty") {
-			queueMicrotask(() => stdout.emit("data", `Connected to ${STAGING_WORKER}, waiting for logs...\n`));
-		} else jsonChild = child;
+		if (format === "json") {
+			jsonChild = child;
+			queueMicrotask(() => stdout.emit("data", [
+				WRANGLER_TAIL_PING_LINE,
+				WRANGLER_TAIL_PONG_LINE,
+				"",
+			].join("\n")));
+		}
 		return child;
 	}
 	const observers = createStagingTailObservers({
 		spawnImpl,
 		delay: async () => undefined,
 		warmupMs: 0,
+		tailReadyWaitMs: 1,
 		candidateAttachmentTraceWaitMs: 1,
+		candidateAttachmentProbeWaitMs: 1,
 		candidateSeedTraceWaitMs: 1,
 	});
 	let createAttempts = 0;
