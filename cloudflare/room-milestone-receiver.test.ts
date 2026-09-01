@@ -441,6 +441,20 @@ test("rejects a canonical occurrence time whose 90-day fact expiry leaves the su
 	assert.equal(database.batchCalls, 0);
 });
 
+test("rejects a receipt time whose 90-day expiry leaves the supported year range", async () => {
+	const database = new FakeReceiverD1(6);
+	await assert.rejects(
+		receiveRoomMilestone(
+			{ PLATFORM_DB: database as unknown as D1Database },
+			delivery(),
+			new Date("9999-12-31T23:59:59.999Z"),
+		),
+		(error: unknown) => error instanceof PlatformError && error.code === "INVALID_INPUT",
+	);
+	assert.equal(database.statements.length, 0);
+	assert.equal(database.batchCalls, 0);
+});
+
 test("a synchronous Analytics Engine failure cannot undo an applied D1 receipt", async (t) => {
 	const item = delivery();
 	const payloadHash = await hashRoomMilestonePayloadV1(item.payloadJson);

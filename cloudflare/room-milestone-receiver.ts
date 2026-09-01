@@ -336,6 +336,10 @@ function receiverTimestamp(value: Date): string {
 	if (timestamp.length !== 24) {
 		throw new PlatformError("INVALID_INPUT", "The milestone receipt time is outside the supported range.");
 	}
+	const receiptExpiry = new Date(value.valueOf() + ROOM_FACT_RETENTION_MS);
+	if (!Number.isFinite(receiptExpiry.valueOf()) || receiptExpiry.toISOString().length !== 24) {
+		throw new PlatformError("INVALID_INPUT", "The milestone receipt expiry is outside the supported range.");
+	}
 	return timestamp;
 }
 
