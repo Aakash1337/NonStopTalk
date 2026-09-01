@@ -31,6 +31,9 @@ export default defineConfig(async () => {
 		test: {
 			include: ["cloudflare/runtime-tests/**/*.test.ts"],
 			setupFiles: ["./cloudflare/runtime-tests/apply-d1-migrations.ts"],
+			// Runtime files share D1 and Durable Object bindings. Separate them so
+			// one pool cannot tear down the Worker while another still uses it.
+			fileParallelism: false,
 		},
 	};
 });
