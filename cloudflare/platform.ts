@@ -6,6 +6,10 @@
  * Coaching payloads are rebuilt from an allowlist before they can reach D1.
  */
 
+import { prepareSyncIdentityTouch, type DeviceKey } from "./sync-identity";
+
+export type { DeviceKey } from "./sync-identity";
+
 export const CLOUD_SUMMARY_POLICY_VERSION = "cloud-summary-v1";
 export const ANONYMOUS_DATA_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 export const ROOM_FACT_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
@@ -193,9 +197,6 @@ export class PlatformError extends Error {
 	}
 }
 
-declare const deviceKeyBrand: unique symbol;
-export type DeviceKey = string & { readonly [deviceKeyBrand]: "DeviceKey" };
-
 export interface CloudSummaryConsent {
 	purpose: "cloud_summary";
 	granted: boolean;
@@ -307,6 +308,7 @@ export interface CleanupResult {
 	coachingSessions: number;
 	consentRecords: number;
 	devices: number;
+	syncProfiles: number;
 	roomFacts: number;
 	hasMore: boolean;
 }
@@ -839,15 +841,6 @@ interface RoomFactRow {
 	last_turn_spoken_seconds: number;
 }
 
-const UPSERT_DEVICE_SQL = `
-	INSERT INTO devices (device_key, created_at, last_seen_at, expires_at)
-	VALUES (?, ?, ?, ?)
-	ON CONFLICT(device_key) DO UPDATE SET
-		last_seen_at = excluded.last_seen_at,
-		expires_at = excluded.expires_at
-	WHERE excluded.expires_at > devices.expires_at
-`;
-
 const UPSERT_CONSENT_SQL = `
 	INSERT INTO consent_records (
 		device_key, purpose, policy_version, granted, granted_at, revoked_at, updated_at
@@ -980,7 +973,7 @@ export class PlatformStore {
 		const policy = normalizePolicyVersion(policyVersion);
 		const deviceKey = await hashDeviceToken(browserToken);
 		const now = this.clock();
-		await this.touchDevice(deviceKey, now);
+		await this.touchSyncIdentity(deviceKey, now);
 		const timestamp = now.toISOString();
 		await databaseOperation("record cloud-summary consent", async () => {
 			await this.#db
@@ -1020,7 +1013,7 @@ export class PlatformStore {
 		const deviceKey = await hashDeviceToken(browserToken);
 		const now = this.clock();
 		if (!(await this.hasActiveDevice(deviceKey, now.toISOString()))) return null;
-		await this.touchDevice(deviceKey, now);
+		await this.touchSyncIdentity(deviceKey, now);
 		return this.readConsent(deviceKey);
 	}
 
@@ -1034,7 +1027,7 @@ export class PlatformStore {
 		const deviceKey = await hashDeviceToken(browserToken);
 		const now = this.clock();
 		const timestamp = now.toISOString();
-		await this.touchDevice(deviceKey, now);
+		await this.touchSyncIdentity(deviceKey, now);
 		await this.requireConsent(deviceKey);
 
 		const result = await databaseOperation("save the coaching summary", () =>
@@ -1062,14 +1055,18 @@ export class PlatformStore {
 		const now = this.clock();
 		const timestamp = now.toISOString();
 		const expiresAt = anonymousExpiryFrom(now);
+		const identityTouch = prepareSyncIdentityTouch(
+			this.#db,
+			deviceKey,
+			timestamp,
+			expiresAt,
+		);
+		const consentInsertIndex = identityTouch.length;
+		const consentUpdateIndex = consentInsertIndex + 1;
+		const summaryInsertIndex = consentUpdateIndex + 1;
 		const results = await databaseOperation("grant consent and save the coaching summary", () =>
 			this.#db.batch([
-				this.#db
-					.prepare("DELETE FROM devices WHERE device_key = ? AND expires_at <= ?")
-					.bind(deviceKey, timestamp),
-				this.#db
-					.prepare(UPSERT_DEVICE_SQL)
-					.bind(deviceKey, timestamp, timestamp, expiresAt),
+				...identityTouch,
 				this.#db
 					.prepare(`INSERT OR IGNORE INTO consent_records (
 						device_key, purpose, policy_version, granted, granted_at, revoked_at, updated_at
@@ -1089,11 +1086,12 @@ export class PlatformStore {
 			summary,
 			serialized,
 			timestamp,
-			resultChanges(results[4]) > 0,
+			resultChanges(results[summaryInsertIndex]) > 0,
 		);
 		return {
 			...saved,
-			consentGranted: resultChanges(results[2]) > 0 || resultChanges(results[3]) > 0,
+			consentGranted: resultChanges(results[consentInsertIndex]) > 0
+				|| resultChanges(results[consentUpdateIndex]) > 0,
 		};
 	}
 
@@ -1104,7 +1102,7 @@ export class PlatformStore {
 		const deviceKey = await hashDeviceToken(browserToken);
 		const now = this.clock();
 		const timestamp = now.toISOString();
-		await this.touchDevice(deviceKey, now);
+		await this.touchSyncIdentity(deviceKey, now);
 		await this.requireConsent(deviceKey);
 		const result = await databaseOperation("update the coaching summary", () =>
 			this.#db
@@ -1145,7 +1143,7 @@ export class PlatformStore {
 		const now = this.clock();
 		const timestamp = now.toISOString();
 		if (!(await this.hasActiveDevice(deviceKey, timestamp))) return null;
-		await this.touchDevice(deviceKey, now);
+		await this.touchSyncIdentity(deviceKey, now);
 		return this.readProtectedSummary(deviceKey, id, timestamp);
 	}
 
@@ -1162,7 +1160,7 @@ export class PlatformStore {
 		if (!(await this.hasActiveDevice(deviceKey, timestamp))) {
 			return { sessions: [], nextCursor: null };
 		}
-		await this.touchDevice(deviceKey, now);
+		await this.touchSyncIdentity(deviceKey, now);
 		const statement = cursor
 			? this.#db
 				.prepare(`SELECT ${SUMMARY_COLUMNS} FROM coaching_sessions
@@ -1200,7 +1198,7 @@ export class PlatformStore {
 				truncated: false,
 			};
 		}
-		await this.touchDevice(deviceKey, now);
+		await this.touchSyncIdentity(deviceKey, now);
 		const result = await databaseOperation("export coaching summaries", () =>
 			this.#db
 				.prepare(`SELECT ${SUMMARY_COLUMNS} FROM coaching_sessions
@@ -1229,7 +1227,7 @@ export class PlatformStore {
 		const now = this.clock();
 		const timestamp = now.toISOString();
 		if (!(await this.hasActiveDevice(deviceKey, timestamp))) return false;
-		await this.touchDevice(deviceKey, now);
+		await this.touchSyncIdentity(deviceKey, now);
 		const result = await databaseOperation("delete the coaching summary", () =>
 			this.#db
 				.prepare("DELETE FROM coaching_sessions WHERE device_key = ? AND session_id = ?")
@@ -1246,7 +1244,7 @@ export class PlatformStore {
 		if (!(await this.hasActiveDevice(deviceKey, now.toISOString()))) {
 			return { deletedCount: 0, consentRevoked: false };
 		}
-		await this.touchDevice(deviceKey, now);
+		await this.touchSyncIdentity(deviceKey, now);
 		const timestamp = now.toISOString();
 		const results = await databaseOperation("clear coaching summaries and revoke consent", () =>
 			this.#db.batch([
@@ -1374,18 +1372,11 @@ export class PlatformStore {
 		return dateInput(this.#now(), "PlatformStore clock");
 	}
 
-	private async touchDevice(deviceKey: DeviceKey, now: Date): Promise<void> {
+	private async touchSyncIdentity(deviceKey: DeviceKey, now: Date): Promise<void> {
 		const timestamp = now.toISOString();
 		const expiresAt = anonymousExpiryFrom(now);
-		await databaseOperation("refresh the anonymous device", () =>
-			this.#db.batch([
-				this.#db
-					.prepare("DELETE FROM devices WHERE device_key = ? AND expires_at <= ?")
-					.bind(deviceKey, timestamp),
-				this.#db
-					.prepare(UPSERT_DEVICE_SQL)
-					.bind(deviceKey, timestamp, timestamp, expiresAt),
-			]),
+		await databaseOperation("refresh the anonymous sync identity", () =>
+			this.#db.batch(prepareSyncIdentityTouch(this.#db, deviceKey, timestamp, expiresAt)),
 		);
 	}
 
@@ -1497,7 +1488,7 @@ export class PlatformStore {
 		const policy = normalizePolicyVersion(policyVersion);
 		const deviceKey = await hashDeviceToken(browserToken);
 		const now = this.clock();
-		await this.touchDevice(deviceKey, now);
+		await this.touchSyncIdentity(deviceKey, now);
 		const timestamp = now.toISOString();
 		const results = await databaseOperation("grant cloud-summary consent", () =>
 			this.#db.batch([
@@ -1594,6 +1585,18 @@ export async function cleanupExpiredData(
 				)`)
 				.bind(timestamp, boundedLimit),
 			db
+				.prepare(`DELETE FROM sync_profiles WHERE rowid IN (
+					SELECT profile.rowid
+					FROM sync_profiles AS profile
+					WHERE profile.expires_at <= ?
+						AND NOT EXISTS (
+							SELECT 1 FROM sync_profile_devices AS membership
+							WHERE membership.profile_id = profile.profile_id
+						)
+					LIMIT ?
+				)`)
+				.bind(timestamp, boundedLimit),
+			db
 				.prepare(`DELETE FROM room_facts WHERE rowid IN (
 					SELECT rowid FROM room_facts WHERE expires_at <= ? LIMIT ?
 				)`)
@@ -1604,7 +1607,8 @@ export async function cleanupExpiredData(
 		coachingSessions: resultChanges(results[0]),
 		consentRecords: resultChanges(results[1]),
 		devices: resultChanges(results[2]),
-		roomFacts: resultChanges(results[3]),
+		syncProfiles: resultChanges(results[3]),
+		roomFacts: resultChanges(results[4]),
 	};
 	return {
 		...deleted,

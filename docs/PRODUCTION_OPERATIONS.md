@@ -75,10 +75,11 @@ npm run deploy:staging
 
 That command applies only staging migrations, deploys with strict mode, checks
 the public pages and status API, writes one synthetic compact baseline summary,
-verifies its relationship round-trip, and deletes the device-scoped cloud
-history. The mutating probe refuses to run against a host that is not the
-designated HTTPS staging Workers.dev hostname. It never sends audio, transcript
-text, user content, or an external model request.
+verifies its schema-v4 profile-foundation and relationship round-trips, and
+deletes the device-scoped cloud history. The mutating probe refuses to run
+against a host that is not the designated HTTPS staging Workers.dev hostname.
+It never sends audio, transcript text, user content, or an external model
+request.
 
 ## Migration discipline
 
@@ -87,9 +88,11 @@ text, user content, or an external model request.
    in the same transaction.
 3. Keep every migration compatible with the currently deployed Worker. D1 is
    migrated before code when deployment automation applies both.
-   The schema-v3 Worker intentionally accepts and reports schema markers 3 and
-   4 so the reviewed schema-v4 expand migration can land without a readiness
-   outage. Do not widen that one-version window without another compatibility
+   The compatibility Worker released before migration `0004` accepts and
+   reports schema markers 3 and 4, so that expand migration can land without a
+   readiness outage and the same Worker remains a safe code rollback on schema
+   4. The matching schema-v4 Worker requires marker 4 because it writes the new
+   tables. Do not widen a compatibility window without another compatibility
    release and explicit old/new Worker tests.
 4. Exercise a fresh database and every supported upgrade path through
    `npm run smoke:platform`.

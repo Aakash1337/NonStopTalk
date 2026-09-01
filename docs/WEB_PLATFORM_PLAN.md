@@ -33,8 +33,8 @@ Browser SPA
   |-- versioned HTTPS API
           |
           +-- Room Durable Object (authoritative live room state + WebSockets)
-          +-- D1 platform store (summaries, consent, room facts, daily rollups,
-          |                      aggregate model-usage budget)
+          +-- D1 platform store (summaries, consent, internal profile mappings,
+          |                      room facts, daily rollups, model-usage budget)
           +-- Analytics Engine (best-effort time-series events)
           +-- Workers Logs/Traces (runtime health)
           +-- topic-provider adapter
@@ -51,7 +51,7 @@ Durable Objects and D1 have different jobs. A room object serializes concurrent 
 
 The first slice uses these modules:
 
-- `cloudflare/platform.ts`: validation, hashed anonymous identity, D1 repositories, consent records, retention, room facts, and aggregate analytics.
+- `cloudflare/platform.ts`: validation, hashed anonymous identity, internal sync-profile membership, D1 repositories, consent records, retention, room facts, and aggregate analytics.
 - `cloudflare/public/cloud-progress.js`: a browser-side allowlist and the optional summary-backup API client.
 - `cloudflare/model-provider.ts`: bounded deterministic, direct GLM-4.7-Flash, Workers AI GLM-5.3-Flash, and Gemma 4 31B topic adapters.
 - `cloudflare/model-routes.ts`: host/setup authorization, per-request consent, D1 budget reservation/reconciliation, response metadata, and deterministic remote-failure fallback.
@@ -73,11 +73,15 @@ GET     /api/v1/admin/model-usage?days=30
 POST    /api/v1/models/topics
 ```
 
-Every new API response includes a request ID and a no-store policy. Mutations require same-origin requests. Both admin endpoints require the same `ANALYTICS_ADMIN_TOKEN` bearer secret. Progress ownership is initially the SHA-256 digest of the existing high-entropy browser token; the raw token is not stored in D1. The public status route verifies D1 readiness and returns top-level `status` (`ok` or `degraded`), `apiVersion`, `schemaVersion`, and `degradedCapabilities`. Its non-secret `capabilities` object reports cloud-progress status, retention, and `newSaveLimit`; keyed-room-fact status; aggregate-analytics delivery/admin-read/Analytics-Engine configuration; and only non-secret topic-provider availability/degradation.
+Every new API response includes a request ID and a no-store policy. Mutations require same-origin requests. Both admin endpoints require the same `ANALYTICS_ADMIN_TOKEN` bearer secret. Progress ownership remains the SHA-256 digest of the existing high-entropy browser token; the raw token is not stored in D1. Schema v4 also assigns an opaque internal sync profile, but its ID is never returned or accepted for access. The public status route verifies D1 readiness and returns top-level `status` (`ok` or `degraded`), `apiVersion`, `schemaVersion`, and `degradedCapabilities`. Its non-secret `capabilities` object reports cloud-progress status, retention, and `newSaveLimit`; keyed-room-fact status; aggregate-analytics delivery/admin-read/Analytics-Engine configuration; and only non-secret topic-provider availability/degradation.
 
 `POST /api/v1/models/topics` is host-only and setup-only. It accepts a room code for authorization, a routine/escalated tier, an explicit consent boolean, and a trimmed theme capped at 200 characters. The normalized theme is the only host or room content forwarded to a model. Fixed instructions and model settings accompany it, but room authorization fields and NonStopTalk request IDs never leave the Worker. The response is a bounded editable topic draft plus provider/fallback metadata; applying that draft remains an ordinary room action. There is at most one external call, no retry, and no automatic escalation. A configured external request without consent is rejected before budget reservation or provider contact. Missing credentials/bindings, invalid provider selectors, unavailable/exhausted D1 budget, provider errors, timeouts, or invalid output return the deterministic draft. Public status reports invalid or incomplete provider configuration as degraded; authorization and input failures remain explicit errors. Status checks binding shape, not Workers Paid entitlement, so a denied first GLM-5.3 request can still fail closed. Provider output is materialized before the 64 KiB validation bound; a timeout stops local waiting, but an upstream that ignores abort may still complete and bill.
 
 Anonymous cloud progress is deliberately transitional. Its access cookie is not an account or recovery credential. Cloud use refreshes one device-level lease, bucketed to a UTC day and lasting at least 30 days (and less than 31 days), for all of that browser's summaries. Ordinary reads do not rewrite each summary merely to renew retention. The daily cleanup deletes bounded batches of expired detail, continues within a capped run budget, and leaves any remaining backlog for the next cron. Clearing the browser cookie can make a backup unreachable before cleanup. A real account will eventually adopt these records into a durable user identity.
+
+Schema v4 is Stage 1 of that identity transition and is deliberately behavior-preserving. `sync_profiles` stores an opaque internal profile and lifecycle metadata; `sync_profile_devices` maps one current device digest to one profile. Existing devices are backfilled one-to-one, and new browsers still receive separate profiles. `coaching_sessions`, consent receipts, authorization, the API response shape, and every visible backup/list/export/delete flow remain device-owned and unchanged. Device deletion cascades the membership, and bounded retention cleanup removes an expired orphan profile. This introduces no visible profile, account, linking, recovery, cross-device access, data upload, or new consent behavior.
+
+The rollout follows expand/contract sequencing: add and backfill the mapping first, validate it while device SQL remains authoritative, then add compatibility behavior in a later release before contracting any device-owned session path. The first proposed linking feature is a bilateral, short-lived numeric-code exchange. It must HMAC code material with a separate `IDENTITY_HASH_KEY`, require explicit confirmation and consent on both browsers, leave existing cloud-summary consent unchanged, and fail without moving or exposing data when either side does not confirm. That flow, profile-scoped session ownership, authentication, and account recovery are future work.
 
 New saves are rejected when an anonymous browser identity already owns 250 cloud summaries. This is a new-save guard, not a retroactive retention cap: the v2 migration preserves every valid, unexpired v1 summary even when an identity has more than 250, while excluding v1 rows whose summary or device lease had already expired. An identity above the guard can still list, export, and delete its records; it must fall below 250 before creating another summary.
 
@@ -86,6 +90,8 @@ New saves are rejected when an anonymous browser identity already owns 250 cloud
 | Record | Purpose | Sensitive data excluded |
 | --- | --- | --- |
 | `devices` | Anonymous owner key and expiry | Cookie token, IP, user agent |
+| `sync_profiles` | Opaque internal profile lifecycle/generation; one profile per browser in Stage 1 | Credentials, content, names, IP, user agent |
+| `sync_profile_devices` | Internal device-to-profile membership and lifecycle | Raw cookie token, content, consent |
 | `coaching_sessions` | Allowlisted compact measurement/advice summary | Audio, samples, recording, captured transcript |
 | `consent_records` | Versioned proof of the summary-backup choice | Form text, media |
 | `room_facts` | Room lifecycle counts keyed by an operator-secret HMAC of the short room code | Raw room code, player names and member tokens |
@@ -130,6 +136,8 @@ Exit: the complete slice runs against local Wrangler/D1, existing game and coach
 
 ### Phase 2 — durable identity and cross-device progress
 
+- Validate the schema-v4 one-device/one-profile foundation before any ownership migration; keep current device queries available through the rollback window.
+- Add bilateral, expiring numeric-code linking only with a separate `IDENTITY_HASH_KEY` and explicit confirmation/consent on both devices. Linking must not silently grant cloud-summary consent.
 - Select an authentication approach after domain/email requirements are known. Prefer passkeys or email magic links; avoid building password storage.
 - Add users, auth identities, revocable sessions, account deletion, and anonymous-to-account adoption.
 - Add paginated sync, offline retry/outbox behavior, and conflict rules.
@@ -161,6 +169,7 @@ Partial exit reached: topic providers can be enabled, disabled, or replaced with
 
 - Do not write D1 on socket presence ticks or page views. Persist only summaries, consent changes, room milestones, analytics increments, and aggregate provider-budget counters.
 - Keep one day-bucketed inactivity lease per anonymous device, reject new saves once 250 summaries exist without forcibly deleting valid legacy rows, and bound each cleanup run so unusual backlogs cannot monopolize Worker execution.
+- Keep the Stage-1 identity expansion to two small metadata rows per browser and the existing bounded cleanup; it requires no additional Cloudflare product, model call, email sender, or paid plan.
 - Use Analytics Engine for high-volume exploratory telemetry because writes are non-blocking and sampled at scale; never depend on it for billing or user-visible state.
 - Keep raw coaching artifacts in IndexedDB. Add R2 only if users explicitly request cloud media storage and a storage/egress budget is approved.
 - Add Queue only for work that genuinely needs retry/delivery semantics. The current topic route makes no retry and falls back deterministically.

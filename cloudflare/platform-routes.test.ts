@@ -55,7 +55,7 @@ class FakeModelUsageStatement {
 
 	async first<T>(): Promise<T | null> {
 		assert.match(this.#query, /SELECT schema_version FROM platform_meta/u);
-		return { schema_version: 3 } as T;
+		return { schema_version: 4 } as T;
 	}
 
 	async all<T>(): Promise<D1Result<T>> {
@@ -107,29 +107,27 @@ function usageRow(overrides: Partial<ModelUsageTestRow> = {}): ModelUsageTestRow
 	};
 }
 
-test("platform status accepts the current and next expand schema and reports the actual marker", async () => {
-	for (const schemaVersion of [3, 4]) {
-		const handled = await handlePlatformRoute(
-			new Request("https://nonstoptalk.test/api/v1/platform/status"),
-			{
-				PLATFORM_DB: new FakeStatusD1(schemaVersion) as unknown as D1Database,
-				ANALYTICS_ADMIN_TOKEN: "1".repeat(64),
-				ROOM_FACT_HASH_KEY: "2".repeat(64),
-			},
-			"3".repeat(64),
-			`status-schema-${schemaVersion}`,
-		);
+test("platform status requires and reports the schema-v4 identity foundation", async () => {
+	const handled = await handlePlatformRoute(
+		new Request("https://nonstoptalk.test/api/v1/platform/status"),
+		{
+			PLATFORM_DB: new FakeStatusD1(4) as unknown as D1Database,
+			ANALYTICS_ADMIN_TOKEN: "1".repeat(64),
+			ROOM_FACT_HASH_KEY: "2".repeat(64),
+		},
+		"3".repeat(64),
+		"status-schema-4",
+	);
 
-		assert(handled);
-		assert.equal(handled.response.status, 200);
-		const body = await handled.response.json() as { status: string; schemaVersion: number };
-		assert.equal(body.status, "ok");
-		assert.equal(body.schemaVersion, schemaVersion);
-	}
+	assert(handled);
+	assert.equal(handled.response.status, 200);
+	const body = await handled.response.json() as { status: string; schemaVersion: number };
+	assert.equal(body.status, "ok");
+	assert.equal(body.schemaVersion, 4);
 });
 
 test("platform status rejects schema markers outside the reviewed compatibility window", async () => {
-	for (const schemaVersion of [2, 5]) {
+	for (const schemaVersion of [2, 3, 5]) {
 		const handled = await handlePlatformRoute(
 			new Request("https://nonstoptalk.test/api/v1/platform/status"),
 			{ PLATFORM_DB: new FakeStatusD1(schemaVersion) as unknown as D1Database },

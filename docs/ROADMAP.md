@@ -73,6 +73,7 @@ The first incremental platform slice is being built without replacing the playab
 - Versioned Worker APIs and a central D1 database for explicitly backed-up compact coaching summaries, versioned consent, anonymous expiry, HMAC-pseudonymous room facts, and best-effort daily aggregate counters
 - An off-by-default browser allowlist that excludes raw samples, audio/recordings, captured transcript text, and artifact metadata from cloud backup
 - Anonymous browser ownership stored as a token digest, with one UTC-day-bucketed device lease lasting at least 30 and less than 31 days after cloud use, a new-save guard once 250 summaries exist, preservation of valid unexpired legacy rows, and bounded cleanup that can continue a backlog on later cron runs
+- A schema-v4 identity expansion with opaque `sync_profiles` and `sync_profile_devices`: one internal profile per browser for now, no exposed profile credential, and no change to device-owned sessions, API behavior, consent, or retention
 - Coarse privacy-safe product events attempted best-effort in both D1 daily rollups and Analytics Engine; D1 supplies protected aggregate product-analytics and model-usage operational readouts, not audit or billing truth
 - Server-authoritative room milestones plus coarse summary-save/delete/consent timing/count values; no page-view, presence-tick, per-person, speaking-ratio, transcript-pattern, or advice telemetry
 - A modular Cloudflare theme-to-topics boundary: deterministic/offline by default; direct Z.AI GLM-4.7-Flash as the strict-free routine option; Workers AI GLM-5.3-Flash as the preferred cheap Workers Paid routine option; and independently enabled Gemma 4 31B only for explicit host escalation
@@ -80,7 +81,7 @@ The first incremental platform slice is being built without replacing the playab
 - Modular separation among Durable Object room authority, D1 repositories, identity, coaching backup, analytics, and topic providers
 - Local coaching and gameplay that continue to work when D1 or analytics is unavailable
 
-This phase remains free-or-cheap by default: it uses existing Cloudflare primitives, keeps routine generation offline unless enabled, makes the larger model an explicit escalation, and caps aggregate external calls. Accounts, cross-device authentication/progress, external coaching AI, Queue-backed work, and R2 media storage remain later phases. See the [Web platform plan](WEB_PLATFORM_PLAN.md).
+This phase remains free-or-cheap by default: it uses existing Cloudflare primitives, keeps routine generation offline unless enabled, makes the larger model an explicit escalation, and caps aggregate external calls. The identity foundation adds only two small D1 metadata rows per browser and bounded cleanup, with no additional service or secret. Accounts, cross-device authentication/progress, external coaching AI, Queue-backed work, and R2 media storage remain later phases. The next identity slice may add bilateral numeric-code linking only with a separate `IDENTITY_HASH_KEY` and explicit consent on both browsers; it must not silently grant cloud-summary consent. See the [Web platform plan](WEB_PLATFORM_PLAN.md).
 
 ## 5. Content, sharing, and retention — Implemented locally
 
@@ -123,6 +124,7 @@ Implemented work includes:
 - TypeScript game/route tests and a Wrangler deploy dry run
 - Deterministic coaching-engine tests and a Cloudflare-SPA coaching smoke flow
 - D1 migrations, platform API/repository tests, compact-summary client tests, configured/degraded capability status, and bounded scheduled anonymous-data cleanup
+- Expand-only schema-v4 sync-profile tables and one-device/one-profile backfill while device-owned session queries remain the rollback-safe authority
 - Host-authorized Cloudflare topic generation with separate provider adapters, per-attempt consent, aggregate daily cost controls, and deterministic failure fallback
 
 Remaining hardening:
@@ -141,7 +143,7 @@ These are future ideas, not current features:
 - Named Lightning and Strict modes
 - Pause, skip-player, and restart-current-turn controls
 - Native desktop wrapper, installers, signing, and updates
-- User profiles
+- Visible user profiles and profile management
 - Family/content filters
 - Post-turn AI summaries
 - Validated learning outcomes, repeatability, and interpretation for baseline/retry coaching programs; descriptive progress comparisons are implemented
