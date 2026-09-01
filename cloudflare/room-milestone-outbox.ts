@@ -90,6 +90,29 @@ export type RoomMilestoneRetryResult =
 	| { outcome: "dead-lettered"; reason: "deadline-exceeded" | "attempts-exhausted" }
 	| { outcome: "stale" };
 
+/**
+ * Classify only bounded contract failures as a fail-open telemetry drop.
+ * Storage and programming failures must continue to throw so the surrounding
+ * room-state transaction can roll back.
+ */
+export function isRoomMilestoneCanonicalizationError(error: unknown): boolean {
+	return error instanceof PlatformError
+		&& (error.code === "INVALID_INPUT" || error.code === "PAYLOAD_TOO_LARGE");
+}
+
+/** Record a known all-or-drop producer outcome without retaining payload data. */
+export function recordRoomMilestoneDrop(
+	sql: SqlStorage,
+	reason: RoomMilestoneDropReason,
+	count: number,
+	droppedAtMs: number,
+): Extract<RoomMilestoneEnqueueResult, { outcome: "dropped" }> {
+	const normalizedAt = safeTimestamp(droppedAtMs, "outbox drop time");
+	const normalizedCount = boundedInteger(count, 1, Number.MAX_SAFE_INTEGER, "dropped event count");
+	recordDrop(sql, reason, normalizedCount, normalizedAt);
+	return { outcome: "dropped", reason, droppedCount: normalizedCount };
+}
+
 interface MetadataRow {
 	[key: string]: SqlStorageValue;
 	schema_version: SqlStorageValue;
@@ -284,13 +307,16 @@ export function enqueueRoomMilestones(
 	const createdAtMs = safeTimestamp(nowMs, "outbox enqueue time");
 	const requestedCount = Array.isArray(facts) ? facts.length : 1;
 	if (!Array.isArray(facts) || facts.length < 1) {
-		recordDrop(sql, "canonicalization", Math.max(1, requestedCount), createdAtMs);
-		return { outcome: "dropped", reason: "canonicalization", droppedCount: Math.max(1, requestedCount) };
+		return recordRoomMilestoneDrop(
+			sql,
+			"canonicalization",
+			Math.max(1, requestedCount),
+			createdAtMs,
+		);
 	}
 	const existingCount = readCount(sql, "room_milestone_outbox");
 	if (facts.length > ROOM_MILESTONE_OUTBOX_CAPACITY - existingCount) {
-		recordDrop(sql, "capacity", facts.length, createdAtMs);
-		return { outcome: "dropped", reason: "capacity", droppedCount: facts.length };
+		return recordRoomMilestoneDrop(sql, "capacity", facts.length, createdAtMs);
 	}
 
 	const metadata = readRoomMilestoneOutboxMetadata(sql);
@@ -302,9 +328,8 @@ export function enqueueRoomMilestones(
 			return { payloadJson, milestone: payload.milestone };
 		});
 	} catch (error) {
-		if (!isCanonicalizationError(error)) throw error;
-		recordDrop(sql, "canonicalization", facts.length, createdAtMs);
-		return { outcome: "dropped", reason: "canonicalization", droppedCount: facts.length };
+		if (!isRoomMilestoneCanonicalizationError(error)) throw error;
+		return recordRoomMilestoneDrop(sql, "canonicalization", facts.length, createdAtMs);
 	}
 
 	const eventIds = new Set<string>();
@@ -666,11 +691,6 @@ function enumValue<const Value extends string>(
 		throw storageInvariant(`${label} is invalid.`);
 	}
 	return value as Value;
-}
-
-function isCanonicalizationError(error: unknown): boolean {
-	return error instanceof PlatformError
-		&& (error.code === "INVALID_INPUT" || error.code === "PAYLOAD_TOO_LARGE");
 }
 
 function storageInvariant(message: string): Error {

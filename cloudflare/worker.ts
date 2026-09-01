@@ -12,6 +12,10 @@ import {
 	type RoomState,
 } from "./game";
 import {
+	mapPublicRoomStateToFact,
+	type PublicRoomFactDraft,
+} from "./platform";
+import {
 	handlePlatformRoute,
 	recordRoomMilestone,
 	runPlatformCleanup,
@@ -27,16 +31,25 @@ import {
 	acknowledgeRoomMilestone,
 	deadLetterExpiredRoomMilestone,
 	deadLetterRoomMilestone,
+	enqueueRoomMilestones,
 	initializeRoomMilestoneOutbox,
+	isRoomMilestoneCanonicalizationError,
 	purgeExpiredRoomMilestoneDeadLetters,
 	readNextRoomMilestoneAlarmAt,
 	readRoomMilestoneOutboxHead,
 	readRoomMilestoneOutboxMetadata,
+	recordRoomMilestoneDrop,
 	recordRoomMilestoneRetry,
+	type RoomMilestoneEnqueueResult,
 	type RoomMilestoneOutboxHead,
+	type RoomMilestoneRandomBytes,
 	type RoomMilestoneRetryFailure,
 } from "./room-milestone-outbox";
-import { normalizeRoomMilestoneDeliveryV1 } from "./room-milestone-contract";
+import {
+	normalizeRoomMilestoneDeliveryV1,
+	type DeliverableRoomMilestone,
+} from "./room-milestone-contract";
+import { roomMilestoneOutboxProducerEnabled } from "./room-milestone-delivery-mode";
 import {
 	receiveRoomMilestone,
 	type RoomMilestoneReceiveResult,
@@ -54,6 +67,10 @@ const ROOM_MILESTONE_ALARM_MIN_DELAY_MS = 1_000;
 const ROOM_MILESTONE_WATCHDOG_MS = 2 * 60 * 1000;
 const HOST_HTTP_PRESENCE_BUCKET_MS = 15_000;
 const ROOM_MILESTONES_HEADER = "X-NonStopTalk-Room-Milestones";
+// A comma-only list contains no legacy milestone after split/trim/filter. That
+// makes this v1 ownership sentinel safe through a Release-A outer Worker, which
+// already strips this header and schedules zero events.
+const ROOM_MILESTONE_OUTBOX_V1_SENTINEL = ",";
 const MODEL_TOPICS_ROUTE = "/api/v1/models/topics";
 const ADMIN_ANALYTICS_DOCUMENT = "/admin/analytics";
 const ADMIN_ANALYTICS_CSP = [
@@ -92,7 +109,7 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 	constructor(ctx: DurableObjectState, env: WorkerEnv) {
 		super(ctx, env);
 		// Missing and ordinary best-effort rooms stay read-only here. An object
-		// that already has a future outbox is repaired using only local SQLite,
+		// that already has a version-1 outbox is repaired using only local SQLite,
 		// and its one alarm is reconciled before any handler runs under this bridge.
 		this.ctx.blockConcurrencyWhile(async () => {
 			const room = this.load();
@@ -128,13 +145,18 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 				const body = await readJson(request);
 				const room = this.load();
 				if (room) return json({ error: "Room code collision." }, 409);
+				const now = Date.now();
+				const onlineTokens = this.onlineTokens();
+				const created = createRoomState(text(body.code), token, text(body.name), now);
+				const publicState = publicRoomState(created, token, onlineTokens, now);
+				const outboxProducer = this.outboxProducerEnabled();
+				if (outboxProducer) {
+					await this.saveWithRoomMilestones(created, publicState, ["created"], now);
+					return withRoomMilestoneOutboxOwnership(json({ room: publicState }, 201));
+				}
 				this.initializeSchema();
-				const created = createRoomState(text(body.code), token, text(body.name));
 				this.save(created);
-				return withRoomMilestones(
-					json({ room: publicRoomState(created, token, this.onlineTokens()) }, 201),
-					["created"],
-				);
+				return withRoomMilestones(json({ room: publicState }, 201), ["created"]);
 			}
 
 			if (request.method === "POST" && url.pathname === "/join") {
@@ -142,11 +164,19 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 				const room = this.load();
 				if (!room) return json({ error: "Room not found." }, 404);
 				const memberBefore = room.members[token];
-				joinRoom(room, token, text(body.name));
-				this.save(room);
+				const now = Date.now();
+				const onlineTokens = this.onlineTokens();
+				joinRoom(room, token, text(body.name), now);
+				const joined = !memberBefore && Boolean(room.members[token]);
+				const publicState = publicRoomState(room, token, onlineTokens, now);
+				const outboxProducer = this.outboxProducerEnabled();
+				if (outboxProducer && joined) {
+					await this.saveWithRoomMilestones(room, publicState, ["joined"], now);
+				} else this.save(room);
 				this.broadcast(room);
-				const response = json({ room: publicRoomState(room, token, this.onlineTokens()) });
-				return memberBefore || !room.members[token] ? response : withRoomMilestones(response, ["joined"]);
+				const response = json({ room: publicState });
+				if (outboxProducer) return withRoomMilestoneOutboxOwnership(response);
+				return joined ? withRoomMilestones(response, ["joined"]) : response;
 			}
 
 			if (request.method === "POST" && url.pathname === "/action") {
@@ -155,10 +185,10 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 				if (!room) return json({ error: "Room not found." }, 404);
 				const priorPhase = room.phase;
 				const priorCompletedTurns = room.completedTurns.length;
-				applyAction(room, token, action, Date.now(), this.onlineTokens());
-				this.save(room);
-				this.broadcast(room);
-				const milestones: Array<"game-started" | "turn-completed" | "game-finished" | "reset"> = [];
+				const now = Date.now();
+				const onlineTokens = this.onlineTokens();
+				applyAction(room, token, action, now, onlineTokens);
+				const milestones: DeliverableRoomMilestone[] = [];
 				if (action.type === "start-game" && priorPhase !== "playing" && room.phase === "playing") {
 					milestones.push("game-started");
 				}
@@ -169,10 +199,16 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 				if (action.type === "reset" && priorPhase !== "setup" && room.phase === "setup") {
 					milestones.push("reset");
 				}
-				return withRoomMilestones(
-					json({ room: publicRoomState(room, token, this.onlineTokens()) }),
-					milestones,
-				);
+				const publicState = publicRoomState(room, token, onlineTokens, now);
+				const outboxProducer = this.outboxProducerEnabled();
+				if (outboxProducer && milestones.length) {
+					await this.saveWithRoomMilestones(room, publicState, milestones, now);
+				} else this.save(room);
+				this.broadcast(room);
+				const response = json({ room: publicState });
+				return outboxProducer
+					? withRoomMilestoneOutboxOwnership(response)
+					: withRoomMilestones(response, milestones);
 			}
 
 			const room = this.load();
@@ -468,10 +504,7 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 	}
 
 	private save(room: RoomState): void {
-		this.ctx.storage.sql.exec(
-			"INSERT INTO room_state (id, json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json",
-			JSON.stringify(room),
-		);
+		this.writeRoomState(room);
 		this.ctx.waitUntil(
 			this.reconcileRoomAlarm(room, this.ctx.storage)
 				.catch((error: unknown) => {
@@ -483,9 +516,62 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 		);
 	}
 
+	private writeRoomState(room: RoomState): void {
+		this.ctx.storage.sql.exec(
+			"INSERT INTO room_state (id, json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json",
+			JSON.stringify(room),
+		);
+	}
+
+	private outboxProducerEnabled(): boolean {
+		return roomMilestoneOutboxProducerEnabled(this.env.ROOM_MILESTONE_DELIVERY_MODE);
+	}
+
+	private async saveWithRoomMilestones(
+		room: RoomState,
+		publicState: unknown,
+		milestones: readonly DeliverableRoomMilestone[],
+		now: number,
+	): Promise<void> {
+		const entropy = createRoomMilestoneEntropy(milestones.length);
+		let enqueueResult: RoomMilestoneEnqueueResult | undefined;
+		await this.ctx.storage.transaction(async (transaction) => {
+			const randomBytes = replayRoomMilestoneEntropy(entropy);
+			initializeRoomMilestoneOutbox(this.ctx.storage.sql, randomBytes);
+			this.writeRoomState(room);
+			let facts: PublicRoomFactDraft[];
+			try {
+				const observedAt = new Date(now);
+				facts = milestones.map((milestone) =>
+					mapPublicRoomStateToFact(publicState, milestone, observedAt)
+				);
+			} catch (error) {
+				if (!isRoomMilestoneCanonicalizationError(error)) throw error;
+				enqueueResult = recordRoomMilestoneDrop(
+					this.ctx.storage.sql,
+					"canonicalization",
+					milestones.length,
+					now,
+				);
+				await this.reconcileRoomAlarm(room, transaction, now);
+				return;
+			}
+			enqueueResult = enqueueRoomMilestones(this.ctx.storage.sql, facts, now, randomBytes);
+			await this.reconcileRoomAlarm(room, transaction, now);
+		});
+		if (!enqueueResult) throw new Error("Room milestone transaction produced no outcome.");
+		if (enqueueResult.outcome === "dropped") {
+			logWorkerEvent("warn", "room_milestone_outbox_dropped", {
+				reason: enqueueResult.reason,
+				droppedCount: enqueueResult.droppedCount,
+			});
+		}
+	}
+
 	private async reconcileRoomAlarm(
 		room: RoomState,
 		alarms: Pick<DurableObjectStorage, "setAlarm"> | Pick<DurableObjectTransaction, "setAlarm">,
+		floorNow = Date.now(),
 	): Promise<void> {
 		const outboxAt = this.hasRoomMilestoneOutbox()
 			? readNextRoomMilestoneAlarmAt(this.ctx.storage.sql)
@@ -495,7 +581,7 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 		// A FIFO follower can already be due when its predecessor is ACKed. Give
 		// the platform an explicit future timestamp so replacing the currently
 		// running alarm cannot be mistaken for leaving it unscheduled.
-		await alarms.setAlarm(Math.max(Date.now() + ROOM_MILESTONE_ALARM_MIN_DELAY_MS, requestedAt));
+		await alarms.setAlarm(Math.max(floorNow + ROOM_MILESTONE_ALARM_MIN_DELAY_MS, requestedAt));
 	}
 
 	private onlineTokens(except?: WebSocket): Set<string> {
@@ -576,6 +662,35 @@ function refreshHTTPHostPresence(
 	room.version += 1;
 	room.updatedAt = now;
 	return true;
+}
+
+/**
+ * Durable Object storage transactions may replay their closure. Generate the
+ * security-sensitive IDs once before entering it, then reset a cursor for each
+ * closure attempt so a logical mutation always keeps the same lifecycle/event
+ * identities.
+ */
+function createRoomMilestoneEntropy(eventCount: number): readonly Uint8Array[] {
+	if (!Number.isSafeInteger(eventCount) || eventCount < 1 || eventCount > 2) {
+		throw new Error("Room milestone event count is outside the producer bound.");
+	}
+	return Array.from({ length: eventCount + 1 }, () =>
+		crypto.getRandomValues(new Uint8Array(32))
+	);
+}
+
+function replayRoomMilestoneEntropy(
+	entropy: readonly Uint8Array[],
+): RoomMilestoneRandomBytes {
+	let cursor = 0;
+	return (target) => {
+		const source = entropy[cursor];
+		cursor += 1;
+		if (!source || source.byteLength !== target.byteLength) {
+			throw new Error("Room milestone entropy plan was exhausted.");
+		}
+		target.set(source);
+	};
 }
 
 export default {
@@ -889,6 +1004,11 @@ function withRoomMilestones(response: Response, milestones: string[]): Response 
 	return response;
 }
 
+function withRoomMilestoneOutboxOwnership(response: Response): Response {
+	response.headers.set(ROOM_MILESTONES_HEADER, ROOM_MILESTONE_OUTBOX_V1_SENTINEL);
+	return response;
+}
+
 function withoutRoomMilestones(response: Response): Response {
 	if (!response.headers.has(ROOM_MILESTONES_HEADER)) return response;
 	const headers = new Headers(response.headers);
@@ -897,8 +1017,13 @@ function withoutRoomMilestones(response: Response): Response {
 }
 
 function scheduleRoomMilestones(ctx: ExecutionContext, env: WorkerEnv, response: Response): void {
-	const milestones = response.headers
-		.get(ROOM_MILESTONES_HEADER)
+	// Cloudflare can briefly route a new outer Worker to an older Durable Object
+	// version. The exact room claims ownership with a sentinel that Release A
+	// already parses as an empty list and strips. Real legacy milestones remain a
+	// safe compatibility fallback when an old/best-effort room handled the action.
+	const encodedMilestones = response.headers.get(ROOM_MILESTONES_HEADER);
+	if (encodedMilestones === ROOM_MILESTONE_OUTBOX_V1_SENTINEL) return;
+	const milestones = encodedMilestones
 		?.split(",")
 		.map((value) => value.trim())
 		.filter(Boolean) ?? [];

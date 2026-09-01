@@ -9,6 +9,7 @@ import {
 	normalizeRoomMilestoneDeliveryV1,
 	type NormalizedRoomMilestonePayloadV1,
 } from "./room-milestone-contract";
+import { isSecureRoomFactHashKey } from "./room-milestone-delivery-mode";
 
 const LOWERCASE_HEX_256_PATTERN = /^[0-9a-f]{64}$/u;
 const RECEIPT_INSERT_SQL = `
@@ -143,7 +144,7 @@ interface ReceiptRow {
 
 /**
  * Apply one trusted, canonical room event to D1. This is intentionally a strict
- * primitive: D1 and cryptographic failures propagate to the future outbox,
+ * primitive: D1 and cryptographic failures propagate to the private outbox,
  * while only Analytics Engine remains best-effort after a committed first
  * application.
  */
@@ -298,12 +299,6 @@ function classifyReceiptResults(
 	if (inserted === 1 && applied === 1 && row.applied_at !== null) return { outcome: "applied" };
 	if (inserted === 0 && applied === 0 && row.applied_at !== null) return { outcome: "duplicate" };
 	return { outcome: "invariant" };
-}
-
-function isSecureRoomFactHashKey(value: string | undefined): value is string {
-	if (typeof value !== "string") return false;
-	const size = new TextEncoder().encode(value).byteLength;
-	return size >= 32 && size <= 1_024;
 }
 
 async function hashRoomInstanceId(roomInstanceId: string, hashKey: string): Promise<string> {

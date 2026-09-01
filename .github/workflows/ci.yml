@@ -41,11 +41,14 @@ jobs:
       - run: npm run test:admin
       - run: npm run test:production-monitor
       - run: npm run test:deployment-contract
+      - run: npm run test:worker-runtime-runner
       - run: npm run test:smoke-support
+      - run: npm run test:staging-outbox-smoke
       - run: npm run check:cloudflare-types
       - run: npm run typecheck:cloudflare
       - run: npm run test:cloudflare
       - run: npm run test:cloudflare-runtime
+      - run: npm run test:cloudflare-runtime-outbox
       - run: npm run check:cloudflare
       - run: npm run check:cloudflare-staging
       - run: npm run check:cloudflare-startup

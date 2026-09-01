@@ -506,13 +506,15 @@ test("platform status preserves the schema-5 capability shape for compatible mar
 	}
 });
 
-test("the rollback bridge never claims durable production from configuration alone", async () => {
-	for (const mode of ["outbox", undefined, "", "best-effort", "unknown", "OUTBOX", " outbox "] as const) {
+test("non-exact delivery modes preserve best-effort status", async () => {
+	for (const mode of [undefined, "", "best-effort", "unknown", "OUTBOX", " outbox "] as const) {
 		const handled = await handlePlatformRoute(
 			new Request("https://nonstoptalk.test/api/v1/platform/status"),
 			{
 				PLATFORM_DB: new FakeStatusD1(6) as unknown as D1Database,
 				ROOM_MILESTONE_DELIVERY_MODE: mode,
+				ANALYTICS_ADMIN_TOKEN: "1".repeat(64),
+				ROOM_FACT_HASH_KEY: "2".repeat(64),
 			},
 			"3".repeat(64),
 			`delivery-mode-${mode ?? "missing"}`,
@@ -525,6 +527,59 @@ test("the rollback bridge never claims durable production from configuration alo
 			capabilities: { aggregateAnalytics: { delivery: string } };
 		};
 		assert.equal(body.capabilities.aggregateAnalytics.delivery, "best-effort", mode);
+	}
+});
+
+test("platform status reports durable delivery only when every outbox readiness gate passes", async () => {
+	for (const scenario of [
+		{
+			name: "ready",
+			schemaVersion: 6,
+			roomFactHashKey: "2".repeat(64),
+			delivery: "durable-outbox",
+			status: "ok",
+			degradedCapabilities: [],
+		},
+		{
+			name: "schema-five",
+			schemaVersion: 5,
+			roomFactHashKey: "2".repeat(64),
+			delivery: "degraded-outbox",
+			status: "degraded",
+			degradedCapabilities: ["aggregateAnalyticsDelivery"],
+		},
+		{
+			name: "weak-fact-key",
+			schemaVersion: 6,
+			roomFactHashKey: "too-short",
+			delivery: "degraded-outbox",
+			status: "degraded",
+			degradedCapabilities: ["roomFacts", "aggregateAnalyticsDelivery"],
+		},
+	] as const) {
+		const handled = await handlePlatformRoute(
+			new Request("https://nonstoptalk.test/api/v1/platform/status"),
+			{
+				PLATFORM_DB: new FakeStatusD1(scenario.schemaVersion) as unknown as D1Database,
+				ROOM_MILESTONE_DELIVERY_MODE: "outbox",
+				ANALYTICS_ADMIN_TOKEN: "1".repeat(64),
+				ROOM_FACT_HASH_KEY: scenario.roomFactHashKey,
+			},
+			"3".repeat(64),
+			`delivery-readiness-${scenario.name}`,
+			noDeferredTasks,
+		);
+
+		assert(handled);
+		assert.equal(handled.response.status, 200);
+		const body = await handled.response.json() as {
+			status: string;
+			degradedCapabilities: string[];
+			capabilities: { aggregateAnalytics: { delivery: string } };
+		};
+		assert.equal(body.status, scenario.status);
+		assert.equal(body.capabilities.aggregateAnalytics.delivery, scenario.delivery);
+		assert.deepEqual(body.degradedCapabilities, scenario.degradedCapabilities);
 	}
 });
 
