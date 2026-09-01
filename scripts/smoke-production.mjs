@@ -61,6 +61,37 @@ for (const pathname of ["/", "/practice", "/progress"]) {
     `${pathname} must permit only same-origin scripts and the configured Cloudflare Web Analytics beacon origin`);
 }
 
+const adminDocumentResponse = await get("/admin/analytics", "text/html");
+assert(adminDocumentResponse.headers.get("content-type")?.startsWith("text/html"),
+  "/admin/analytics did not return HTML");
+const adminDocument = await adminDocumentResponse.text();
+assert(adminDocument.includes("<title>Operator analytics · NonStopTalk</title>"),
+  "/admin/analytics did not return its dedicated document");
+assert(adminDocument.includes("/admin-analytics-page.js") && !adminDocument.includes('src="/app.js"'),
+  "/admin/analytics is not isolated from the public SPA");
+assert(!adminDocument.includes("static.cloudflareinsights.com"),
+  "/admin/analytics contains an injected Web Analytics beacon");
+assert(adminDocumentResponse.headers.get("cache-control") === "public, max-age=0, must-revalidate, no-transform",
+  "/admin/analytics must disable edge payload transforms");
+const adminCsp = adminDocumentResponse.headers.get("content-security-policy") || "";
+for (const directive of [
+  "default-src 'none'", "script-src 'self'", "script-src-attr 'none'", "style-src 'self'",
+  "style-src-attr 'none'", "connect-src 'self'", "form-action 'none'", "frame-ancestors 'none'", "worker-src 'none'",
+]) {
+  assert(adminCsp.includes(directive), `/admin/analytics CSP is missing ${directive}`);
+}
+assert(!adminCsp.includes("static.cloudflareinsights.com"),
+  "/admin/analytics CSP permits Web Analytics");
+assert(adminDocumentResponse.headers.get("referrer-policy") === "no-referrer",
+  "/admin/analytics must not send referrers");
+assert(adminDocumentResponse.headers.get("x-robots-tag") === "noindex, nofollow, noarchive",
+  "/admin/analytics must be excluded from indexing");
+const directAdminAsset = await get("/admin/analytics/index.html", "text/html");
+assert(directAdminAsset.headers.get("content-security-policy") === adminCsp,
+  "the direct admin asset path bypasses the isolated document policy");
+assert(!(await directAdminAsset.text()).includes("static.cloudflareinsights.com"),
+  "the direct admin asset path contains an injected Web Analytics beacon");
+
 const statusResponse = await get("/api/v1/platform/status", "application/json");
 const status = await statusResponse.json();
 assert(status.status === "ok", `platform status is ${String(status.status || "unavailable")}`);
@@ -79,5 +110,5 @@ console.log(JSON.stringify({
   origin: origin.origin,
   apiVersion: status.apiVersion,
   schemaVersion: status.schemaVersion,
-  checkedRoutes: ["/", "/practice", "/progress", "/api/v1/platform/status"],
+  checkedRoutes: ["/", "/practice", "/progress", "/admin/analytics", "/api/v1/platform/status"],
 }));

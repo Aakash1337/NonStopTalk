@@ -3,6 +3,165 @@ import test from "node:test";
 
 import { handlePlatformRoute } from "./platform-routes.ts";
 
+const noDeferredTasks = (task: Promise<void>): void => {
+	void task.catch(() => undefined);
+};
+
+interface Deferred<Value> {
+	promise: Promise<Value>;
+	resolve(value: Value | PromiseLike<Value>): void;
+}
+
+function deferred<Value>(): Deferred<Value> {
+	let resolve!: (value: Value | PromiseLike<Value>) => void;
+	const promise = new Promise<Value>((complete) => {
+		resolve = complete;
+	});
+	return { promise, resolve };
+}
+
+function coachingSummary(): Record<string, unknown> {
+	return {
+		analysisSchemaVersion: 2,
+		id: "attempt-2026-09-01-1",
+		createdAt: "2026-09-01T10:15:16.000Z",
+		scenario: "interview",
+		goal: "pauses",
+		targetDurationMs: 45_000,
+		metrics: {
+			durationMs: 44_500,
+			voicedMs: 31_000,
+			speakingRatio: 0.6966,
+			pauseCount: 4,
+			observedDurationMs: 44_000,
+			unknownMs: 500,
+			coverageRatio: 0.9888,
+			maxSampleGapMs: 500,
+			medianPauseMs: 740,
+			longestPauseMs: 1_300,
+			longestSpeakingRunMs: 12_500,
+			levelConsistencyPct: 82.5,
+			clippingPct: 0.25,
+			audioConfidence: "high",
+			transcriptMetrics: null,
+		},
+		advice: {
+			strength: "Usable pause length",
+			strengthEvidence: "Four measured pauses separated ideas.",
+			focus: "Leave more room between phrases",
+			focusEvidence: "The longest speaking run was 12.5 seconds.",
+			drill: "Retry with one change.",
+			drillDetail: "Take one breath between complete ideas.",
+		},
+	};
+}
+
+function progressRequest(method: "POST" | "DELETE"): Request {
+	return new Request("https://nonstoptalk.test/api/v1/progress/sessions", {
+		method,
+		headers: {
+			Origin: "https://nonstoptalk.test",
+			...(method === "POST" ? { "Content-Type": "application/json" } : {}),
+		},
+		...(method === "POST" ? { body: JSON.stringify({ session: coachingSummary() }) } : {}),
+	});
+}
+
+function fakeResult(changes = 0): D1Result<unknown> {
+	return {
+		success: true,
+		results: [],
+		meta: { changes },
+	} as unknown as D1Result<unknown>;
+}
+
+interface FakeProgressOptions {
+	created?: boolean;
+	consentChanged?: boolean;
+	deletedCount?: number;
+	consentRevoked?: boolean;
+	failAnalytics?: boolean;
+}
+
+class FakeProgressD1 {
+	readonly analyticsStarted = deferred<void>();
+	readonly analyticsRelease = deferred<void>();
+	readonly analyticsBindings: unknown[][] = [];
+	readonly options: FakeProgressOptions;
+
+	constructor(options: FakeProgressOptions) {
+		this.options = options;
+	}
+
+	prepare(query: string): D1PreparedStatement {
+		return new FakeProgressStatement(this, query) as unknown as D1PreparedStatement;
+	}
+
+	async batch(statements: D1PreparedStatement[]): Promise<D1Result<unknown>[]> {
+		return statements.map((statement) => {
+			const query = (statement as unknown as FakeProgressStatement).query;
+			if (/INSERT OR IGNORE INTO consent_records/u.test(query)) {
+				return fakeResult(this.options.consentChanged ? 1 : 0);
+			}
+			if (/UPDATE consent_records/u.test(query)) {
+				return fakeResult(this.options.consentChanged || this.options.consentRevoked ? 1 : 0);
+			}
+			if (/INSERT INTO coaching_sessions/u.test(query)) {
+				return fakeResult(this.options.created ? 1 : 0);
+			}
+			if (/DELETE FROM coaching_sessions/u.test(query)) {
+				return fakeResult(this.options.deletedCount ?? 0);
+			}
+			return fakeResult();
+		});
+	}
+}
+
+class FakeProgressStatement {
+	readonly database: FakeProgressD1;
+	readonly query: string;
+
+	constructor(database: FakeProgressD1, query: string) {
+		this.database = database;
+		this.query = query;
+	}
+
+	bind(...values: unknown[]): FakeProgressStatement {
+		if (/INSERT INTO analytics_daily/u.test(this.query)) {
+			this.database.analyticsBindings.push(values);
+		}
+		return this;
+	}
+
+	async run<T>(): Promise<D1Result<T>> {
+		if (/INSERT INTO analytics_daily/u.test(this.query)) {
+			this.database.analyticsStarted.resolve();
+			if (this.database.options.failAnalytics) throw new Error("analytics D1 unavailable");
+			await this.database.analyticsRelease.promise;
+		}
+		return fakeResult(1) as D1Result<T>;
+	}
+
+	async first<T>(): Promise<T | null> {
+		if (/SELECT 1 AS found FROM devices/u.test(this.query)) return { found: 1 } as T;
+		if (/FROM coaching_sessions/u.test(this.query)) {
+			return { summary_json: JSON.stringify(coachingSummary()) } as T;
+		}
+		if (/SELECT \* FROM analytics_daily/u.test(this.query)) {
+			return {
+				day: "2026-09-01",
+				metric: "coaching_summary_saved",
+				event_count: 1,
+				value_sum: 44_500,
+				value_min: 44_500,
+				value_max: 44_500,
+				updated_at: "2026-09-01T10:15:16.000Z",
+			} as T;
+		}
+		throw new Error(`Unexpected first query: ${this.query}`);
+	}
+}
+
 interface ModelUsageTestRow {
 	day: string;
 	scope: "global" | "provider";
@@ -117,6 +276,7 @@ test("platform status requires and reports the schema-v4 identity foundation", a
 		},
 		"3".repeat(64),
 		"status-schema-4",
+		noDeferredTasks,
 	);
 
 	assert(handled);
@@ -133,6 +293,7 @@ test("platform status rejects schema markers outside the reviewed compatibility 
 			{ PLATFORM_DB: new FakeStatusD1(schemaVersion) as unknown as D1Database },
 			"4".repeat(64),
 			`unsupported-schema-${schemaVersion}`,
+			noDeferredTasks,
 		);
 
 		assert(handled);
@@ -141,6 +302,149 @@ test("platform status rejects schema markers outside the reviewed compatibility 
 		const body = await handled.response.json() as { error: { code: string } };
 		assert.equal(body.error.code, "DATABASE_UNAVAILABLE");
 	}
+});
+
+test("admin analytics configuration requires a numeric high-entropy token", async () => {
+	const weakToken = "letters-are-not-the-reviewed-secret-format";
+	const database = new FakeStatusD1(4) as unknown as D1Database;
+	const status = await handlePlatformRoute(
+		new Request("https://nonstoptalk.test/api/v1/platform/status"),
+		{
+			PLATFORM_DB: database,
+			ANALYTICS_ADMIN_TOKEN: weakToken,
+			ROOM_FACT_HASH_KEY: "2".repeat(64),
+		},
+		"4".repeat(64),
+		"status-nonnumeric-admin-token",
+		noDeferredTasks,
+	);
+	assert(status);
+	const statusBody = await status.response.json() as { degradedCapabilities: string[] };
+	assert.deepEqual(statusBody.degradedCapabilities, ["adminAnalytics"]);
+
+	const readout = await handlePlatformRoute(
+		new Request("https://nonstoptalk.test/api/v1/admin/model-usage", {
+			headers: { Authorization: `Bearer ${weakToken}` },
+		}),
+		{ PLATFORM_DB: database, ANALYTICS_ADMIN_TOKEN: weakToken },
+		"4".repeat(64),
+		"readout-nonnumeric-admin-token",
+		noDeferredTasks,
+	);
+	assert(readout);
+	assert.equal(readout.response.status, 503);
+});
+
+test("progress mutations return 201/200 before a pending analytics rollup settles", async (t) => {
+	const cases: Array<{
+		name: string;
+		method: "POST" | "DELETE";
+		expectedStatus: number;
+		options: FakeProgressOptions;
+		expectedAnalyticsWrites: number;
+	}> = [
+		{
+			name: "new save",
+			method: "POST",
+			expectedStatus: 201,
+			options: { created: true },
+			expectedAnalyticsWrites: 1,
+		},
+		{
+			name: "idempotent save with a consent transition",
+			method: "POST",
+			expectedStatus: 200,
+			options: { consentChanged: true },
+			expectedAnalyticsWrites: 1,
+		},
+		{
+			name: "clear saved progress",
+			method: "DELETE",
+			expectedStatus: 200,
+			options: { deletedCount: 2, consentRevoked: true },
+			expectedAnalyticsWrites: 2,
+		},
+	];
+
+	for (const scenario of cases) {
+		await t.test(scenario.name, async () => {
+			const database = new FakeProgressD1(scenario.options);
+			const deferredTasks: Promise<void>[] = [];
+			let analyticsEngineWrites = 0;
+			const routePromise = handlePlatformRoute(
+				progressRequest(scenario.method),
+				{
+					PLATFORM_DB: database as unknown as D1Database,
+					PRODUCT_ANALYTICS: {
+						writeDataPoint: () => {
+							analyticsEngineWrites += 1;
+						},
+					} as unknown as AnalyticsEngineDataset,
+				},
+				"5".repeat(64),
+				`progress-${scenario.name}`,
+				(task) => deferredTasks.push(task),
+			);
+
+			await database.analyticsStarted.promise;
+			const firstOutcome = await Promise.race([
+				routePromise.then((handled) => ({ kind: "response" as const, handled })),
+				new Promise<{ kind: "blocked" }>((resolve) => {
+					setImmediate(() => resolve({ kind: "blocked" }));
+				}),
+			]);
+			database.analyticsRelease.resolve();
+
+			assert.equal(firstOutcome.kind, "response", "the analytics promise held the API response open");
+			if (firstOutcome.kind !== "response") {
+				await routePromise;
+				return;
+			}
+			assert(firstOutcome.handled);
+			assert.equal(firstOutcome.handled.response.status, scenario.expectedStatus);
+			assert.equal(deferredTasks.length, 1);
+			await Promise.all(deferredTasks);
+			assert.equal(analyticsEngineWrites, scenario.expectedAnalyticsWrites);
+			assert.equal(database.analyticsBindings.length, scenario.expectedAnalyticsWrites);
+			assert.equal(
+				new Set(database.analyticsBindings.map((bindings) => bindings[6])).size,
+				1,
+				"one progress mutation split its analytics events across observation times",
+			);
+		});
+	}
+});
+
+test("deferred analytics failures remain non-fatal and produce bounded warning events", async (t) => {
+	const warnings: unknown[] = [];
+	t.mock.method(console, "warn", (value: unknown) => {
+		warnings.push(value);
+	});
+	const database = new FakeProgressD1({ created: true, failAnalytics: true });
+	const deferredTasks: Promise<void>[] = [];
+	const handled = await handlePlatformRoute(
+		progressRequest("POST"),
+		{
+			PLATFORM_DB: database as unknown as D1Database,
+			PRODUCT_ANALYTICS: {
+				writeDataPoint: () => {
+					throw new Error("Analytics Engine unavailable");
+				},
+			} as unknown as AnalyticsEngineDataset,
+		},
+		"6".repeat(64),
+		"progress-analytics-failures",
+		(task) => deferredTasks.push(task),
+	);
+
+	assert(handled);
+	assert.equal(handled.response.status, 201);
+	assert.equal(deferredTasks.length, 1);
+	await Promise.all(deferredTasks);
+	assert.deepEqual(
+		warnings.map((warning) => (warning as { event?: unknown }).event),
+		["product_analytics_rollup_failed", "analytics_engine_write_failed"],
+	);
 });
 
 test("admin model usage reports complete global token totals without double-counting provider rows", async () => {
@@ -172,7 +476,7 @@ test("admin model usage reports complete global token totals without double-coun
 			reasoningTokens: 999,
 		}),
 	]);
-	const adminToken = "admin-test-token-long-enough-123456";
+	const adminToken = "7".repeat(64);
 	const handled = await handlePlatformRoute(
 		new Request("https://nonstoptalk.test/api/v1/admin/model-usage?days=2", {
 			headers: { Authorization: `Bearer ${adminToken}` },
@@ -183,6 +487,7 @@ test("admin model usage reports complete global token totals without double-coun
 		},
 		"private-browser-token-must-not-appear",
 		"model-usage-request",
+		noDeferredTasks,
 	);
 
 	assert(handled);

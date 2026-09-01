@@ -17,6 +17,7 @@
     "db:migrate:staging": "wrangler d1 migrations apply PLATFORM_DB --remote --env staging",
     "test:coach": "node --test cloudflare/public/coach-engine.test.js cloudflare/public/coach-loop.test.js",
     "test:cloud-progress": "node --test cloudflare/public/cloud-progress.test.js",
+    "test:admin": "node --test cloudflare/public/admin-analytics.test.js",
     "test:cloudflare": "tsx --test cloudflare/*.test.ts",
     "test:cloudflare-runtime": "tsc -p cloudflare/runtime-tests/tsconfig.json && vitest run --config vitest.worker.config.ts",
     "types:cloudflare": "wrangler types cloudflare/worker-configuration.d.ts --include-runtime false",
@@ -26,6 +27,7 @@
     "dev": "wrangler dev",
     "smoke": "node scripts/smoke-local.mjs",
     "smoke:coach": "node scripts/smoke-coach.mjs",
+    "smoke:admin": "node scripts/smoke-admin.mjs",
     "smoke:platform": "node scripts/smoke-platform.mjs",
     "smoke:production": "node scripts/smoke-production.mjs",
     "smoke:staging": "node scripts/smoke-production.mjs https://nonstoptalk-staging.aakashplays656.workers.dev && node scripts/smoke-staging.mjs https://nonstoptalk-staging.aakashplays656.workers.dev"

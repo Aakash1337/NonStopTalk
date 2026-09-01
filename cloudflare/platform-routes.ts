@@ -54,6 +54,7 @@ export async function handlePlatformRoute(
 	env: PlatformBindings,
 	browserToken: string,
 	requestId: string,
+	defer: (task: Promise<void>) => void,
 ): Promise<PlatformRouteResult | null> {
 	const url = new URL(request.url);
 	if (!url.pathname.startsWith("/api/v1/")) return null;
@@ -122,15 +123,17 @@ export async function handlePlatformRoute(
 					body.session,
 					CLOUD_SUMMARY_POLICY_VERSION,
 				);
+				const analyticsEvents: AnalyticsEventInput[] = [];
 				if (saved.consentGranted) {
-					await recordProductEvent(env, { type: "cloud_consent_granted" });
+					analyticsEvents.push({ type: "cloud_consent_granted" });
 				}
 				if (saved.created) {
-					await recordProductEvent(
-						env,
-						{ type: "coaching_summary_saved", durationMs: saved.summary.metrics.durationMs },
-					);
+					analyticsEvents.push({
+						type: "coaching_summary_saved",
+						durationMs: saved.summary.metrics.durationMs,
+					});
 				}
+				deferProductEvents(defer, env, analyticsEvents);
 				return result(
 					platformJson({ created: saved.created, session: saved.summary, requestId }, saved.created ? 201 : 200, requestId),
 					true,
@@ -139,15 +142,17 @@ export async function handlePlatformRoute(
 			if (request.method === "DELETE") {
 				requireExactMutationOrigin(request);
 				const deleted = await store.clearCoachingSummaries(browserToken);
+				const analyticsEvents: AnalyticsEventInput[] = [];
 				if (deleted.deletedCount > 0) {
-					await recordProductEvent(env, {
+					analyticsEvents.push({
 						type: "coaching_summary_deleted",
 						deletedCount: deleted.deletedCount,
 					});
 				}
 				if (deleted.consentRevoked) {
-					await recordProductEvent(env, { type: "cloud_consent_revoked" });
+					analyticsEvents.push({ type: "cloud_consent_revoked" });
 				}
+				deferProductEvents(defer, env, analyticsEvents);
 				return result(platformJson({ ...deleted, requestId }, 200, requestId), true);
 			}
 			return result(methodNotAllowed(requestId, "GET, POST, DELETE"), true);
@@ -396,6 +401,18 @@ export async function recordProductEvent(
 	}
 }
 
+function deferProductEvents(
+	defer: (task: Promise<void>) => void,
+	env: PlatformBindings,
+	events: readonly AnalyticsEventInput[],
+): void {
+	if (events.length === 0) return;
+	const occurredAt = new Date();
+	defer((async () => {
+		for (const event of events) await recordProductEvent(env, event, occurredAt);
+	})());
+}
+
 export async function runPlatformCleanup(env: PlatformBindings, now = new Date()): Promise<void> {
 	const deleted = { coachingSessions: 0, consentRecords: 0, devices: 0, syncProfiles: 0, roomFacts: 0 };
 	let hasMore = false;
@@ -559,7 +576,7 @@ async function requireAdmin(request: Request, expectedToken: string | undefined)
 function isSecureAdminToken(value: string | undefined): value is string {
 	if (typeof value !== "string") return false;
 	const bytes = new TextEncoder().encode(value).byteLength;
-	return bytes >= 24 && bytes <= 1_024;
+	return bytes >= 24 && bytes <= 1_024 && /^\d+$/u.test(value);
 }
 
 function isSecureRoomFactKey(value: string | undefined): value is string {

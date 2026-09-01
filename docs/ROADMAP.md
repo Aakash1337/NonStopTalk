@@ -75,6 +75,7 @@ The first incremental platform slice is being built without replacing the playab
 - Anonymous browser ownership stored as a token digest, with one UTC-day-bucketed device lease lasting at least 30 and less than 31 days after cloud use, a new-save guard once 250 summaries exist, preservation of valid unexpired legacy rows, and bounded cleanup that can continue a backlog on later cron runs
 - A schema-v4 identity expansion with opaque `sync_profiles` and `sync_profile_devices`: one internal profile per browser for now, no exposed profile credential, and no change to device-owned sessions, API behavior, consent, or retention
 - Coarse privacy-safe product events attempted best-effort in both D1 daily rollups and Analytics Engine; D1 supplies protected aggregate product-analytics and model-usage operational readouts, not audit or billing truth
+- A protected, dependency-free `/admin/analytics` operator document that validates and reconciles those daily aggregates, derives 1/7/30/90-day views locally, keeps its numeric bearer token out of storage/URLs/output, and blocks public-site browser telemetry on the token-bearing page
 - Server-authoritative room milestones plus coarse summary-save/delete/consent timing/count values; no page-view, presence-tick, per-person, speaking-ratio, transcript-pattern, or advice telemetry
 - A modular Cloudflare theme-to-topics boundary: deterministic/offline by default; direct Z.AI GLM-4.7-Flash as the strict-free routine option; Workers AI GLM-5.3-Flash as the preferred cheap Workers Paid routine option; and independently enabled Gemma 4 31B only for explicit host escalation
 - Per-generation host consent; a normalized theme capped at 200 characters as the only host or room content sent externally; aggregate D1 daily usage budgeting (100 calls by default); and deterministic fallback without provider retry or Queue delivery
@@ -126,13 +127,14 @@ Implemented work includes:
 - D1 migrations, platform API/repository tests, compact-summary client tests, configured/degraded capability status, and bounded scheduled anonymous-data cleanup
 - Expand-only schema-v4 sync-profile tables and one-device/one-profile backfill while device-owned session queries remain the rollback-safe authority
 - Host-authorized Cloudflare topic generation with separate provider adapters, per-attempt consent, aggregate daily cost controls, and deterministic failure fallback
+- A separate-document operator analytics dashboard with strict CSP/no-transform isolation, source-quality tests, and narrow/mobile browser smoke coverage
+- Separate production/staging databases, analytics datasets, rate limits, secrets, cron schedules, deployment probes, migration checks, and production incident/recovery guidance
 
 Remaining hardening:
 
 - Game-feature parity between the Go and Cloudflare editions
 - Stronger automated cross-edition rule-parity checks
 - Broader browser/device testing
-- Observability and production operations guidance
 - Formal security and accessibility reviews
 
 ## 8. Explicit product backlog

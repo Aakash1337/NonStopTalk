@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const wrangler = path.join(root, "node_modules", "wrangler", "bin", "wrangler.js");
-const adminToken = "local-platform-smoke-token-32-chars";
+const adminToken = "6".repeat(64);
 const roomFactHashKey = "local-room-fact-hmac-key-32-characters-minimum";
 const offlineModelWranglerArgs = [
   "--var", "TOPIC_ROUTINE_PROVIDER:offline",
@@ -696,6 +696,69 @@ try {
     "Platform status should disclose that Gemma escalation is unavailable by default");
   assert(status.payload.capabilities?.aggregateAnalytics?.delivery === "best-effort", "Platform status must not overstate analytics delivery");
 
+  const concurrentToken = "c".repeat(64);
+  const concurrentDeviceKey = createHash("sha256").update(concurrentToken).digest("hex");
+  const saveConcurrentSummary = (id) => fetch(`${origin}/api/v1/progress/sessions`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Cookie: `nonstoptalk_token=${concurrentToken}`,
+      Origin: origin,
+    },
+    body: JSON.stringify({ session: completeSummary(id) }),
+  });
+  const concurrentResponses = await Promise.all([
+    saveConcurrentSummary("concurrent-first-touch-a"),
+    saveConcurrentSummary("concurrent-first-touch-b"),
+  ]);
+  const concurrentPayloads = await Promise.all(concurrentResponses.map((response) => response.json()));
+  assert(concurrentResponses.every((response) => response.status === 201),
+    `Concurrent first-touch saves must both succeed: ${concurrentResponses.map((response) => response.status).join(", ")} ${JSON.stringify(concurrentPayloads)}`);
+  assert(concurrentPayloads.every((payload) => payload.created === true),
+    "Concurrent first-touch saves must create two distinct summaries");
+
+  let concurrentAnalytics;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    concurrentAnalytics = await request("/api/v1/admin/analytics?days=1", {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    if (concurrentAnalytics.payload.totals?.coaching_summary_saved?.events === 2) break;
+    await delay(100);
+  }
+  assert(concurrentAnalytics?.payload.totals?.coaching_summary_saved?.events === 2,
+    "Both concurrent saves must reach the best-effort D1 aggregate before the race fixture is inspected");
+
+  const concurrentIdentityCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+      "--command", `SELECT
+        (SELECT COUNT(*) FROM devices WHERE device_key = '${concurrentDeviceKey}') AS devices,
+        (SELECT COUNT(*) FROM sync_profile_devices WHERE device_key = '${concurrentDeviceKey}') AS memberships,
+        (SELECT COUNT(DISTINCT profile_id) FROM sync_profile_devices
+          WHERE device_key = '${concurrentDeviceKey}') AS profiles,
+        (SELECT COUNT(*) FROM coaching_sessions
+          WHERE device_key = '${concurrentDeviceKey}') AS summaries,
+        (SELECT COUNT(*) FROM consent_records
+          WHERE device_key = '${concurrentDeviceKey}' AND purpose = 'cloud_summary' AND granted = 1) AS consents,
+        (SELECT COUNT(*) FROM pragma_foreign_key_check) AS foreignKeyViolations`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (concurrentIdentityCheck.status !== 0) {
+    throw new Error(`Could not verify concurrent profile provisioning.\n${concurrentIdentityCheck.stdout}\n${concurrentIdentityCheck.stderr}`);
+  }
+  const concurrentIdentity = JSON.parse(concurrentIdentityCheck.stdout)[0]?.results?.[0];
+  assert(concurrentIdentity?.devices === 1
+    && concurrentIdentity?.memberships === 1
+    && concurrentIdentity?.profiles === 1
+    && concurrentIdentity?.summaries === 2
+    && concurrentIdentity?.consents === 1
+    && concurrentIdentity?.foreignKeyViolations === 0,
+  `Concurrent first-touch provisioning must converge atomically: ${JSON.stringify(concurrentIdentity)}`);
+
   const quotaRetryResponse = await fetch(`${origin}/api/v1/progress/sessions`, {
     method: "POST",
     headers: {
@@ -894,12 +957,12 @@ try {
     analytics = await request("/api/v1/admin/analytics?days=1", {
       headers: { Authorization: `Bearer ${adminToken}` },
     });
-    if (analytics.payload.totals?.coaching_summary_saved?.events === 1 && analytics.payload.totals?.room_created?.events === 1) break;
+    if (analytics.payload.totals?.coaching_summary_saved?.events === 3 && analytics.payload.totals?.room_created?.events === 1) break;
     await delay(100);
   }
   assert(analytics.response.ok, `Admin analytics failed (${analytics.response.status})`);
-  assert(analytics.payload.totals.coaching_summary_saved.events === 1, "Summary sync aggregate was not recorded");
-  assert(analytics.payload.totals.cloud_consent_granted.events === 1, "Consent grant transition was not recorded once");
+  assert(analytics.payload.totals.coaching_summary_saved.events === 3, "Summary sync aggregates were not recorded");
+  assert(analytics.payload.totals.cloud_consent_granted.events === 2, "Consent grant transitions were not recorded once per device");
   assert(analytics.payload.totals.room_created.events === 1, "Room milestone aggregate was not recorded");
   assert(!JSON.stringify(analytics.payload).includes("Smoke host"), "Analytics response must not contain player names");
 
@@ -943,9 +1006,16 @@ try {
     && identityAfterDelete?.summaries === 0
     && identityAfterDelete?.revokedConsents === 1,
   `Deleting progress must retain the active anonymous identity foundation: ${JSON.stringify(identityAfterDelete)}`);
-  const finalAnalytics = await request("/api/v1/admin/analytics?days=1", {
-    headers: { Authorization: `Bearer ${adminToken}` },
-  });
+  let finalAnalytics;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    finalAnalytics = await request("/api/v1/admin/analytics?days=1", {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    if (finalAnalytics.payload.totals?.coaching_summary_deleted?.events === 1
+      && finalAnalytics.payload.totals?.cloud_consent_revoked?.events === 1) break;
+    await delay(100);
+  }
+  assert(finalAnalytics?.response.ok, `Final admin analytics failed (${finalAnalytics?.response.status ?? "no response"})`);
   assert(finalAnalytics.payload.totals.coaching_summary_deleted.events === 1, "Real delete operation was not recorded once");
   assert(finalAnalytics.payload.totals.coaching_summary_deleted.value === 1, "Deleted-summary aggregate has the wrong value");
   assert(finalAnalytics.payload.totals.cloud_consent_revoked.events === 1, "Consent revocation transition was not recorded once");
