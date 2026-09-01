@@ -12,6 +12,14 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function contentSecurityPolicySources(policy, directiveName) {
+  const directive = String(policy)
+    .split(";")
+    .map((item) => item.trim().split(/\s+/u))
+    .find(([name]) => name === directiveName);
+  return directive ? directive.slice(1) : [];
+}
+
 async function get(pathname, accept) {
   let lastError;
   for (let attempt = 1; attempt <= 5; attempt += 1) {
@@ -40,8 +48,17 @@ for (const pathname of ["/", "/practice", "/progress"]) {
   assert(response.headers.get("x-content-type-options") === "nosniff", `${pathname} is missing security headers`);
   assert(response.headers.get("strict-transport-security")?.includes("max-age=31536000"),
     `${pathname} is missing the production HSTS policy`);
-  assert(response.headers.get("content-security-policy")?.includes("default-src 'self'"),
+  const contentSecurityPolicy = response.headers.get("content-security-policy") || "";
+  assert(contentSecurityPolicy.includes("default-src 'self'"),
     `${pathname} is missing the Content Security Policy`);
+  const connectSources = contentSecurityPolicySources(contentSecurityPolicy, "connect-src");
+  assert(connectSources.length === 1 && connectSources[0] === "'self'",
+    `${pathname} must permit only same-origin browser connections`);
+  const scriptSources = contentSecurityPolicySources(contentSecurityPolicy, "script-src");
+  assert(scriptSources.length === 2
+    && scriptSources.includes("'self'")
+    && scriptSources.includes("https://static.cloudflareinsights.com"),
+    `${pathname} must permit only same-origin scripts and the configured Cloudflare Web Analytics beacon origin`);
 }
 
 const statusResponse = await get("/api/v1/platform/status", "application/json");
