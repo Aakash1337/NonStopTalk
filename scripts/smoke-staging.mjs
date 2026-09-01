@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 
 const origin = new URL(process.argv[2] || "https://nonstoptalk-staging.aakashplays656.workers.dev").origin;
 const hostname = new URL(origin).hostname;
 const STAGING_HOSTNAME = "nonstoptalk-staging.aakashplays656.workers.dev";
+const STATUS_ATTEMPTS = 5;
+const STATUS_RETRY_MS = 1_000;
 const SUPPORTED_PLATFORM_SCHEMA_VERSIONS = new Set([5, 6]);
 
 if (new URL(origin).protocol !== "https:"
@@ -34,6 +37,22 @@ async function request(pathname, options = {}) {
     // Status and response shape are asserted by each caller.
   }
   return { response, payload };
+}
+
+async function waitForHealthyStatus() {
+  let lastResult;
+  let lastError;
+  for (let attempt = 1; attempt <= STATUS_ATTEMPTS; attempt += 1) {
+    try {
+      lastResult = await request("/api/v1/platform/status");
+      if (lastResult.response.status === 200) return lastResult;
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < STATUS_ATTEMPTS) await delay(STATUS_RETRY_MS);
+  }
+  if (lastResult) return lastResult;
+  throw lastError instanceof Error ? lastError : new Error("Staging status did not respond.");
 }
 
 function stagingSummary(id, practiceLoopId) {
@@ -77,7 +96,10 @@ function stagingSummary(id, practiceLoopId) {
 }
 
 try {
-  const status = await request("/api/v1/platform/status");
+  // Remote D1 can briefly return an unavailable response immediately after a
+  // successful migration. Bound retries to this read-only preflight; mutations
+  // remain single-attempt so uncertain writes cannot be duplicated.
+  const status = await waitForHealthyStatus();
   assert.equal(status.response.status, 200, "Staging status must be healthy before a write probe.");
   assert.equal(status.payload.status, "ok");
   assert.ok(SUPPORTED_PLATFORM_SCHEMA_VERSIONS.has(status.payload.schemaVersion),
