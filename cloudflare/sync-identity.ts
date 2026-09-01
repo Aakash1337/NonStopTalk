@@ -101,8 +101,9 @@ const REFRESH_PROFILE_SQL = `
 
 /**
  * Build one ordered D1 batch that refreshes the device lease and guarantees an
- * internal one-device profile membership. A candidate-ID collision aborts the
- * batch; it is never treated as an existing identity.
+ * internal one-device profile membership. A candidate primary-key collision
+ * in its target table aborts the batch; it is never treated as an existing
+ * identity.
  */
 export function prepareSyncIdentityTouch(
 	database: D1Database,
