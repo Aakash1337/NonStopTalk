@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,7 @@ import {
 	CHECKPOINT_FILENAME_PREFIX,
 	CREATE_ONLY_DELTAS,
 	FAULT_CONFIG_FILENAME,
+	JOIN_ONLY_DELTAS,
 	LEGACY_CREATE_DELTAS,
 	RELEASE_A_SCRIPT_ETAG,
 	RELEASE_A_STAGING_VERSION,
@@ -21,8 +23,12 @@ import {
 	assertSingleVersionDeployment,
 	buildReceiverFaultConfig,
 	checkpointFilename,
+	createStagingTailObservers,
 	createStagingWranglerReaders,
+	findCandidateSeedProof,
+	findFaultSeededJoinProof,
 	findFaultTraceProof,
+	hasFaultStateBarrier,
 	hasRollbackTraceProof,
 	locateAggregateCheckpoint,
 	parseCliArguments,
@@ -30,6 +36,7 @@ import {
 	parseJsonc,
 	parseTailTraceStream,
 	pollForCreateDrain,
+	pollForJoinedDrain,
 	prepareRollbackDrainProof,
 	readAggregateCheckpoint,
 	requireDrillCoordinates,
@@ -44,7 +51,11 @@ import { D1_SNAPSHOT_SQL, STAGING_ORIGIN } from "./smoke-staging-outbox.mjs";
 const CANDIDATE_VERSION = RELEASE_B_STAGING_VERSION;
 const FAULT_VERSION = "22222222-2222-4222-8222-222222222222";
 const ROLLBACK_VERSION = RELEASE_A_STAGING_VERSION;
+const CANDIDATE_DEPLOYMENT = "66666666-6666-4666-8666-666666666666";
+const FAULT_DEPLOYMENT = "77777777-7777-4777-8777-777777777777";
+const ROLLBACK_DEPLOYMENT = "88888888-8888-4888-8888-888888888888";
 const HOST_TOKEN = "a".repeat(64);
+const GUEST_TOKEN = "b".repeat(64);
 const PROOF_DIGEST = "c".repeat(64);
 const CREATED_DO_ID = "a".repeat(64);
 const OTHER_DO_ID = "b".repeat(64);
@@ -110,8 +121,10 @@ function rollbackDocument(overrides = {}) {
 	});
 }
 
-function deployment(version) {
-	return { versions: [{ version_id: version, percentage: 100 }] };
+function deployment(version, id = version === CANDIDATE_VERSION
+	? CANDIDATE_DEPLOYMENT
+	: version === FAULT_VERSION ? FAULT_DEPLOYMENT : ROLLBACK_DEPLOYMENT) {
+	return { id, versions: [{ version_id: version, percentage: 100 }] };
 }
 
 function faultStatus() {
@@ -122,6 +135,18 @@ function faultStatus() {
 		},
 		requestId: "request-only",
 	}), { status: 503, headers: { "Content-Type": "application/json" } });
+}
+
+function healthyCandidateStatus() {
+	return new Response(JSON.stringify({
+		status: "ok",
+		schemaVersion: 6,
+		capabilities: {
+			aggregateAnalytics: { delivery: "durable-outbox" },
+			roomFacts: { status: "ready" },
+			retentionCleanup: { status: "ready" },
+		},
+	}), { status: 200, headers: { "Content-Type": "application/json" } });
 }
 
 function healthyRollbackStatus() {
@@ -154,6 +179,47 @@ function createdRoomResponse() {
 			"Set-Cookie": `nonstoptalk_token=${HOST_TOKEN}; Path=/; HttpOnly; Secure`,
 		},
 	});
+}
+
+function guestIdentityResponse() {
+	return new Response(JSON.stringify({ error: "Not found." }), {
+		status: 404,
+		headers: {
+			"Content-Type": "application/json",
+			"Set-Cookie": `nonstoptalk_token=${GUEST_TOKEN}; Path=/; HttpOnly; Secure`,
+		},
+	});
+}
+
+function seededRoomStateResponse() {
+	return new Response(JSON.stringify({
+		room: {
+			code: "ABC234",
+			version: 1,
+			phase: "setup",
+			players: [{ id: "private-player", score: 0 }],
+			activeTurn: null,
+			completedTurns: [],
+			viewer: { isHost: false, isMember: false },
+		},
+	}), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
+function joinedRoomResponse() {
+	return new Response(JSON.stringify({
+		room: {
+			code: "ABC234",
+			version: 2,
+			phase: "setup",
+			players: [
+				{ id: "private-player", score: 0 },
+				{ id: "private-guest", score: 0 },
+			],
+			activeTurn: null,
+			completedTurns: [],
+			viewer: { isHost: false, isMember: true },
+		},
+	}), { status: 200, headers: { "Content-Type": "application/json" } });
 }
 
 function coordinates(overrides = {}) {
@@ -203,6 +269,43 @@ function createTrace(overrides = {}) {
 				cf: { city: "must-not-survive-projection" },
 			},
 			response: { status: 201 },
+		},
+		...overrides,
+	});
+}
+
+function seedAcknowledgementTrace(overrides = {}) {
+	return traceDocument({
+		version: CANDIDATE_VERSION,
+		event: { scheduledTime: 1_788_271_199_000 },
+		logs: [],
+		...overrides,
+	});
+}
+
+function stateTrace(overrides = {}) {
+	return traceDocument({
+		event: {
+			request: {
+				method: "GET",
+				url: "https://room.internal/state",
+				headers: { "X-NonStopTalk-Token": "must-not-survive-projection" },
+			},
+			response: { status: 200 },
+		},
+		...overrides,
+	});
+}
+
+function joinTrace(overrides = {}) {
+	return traceDocument({
+		event: {
+			request: {
+				method: "POST",
+				url: "https://room.internal/join",
+				headers: { "X-NonStopTalk-Token": "must-not-survive-projection" },
+			},
+			response: { status: 200 },
 		},
 		...overrides,
 	});
@@ -387,6 +490,54 @@ test("fault trace proof requires one 201 create and one same-object first retry 
 	], FAULT_VERSION), /create trace emitted an unexpected log/u);
 });
 
+test("seeded-room proof requires candidate ACK, then fault state, join, and first retry on one object", () => {
+	const seedProof = findCandidateSeedProof([
+		createTrace({ version: CANDIDATE_VERSION }),
+		seedAcknowledgementTrace(),
+	], CANDIDATE_VERSION);
+	assert.match(seedProof, /^[0-9a-f]{64}$/u);
+	assert.equal(hasFaultStateBarrier([stateTrace()], FAULT_VERSION, seedProof), true);
+	assert.equal(findFaultSeededJoinProof([
+		stateTrace(),
+		stateTrace(),
+		joinTrace(),
+		retryAlarmTrace(),
+	], FAULT_VERSION, seedProof), seedProof);
+	assert.equal(findCandidateSeedProof([
+		createTrace({ version: CANDIDATE_VERSION }),
+	], CANDIDATE_VERSION), null);
+	assert.throws(() => findCandidateSeedProof([
+		createTrace({ version: CANDIDATE_VERSION }),
+		seedAcknowledgementTrace({ logs: [{ event: "room_milestone_outbox_retry_scheduled" }] }),
+	], CANDIDATE_VERSION), /cleanly acknowledge/u);
+	assert.throws(() => findFaultSeededJoinProof([
+		stateTrace(),
+		joinTrace({ durableObjectId: OTHER_DO_ID }),
+		retryAlarmTrace(),
+	], FAULT_VERSION, seedProof), /concurrent staging room mutation/u);
+	assert.throws(() => findFaultSeededJoinProof([
+		stateTrace(),
+		retryAlarmTrace(),
+		joinTrace(),
+	], FAULT_VERSION, seedProof), /not one ordered/u);
+	assert.throws(() => findFaultSeededJoinProof([
+		stateTrace(),
+		joinTrace(),
+		retryAlarmTrace({ logs: [
+			{ event: "room_milestone_outbox_delivery_failed" },
+			{
+				event: "room_milestone_outbox_retry_scheduled",
+				failure: "database-unavailable",
+				attemptCount: 2,
+			},
+		] }),
+	], FAULT_VERSION, seedProof), /first retry evidence/u);
+	assert.throws(() => findFaultSeededJoinProof([
+		stateTrace(),
+		createTrace(),
+	], FAULT_VERSION, seedProof), /concurrent staging room mutation/u);
+});
+
 test("tail proof rejects truncation, missing metadata, overload, exceptions, and dirty A alarms", () => {
 	const proof = findFaultTraceProof([createTrace(), retryAlarmTrace()], FAULT_VERSION);
 	for (const invalid of [
@@ -410,6 +561,26 @@ test("tail proof rejects truncation, missing metadata, overload, exceptions, and
 		`${JSON.stringify(createTrace({ logs: [{ event: "room_alarm_schedule_failed" }] }))}\n${JSON.stringify(retryAlarmTrace())}\n`,
 	);
 	assert.throws(() => findFaultTraceProof(projectedUnexpected, FAULT_VERSION), /unexpected log/u);
+	const projectedOuter = parseTailTraceStream(JSON.stringify(traceDocument({
+		durableObjectId: undefined,
+		entrypoint: "fetch",
+		executionModel: "stateless",
+		event: {
+			request: {
+				method: "GET",
+				url: "https://example.invalid/api/rooms/ABC234/state",
+				headers: { Cookie: "must-not-survive-projection" },
+				cf: { city: "must-not-survive-projection" },
+			},
+			response: { status: 200 },
+		},
+	})));
+	assert.doesNotMatch(
+		JSON.stringify(projectedOuter),
+		/ABC234|pathname|headers|Cookie|cf|city|must-not-survive-projection/u,
+	);
+	assert.equal(projectedOuter[0].event.request.method, "GET");
+	assert.equal(projectedOuter[0].event.response.status, 200);
 	assert.equal(hasRollbackTraceProof([
 		rollbackAlarmTrace({ entrypoint: "AnotherObject" }),
 	], ROLLBACK_VERSION, proof), false);
@@ -428,76 +599,282 @@ test("tail argv selects config staging, filters one version, omits duplicate nam
 	assert.deepEqual(stagingTailArguments("rollback", ROLLBACK_VERSION, "pretty").slice(1), [
 		"tail", "--env", "staging", "--format", "pretty", "--version-id", ROLLBACK_VERSION,
 	]);
+	assert.deepEqual(stagingTailArguments("seed", CANDIDATE_VERSION).slice(1), [
+		"tail", "--env", "staging", "--format", "json", "--version-id", CANDIDATE_VERSION,
+	]);
 });
 
-test("prepare claims pending only after causal trace proof and unchanged fault-bracketed counters", async () => {
-	const baseline = snapshot();
-	let fetchCount = 0;
-	let snapshotCount = 0;
+test("tail observer signals before activation, safely retries state, and never retries join", async () => {
+	const jsonChildren = new Map();
+	function childProcess(format, version) {
+		const stdout = new EventEmitter();
+		const stderr = new EventEmitter();
+		const child = new EventEmitter();
+		child.stdout = stdout;
+		child.stderr = stderr;
+		let stopped = false;
+		child.kill = () => {
+			if (!stopped) {
+				stopped = true;
+				child.emit("exit", 0, null);
+			}
+		};
+		if (format === "pretty") {
+			queueMicrotask(() => stdout.emit("data", `Connected to ${STAGING_WORKER}, waiting for logs...\n`));
+		} else jsonChildren.set(version, child);
+		return child;
+	}
+	const sequence = [];
+	let activated = false;
+	const observers = createStagingTailObservers({
+		spawnImpl: (_executable, args) => {
+			const format = args[args.indexOf("--format") + 1];
+			const version = args[args.indexOf("--version-id") + 1];
+			return childProcess(format, version);
+		},
+		onReady(kind) {
+			assert.equal(kind, "fault");
+			sequence.push("fault-observer-ready");
+			activated = true;
+		},
+		delay: async () => undefined,
+		warmupMs: 0,
+		stateBarrierAttempts: 2,
+		stateBarrierTraceWaitMs: 1,
+		stateBarrierRetryDelayMs: 0,
+	});
+	const seed = await observers.observeCandidateSeed(async () => {
+		jsonChildren.get(CANDIDATE_VERSION).stdout.emit("data", [
+			JSON.stringify(createTrace({ version: CANDIDATE_VERSION })),
+			JSON.stringify(seedAcknowledgementTrace()),
+			"",
+		].join("\n"));
+		return { privateRoom: "must-not-be-output" };
+	}, CANDIDATE_VERSION, async () => sequence.push("seed-tail-ready"));
+	assert.match(seed.proofDigest, /^[0-9a-f]{64}$/u);
+	let stateAttempts = 0;
+	let joinAttempts = 0;
+	const fault = await observers.observeFaultSeededJoin({
+		async awaitActivation() {
+			assert.equal(activated, true);
+			sequence.push("fault-activated");
+		},
+		async stateOperation() {
+			stateAttempts += 1;
+			sequence.push(`state-${stateAttempts}`);
+			if (stateAttempts === 2) {
+				// Model the first trace arriving late alongside the deliberate retry.
+				jsonChildren.get(FAULT_VERSION).stdout.emit("data", [
+					JSON.stringify(stateTrace()),
+					JSON.stringify(stateTrace()),
+					"",
+				].join("\n"));
+			}
+		},
+		async beforeJoinOperation() {
+			sequence.push("before-join");
+		},
+		async joinOperation() {
+			joinAttempts += 1;
+			sequence.push("join");
+			jsonChildren.get(FAULT_VERSION).stdout.emit("data", [
+				JSON.stringify(joinTrace()),
+				JSON.stringify(retryAlarmTrace()),
+				"",
+			].join("\n"));
+			return { privateGuest: "must-not-be-output" };
+		},
+	}, FAULT_VERSION, seed.proofDigest, async () => sequence.push("fault-precheck"));
+	assert.equal(fault.proofDigest, seed.proofDigest);
+	assert.equal(stateAttempts, 2);
+	assert.equal(joinAttempts, 1);
+	assert.deepEqual(sequence, [
+		"seed-tail-ready",
+		"fault-precheck",
+		"fault-observer-ready",
+		"fault-activated",
+		"state-1",
+		"state-2",
+		"before-join",
+		"join",
+	]);
+	assert.doesNotMatch(JSON.stringify({ proofDigest: fault.proofDigest }), /privateRoom|privateGuest/u);
+});
+
+test("prepare seeds and drains under B, signals a ready fault observer, then proves one same-object join", async () => {
+	const beforeSeed = snapshot();
+	const baseline = addDeltas(beforeSeed, CREATE_ONLY_DELTAS);
+	let activeVersion = CANDIDATE_VERSION;
+	let seedCreated = false;
+	let seedPrivateResult;
+	let seedPrivateHost;
+	let joinAttempts = 0;
+	let faultStatusReads = 0;
+	const sequence = [];
 	const result = await prepareRollbackDrainProof({
 		...coordinates(),
-		fetchImpl: async (url) => {
-			fetchCount += 1;
-			return new URL(url).pathname === "/api/v1/platform/status" ? faultStatus() : createdRoomResponse();
+		fetchImpl: async (url, init = {}) => {
+			const pathname = new URL(url).pathname;
+			if (pathname === "/api/v1/platform/status") {
+				if (activeVersion === CANDIDATE_VERSION) return healthyCandidateStatus();
+				faultStatusReads += 1;
+				return faultStatusReads === 1 ? healthyCandidateStatus() : faultStatus();
+			}
+			if (pathname === "/api/rooms") {
+				assert.equal(activeVersion, CANDIDATE_VERSION);
+				seedCreated = true;
+				sequence.push("seed-create");
+				return createdRoomResponse();
+			}
+			if (pathname === "/api/nonstoptalk-rollback-guest-identity") {
+				assert.equal(new Headers(init.headers).get("Cookie"), null);
+				sequence.push("guest-identity");
+				return guestIdentityResponse();
+			}
+			if (pathname.endsWith("/state")) {
+				assert.equal(activeVersion, FAULT_VERSION);
+				assert.equal(new Headers(init.headers).get("Cookie"), `nonstoptalk_token=${GUEST_TOKEN}`);
+				sequence.push("fault-state");
+				return seededRoomStateResponse();
+			}
+			assert.match(pathname, /\/join$/u);
+			assert.equal(activeVersion, FAULT_VERSION);
+			assert.equal(new Headers(init.headers).get("Cookie"), `nonstoptalk_token=${GUEST_TOKEN}`);
+			joinAttempts += 1;
+			sequence.push("fault-join");
+			return joinedRoomResponse();
 		},
-		readDeployment: async () => deployment(FAULT_VERSION),
+		readDeployment: async () => deployment(activeVersion),
 		readVersion: async (version) => version === CANDIDATE_VERSION
 			? versionDocument(CANDIDATE_VERSION)
 			: versionDocument(FAULT_VERSION, { database: false }),
-		readSnapshot: async () => { snapshotCount += 1; return baseline; },
-		observeFaultRetry: async (operation, version, readyOperation) => {
-			assert.equal(version, FAULT_VERSION);
+		readSnapshot: async () => seedCreated ? baseline : beforeSeed,
+		observeCandidateSeed: async (operation, version, readyOperation) => {
+			assert.equal(version, CANDIDATE_VERSION);
 			await readyOperation();
-			return { result: await operation(), proofDigest: PROOF_DIGEST };
+			sequence.push("seed-observer-ready");
+			seedPrivateResult = await operation();
+			seedPrivateHost = seedPrivateResult.host;
+			return { result: seedPrivateResult, proofDigest: PROOF_DIGEST };
+		},
+		observeFaultSeededJoin: async (operations, version, proofDigest, readyOperation) => {
+			assert.equal(version, FAULT_VERSION);
+			assert.equal(proofDigest, PROOF_DIGEST);
+			assert.equal(activeVersion, CANDIDATE_VERSION);
+			assert.equal(seedPrivateResult.host, undefined);
+			assert.equal(seedPrivateResult.created, undefined);
+			assert.equal(seedPrivateHost.cookie, "");
+			await readyOperation();
+			sequence.push("fault-observer-ready");
+			activeVersion = FAULT_VERSION;
+			sequence.push("fault-activated");
+			await operations.awaitActivation();
+			await operations.stateOperation();
+			await operations.beforeJoinOperation();
+			return { result: await operations.joinOperation(), proofDigest: PROOF_DIGEST };
 		},
 		delay: async () => undefined,
-		faultPropagationSoakMs: 13,
-		faultObservationDelayMs: 17,
+		faultObservationDelayMs: 1,
+		deploymentWaitAttempts: 1,
+		deploymentWaitDelayMs: 0,
+		faultStatusWaitAttempts: 2,
+		faultStatusWaitDelayMs: 0,
+		pollAttempts: 1,
+		pollDelayMs: 0,
 	});
 	assert.deepEqual(result.baseline, baseline);
 	assert.equal(result.proofDigest, PROOF_DIGEST);
-	assert.equal(fetchCount, 3);
-	assert.equal(snapshotCount, 4);
+	assert.equal(joinAttempts, 1);
+	assert.equal(faultStatusReads, 2);
+	assert.deepEqual(sequence, [
+		"seed-observer-ready",
+		"seed-create",
+		"guest-identity",
+		"fault-observer-ready",
+		"fault-activated",
+		"fault-state",
+		"fault-join",
+	]);
 	assert.deepEqual(result.summary, {
 		status: "ok",
-		phase: "pending-row-established",
+		phase: "pending-joined-row-established",
 		rollbackRequired: true,
 		expectedReceiptsAfterRollback: 1,
+		expectedRoomJoinedEventsAfterRollback: 1,
 	});
-	assert.doesNotMatch(JSON.stringify(result.summary), /ABC234|private-player|aaaa|e237d4e3|22222222/u);
+	assert.doesNotMatch(JSON.stringify(result), /ABC234|private-player|aaaa|bbbb|e237d4e3|22222222/u);
 });
 
-test("prepare never claims pending without observer proof or when a counter changes", async () => {
-	const baseline = snapshot();
-	const base = {
+test("prepare fails closed on an undrained seed or a deployment change between state and join", async () => {
+	const beforeSeed = snapshot();
+	const baseline = addDeltas(beforeSeed, CREATE_ONLY_DELTAS);
+	const common = {
 		...coordinates(),
-		fetchImpl: async (url) => new URL(url).pathname === "/api/v1/platform/status"
-			? faultStatus()
-			: createdRoomResponse(),
-		readDeployment: async () => deployment(FAULT_VERSION),
 		readVersion: async (version) => version === CANDIDATE_VERSION
 			? versionDocument(CANDIDATE_VERSION)
 			: versionDocument(FAULT_VERSION, { database: false }),
 		delay: async () => undefined,
-		faultPropagationSoakMs: 1,
 		faultObservationDelayMs: 1,
+		deploymentWaitAttempts: 1,
+		deploymentWaitDelayMs: 0,
+		pollAttempts: 1,
+		pollDelayMs: 0,
 	};
+	let activeVersion = CANDIDATE_VERSION;
 	await assert.rejects(prepareRollbackDrainProof({
-		...base,
-		readSnapshot: async () => baseline,
-		observeFaultRetry: async () => ({ proofDigest: "not-a-proof" }),
-	}), /proof digest/u);
-	let reads = 0;
+		...common,
+		fetchImpl: async (url) => new URL(url).pathname === "/api/v1/platform/status"
+			? healthyCandidateStatus()
+			: createdRoomResponse(),
+		readDeployment: async () => deployment(activeVersion),
+		readSnapshot: async () => beforeSeed,
+		observeCandidateSeed: async (operation, _version, readyOperation) => {
+			await readyOperation();
+			return { result: await operation(), proofDigest: PROOF_DIGEST };
+		},
+		observeFaultSeededJoin: async () => assert.fail("Fault observer must not start before seed drain."),
+	}), /candidate seed create did not drain/u);
+
+	activeVersion = CANDIDATE_VERSION;
+	let activeDeploymentId = CANDIDATE_DEPLOYMENT;
+	let seedCreated = false;
 	await assert.rejects(prepareRollbackDrainProof({
-		...base,
-		readSnapshot: async () => ++reads === 1 ? baseline : addDeltas(baseline, CREATE_ONLY_DELTAS),
-		observeFaultRetry: async (operation) => ({ result: await operation(), proofDigest: PROOF_DIGEST }),
-	}), /changed a durable aggregate/u);
+		...common,
+		fetchImpl: async (url) => {
+			const pathname = new URL(url).pathname;
+			if (pathname === "/api/v1/platform/status") {
+				return activeVersion === CANDIDATE_VERSION ? healthyCandidateStatus() : faultStatus();
+			}
+			if (pathname === "/api/rooms") {
+				seedCreated = true;
+				return createdRoomResponse();
+			}
+			if (pathname === "/api/nonstoptalk-rollback-guest-identity") return guestIdentityResponse();
+			if (pathname.endsWith("/state")) return seededRoomStateResponse();
+			return joinedRoomResponse();
+		},
+		readDeployment: async () => deployment(activeVersion, activeDeploymentId),
+		readSnapshot: async () => seedCreated ? baseline : beforeSeed,
+		observeCandidateSeed: async (operation, _version, readyOperation) => {
+			await readyOperation();
+			return { result: await operation(), proofDigest: PROOF_DIGEST };
+		},
+		observeFaultSeededJoin: async (operations, _version, _proof, readyOperation) => {
+			await readyOperation();
+			activeVersion = FAULT_VERSION;
+			activeDeploymentId = FAULT_DEPLOYMENT;
+			await operations.awaitActivation();
+			await operations.stateOperation();
+			activeDeploymentId = "99999999-9999-4999-8999-999999999999";
+			await operations.beforeJoinOperation();
+			return { proofDigest: PROOF_DIGEST };
+		},
+	}), /changed deployments/u);
 });
 
 test("verify observes fault-to-pinned-A drain, rechecks proof, then proves legacy best-effort control", async () => {
 	const baseline = snapshot();
-	const drained = addDeltas(baseline, CREATE_ONLY_DELTAS);
+	const drained = addDeltas(baseline, JOIN_ONLY_DELTAS);
 	const legacy = addDeltas(drained, LEGACY_CREATE_DELTAS);
 	const observations = [baseline, baseline, drained, drained, legacy];
 	let observationIndex = 0;
@@ -537,10 +914,11 @@ test("verify observes fault-to-pinned-A drain, rechecks proof, then proves legac
 	assert.equal(fetchCount, 2);
 	assert.deepEqual(summary, {
 		status: "ok",
-		phase: "rollback-drain-and-legacy-proved",
+		phase: "rollback-joined-drain-and-legacy-proved",
 		receiptsAdded: 1,
-		roomFactsAdded: 1,
-		roomCreatedEventsAdded: 1,
+		roomFactsAdded: 0,
+		roomCreatedEventsAdded: 0,
+		roomJoinedEventsAdded: 1,
 		legacyReceiptsAdded: 0,
 		legacyRoomFactsAdded: 1,
 		legacyRoomCreatedEventsAdded: 1,
@@ -587,24 +965,30 @@ test("verify refuses a changed pre-rollback snapshot and any third deployment", 
 
 test("drain polling fails closed on overlap, cleanup, or exhaustion", async () => {
 	const baseline = snapshot();
-	const exact = addDeltas(baseline, CREATE_ONLY_DELTAS);
+	const exact = addDeltas(baseline, JOIN_ONLY_DELTAS);
 	for (const invalid of [
 		{ ...exact, receiptCount: exact.receiptCount + 1 },
 		{ ...baseline, roomFactCount: baseline.roomFactCount - 1 },
-	]) await assert.rejects(pollForCreateDrain({
+	]) await assert.rejects(pollForJoinedDrain({
 		baseline,
 		readSnapshot: async () => invalid,
 		delay: async () => assert.fail("Overlap must stop immediately."),
 		attempts: 2,
 		delayMs: 1,
 	}), /overlapped/u);
-	await assert.rejects(pollForCreateDrain({
+	await assert.rejects(pollForJoinedDrain({
 		baseline,
 		readSnapshot: async () => baseline,
 		delay: async () => undefined,
 		attempts: 2,
 		delayMs: 1,
 	}), /bounded window/u);
+	assert.deepEqual(await pollForCreateDrain({
+		baseline,
+		readSnapshot: async () => addDeltas(baseline, CREATE_ONLY_DELTAS),
+		attempts: 1,
+		delayMs: 0,
+	}), addDeltas(baseline, CREATE_ONLY_DELTAS));
 });
 
 test("checkpoint is private, coordinate/proof-bound, aggregate-only, exclusive, and bounded", async () => {

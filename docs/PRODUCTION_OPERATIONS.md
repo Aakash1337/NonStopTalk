@@ -194,8 +194,12 @@ Use this order:
    npx wrangler versions upload --strict --env staging --config .nonstoptalk-staging-receiver-fault.jsonc
    # Record FAULT_UUID from the upload. Nothing has been activated yet.
    npm run drill:staging-outbox-rollback -- validate-fault e237d4e3-f933-4b35-b618-a61ea4da14ba <FAULT_UUID> 3116a969-0f6f-4977-959a-97fc3643ad79
-   npx wrangler versions deploy <FAULT_UUID>@100% --env staging --message "Staging receiver-fault rollback drill" --yes
+
+   # Terminal 1: start while Release B is still alone at 100%; leave it running.
    npm run drill:staging-outbox-rollback -- prepare e237d4e3-f933-4b35-b618-a61ea4da14ba <FAULT_UUID> 3116a969-0f6f-4977-959a-97fc3643ad79
+
+   # Terminal 2: run only after Terminal 1 reports fault-observer-ready.
+   npx wrangler versions deploy <FAULT_UUID>@100% --env staging --message "Staging receiver-fault rollback drill" --yes
    ```
 
    The generator hard-requires production `best-effort` plus staging `outbox`
@@ -206,23 +210,59 @@ Use this order:
    and proves the uploaded fault version differs only by the missing staging
    `PLATFORM_DB`. Do not activate a fault upload unless that preflight succeeds.
 
-   `prepare` repeats the version/resource checks after activation, requires the
-   exact staging hostname and Worker, one fault version at 100%, and failed D1
-   readiness. It holds a three-minute propagation soak and requires the fault
-   deployment, failed readiness, and unchanged aggregate baseline on both sides;
-   this prevents a newly deployed outer Worker from creating the proof room in a
-   Durable Object still assigned to the prior version. Its unsampled,
-   version-filtered tail must then causally observe exactly
-   one successful Durable Object `POST /create` and that same object's first
-   `database-unavailable` retry alarm, with complete, exception-free trace
-   metadata and no terminal/unexpected logs. The fixed D1 aggregates must remain
-   unchanged before and after the retry window. Only the same-object trace plus
-   unchanged aggregates establishes a pending local row. Tail data is bounded
-   and immediately projected to proof-only fields; request headers, client/TLS
-   metadata, room data, and unrelated logs are neither retained, printed, nor
-   written. The mode-0600 checkpoint body contains exactly seven counters. Its
-   opaque filename digests bind the reviewed versions and Durable Object without
-   exposing a room code, cookie, player, event ID, raw object ID, or payload.
+   `prepare` starts while the pinned Release-B candidate is still alone at 100%.
+   It repeats the version/resource checks, requires healthy schema-6
+   `durable-outbox` readiness, and brackets every aggregate read with candidate
+   deployment checks. It first attaches an unsampled candidate-version tail and
+   creates one seed room. The seed is accepted only after the tail observes the
+   same Durable Object's successful `POST /create` and clean acknowledgement
+   alarm and D1 converges by exactly +1 receipt, +1 room fact, and +1
+   `room_created`, with every other tracked counter unchanged. That post-seed
+   snapshot becomes the fault and rollback baseline; the clean alarm proves the
+   seed row was locally acknowledged before fault activation.
+
+   The helper then obtains a distinct guest identity through a 404 path that
+   reaches neither D1 nor a Durable Object. After proving that identity differs
+   from the host, it clears the host cookie and retains only the seed room code
+   plus guest cookie inside the running process. It attaches and warms a tail
+   filtered to the still-inactive fault version, rechecks the candidate
+   deployment and baseline, and prints
+   `{"status":"waiting","phase":"fault-observer-ready",...}`. This line is the
+   authorization boundary for Terminal 2. Do not activate the fault version
+   before it appears, and do not stop Terminal 1 after it appears.
+
+   After activation, `prepare` permits only the candidate-to-fault
+   single-version transition. It requires failed D1 readiness and unchanged
+   aggregates, then uses the distinct non-host guest for `GET /state` on the
+   seeded room. The handler creates no room milestone or D1 effect for that
+   guest; a reset object may only reconcile its existing local alarm. The
+   version-filtered tail must attribute the successful state read to the exact
+   seeded Durable Object under the exact fault version. For one unchanged
+   deployment, [Cloudflare assigns each Durable Object one Worker version for
+   every request](https://developers.cloudflare.com/workers/versions-and-deployments/gradual-deployments/with-durable-objects/).
+   The helper therefore needs no fixed propagation soak: the observed state read,
+   same-object digest, and unchanged fault deployment are the positive barrier.
+
+   Only after that barrier does `prepare` immediately `POST /join` with the same
+   guest. It requires an ordered, complete fault-version trace containing the
+   same object's successful state read, successful join, and first
+   `database-unavailable` delivery failure plus attempt-1 retry schedule. The D1
+   baseline must remain unchanged immediately and through the bounded observation
+   window. Those facts establish one pending local `joined` row; a timed wait or
+   a fresh random object is never accepted as proof. Sampling, truncation,
+   exceptions, terminal/unexpected outbox logs, concurrent room mutations,
+   cleanup, aggregate movement, split traffic, or a third version fails closed.
+
+   Tail data is bounded and immediately projected to proof-only fields. Request
+   headers, cookies, client/TLS metadata, room data, event IDs, payloads, and
+   unrelated logs are discarded at the parser boundary. The raw Durable Object
+   ID is held only in bounded process memory long enough to correlate and hash
+   the traces; it is never printed or written. The room code and guest cookie
+   likewise remain only in the running `prepare` process and are discarded when
+   that operation ends. Only after the full fault proof succeeds does `prepare`
+   write a checkpoint: its mode-0600 body contains exactly seven aggregate
+   counters, and its opaque filename digests bind the reviewed versions and
+   Durable Object without exposing private values.
 
    Start `verify` in the first terminal **while the fault version is still at
    100%**. It attaches and warms the pinned Release-A tail, rechecks that the
@@ -241,14 +281,17 @@ Use this order:
    `verify` permits only the fault-to-pinned-A single-version transition. It
    requires healthy schema-6 `best-effort` readiness, attributes an `ok` alarm
    to the checkpointed Durable Object under the pinned A version, brackets every
-   D1 read with A-at-100% checks, and proves an exact +1 receipt, +1 room fact,
-   +1 `room_created` bridge drain. While A remains at 100%, it then creates a
-   separate ordinary legacy room and proves +1 room fact and +1 `room_created`
-   with receipt count unchanged; all other tracked counters must remain
-   unchanged in both controls. Concurrent traffic, cleanup, split traffic, a
-   third version, a counter decrease, or an overshoot fails closed. A successful
-   verify removes the checkpoint and fault config. Restore the pinned Release-B
-   candidate only after verify exits, then repeat the exact-mode smoke:
+   D1 read with A-at-100% checks, and proves the pending join drains as exactly
+   +1 receipt, +0 room-fact rows, and +1 `room_joined`; `room_created` and every
+   other tracked counter remain unchanged. The room fact count does not grow
+   because the joined state updates the seed room's existing fact. While A
+   remains at 100%, `verify` then creates a separate ordinary legacy room and
+   proves +1 room fact and +1 `room_created` with receipt count unchanged; all
+   other tracked counters remain unchanged in that control. Concurrent traffic,
+   cleanup, split traffic, a third version, a counter decrease, or an overshoot
+   fails closed. A successful verify removes the checkpoint and fault config.
+   Restore the pinned Release-B candidate only after verify exits, then repeat
+   the exact-mode smoke:
 
    ```sh
    npx wrangler versions deploy e237d4e3-f933-4b35-b618-a61ea4da14ba@100% --env staging --message "Restore reviewed Release-B staging candidate" --yes
@@ -261,10 +304,19 @@ Use this order:
    `nonstoptalk-staging-staging`. The helper therefore uses the config-resolved
    target and independently requires every proof trace to report exact
    `scriptName: nonstoptalk-staging`, entrypoint `RoomDurableObject`, and the
-   pinned version ID. If the drill aborts, preserve the aggregate checkpoint for
-   diagnosis, restore the reviewed Release-B candidate first, and remove only
-   the two narrowly named Git-ignored files after the result is resolved. Never
-   select a pre-Release-A version.
+   pinned version ID. If `prepare` fails before attempting the join, it writes no
+   checkpoint and has established no pending proof row. If it loses the causal
+   trace after the join attempt, it also writes no checkpoint, and that same
+   fault activation must not be retried: the attempted row cannot be classified
+   safely without its trace. Restore the reviewed Release-B candidate at 100%,
+   wait for healthy exact readiness and aggregate stabilization, and accept only
+   no joined-row delta or the exact candidate drain of +1 receipt, +0 room-fact
+   rows, and +1 `room_joined`, according to whether the join was attempted. Any
+   other delta is an overlap and stops the drill. Then rerun `validate-fault` and
+   start a fresh seeded-room prepare/activation sequence. If a later phase aborts
+   after a checkpoint exists, preserve that checkpoint for diagnosis and restore
+   the candidate first. Remove only the two narrowly named Git-ignored files
+   after the result is resolved. Never select a pre-Release-A version.
 5. Only after the staging activation and rollback drill pass, make a separate
    production configuration change. Reconfirm schema 6, the secure production
    room-fact key, zero pending migrations, the exact version, and recent cleanup

@@ -17,6 +17,7 @@ import {
 	D1_SNAPSHOT_SQL,
 	EXPECTED_DELTAS,
 	STAGING_ORIGIN,
+	assertOutboxReadiness,
 	createStagingRequester,
 	parseD1Snapshot,
 	runPublicRoomCreate,
@@ -39,10 +40,13 @@ const FAULT_CONFIG_PATH = fileURLToPath(new URL(`../${FAULT_CONFIG_FILENAME}`, i
 const VERSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const PROOF_DIGEST_PATTERN = /^[0-9a-f]{64}$/u;
 const DURABLE_OBJECT_ID_PATTERN = /^[0-9a-f]{64}$/u;
-const DEFAULT_FAULT_PROPAGATION_SOAK_MS = 3 * 60_000;
 const DEFAULT_FAULT_OBSERVATION_DELAY_MS = 8_000;
 const DEFAULT_DRAIN_POLL_ATTEMPTS = 120;
 const DEFAULT_DRAIN_POLL_DELAY_MS = 5_000;
+const DEFAULT_DEPLOYMENT_WAIT_ATTEMPTS = 300;
+const DEFAULT_DEPLOYMENT_WAIT_DELAY_MS = 2_000;
+const DEFAULT_FAULT_STATUS_WAIT_ATTEMPTS = 120;
+const DEFAULT_FAULT_STATUS_WAIT_DELAY_MS = 2_000;
 const MAX_WRANGLER_OUTPUT_BYTES = 1_024 * 1_024;
 const MAX_TAIL_OUTPUT_BYTES = 512 * 1_024;
 const MAX_CHECKPOINT_BYTES = 4_096;
@@ -54,6 +58,16 @@ export const CREATE_ONLY_DELTAS = Object.freeze({
 	roomFactCount: 1,
 	roomCreatedCount: 1,
 	roomJoinedCount: 0,
+	gameStartedCount: 0,
+	turnCompletedCount: 0,
+	gameFinishedCount: 0,
+});
+
+export const JOIN_ONLY_DELTAS = Object.freeze({
+	receiptCount: 1,
+	roomFactCount: 0,
+	roomCreatedCount: 0,
+	roomJoinedCount: 1,
 	gameStartedCount: 0,
 	turnCompletedCount: 0,
 	gameFinishedCount: 0,
@@ -476,6 +490,20 @@ function singleVersionDeploymentId(document) {
 	return requireVersionId(document.versions[0].version_id, "active");
 }
 
+function deploymentIdentity(document, expectedVersion) {
+	assertSingleVersionDeployment(document, expectedVersion);
+	if (typeof document.id !== "string" || !VERSION_ID_PATTERN.test(document.id)) {
+		return fail("The staging deployment identity is missing or invalid.");
+	}
+	return document.id;
+}
+
+function assertSameDeployment(document, expectedVersion, expectedDeploymentId) {
+	if (deploymentIdentity(document, expectedVersion) !== expectedDeploymentId) {
+		return fail("Staging changed deployments during the same-object version-affinity proof.");
+	}
+}
+
 function canonicalValue(value) {
 	if (Array.isArray(value)) return value.map(canonicalValue);
 	if (!isObject(value)) return value;
@@ -644,7 +672,7 @@ export function createStagingWranglerReaders({ execFileImpl = execFileAsync } = 
 
 export function stagingTailArguments(kind, version, format = "json") {
 	const checked = requireVersionId(version, "tailed");
-	if (kind !== "fault" && kind !== "rollback") {
+	if (kind !== "seed" && kind !== "fault" && kind !== "rollback") {
 		return fail("The staging tail proof kind is invalid.");
 	}
 	if (format !== "json" && format !== "pretty") {
@@ -693,13 +721,20 @@ function projectTailDocument(document) {
 		projectedEvent = { type: event.type };
 	} else if (isObject(event?.request)) {
 		let pathname = null;
-		try {
-			pathname = new URL(event.request.url).pathname;
-		} catch {
-			// Retain only a null invalid marker; never retain the raw URL.
+		const retainInternalRoomPath = document.executionModel === "durableObject"
+			&& document.entrypoint === "RoomDurableObject";
+		if (retainInternalRoomPath) {
+			try {
+				pathname = new URL(event.request.url).pathname;
+			} catch {
+				// Retain only a null invalid marker; never retain the raw URL.
+			}
 		}
 		projectedEvent = {
-			request: { method: event.request.method, pathname },
+			request: {
+				method: event.request.method,
+				...(retainInternalRoomPath ? { pathname } : {}),
+			},
 			...(isObject(event.response) ? { response: { status: event.response.status } } : {}),
 		};
 	} else if (event?.scheduledTime !== undefined) {
@@ -787,6 +822,146 @@ function isSuccessfulDurableObjectTrace(document) {
 		&& document.outcome === "ok"
 		&& typeof document.durableObjectId === "string"
 		&& DURABLE_OBJECT_ID_PATTERN.test(document.durableObjectId);
+}
+
+function traceRequestPathname(document) {
+	const request = document.event?.request;
+	if (!isObject(request) || typeof request.method !== "string") return null;
+	if (typeof request.pathname === "string") return request.pathname;
+	try {
+		return new URL(request.url).pathname;
+	} catch {
+		return fail("A Durable Object proof trace URL is malformed.");
+	}
+}
+
+function assertTraceHasNoLogs(document, message) {
+	if (traceLogValueCount(document) !== 0 || unexpectedTraceLogCount(document) !== 0) {
+		return fail(message);
+	}
+}
+
+export function findCandidateSeedProof(documents, version) {
+	assertSafeTailDocuments(documents, version);
+	const creates = [];
+	const cleanAlarms = [];
+	for (const [index, document] of documents.entries()) {
+		if (!isSuccessfulDurableObjectTrace(document)) continue;
+		const pathname = traceRequestPathname(document);
+		if (document.event.request?.method === "POST" && pathname === "/create") {
+			if (document.event.response?.status !== 201) {
+				return fail("The candidate seed Durable Object create was not a successful 201 response.");
+			}
+			assertTraceHasNoLogs(document, "The candidate seed create emitted an unexpected log.");
+			creates.push({ index, durableObjectId: document.durableObjectId });
+		}
+		if (!isAlarmTrace(document)) continue;
+		if (unexpectedTraceLogCount(document) !== 0) {
+			return fail("The candidate seed alarm emitted an unexpected log.");
+		}
+		if (traceLogRecords(document).some((record) => (
+			typeof record.event === "string"
+			&& record.event.startsWith("room_milestone_outbox_")
+		))) return fail("The candidate seed alarm did not cleanly acknowledge its outbox row.");
+		if (traceLogValueCount(document) === 0) {
+			cleanAlarms.push({ index, durableObjectId: document.durableObjectId });
+		}
+	}
+	if (creates.length > 1) return fail("Concurrent staging room creation made the candidate seed proof ambiguous.");
+	if (creates.length === 0) return null;
+	const create = creates[0];
+	const matchingAlarms = cleanAlarms.filter((alarm) => (
+		alarm.durableObjectId === create.durableObjectId && alarm.index > create.index
+	));
+	if (matchingAlarms.length === 0) return null;
+	if (matchingAlarms.length !== 1) return fail("The candidate seed acknowledgement proof was ambiguous.");
+	return durableObjectProofDigest(create.durableObjectId);
+}
+
+export function hasFaultStateBarrier(documents, version, expectedProofDigest) {
+	assertSafeTailDocuments(documents, version);
+	const checkedDigest = requireProofDigest(expectedProofDigest);
+	const matchingStates = [];
+	for (const [index, document] of documents.entries()) {
+		if (!isSuccessfulDurableObjectTrace(document)) continue;
+		const pathname = traceRequestPathname(document);
+		if (document.event.request?.method !== "GET" || pathname !== "/state") continue;
+		if (durableObjectProofDigest(document.durableObjectId) !== checkedDigest) continue;
+		if (document.event.response?.status !== 200) {
+			return fail("The fault-version seeded-room state barrier was not a successful 200 response.");
+		}
+		assertTraceHasNoLogs(document, "The fault-version seeded-room state barrier emitted an unexpected log.");
+		matchingStates.push({ index, durableObjectId: document.durableObjectId });
+	}
+	return matchingStates.length >= 1;
+}
+
+export function findFaultSeededJoinProof(documents, version, expectedProofDigest) {
+	assertSafeTailDocuments(documents, version);
+	const checkedDigest = requireProofDigest(expectedProofDigest);
+	const states = [];
+	const joins = [];
+	const retryAlarms = [];
+	for (const [index, document] of documents.entries()) {
+		if (!isSuccessfulDurableObjectTrace(document)) continue;
+		const pathname = traceRequestPathname(document);
+		const method = document.event.request?.method;
+		const digest = durableObjectProofDigest(document.durableObjectId);
+		if (method === "GET" && pathname === "/state" && digest === checkedDigest) {
+			if (document.event.response?.status !== 200) {
+				return fail("The fault-version seeded-room state barrier was not a successful 200 response.");
+			}
+			assertTraceHasNoLogs(document, "The fault-version seeded-room state barrier emitted an unexpected log.");
+			states.push({ index, durableObjectId: document.durableObjectId });
+		}
+		if (method === "POST") {
+			if (pathname !== "/join" || digest !== checkedDigest) {
+				return fail("A concurrent staging room mutation made the seeded-room fault proof ambiguous.");
+			}
+			if (document.event.response?.status !== 200) {
+				return fail("The fault-version seeded-room join was not a successful 200 response.");
+			}
+			assertTraceHasNoLogs(document, "The fault-version seeded-room join emitted an unexpected log.");
+			joins.push({ index, durableObjectId: document.durableObjectId });
+		}
+		if (!isAlarmTrace(document)) continue;
+		const logs = traceLogRecords(document);
+		const outboxLogs = logs.filter((record) => (
+			typeof record.event === "string"
+			&& record.event.startsWith("room_milestone_outbox_")
+		));
+		if (outboxLogs.length === 0) continue;
+		if (unexpectedTraceLogCount(document) !== 0) {
+			return fail("The seeded-room fault alarm emitted an unexpected log.");
+		}
+		const deliveryFailed = outboxLogs.filter((record) => (
+			record.event === "room_milestone_outbox_delivery_failed"
+		));
+		const retryScheduled = outboxLogs.filter((record) => (
+			record.event === "room_milestone_outbox_retry_scheduled"
+			&& record.failure === "database-unavailable"
+			&& record.attemptCount === 1
+		));
+		if (
+			digest !== checkedDigest
+			|| outboxLogs.length !== 2
+			|| deliveryFailed.length !== 1
+			|| retryScheduled.length !== 1
+		) return fail("The seeded-room first retry evidence was split, unrelated, or incomplete.");
+		retryAlarms.push({ index, durableObjectId: document.durableObjectId });
+	}
+	if (joins.length > 1 || retryAlarms.length > 1) {
+		return fail("The seeded-room fault proof was ambiguous.");
+	}
+	if (states.length === 0 || joins.length === 0 || retryAlarms.length === 0) return null;
+	const stateBeforeJoin = states.findLast((state) => state.index < joins[0].index);
+	if (
+		!stateBeforeJoin
+		|| stateBeforeJoin.durableObjectId !== joins[0].durableObjectId
+		|| joins[0].durableObjectId !== retryAlarms[0].durableObjectId
+		|| joins[0].index >= retryAlarms[0].index
+	) return fail("The seeded-room state, join, and first retry were not one ordered Durable Object proof.");
+	return checkedDigest;
 }
 
 export function findFaultTraceProof(documents, version) {
@@ -973,6 +1148,9 @@ export function createStagingTailObservers({
 	onReady = () => undefined,
 	delay = sleep,
 	warmupMs = 15_000,
+	stateBarrierAttempts = 12,
+	stateBarrierTraceWaitMs = 5_000,
+	stateBarrierRetryDelayMs = 1_000,
 } = {}) {
 	if (typeof spawnImpl !== "function" || typeof onReady !== "function" || typeof delay !== "function") {
 		fail("A staging tail process adapter is required.");
@@ -980,6 +1158,17 @@ export function createStagingTailObservers({
 	if (!Number.isSafeInteger(warmupMs) || warmupMs < 0 || warmupMs > 30_000) {
 		fail("The staging tail warm-up bound is invalid.");
 	}
+	if (
+		!Number.isSafeInteger(stateBarrierAttempts)
+		|| stateBarrierAttempts < 1
+		|| stateBarrierAttempts > 30
+		|| !Number.isSafeInteger(stateBarrierTraceWaitMs)
+		|| stateBarrierTraceWaitMs < 1
+		|| stateBarrierTraceWaitMs > 30_000
+		|| !Number.isSafeInteger(stateBarrierRetryDelayMs)
+		|| stateBarrierRetryDelayMs < 0
+		|| stateBarrierRetryDelayMs > 30_000
+	) fail("The seeded-room state barrier retry bound is invalid.");
 
 	function startTail(kind, version, format) {
 		let child;
@@ -1042,9 +1231,18 @@ export function createStagingTailObservers({
 		return fail(message);
 	}
 
-	async function observe(kind, version, operation, expectedProofDigest, readyOperation = () => undefined) {
-		if (typeof operation !== "function") fail("A staging tail operation is required.");
-		if (typeof readyOperation !== "function") fail("A staging tail readiness operation is required.");
+	async function waitForMaybe(tail, predicate, timeoutMs, terminalMessage) {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() <= deadline) {
+			if (tail.stderr.trim() !== "") return fail("The version-filtered staging tail emitted an error or warning.");
+			if (predicate()) return true;
+			if (tail.terminal) return fail(terminalMessage);
+			await delay(50);
+		}
+		return false;
+	}
+
+	async function attachJsonTail(kind, version) {
 		const jsonTail = startTail(kind, version, "json");
 		let readyTail;
 		try {
@@ -1069,47 +1267,131 @@ export function createStagingTailObservers({
 				5_000,
 				"The version-filtered staging JSON tail did not reach a trace boundary.",
 			);
+			return jsonTail;
+		} catch (error) {
+			await jsonTail.stop();
+			throw error;
+		} finally {
+			await readyTail?.stop();
+		}
+	}
+
+	async function observeCandidateSeed(operation, version, readyOperation = () => undefined) {
+		if (typeof operation !== "function" || typeof readyOperation !== "function") {
+			fail("A candidate seed tail operation is required.");
+		}
+		const jsonTail = await attachJsonTail("seed", version);
+		try {
 			const startIndex = jsonTail.accumulator.state().documents.length;
 			await readyOperation();
-			await onReady(kind);
 			const result = await operation();
 			let proofDigest;
 			await waitFor(
 				jsonTail,
 				() => {
-					const documents = jsonTail.accumulator.state().documents.slice(startIndex);
-					if (kind === "fault") {
-						proofDigest = findFaultTraceProof(documents, version);
-						return proofDigest !== null;
-					}
-					return hasRollbackTraceProof(documents, version, expectedProofDigest);
+					proofDigest = findCandidateSeedProof(
+						jsonTail.accumulator.state().documents.slice(startIndex),
+						version,
+					);
+					return proofDigest !== null;
 				},
-				kind === "fault" ? 45_000 : 20_000,
-				kind === "fault"
-					? "The fault version emitted no causal Durable Object retry proof."
-					: "The pinned Release-A version emitted no correlated successful alarm proof.",
+				45_000,
+				"The candidate seed emitted no same-object create and clean acknowledgement proof.",
 			);
-			// The fault operation result contains the ephemeral room response and
-			// cookie holder; discard it at the observer boundary.
-			return kind === "fault" ? { proofDigest } : result;
+			return { result, proofDigest };
 		} finally {
-			await readyTail?.stop();
+			await jsonTail.stop();
+		}
+	}
+
+	async function observeFaultSeededJoin(operations, version, expectedProofDigest, readyOperation = () => undefined) {
+		const required = [
+			"awaitActivation", "stateOperation", "beforeJoinOperation", "joinOperation",
+		];
+		if (!isObject(operations) || required.some((name) => typeof operations[name] !== "function")) {
+			fail("The seeded-room fault tail operations are invalid.");
+		}
+		if (typeof readyOperation !== "function") fail("A staging tail readiness operation is required.");
+		const checkedDigest = requireProofDigest(expectedProofDigest);
+		const jsonTail = await attachJsonTail("fault", version);
+		try {
+			const startIndex = jsonTail.accumulator.state().documents.length;
+			await readyOperation();
+			// This signal is the authorization boundary for the separate shell to
+			// activate the already-validated receiver-fault version.
+			await onReady("fault");
+			await operations.awaitActivation();
+			let stateBarrierObserved = false;
+			for (let attempt = 1; attempt <= stateBarrierAttempts; attempt += 1) {
+				await operations.stateOperation();
+				stateBarrierObserved = await waitForMaybe(
+					jsonTail,
+					() => hasFaultStateBarrier(
+						jsonTail.accumulator.state().documents.slice(startIndex),
+						version,
+						checkedDigest,
+					),
+					stateBarrierTraceWaitMs,
+					"The fault-version staging tail stopped before the seeded-room state barrier.",
+				);
+				if (stateBarrierObserved) break;
+				if (attempt < stateBarrierAttempts) await delay(stateBarrierRetryDelayMs);
+			}
+			if (!stateBarrierObserved) {
+				fail("The fault version emitted no same-object seeded-room state barrier inside the bounded retry window.");
+			}
+			await operations.beforeJoinOperation();
+			const result = await operations.joinOperation();
+			let proofDigest;
+			await waitFor(
+				jsonTail,
+				() => {
+					proofDigest = findFaultSeededJoinProof(
+						jsonTail.accumulator.state().documents.slice(startIndex),
+						version,
+						checkedDigest,
+					);
+					return proofDigest !== null;
+				},
+				45_000,
+				"The fault version emitted no causal seeded-room join retry proof. Do not retry under this fault deployment; restore Release B, verify the one attempted join has resolved, rebaseline, and start a fresh seeded-room drill.",
+			);
+			return { result, proofDigest };
+		} finally {
+			await jsonTail.stop();
+		}
+	}
+
+	async function observeRollbackAlarm(operation, version, proofDigest, readyOperation = () => undefined) {
+		if (typeof operation !== "function" || typeof readyOperation !== "function") {
+			fail("A rollback tail operation is required.");
+		}
+		const checkedDigest = requireProofDigest(proofDigest);
+		const jsonTail = await attachJsonTail("rollback", version);
+		try {
+			const startIndex = jsonTail.accumulator.state().documents.length;
+			await readyOperation();
+			await onReady("rollback");
+			const result = await operation();
+			await waitFor(
+				jsonTail,
+				() => hasRollbackTraceProof(
+					jsonTail.accumulator.state().documents.slice(startIndex),
+					version,
+					checkedDigest,
+				),
+				20_000,
+				"The pinned Release-A version emitted no correlated successful alarm proof.",
+			);
+			return result;
+		} finally {
 			await jsonTail.stop();
 		}
 	}
 	return {
-		observeFaultRetry(operation, version, readyOperation) {
-			return observe("fault", version, operation, undefined, readyOperation);
-		},
-		observeRollbackAlarm(operation, version, proofDigest, readyOperation) {
-			return observe(
-				"rollback",
-				version,
-				operation,
-				requireProofDigest(proofDigest),
-				readyOperation,
-			);
-		},
+		observeCandidateSeed,
+		observeFaultSeededJoin,
+		observeRollbackAlarm,
 	};
 }
 
@@ -1197,8 +1479,17 @@ export async function pollForCreateDrain(options) {
 	return pollForExactDelta({
 		...options,
 		deltas: CREATE_ONLY_DELTAS,
-		overlapMessage: "Another staging write or cleanup overlapped the rollback drain proof.",
-		exhaustedMessage: "The Release-A rollback bridge did not drain the pending row inside the bounded window.",
+		overlapMessage: "Another staging write or cleanup overlapped the candidate seed drain proof.",
+		exhaustedMessage: "The candidate seed create did not drain inside the bounded window.",
+	});
+}
+
+export async function pollForJoinedDrain(options) {
+	return pollForExactDelta({
+		...options,
+		deltas: JOIN_ONLY_DELTAS,
+		overlapMessage: "Another staging write or cleanup overlapped the rollback joined-row drain proof.",
+		exhaustedMessage: "The Release-A rollback bridge did not drain the pending joined row inside the bounded window.",
 	});
 }
 
@@ -1240,6 +1531,66 @@ async function waitForRollbackDeployment({
 		if (attempt < attempts) await delay(delayMs);
 	}
 	return fail("The reviewed Release-A staging rollback was not observed inside the bounded window.");
+}
+
+async function waitForFaultDeployment({
+	readDeployment,
+	delay,
+	candidateVersion,
+	faultVersion,
+	attempts,
+	delayMs,
+}) {
+	if (!Number.isSafeInteger(attempts) || attempts < 1 || attempts > 600) {
+		return fail("The fault deployment wait bound is invalid.");
+	}
+	if (!Number.isSafeInteger(delayMs) || delayMs < 0 || delayMs > 60_000) {
+		return fail("The fault deployment wait delay is invalid.");
+	}
+	for (let attempt = 1; attempt <= attempts; attempt += 1) {
+		const deployment = await readDeployment();
+		const active = singleVersionDeploymentId(deployment);
+		if (active === faultVersion) return deploymentIdentity(deployment, faultVersion);
+		if (active !== candidateVersion) {
+			return fail("Staging left the reviewed Release-B-to-fault deployment path.");
+		}
+		if (attempt < attempts) await delay(delayMs);
+	}
+	return fail("The reviewed staging receiver-fault deployment was not observed inside the bounded window.");
+}
+
+async function waitForReceiverFaultStatus({
+	request,
+	assertDeployment,
+	delay,
+	attempts,
+	delayMs,
+}) {
+	if (!Number.isSafeInteger(attempts) || attempts < 1 || attempts > 240) {
+		return fail("The receiver-fault readiness wait bound is invalid.");
+	}
+	if (!Number.isSafeInteger(delayMs) || delayMs < 0 || delayMs > 60_000) {
+		return fail("The receiver-fault readiness wait delay is invalid.");
+	}
+	for (let attempt = 1; attempt <= attempts; attempt += 1) {
+		await assertDeployment();
+		const status = await request(null, "/api/v1/platform/status");
+		await assertDeployment();
+		try {
+			assertReceiverFaultStatus(status);
+			return;
+		} catch (error) {
+			// The deployment API can converge before public request routing. Permit
+			// only the exact reviewed candidate readiness shape while it catches up.
+			try {
+				assertOutboxReadiness(status);
+			} catch {
+				throw error;
+			}
+		}
+		if (attempt < attempts) await delay(delayMs);
+	}
+	return fail("The receiver-fault public readiness boundary did not converge inside the bounded window.");
 }
 
 export async function validateFaultPreflight({
@@ -1290,10 +1641,16 @@ export async function prepareRollbackDrainProof({
 	readDeployment,
 	readVersion,
 	readSnapshot,
-	observeFaultRetry,
+	observeCandidateSeed,
+	observeFaultSeededJoin,
 	delay = sleep,
-	faultPropagationSoakMs = DEFAULT_FAULT_PROPAGATION_SOAK_MS,
 	faultObservationDelayMs = DEFAULT_FAULT_OBSERVATION_DELAY_MS,
+	deploymentWaitAttempts = DEFAULT_DEPLOYMENT_WAIT_ATTEMPTS,
+	deploymentWaitDelayMs = DEFAULT_DEPLOYMENT_WAIT_DELAY_MS,
+	faultStatusWaitAttempts = DEFAULT_FAULT_STATUS_WAIT_ATTEMPTS,
+	faultStatusWaitDelayMs = DEFAULT_FAULT_STATUS_WAIT_DELAY_MS,
+	pollAttempts = DEFAULT_DRAIN_POLL_ATTEMPTS,
+	pollDelayMs = DEFAULT_DRAIN_POLL_DELAY_MS,
 }) {
 	const coordinates = requireDrillCoordinates({
 		origin,
@@ -1302,21 +1659,25 @@ export async function prepareRollbackDrainProof({
 		faultVersion,
 		rollbackVersion,
 	});
-	requireAdapters({ fetchImpl, readDeployment, readVersion, readSnapshot, observeFaultRetry, delay }, [
-		"fetchImpl", "readDeployment", "readVersion", "readSnapshot", "observeFaultRetry", "delay",
+	requireAdapters({
+		fetchImpl,
+		readDeployment,
+		readVersion,
+		readSnapshot,
+		observeCandidateSeed,
+		observeFaultSeededJoin,
+		delay,
+	}, [
+		"fetchImpl", "readDeployment", "readVersion", "readSnapshot",
+		"observeCandidateSeed", "observeFaultSeededJoin", "delay",
 	]);
-	if (
-		!Number.isSafeInteger(faultPropagationSoakMs)
-		|| faultPropagationSoakMs < 1
-		|| faultPropagationSoakMs > 5 * 60_000
-	) return fail("The receiver-fault propagation soak is invalid.");
 	if (
 		!Number.isSafeInteger(faultObservationDelayMs)
 		|| faultObservationDelayMs < 1
 		|| faultObservationDelayMs > 60_000
 	) return fail("The receiver-fault observation window is invalid.");
 
-	assertSingleVersionDeployment(await readDeployment(), coordinates.faultVersion);
+	assertSingleVersionDeployment(await readDeployment(), coordinates.candidateVersion);
 	const [candidateDocument, faultDocument] = await Promise.all([
 		readVersion(coordinates.candidateVersion),
 		readVersion(coordinates.faultVersion),
@@ -1329,39 +1690,163 @@ export async function prepareRollbackDrainProof({
 	});
 
 	const request = createStagingRequester({ origin: coordinates.origin, fetchImpl });
-	assertReceiverFaultStatus(await request(null, "/api/v1/platform/status"));
-	const readFaultSnapshot = async () => {
-		assertSingleVersionDeployment(await readDeployment(), coordinates.faultVersion);
+	assertOutboxReadiness(await request(null, "/api/v1/platform/status"));
+	const readCandidateSnapshot = async () => {
+		assertSingleVersionDeployment(await readDeployment(), coordinates.candidateVersion);
 		const observed = await readSnapshot();
-		assertSingleVersionDeployment(await readDeployment(), coordinates.faultVersion);
+		assertSingleVersionDeployment(await readDeployment(), coordinates.candidateVersion);
 		return observed;
 	};
-	const baseline = normalizedSnapshot(await readFaultSnapshot(), true);
-	// A newly deployed outer Worker can briefly reach a Durable Object still
-	// assigned to the prior version. Hold a quiet, fully faulted interval and
-	// recheck every externally visible gate before creating the proof room.
-	await delay(faultPropagationSoakMs);
-	assertSingleVersionDeployment(await readDeployment(), coordinates.faultVersion);
-	assertReceiverFaultStatus(await request(null, "/api/v1/platform/status"));
-	assertUnchangedSnapshot(baseline, await readFaultSnapshot());
-	const observedProof = await observeFaultRetry(
+	const beforeSeed = normalizedSnapshot(await readCandidateSnapshot(), true);
+	const observedSeed = await observeCandidateSeed(
 		async () => runPublicRoomCreate(request),
-		coordinates.faultVersion,
-		async () => assertSingleVersionDeployment(await readDeployment(), coordinates.faultVersion),
+		coordinates.candidateVersion,
+		async () => {
+			assertSingleVersionDeployment(await readDeployment(), coordinates.candidateVersion);
+			assertUnchangedSnapshot(beforeSeed, await readCandidateSnapshot());
+		},
 	);
-	if (!isObject(observedProof)) return fail("The fault trace observer returned an invalid proof.");
-	const proofDigest = requireProofDigest(observedProof.proofDigest);
+	if (!isObject(observedSeed) || !isObject(observedSeed.result)) {
+		return fail("The candidate seed observer returned an invalid proof.");
+	}
+	const proofDigest = requireProofDigest(observedSeed.proofDigest);
+	const seedHost = observedSeed.result.host;
+	const seedCode = observedSeed.result.created?.code;
+	if (
+		!isObject(seedHost)
+		|| typeof seedHost.cookie !== "string"
+		|| seedHost.cookie === ""
+		|| typeof seedCode !== "string"
+		|| !/^[A-HJ-NP-Z2-9]{6}$/u.test(seedCode)
+	) return fail("The candidate seed observer returned an invalid public room result.");
+	// The create observer has already validated the public payload. Retain only
+	// the one routing code needed for the same-object barrier.
+	observedSeed.result.created = undefined;
+	const baseline = normalizedSnapshot(await pollForCreateDrain({
+		baseline: beforeSeed,
+		readSnapshot: readCandidateSnapshot,
+		delay,
+		attempts: pollAttempts,
+		delayMs: pollDelayMs,
+	}), true);
+
+	// Mint a distinct outer-Worker identity before attaching the inactive fault
+	// tail. This 404 path reaches neither a Durable Object nor D1.
+	const guest = { cookie: "" };
+	const guestIdentity = await request(guest, "/api/nonstoptalk-rollback-guest-identity");
+	if (
+		guestIdentity.status !== 404
+		|| guestIdentity.payload?.error !== "Not found."
+		|| !guest.cookie
+		|| guest.cookie === seedHost.cookie
+	) return fail("The seeded-room drill could not establish a distinct guest identity.");
+	// Distinctness is now proved. The host credential is never needed again.
+	seedHost.cookie = "";
+	observedSeed.result.host = undefined;
+	observedSeed.result = undefined;
+	assertUnchangedSnapshot(baseline, await readCandidateSnapshot());
+
+	let faultDeploymentId;
+	const assertFaultDeployment = async () => {
+		if (!faultDeploymentId) return fail("The fault deployment identity has not been established.");
+		assertSameDeployment(
+			await readDeployment(),
+			coordinates.faultVersion,
+			faultDeploymentId,
+		);
+	};
+	const readFaultSnapshot = async () => {
+		await assertFaultDeployment();
+		const observed = await readSnapshot();
+		await assertFaultDeployment();
+		return observed;
+	};
+	const roomPath = `/api/rooms/${seedCode}`;
+	const observedProof = await observeFaultSeededJoin({
+		async awaitActivation() {
+			faultDeploymentId = await waitForFaultDeployment({
+				readDeployment,
+				delay,
+				candidateVersion: coordinates.candidateVersion,
+				faultVersion: coordinates.faultVersion,
+				attempts: deploymentWaitAttempts,
+				delayMs: deploymentWaitDelayMs,
+			});
+			await waitForReceiverFaultStatus({
+				request,
+				assertDeployment: assertFaultDeployment,
+				delay,
+				attempts: faultStatusWaitAttempts,
+				delayMs: faultStatusWaitDelayMs,
+			});
+			assertUnchangedSnapshot(baseline, await readFaultSnapshot());
+		},
+		async stateOperation() {
+			await assertFaultDeployment();
+			const state = await request(guest, `${roomPath}/state`);
+			const room = state.payload?.room;
+			if (
+				state.status !== 200
+				|| !isObject(room)
+				|| room.code !== seedCode
+				|| room.version !== 1
+				|| !Array.isArray(room.players)
+				|| room.players.length !== 1
+				|| room.viewer?.isHost !== false
+				|| room.viewer?.isMember !== false
+				|| !guest.cookie
+			) return fail("The seeded-room fault state barrier returned an invalid public room state.");
+			await assertFaultDeployment();
+		},
+		async beforeJoinOperation() {
+			assertUnchangedSnapshot(baseline, await readFaultSnapshot());
+		},
+		async joinOperation() {
+			await assertFaultDeployment();
+			const joined = await request(guest, `${roomPath}/join`, {
+				method: "POST",
+				body: { name: "Rollback drill guest" },
+			});
+			const room = joined.payload?.room;
+			if (
+				joined.status !== 200
+				|| !isObject(room)
+				|| room.code !== seedCode
+				|| room.version !== 2
+				|| !Array.isArray(room.players)
+				|| room.players.length !== 2
+				|| room.viewer?.isHost !== false
+				|| room.viewer?.isMember !== true
+				|| !guest.cookie
+			) return fail("The seeded-room fault join returned an invalid public room state.");
+			await assertFaultDeployment();
+			return { joined: true };
+		},
+	},
+		coordinates.faultVersion,
+		proofDigest,
+		async () => {
+			assertSingleVersionDeployment(await readDeployment(), coordinates.candidateVersion);
+			assertUnchangedSnapshot(baseline, await readCandidateSnapshot());
+		},
+	);
+	if (
+		!isObject(observedProof)
+		|| requireProofDigest(observedProof.proofDigest) !== proofDigest
+	) return fail("The seeded-room fault observer returned an invalid proof.");
 	assertUnchangedSnapshot(baseline, await readFaultSnapshot());
 	await delay(faultObservationDelayMs);
 	assertUnchangedSnapshot(baseline, await readFaultSnapshot());
+	guest.cookie = "";
 	return {
 		baseline,
 		proofDigest,
 		summary: {
 			status: "ok",
-			phase: "pending-row-established",
+			phase: "pending-joined-row-established",
 			rollbackRequired: true,
-			expectedReceiptsAfterRollback: CREATE_ONLY_DELTAS.receiptCount,
+			expectedReceiptsAfterRollback: JOIN_ONLY_DELTAS.receiptCount,
+			expectedRoomJoinedEventsAfterRollback: JOIN_ONLY_DELTAS.roomJoinedCount,
 		},
 	};
 }
@@ -1431,7 +1916,7 @@ export async function verifyRollbackDrainProof({
 			assertSingleVersionDeployment(await readDeployment(), coordinates.rollbackVersion);
 			return observed;
 		};
-		const drained = await pollForCreateDrain({
+		const drained = await pollForJoinedDrain({
 			baseline: checkedBaseline,
 			readSnapshot: checkedSnapshot,
 			delay,
@@ -1470,10 +1955,11 @@ export async function verifyRollbackDrainProof({
 	assertSingleVersionDeployment(await readDeployment(), coordinates.rollbackVersion);
 	return {
 		status: "ok",
-		phase: "rollback-drain-and-legacy-proved",
-		receiptsAdded: CREATE_ONLY_DELTAS.receiptCount,
-		roomFactsAdded: CREATE_ONLY_DELTAS.roomFactCount,
-		roomCreatedEventsAdded: CREATE_ONLY_DELTAS.roomCreatedCount,
+		phase: "rollback-joined-drain-and-legacy-proved",
+		receiptsAdded: JOIN_ONLY_DELTAS.receiptCount,
+		roomFactsAdded: JOIN_ONLY_DELTAS.roomFactCount,
+		roomCreatedEventsAdded: JOIN_ONLY_DELTAS.roomCreatedCount,
+		roomJoinedEventsAdded: JOIN_ONLY_DELTAS.roomJoinedCount,
 		legacyReceiptsAdded: LEGACY_CREATE_DELTAS.receiptCount,
 		legacyRoomFactsAdded: LEGACY_CREATE_DELTAS.roomFactCount,
 		legacyRoomCreatedEventsAdded: LEGACY_CREATE_DELTAS.roomCreatedCount,
@@ -1555,10 +2041,12 @@ async function main(argv) {
 	}
 	const observers = createStagingTailObservers({
 		onReady(kind) {
-			if (kind === "rollback") {
+			if (kind === "fault" || kind === "rollback") {
 				console.error(JSON.stringify({
 					status: "waiting",
-					phase: "rollback-observer-ready",
+					phase: kind === "fault"
+						? "fault-observer-ready"
+						: "rollback-observer-ready",
 					deploymentPerformed: false,
 				}));
 			}
