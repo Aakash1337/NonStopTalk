@@ -77,9 +77,9 @@ Large, tightly tracked headlines provide the visual identity. Monospaced/tabular
 The speaker should see, in order:
 
 1. The prompt and chosen goal
-2. The local-processing disclosure and two independent choices before the attempt: transcript analysis and full-session artifact retention
+2. The practice-format choice, local-processing disclosure, and three independent optional choices before the attempt: transcript analysis, full-session artifact retention, and compact cloud backup
 3. The current attempt state and remaining time
-4. One live cue at most
+4. No live measurement/cue surface in the review-only baseline/retry format; one live cue at most in the single coached format
 5. A clear stop action
 
 Do not show the full post-session dashboard while the person is speaking. Analysis belongs in review, where each recommendation follows this shape:
@@ -94,7 +94,7 @@ The active topic, timer, voice status, and score remain the centerpiece. Host co
 
 ### Progress
 
-Lead with recent attempts and goal-specific trends. Compare the user with their own history. Do not rank people, infer demographic traits, or collapse pause, pace, filler, and input-level measurements into an opaque universal quality score. When an attempt has opted-in artifacts, expose separate recording/transcript download actions beside that attempt; JSON export must remain visibly distinct because it contains summaries and derived word patterns, not the full artifacts. The delete action must say that it clears both stores for this site.
+Lead with explicit practice loops, completed-loop/awaiting-retry state, and goal-specific paired evidence. Keep legacy, standalone, malformed, duplicate, and orphan records visible without pairing them by recency. Compare the user with their own baseline, but do not label a raw direction as improvement, rank people, infer demographic traits, or collapse pause, pace, filler, and input-level measurements into an opaque universal quality score. When an attempt has opted-in artifacts, expose separate recording/transcript download and artifact-only deletion actions beside that attempt; JSON export must remain visibly distinct because it contains summaries and derived word patterns, not the full artifacts. The full-history delete action must say that it clears both stores for this site.
 
 ## Core components
 
@@ -110,14 +110,14 @@ Practice and Progress:
 - Scenario and focus-goal selector
 - Prompt surface
 - Microphone readiness/privacy disclosure
-- Separate, unchecked controls for optional on-device transcript analysis and optional attempt-recording/captured-transcript retention
-- Live level indicator, with a sparse clipping cue when the measured condition qualifies
-- Single-tip coaching surface
+- Recommended review-only baseline/retry and alternative single-coached-attempt format controls
+- Separate, unchecked controls for optional on-device transcript analysis, optional attempt-recording/captured-transcript retention, and optional compact cloud backup
+- Live level indicator and single-tip coaching surface only for the single coached format; review-only attempts expose the prompt, timer, microphone-connected state, and no live measurements/cues
 - Evidence row with value, unit, and explanation
 - Compact grounding label that says whether the retrieved coaching card supplied the retry drill or was context only because an evidence-safety rule supplied it
 - Actionable review card
 - Device-local attempt history and empty state
-- Per-attempt download controls only when the relevant retained artifact exists, plus one confirmed action that clears summaries and artifacts; possibly partial transcripts carry a visible warning
+- Per-attempt download and artifact-only deletion controls when retained artifacts exist, plus one confirmed action that clears summaries and artifacts; possibly partial transcripts carry a visible warning
 
 Play:
 

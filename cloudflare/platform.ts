@@ -25,6 +25,8 @@ const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const SCENARIOS = new Set(["interview", "presentation", "impromptu"] as const);
 const GOALS = new Set(["pace", "pauses", "energy"] as const);
 const AUDIO_CONFIDENCE = new Set(["low", "medium", "high", "unknown"] as const);
+const ATTEMPT_ROLES = new Set(["standalone", "baseline", "retry"] as const);
+const FEEDBACK_MODES = new Set(["live-cues", "review-only"] as const);
 const TOPIC_PACKS = new Set(["everyday", "story", "absurd", "debate", "expert", "custom"] as const);
 
 const FORBIDDEN_CLOUD_KEYS = new Set([
@@ -61,12 +63,17 @@ const SUMMARY_COLUMNS = `
 	pause_count,
 	audio_confidence,
 	transcript_metrics_used,
+	practice_loop_id,
+	baseline_attempt_id,
+	attempt_role,
 	summary_json
 `;
 
 export type CoachingScenario = "interview" | "presentation" | "impromptu";
 export type CoachingGoal = "pace" | "pauses" | "energy";
 export type AudioConfidence = "low" | "medium" | "high" | "unknown";
+export type CoachingAttemptRole = "standalone" | "baseline" | "retry";
+export type CoachingFeedbackMode = "live-cues" | "review-only";
 
 export interface WordPattern {
 	phrase: string;
@@ -136,6 +143,11 @@ export interface CoachingSummary {
 	metrics: CoachingMetrics;
 	advice: CoachingAdvice;
 	artifacts?: LocalArtifactMetadata;
+	/** Optional for backward compatibility with pre-loop analysis-v2 summaries. */
+	practiceLoopId?: string | null;
+	baselineAttemptId?: string | null;
+	attemptRole?: CoachingAttemptRole;
+	feedbackMode?: CoachingFeedbackMode;
 }
 
 export type ExportedCoachingSummary = Omit<CoachingSummary, "artifacts">;
@@ -325,8 +337,13 @@ export function normalizeCoachingSummary(input: unknown): CoachingSummary {
 			"metrics",
 			"advice",
 			"artifacts",
+			"practiceLoopId",
+			"baselineAttemptId",
+			"attemptRole",
+			"feedbackMode",
 		],
 		"summary",
+		["artifacts", "practiceLoopId", "baselineAttemptId", "attemptRole", "feedbackMode"],
 	);
 	if (source.analysisSchemaVersion !== 2) {
 		throw invalid("summary.analysisSchemaVersion", "must be exactly 2");
@@ -340,6 +357,7 @@ export function normalizeCoachingSummary(input: unknown): CoachingSummary {
 	const metrics = normalizeMetrics(source.metrics);
 	const advice = normalizeAdvice(source.advice);
 	const artifacts = source.artifacts === undefined ? undefined : normalizeArtifactMetadata(source.artifacts);
+	const relationship = normalizePracticeRelationship(source, id);
 
 	if (metrics.voicedMs > metrics.durationMs + 1) {
 		throw invalid("summary.metrics.voicedMs", "cannot exceed durationMs");
@@ -361,6 +379,7 @@ export function normalizeCoachingSummary(input: unknown): CoachingSummary {
 		metrics,
 		advice,
 		...(artifacts === undefined ? {} : { artifacts }),
+		...relationship,
 	};
 	assertJsonSize(normalized, MAX_CLOUD_SUMMARY_BYTES, "Normalized cloud coaching summary");
 	return normalized;
@@ -722,6 +741,46 @@ function normalizeArtifactMetadata(input: unknown): LocalArtifactMetadata {
 	};
 }
 
+function normalizePracticeRelationship(
+	source: Record<string, unknown>,
+	sessionId: string,
+): Pick<CoachingSummary, "practiceLoopId" | "baselineAttemptId" | "attemptRole" | "feedbackMode"> | Record<string, never> {
+	const keys = ["practiceLoopId", "baselineAttemptId", "attemptRole", "feedbackMode"] as const;
+	const present = keys.filter((key) => Object.hasOwn(source, key));
+	if (present.length === 0) return {};
+	if (present.length !== keys.length) {
+		throw invalid("summary practice relationship", "must include all relationship fields or none");
+	}
+	const attemptRole = enumValue(source.attemptRole, ATTEMPT_ROLES, "summary.attemptRole");
+	const feedbackMode = enumValue(source.feedbackMode, FEEDBACK_MODES, "summary.feedbackMode");
+	if (attemptRole === "standalone") {
+		if (source.practiceLoopId !== null || source.baselineAttemptId !== null) {
+			throw invalid("summary practice relationship", "standalone attempts cannot belong to a loop");
+		}
+		if (feedbackMode !== "live-cues") {
+			throw invalid("summary.feedbackMode", "standalone attempts must use live-cues");
+		}
+		return {
+			practiceLoopId: null,
+			baselineAttemptId: null,
+			attemptRole,
+			feedbackMode,
+		};
+	}
+	const practiceLoopId = normalizeSessionId(source.practiceLoopId, "summary.practiceLoopId");
+	const baselineAttemptId = normalizeSessionId(source.baselineAttemptId, "summary.baselineAttemptId");
+	if (feedbackMode !== "review-only") {
+		throw invalid("summary.feedbackMode", "paired attempts must use review-only");
+	}
+	if (attemptRole === "baseline" && baselineAttemptId !== sessionId) {
+		throw invalid("summary.baselineAttemptId", "must equal summary.id for a baseline");
+	}
+	if (attemptRole === "retry" && baselineAttemptId === sessionId) {
+		throw invalid("summary.baselineAttemptId", "cannot point a retry to itself");
+	}
+	return { practiceLoopId, baselineAttemptId, attemptRole, feedbackMode };
+}
+
 interface CoachingSummaryRow {
 	session_id: string;
 	analysis_schema_version: number;
@@ -736,6 +795,9 @@ interface CoachingSummaryRow {
 	pause_count: number;
 	audio_confidence: string;
 	transcript_metrics_used: number;
+	practice_loop_id: string | null;
+	baseline_attempt_id: string | null;
+	attempt_role: CoachingAttemptRole;
 	summary_json: string;
 }
 
@@ -806,9 +868,10 @@ const INSERT_SUMMARY_SQL = `
 		device_key, session_id, analysis_schema_version, client_created_at,
 		received_at, updated_at, scenario, goal, target_duration_ms,
 		duration_ms, speaking_ratio, pause_count, audio_confidence,
-		transcript_metrics_used, summary_json
+		transcript_metrics_used, practice_loop_id, baseline_attempt_id,
+		attempt_role, summary_json
 	)
-	SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+	SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 	WHERE EXISTS (
 		SELECT 1
 		FROM consent_records AS consent
@@ -830,7 +893,8 @@ const UPDATE_SUMMARY_SQL = `
 	UPDATE coaching_sessions
 	SET analysis_schema_version = ?, client_created_at = ?, updated_at = ?,
 		scenario = ?, goal = ?, target_duration_ms = ?, duration_ms = ?, speaking_ratio = ?,
-		pause_count = ?, audio_confidence = ?, transcript_metrics_used = ?, summary_json = ?
+		pause_count = ?, audio_confidence = ?, transcript_metrics_used = ?,
+		practice_loop_id = ?, baseline_attempt_id = ?, attempt_role = ?, summary_json = ?
 	WHERE device_key = ? AND session_id = ?
 		AND EXISTS (
 			SELECT 1 FROM devices
@@ -1057,6 +1121,9 @@ export class PlatformStore {
 					summary.metrics.pauseCount,
 					summary.metrics.audioConfidence,
 					summary.metrics.transcriptMetrics === null ? 0 : 1,
+					summary.practiceLoopId ?? null,
+					summary.baselineAttemptId ?? null,
+					summary.attemptRole ?? "standalone",
 					serialized,
 					deviceKey,
 					summary.id,
@@ -1366,6 +1433,9 @@ export class PlatformStore {
 				summary.metrics.pauseCount,
 				summary.metrics.audioConfidence,
 				summary.metrics.transcriptMetrics === null ? 0 : 1,
+				summary.practiceLoopId ?? null,
+				summary.baselineAttemptId ?? null,
+				summary.attemptRole ?? "standalone",
 				serialized,
 				deviceKey,
 				timestamp,
@@ -1648,13 +1718,19 @@ function array(value: unknown, path: string, maximumLength: number): unknown[] {
 	return value;
 }
 
-function assertExactKeys(source: Record<string, unknown>, allowed: readonly string[], path: string): void {
+function assertExactKeys(
+	source: Record<string, unknown>,
+	allowed: readonly string[],
+	path: string,
+	optional: readonly string[] = ["artifacts"],
+): void {
 	const expected = new Set(allowed);
+	const optionalKeys = new Set(optional);
 	for (const key of Object.keys(source)) {
 		if (!expected.has(key)) throw invalid(`${path}.${key}`, "is not an allowlisted field");
 	}
 	for (const key of allowed) {
-		if (key === "artifacts") continue;
+		if (optionalKeys.has(key)) continue;
 		if (!Object.hasOwn(source, key)) throw invalid(`${path}.${key}`, "is required");
 	}
 }

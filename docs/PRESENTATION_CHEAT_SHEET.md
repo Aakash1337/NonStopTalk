@@ -4,7 +4,7 @@ Keep this page open beside the demo. Use [Learn NonStopTalk in 45 minutes](LEARN
 
 ## 30-second pitch
 
-> NonStopTalk turns private speaking rehearsal into a deliberate-practice loop: speak, see a small number of explainable signals, get one useful next action, and try again. Practice provides private browser-side coaching, Play keeps the original multiplayer game, and Progress is local-first with optional compact-summary backup. The prototype uses transparent signal processing and a small local retrieval layer, not a paid speech service or an LLM.
+> NonStopTalk turns private speaking rehearsal into a deliberate-practice loop: complete a review-only baseline, inspect explainable evidence and one next action, then make a linked unassisted retry and inspect raw goal-specific change. Practice provides private browser-side coaching, Play keeps the original multiplayer game, and Progress is local-first with optional compact-summary backup. The prototype uses transparent signal processing and a small local retrieval layer, not a paid speech service or an LLM. It does not claim the retry improved.
 
 ## Three tabs
 
@@ -12,7 +12,7 @@ Keep this page open beside the demo. Use [Learn NonStopTalk in 45 minutes](LEARN
 | --- | --- |
 | **Practice** `/practice` | “This is the coaching mode: calibrate, speak, review evidence, and retry.” |
 | **Play** `/` | “This is the social speaking game. Online rooms use a Worker and one Durable Object per room.” |
-| **Progress** `/progress` | “This is local-first Practice history with an optional compact-summary backup, not a leaderboard or universal speech score.” |
+| **Progress** `/progress` | “This groups only explicitly linked practice loops and shows descriptive selected-goal evidence with an optional compact-summary backup—not a leaderboard, universal score, or proof of improvement.” |
 
 Memory aid: **Practice coaches. Play motivates. Progress makes practice visible.**
 
@@ -59,12 +59,13 @@ Then:
 
 1. Open `/` and name the three tabs.
 2. Open `/practice`; choose Presentation opening, Purposeful pauses, 30 seconds.
-3. Leave all optional choices off for the primary demo.
+3. Keep the recommended baseline/retry format and leave all optional data choices off for the primary demo.
 4. Calibrate: about two seconds quiet, then two seconds normal speech.
 5. Speak, pause for about one second, and speak again. Voice must occur on both sides for an interior pause.
-6. On Review, show Strength, Focus next, Drill, evidence, timeline, and Local RAG grounding label.
-7. Open `/progress` and show the compact local summary.
-8. Demonstrate transcription or artifact retention only in a browser where you already tested it.
+6. Point out that the review-only baseline showed no live meter, statistics, or coaching cues. On Review, show Strength, Focus next, Drill, evidence, timeline, and Local RAG grounding label.
+7. Show **Prepare unassisted retry** and the locked scenario/goal/duration. Complete it only if time permits; otherwise prepare a non-sensitive completed pair on this exact origin before presenting.
+8. Open `/progress`; show the grouped/resumable loop or completed raw goal-specific comparison, including its limited-evidence reasons and caveats.
+9. Demonstrate transcription or artifact retention only in a browser where you already tested it.
 
 The Go command at port 8080 runs a separate game edition; it does not contain Practice or Progress.
 
@@ -83,9 +84,10 @@ What is retrieved? **A coaching card.** What is generated? **A bounded assembly 
 | Full-session retention checked | Separate store may keep a browser-encoded attempt recording and available captured transcript; calibration is excluded |
 | Compact cloud backup checked | Sends only allowlisted measurements/advice and bounded derived word-pattern fields to D1 under an anonymous browser identity |
 | JSON export | Summaries only; no recording or captured transcript |
+| Delete saved artifacts | Removes one attempt's local recording/transcript and resets artifact metadata; preserves its compact summary and paired comparison |
 | Delete history | Clears both local stores and, when cloud backup is enabled/reachable, this browser identity's compact D1 summaries; cannot delete downloaded files |
 
-The optional choices start off and do different jobs. **Try again** preserves the visible selections so the user can review or uncheck them. Cloud backup is not an account: access is tied to this anonymous browser identity. One UTC-day-bucketed device lease controls all its summaries and lasts at least 30 and less than 31 days after cloud use. New saves stop when 250 summaries already exist; migration does not forcibly delete valid unexpired legacy rows. There is no cross-device authentication or sync. Local artifacts have no automatic expiry. A transcript that fails to finalize after captured text arrives can be retained locally with a visible **possibly partial** warning.
+The optional choices start off and do different jobs. A standalone **Try again** and a direct baseline retry preserve visible selections so the user can review or uncheck them; a retry resumed from Progress starts all optional data choices unchecked. Cloud backup is not an account: access is tied to this anonymous browser identity. One UTC-day-bucketed device lease controls all its summaries and lasts at least 30 and less than 31 days after cloud use. New saves stop when 250 summaries already exist; migration does not forcibly delete valid unexpired legacy rows. There is no cross-device authentication or sync. Local artifacts have no automatic expiry. A transcript that fails to finalize after captured text arrives can be retained locally with a visible **possibly partial** warning.
 
 ## Durable Object answer
 
@@ -125,7 +127,7 @@ For a repository-connected build, create a **Worker** project, use repository ro
 | Local lexical retrieval and deterministic templates | LLM-generated or vector-searched advice |
 | Browser-encoded recording after opt-in | Raw PCM retention |
 | Engineering behavior covered by deterministic and browser tests | Proven real-device accuracy, learning, fairness, accessibility, security, or privacy certification |
-| Descriptive local-first attempt history | Progress already proves improvement |
+| Explicitly linked raw baseline/retry values, descriptive deltas, signal limitations, and caveats | Progress proves improvement, a learning outcome, or a universally better direction |
 | General rehearsal tool | Speech therapy, diagnosis, or replacement for a professional |
 
 Never say the app infers confidence, emotion, honesty, personality, health, identity, professionalism, or accent quality.
@@ -146,7 +148,7 @@ No coaching audio, recording, or captured transcript does. Cloud backup is off b
 
 **Can I keep the recording and transcript?**
 
-The separate unchecked retention choice records the active attempt. It keeps a captured transcript only when the experimental transcript-analysis option was also enabled, strict local recognition returned text, and retention was selected. Available artifacts remain in origin-local IndexedDB and download individually. The recording is browser-encoded, not raw PCM.
+The separate unchecked retention choice records the active attempt. It keeps a captured transcript only when the experimental transcript-analysis option was also enabled, strict local recognition returned text, and retention was selected. Available artifacts remain in origin-local IndexedDB and download individually. Progress can delete one attempt's artifacts while preserving its compact summary and pair; downloaded files remain outside application control. The recording is browser-encoded, not raw PCM.
 
 **Why AudioWorklet?**
 
@@ -158,7 +160,7 @@ That adds cost, latency, provider and consent boundaries, nondeterminism, source
 
 **How do you know it helps?**
 
-We do not claim that yet. The next pilot should measure completed baseline/review/unassisted-retry loops, paired goal-specific change, false tips, distraction, availability, privacy, grounding, device effects, and fairness. The platform's best-effort room/summary-save/delete/consent counters do not measure learning outcomes; a pilot still needs a separate consented study design.
+We do not claim that yet. Pairing and descriptive comparison are implemented; their accuracy, repeatability, usefulness, fairness, and learning effect are not validated. The next pilot should measure completed loops, paired goal-specific distributions, false tips, distraction, availability, privacy, grounding, device effects, and fairness. The platform's best-effort room/summary-save/delete/consent counters do not measure learning outcomes; a pilot still needs a separate consented study design.
 
 **Why did the original Cloudflare deploy fail?**
 
@@ -186,4 +188,4 @@ Play creates social repetition and motivation; Practice creates deliberate perso
 
 ## Closing line
 
-> This prototype proves that private, explainable coaching can coexist with the original social game and deploy on the free web stack. It does not yet prove learning outcomes or equal performance across devices and users. The next step is a small consented pilot and comparable baseline-to-retry measurement.
+> This prototype proves that private, explainable coaching and an explicit baseline-to-retry measurement loop can coexist with the original social game and deploy on the free web stack. It does not prove learning outcomes or equal performance across devices and users. The next step is a small consented pilot to validate repeatability and interpretation.

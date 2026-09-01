@@ -1,6 +1,6 @@
 # Copy to .dev.vars for local platform testing. Never commit real secrets.
-ANALYTICS_ADMIN_TOKEN=replace-with-at-least-24-random-characters
-ROOM_FACT_HASH_KEY=replace-with-at-least-32-random-characters
+ANALYTICS_ADMIN_TOKEN=replace-with-64-cryptographically-random-digits
+ROOM_FACT_HASH_KEY=replace-with-64-cryptographically-random-digits
 
 # External topic generation is disabled by default. `glm` uses the free
 # GLM-4.7-Flash Z.AI API and needs ZAI_API_KEY. `glm53` uses the configured

@@ -8,11 +8,11 @@ An incremental [web platform foundation](docs/WEB_PLATFORM_PLAN.md) is now in pr
 
 ## Implemented now
 
-- A Cloudflare-SPA coaching prototype at `/practice`: 30–90 second interview, presentation, or impromptu attempts; microphone calibration; browser-side audio measurements; sparse deterministic live tips; and evidence-based review
+- A Cloudflare-SPA coaching prototype at `/practice`: 30–90 second interview, presentation, or impromptu attempts; microphone calibration; browser-side audio measurements; an explicit review-only baseline → review → unassisted-retry loop by default; an alternative single coached attempt with sparse deterministic live tips; and evidence-based review
 - A small local RAG layer: goal/evidence queries lexically retrieve curated in-app coaching cards; normally the top card supplies an intact base drill, but an evidence-safety rule can use the measured priority's drill instead when the card is unsupported. The review distinguishes used guidance from context-only retrieval, with no LLM, free-form model prose, embeddings, vector database, or network call
 - Optional pace and word-pattern estimates only when the user consents and the browser supports strict on-device speech recognition; the summary retains derived filler/repetition patterns, while captured transcript text is discarded by default
-- Origin-local coaching summaries, JSON export, and deletion at `/progress` through IndexedDB in the current browser profile
-- A separate, off-by-default retention choice that can keep the attempt recording and any locally captured transcript in the same origin-local IndexedDB database; recognition gets up to two seconds to flush at finish, and a timeout or error after text was captured preserves it but marks it as possibly partial in Review and Progress. JSON export excludes these artifacts, and deletion clears both stores
+- Origin-local coaching summaries, explicit loop grouping, goal-specific baseline/retry comparisons, JSON export, and deletion at `/progress` through IndexedDB in the current browser profile. Legacy and single coached attempts remain independent; unrelated records are never paired by recency
+- A separate, off-by-default retention choice that can keep the attempt recording and any locally captured transcript in the same origin-local IndexedDB database; recognition gets up to two seconds to flush at finish, and a timeout or error after text was captured preserves it but marks it as possibly partial in Review and Progress. JSON export excludes these artifacts. Each attempt's artifacts can be deleted while its compact summary and comparison remain, and full history deletion clears both stores
 - Six-character rooms with a host, remote seats, browser-based reconnect, live updates (SSE in the local Go app and hibernatable WebSockets online), host transfer, and takeover after a short absence grace period
 - Local pass-and-play and remote turns in the same room
 - Player add, rename, remove, and reorder controls
@@ -185,7 +185,7 @@ npm run smoke:coach
 npm run smoke:platform
 ```
 
-`test:coach` runs 21 deterministic measurement, continuity, transcript-analysis, retrieval, grounding-safety, and advice tests without a microphone. `smoke:coach` drives the default/off coaching path with synthetic media and asserts that path makes no coaching-data API request; it also covers local storage, artifact, lifecycle, and review behavior. `test:cloud-progress` checks the separate opt-in client's summary allowlist, merge behavior, API calls, and preference state. `smoke:platform` starts a local Wrangler/D1 instance and exercises the status, summary-backup, export, analytics, privacy, and deletion boundaries.
+`test:coach` runs 33 deterministic measurement, continuity, transcript-analysis, retrieval, grounding-safety, advice, relationship, grouping, and paired-comparison tests without a microphone. `smoke:coach` drives synthetic media through the single coached path and the default review-only baseline → Progress/reload → locked unassisted-retry path; it checks that local-first attempts make no coaching-data API request, and covers local storage, per-attempt artifact deletion, lifecycle, review, and comparison behavior. `test:cloud-progress` checks the separate opt-in client's summary allowlist, relationship metadata, legacy compatibility, merge behavior, API calls, and preference state. `smoke:platform` starts a local Wrangler/D1 instance and exercises status, summary backup, relationship-column persistence, export, analytics, privacy, and deletion boundaries.
 
 ## Architecture
 
@@ -198,7 +198,7 @@ npm run smoke:platform
 - Native TypeScript Worker, Workers Static Assets, and one SQLite-backed Durable Object per online room
 - Hibernatable WebSockets for cost-efficient online synchronization
 - Browser `AudioWorklet` (with an `AnalyserNode` compatibility fallback) for coaching signal reduction, plus deterministic analysis and local lexical coaching-card retrieval
-- Origin-scoped IndexedDB v2 for compact coaching summaries and a separate, explicitly opted-in recording/captured-transcript store; exports exclude those artifacts and local deletion clears both stores
+- Origin-scoped IndexedDB v2 for compact coaching summaries—including explicit loop/baseline/role metadata—and a separate, explicitly opted-in recording/captured-transcript store; exports exclude those artifacts, per-attempt deletion preserves the compact record, and full local deletion clears both stores
 - An in-progress modular platform layer using D1 for queryable consented summaries and protected best-effort daily rollups, plus Analytics Engine for coarse best-effort telemetry; neither analytics path is audit or billing truth, and Durable Objects remain responsible for live rooms
 - A separate Cloudflare topic-provider adapter with deterministic default/fallback behavior, optional direct GLM-4.7 or Workers AI GLM-5.3-Flash routine generation, explicit Gemma 4 31B escalation, and aggregate D1 cost controls
 - Playwright browser smoke coverage plus Go unit and handler tests
@@ -217,7 +217,7 @@ These ideas are not presented as current features:
 - Family/content filters
 - Post-turn AI summaries
 - Full multiplayer-game feature parity between the local Go and free Cloudflare editions (AI judge, saved presets, import/export, microphone picker, and sound cues)
-- Validated baseline-to-unassisted-retry coaching comparisons
+- Validated learning outcomes from baseline-to-unassisted-retry coaching programs; the product now implements descriptive pairing but does not claim that a changed measurement is improvement
 - Coaching accuracy, usability, accessibility, and accent/language fairness validation across browsers and microphones
 - Guided programs, accounts and cross-device authentication/progress, educator tools, and optional external semantic/AI coaching
 - Queue-backed provider jobs or R2 media storage; neither is configured in the first platform slice

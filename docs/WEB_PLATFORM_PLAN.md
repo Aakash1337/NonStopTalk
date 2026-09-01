@@ -133,7 +133,7 @@ Exit: the complete slice runs against local Wrangler/D1, existing game and coach
 - Select an authentication approach after domain/email requirements are known. Prefer passkeys or email magic links; avoid building password storage.
 - Add users, auth identities, revocable sessions, account deletion, and anonymous-to-account adoption.
 - Add paginated sync, offline retry/outbox behavior, and conflict rules.
-- Add explicit baseline/retry relationships so comparisons are goal-specific rather than averages across unrelated attempts.
+- Preserve the implemented explicit baseline/retry relationship fields and goal-specific comparison semantics across account adoption; never replace them with averages across unrelated attempts.
 
 Exit: a user can sign in on a second device, see consented summaries, export them, and delete the account/data.
 

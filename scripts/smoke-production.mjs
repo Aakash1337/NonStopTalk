@@ -1,0 +1,66 @@
+import process from "node:process";
+
+const configuredOrigin = process.argv[2]
+  || process.env.NONSTOPTALK_PRODUCTION_ORIGIN
+  || "https://dontstoptalking.org";
+const origin = new URL(configuredOrigin);
+if (!/^https:$/.test(origin.protocol) || origin.pathname !== "/") {
+  throw new Error("NONSTOPTALK_PRODUCTION_ORIGIN must be an HTTPS origin without a path.");
+}
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+async function get(pathname, accept) {
+  let lastError;
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    try {
+      const response = await fetch(new URL(pathname, origin), {
+        headers: { Accept: accept },
+        redirect: "error",
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (response.ok) return response;
+      await response.body?.cancel().catch(() => undefined);
+      lastError = new Error(`${pathname} returned HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
+  }
+  throw lastError instanceof Error ? lastError : new Error(`${pathname} did not respond.`);
+}
+
+for (const pathname of ["/", "/practice", "/progress"]) {
+  const response = await get(pathname, "text/html");
+  assert(response.headers.get("content-type")?.startsWith("text/html"), `${pathname} did not return HTML`);
+  const html = await response.text();
+  assert(html.includes("<title>NonStopTalk</title>"), `${pathname} did not return the NonStopTalk shell`);
+  assert(response.headers.get("x-content-type-options") === "nosniff", `${pathname} is missing security headers`);
+  assert(response.headers.get("strict-transport-security")?.includes("max-age=31536000"),
+    `${pathname} is missing the production HSTS policy`);
+  assert(response.headers.get("content-security-policy")?.includes("default-src 'self'"),
+    `${pathname} is missing the Content Security Policy`);
+}
+
+const statusResponse = await get("/api/v1/platform/status", "application/json");
+const status = await statusResponse.json();
+assert(status.status === "ok", `platform status is ${String(status.status || "unavailable")}`);
+assert(status.apiVersion === "v1", "production API version is not v1");
+assert(Number.isSafeInteger(status.schemaVersion) && status.schemaVersion > 0, "production schema version is invalid");
+assert(Array.isArray(status.degradedCapabilities) && status.degradedCapabilities.length === 0,
+  `production reports degraded capabilities: ${JSON.stringify(status.degradedCapabilities)}`);
+assert(status.capabilities?.cloudProgress?.status === "ready", "cloud progress is not ready");
+assert(status.capabilities?.roomFacts?.status === "ready", "room facts are not ready");
+assert(status.capabilities?.aggregateAnalytics?.status === "ready", "aggregate analytics is not ready");
+assert(statusResponse.headers.get("cache-control") === "no-store", "platform status must not be cached");
+assert(Boolean(statusResponse.headers.get("x-request-id")), "platform status is missing its request ID");
+
+console.log(JSON.stringify({
+  status: "ok",
+  origin: origin.origin,
+  apiVersion: status.apiVersion,
+  schemaVersion: status.schemaVersion,
+  checkedRoutes: ["/", "/practice", "/progress", "/api/v1/platform/status"],
+}));

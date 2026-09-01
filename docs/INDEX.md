@@ -98,7 +98,7 @@ Use this table when two documents discuss the same topic. Code and tests are the
 | “Raw audio is retained” | “The optional artifact is a browser-encoded `MediaRecorder` recording; raw sample frames are reduced and not retained.” |
 | “LLM RAG” or “vector search” | “Local lexical retrieval plus deterministic template assembly, with no LLM, embeddings, vector database, or network call.” |
 | “Speaker confidence score” | “Signal or measurement confidence; the app does not infer a person's confidence.” |
-| “Progress proves improvement” | “Progress shows standalone local-first attempts; comparable baseline-to-retry validation is future work.” |
+| “Progress proves improvement” | “Progress shows explicitly linked, descriptive baseline-to-retry measurements with signal guardrails; learning outcomes and an improvement interpretation remain unvalidated.” |
 | “The local app” | Specify either “the Wrangler Cloudflare edition” or “the separate Go edition.” |
 
 ## Maintaining these docs

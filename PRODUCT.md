@@ -40,7 +40,7 @@ choose one goal
   → compare with the baseline
 ```
 
-The first prototype implements standalone practice attempts, analysis/advice, and origin-scoped IndexedDB summaries in the current browser profile. Consented transcript analysis retains derived filler/repetition patterns in the summary but discards captured transcript text by default. A separate, unchecked choice can retain the attempt recording and available captured transcript locally for individual download; a two-second finalization timeout or late recognition error preserves existing text but marks it as possibly partial in Review and Progress. Summary export omits those artifacts, and deleting local history clears them. Its small local RAG pattern ranks curated in-app coaching cards; the top card normally supplies the intact base drill, but an evidence-safety rule uses the measured priority's drill when the retrieved card lacks support. The review distinguishes a card used for the drill from context-only retrieval. Explicit baseline/retry pairing and validated learning outcomes are still work in progress.
+The current prototype implements this explicit relationship. Its recommended format records a review-only baseline, lets the user inspect evidence/advice, locks scenario, goal, and target duration for an unassisted review-only retry, and shows raw goal-specific paired measurements with signal guardrails and caveats. The alternative single coached attempt keeps sparse live cues and remains independent. Progress groups only records linked by explicit IDs; it never invents a pair from recency. Consented transcript analysis retains derived filler/repetition patterns in the summary but discards captured transcript text by default. A separate, unchecked choice can retain the attempt recording and available captured transcript locally for individual download or later per-attempt deletion; a two-second finalization timeout or late recognition error preserves existing text but marks it as possibly partial in Review and Progress. Summary export omits those artifacts, while deleting them preserves the compact attempt and paired comparison. Its small local RAG pattern ranks curated in-app coaching cards; the top card normally supplies the intact base drill, but an evidence-safety rule uses the measured priority's drill when the retrieved card lacks support. The review distinguishes a card used for the drill from context-only retrieval. Measurement accuracy and learning outcomes remain work in progress.
 
 Play creates a lightweight speaking challenge: keep talking about a topic without exceeding the silence limit. It makes rules visible, handles timing and scoring, and reduces host bookkeeping.
 
@@ -48,7 +48,7 @@ These modes must keep different success models. A pause can be a failure conditi
 
 ## Product success
 
-The primary future coaching outcomes are:
+The primary coaching outcomes for a future consented pilot are:
 
 1. People complete a deliberate-practice loop: baseline, evidence/advice review, and unassisted retry.
 2. The unassisted retry improves the one goal the person selected, measured as a paired goal-specific change rather than one opaque score.

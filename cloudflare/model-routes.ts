@@ -8,6 +8,7 @@ import {
 	type TopicProviderBindings,
 	type TopicProviderDescription,
 } from "./model-provider";
+import { logWorkerEvent } from "./observability";
 
 const TOPIC_ROUTE = "/api/v1/models/topics";
 const MAX_MODEL_BODY_BYTES = 16 * 1024;
@@ -524,7 +525,7 @@ async function safelyReconcileUsage(
 				),
 		]);
 	} catch (error) {
-		console.warn("model usage reconciliation was not written", {
+		logWorkerEvent("warn", "model_usage_reconciliation_failed", {
 			error: error instanceof Error ? error.name : "UnknownError",
 		});
 	}

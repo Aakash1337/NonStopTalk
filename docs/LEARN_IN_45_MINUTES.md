@@ -86,12 +86,13 @@ Checkpoint: Which tab uses Durable Objects? **Play only.** Which tab contains co
 Open `/practice` and make the safest primary demo:
 
 1. Choose **Presentation opening**, **Purposeful pauses**, and **30 seconds**.
-2. Leave transcript analysis and full-session retention unchecked.
+2. Keep the recommended **Baseline + unassisted retry** format and leave every optional data choice unchecked.
 3. Grant microphone permission.
 4. Stay quiet for about two seconds, then speak normally for about two seconds.
 5. Speak one complete phrase, pause for roughly one second, then speak another phrase.
-6. Finish and inspect **Strength**, **Focus next**, **Drill**, measured evidence, the timeline, and the Local RAG source label.
-7. Open `/progress` and locate the summary.
+6. Finish the baseline and inspect **Strength**, **Focus next**, **Drill**, measured evidence, the timeline, and the Local RAG source label.
+7. Choose **Prepare unassisted retry**. Confirm that scenario, goal, and duration are locked, then calibrate and repeat without any live meter, statistics, or coaching cue.
+8. Inspect the raw goal-specific baseline → retry comparison and its limited-evidence reasons/caveats, then open `/progress` and locate the grouped loop.
 
 The user loop is:
 
@@ -99,7 +100,7 @@ The user loop is:
 choose one goal → calibrate → speak → review one priority → retry → compare
 ```
 
-The current prototype implements standalone attempts and local-first history. Explicitly paired, comparable, unassisted retries are the next measurement feature; do not claim that Progress already proves improvement.
+The current prototype implements that explicit relationship and comparison. It also keeps a separate **Single coached attempt** format with sparse live cues. Do not claim that a displayed numerical change proves improvement: the pair is descriptive engineering evidence, and a pilot is still required for accuracy, usefulness, fairness, and learning outcomes.
 
 Checkpoint: Point to one measured fact and explain why it supports the recommended next action. If you cannot connect them, inspect the evidence and source label again.
 
@@ -120,7 +121,7 @@ The product is not trying to replace a human coach. It is trying to make repetit
 | Voice can be sensitive | Keep coaching analysis and storage in the browser by default; make full-artifact retention a separate choice |
 | Microphones and rooms vary | Calibrate each attempt and expose missing/uncertain evidence rather than inventing it |
 | Browser speech support varies | Require strict on-device recognition and fail closed to audio-only coaching |
-| Live feedback can distract | Delay and throttle cues; show one short cue at a time |
+| Live feedback can distract or compromise an unassisted comparison | Hide all live measurements/cues in baseline/retry attempts; delay and throttle one short cue only in the separate single coached format |
 | Advice must be explainable | Connect aggregate evidence to a product-authored drill and display provenance |
 | Accent and dialect are not defects | Avoid universal quality scores and do not infer emotion, honesty, identity, health, or professionalism |
 | The prototype must cost nothing to demonstrate | Use browser APIs, bundled cards, deterministic logic, Workers Static Assets, and Durable Objects for multiplayer only |
@@ -133,13 +134,13 @@ The design follows directly from those constraints:
 - reduce microphone samples to objective, device-relative measurements in the browser;
 - optionally add word-derived metrics only with strict local recognition and consent;
 - retrieve a small product-authored coaching card locally;
-- use sparse deterministic advice rather than an opaque model score;
+- use review-only paired attempts by default and sparse deterministic live advice only in the standalone mode rather than an opaque model score;
 - keep summaries and optional artifacts in separate browser stores; and
 - keep multiplayer room coordination separate in the Cloudflare Worker and Durable Objects.
 
 ### Measurement
 
-The future primary loop is **completed baseline → review → comparable unassisted retry**. Measure the paired change on the one chosen goal as a distribution, not as one universal grade.
+The implemented primary interaction is **completed baseline → review → comparable unassisted retry**. A future consented pilot should measure completion and the distribution of raw paired change on the one chosen goal, not treat the UI delta as one universal grade or a proven improvement.
 
 Guardrails include false tips, distraction, valid-input coverage, strict-local-transcription availability, privacy network violations, retention-boundary violations, grounding quality, device effects, accessibility, and subgroup fairness.
 
@@ -167,7 +168,7 @@ Retrieve → Assemble → Store
 | **5. Measure** | The engine aggregates observed time, coverage, speaking ratio, interior pauses, continuity, relative level, clipping, and optional transcript counts. | `CoachingAnalyzer.snapshot()` and `analyzeTranscript` in `coach-engine.js` |
 | **6. Retrieve** | The selected goal plus aggregate evidence becomes a lexical query that ranks six bundled coaching cards, keeps up to two results, and presents the top result as the primary context. | `retrieveCoachingGuidance` in `coach-engine.js` |
 | **7. Assemble** | Transparent rules choose Strength and Focus. A supported card normally contributes its unchanged drill; a safety rule can substitute a measurement-backed drill. One fixed comparison sentence is appended. | `buildAdvice` in `coach-engine.js` |
-| **8. Store** | A compact summary is saved to IndexedDB. Separate choices may retain local artifacts or back up the narrower summary allowlist to D1. | Local helpers in `app.js` and the opt-in client in `cloud-progress.js` |
+| **8. Store + relate** | A compact summary is saved to IndexedDB with explicit standalone or baseline/retry metadata. Separate choices may retain local artifacts or back up the narrower summary allowlist to D1. Progress validates relationships before grouping/comparison. | Local helpers in `app.js`, `coach-loop.js`, and the opt-in client in `cloud-progress.js` |
 
 ### Terms you need to explain
 
@@ -180,14 +181,13 @@ Retrieve → Assemble → Store
 - **AudioWorklet:** browser audio-rendering-thread processing that provides regular sample blocks and sends compact measurements to the page.
 - **IndexedDB:** origin-scoped browser storage for structured summaries and `Blob` artifacts.
 
-### Live feedback and review are different
+### Feedback mode and review are different
 
-| During the attempt | After the attempt |
-| --- | --- |
-| Acoustic evidence only | Acoustic plus optional transcript-derived evidence |
-| No cue in the first five seconds | Strength, one highest-value focus, and one drill |
-| One cue shown for five seconds | Evidence and card provenance displayed |
-| At least ten seconds between displayed cues | Captured text cleared unless separate retention was selected |
+| During a review-only baseline/retry | During a single coached attempt | After either attempt |
+| --- | --- | --- |
+| Prompt, goal, timer, and microphone-connected state only | Acoustic evidence only; no cue in the first five seconds | Acoustic plus optional transcript-derived evidence |
+| No live meter, statistics, or coaching-tip surface | One cue shown for five seconds, with at least ten seconds between displayed cues | Strength, one highest-value focus, one drill, evidence, and card provenance |
+| Measurements withheld until review | Sparse live evidence is not used to create a pair | Captured text cleared unless separate retention was selected; a linked retry also receives the goal-specific pair comparison |
 
 This separation reduces cognitive load and prevents late transcript results from changing live behavior invisibly.
 
@@ -283,11 +283,11 @@ This is a **Worker with Static Assets**, not a Pages-only project and not a Cont
 | Aggregate measurements and advice | Saved after a completed attempt when IndexedDB is available | `session-summaries` in origin-local IndexedDB | Default/off makes no coaching-data API call; included in summary JSON |
 | Derived pace/filler/repetition evidence | Only after transcript-analysis consent and strict-local support | Bounded fields in the compact summary | No remote fallback; derived words can still be sensitive |
 | Captured transcript text | No | `session-artifacts` only when transcript analysis captured text **and** full-session retention was selected | Excluded from JSON; individual download; may be flagged possibly partial |
-| Attempt recording | No | Browser-encoded `MediaRecorder` `Blob` in `session-artifacts` after separate retention opt-in | Calibration excluded; no upload; excluded from JSON; individual download |
+| Attempt recording | No | Browser-encoded `MediaRecorder` `Blob` in `session-artifacts` after separate retention opt-in | Calibration excluded; no upload; excluded from JSON; individual download or artifact-only deletion |
 | Compact cloud summary | No | Central D1, keyed to a hashed anonymous browser identity | Separate explicit choice; allowlisted metrics/advice and bounded derived patterns only; one device-level day-bucketed 30–31-day inactivity lease; new saves stop once 250 exist |
 | Multiplayer room state | Only for Play rooms | Private SQLite storage in the room Durable Object | Worker/DO traffic; expires after 30 days without a state change |
 
-Full-session retention and compact cloud backup are independent and start off. **Try again** preserves the visible setup selections so the user can review or uncheck them. Local artifacts have no automatic expiry. One UTC-day-bucketed device lease controls all of an anonymous browser's summaries, lasts at least 30 and less than 31 days after cloud use, and avoids per-summary renewal writes. The cloud cookie is not an account or recovery credential, so there is no cross-device Progress. IndexedDB remains best-effort, and deleting history cannot remove files already downloaded.
+Full-session retention and compact cloud backup are independent and start off. A standalone **Try again** and direct baseline retry preserve visible selections so the user can review or uncheck them; a retry resumed from Progress starts every optional data choice unchecked. Progress can delete one attempt's artifacts while preserving its compact summary and pair. Local artifacts have no automatic expiry. One UTC-day-bucketed device lease controls all of an anonymous browser's summaries, lasts at least 30 and less than 31 days after cloud use, and avoids per-summary renewal writes. The cloud cookie is not an account or recovery credential, so there is no cross-device Progress. IndexedDB remains best-effort, and deleting browser data cannot remove files already downloaded.
 
 ### Two editions that can both run locally
 
@@ -306,13 +306,13 @@ Checkpoint: Trace one Practice attempt and one Play action. Name exactly where e
 - sparse live acoustic cues and deterministic post-attempt advice;
 - six-card local lexical retrieval with grounding status;
 - optional strict on-device transcript-derived metrics;
-- local-first summaries, export, two-store deletion, opted-in artifact downloads, and optional compact D1 backup;
+- local-first summaries, explicit loop grouping/comparison, export, artifact-only and two-store deletion, opted-in artifact downloads, and optional compact D1 backup;
 - Worker-with-Assets deployment and Durable Object multiplayer rooms;
-- 21 deterministic coaching-engine tests plus coaching/platform browser smoke, Worker tests, typechecking, Go checks, and Wrangler dry-run validation.
+- 33 deterministic coaching/loop tests plus coaching/platform browser smoke, Worker tests, typechecking, Go checks, and Wrangler dry-run validation.
 
 ### Not proven or not implemented
 
-- no validated learning outcome or paired baseline-to-unassisted-retry feature yet;
+- no validated learning outcome or evidence that the implemented paired delta means improvement;
 - no universal speaker-quality, confidence, emotion, honesty, accent, health, or professionalism score;
 - no guarantee across microphones, rooms, browsers, languages, accents, or disabilities;
 - no account, cross-device authentication/sync, curriculum, or production external semantic/LLM coaching;
@@ -322,7 +322,7 @@ Checkpoint: Trace one Practice attempt and one Play action. Name exactly where e
 
 Tests show that the implementation follows its defined rules and privacy boundaries under tested conditions. They do not prove real-device measurement accuracy, usefulness, fairness, or learning outcomes.
 
-The future primary outcome is the distribution of paired, goal-specific change between a baseline and a comparable unassisted retry. Do not choose a numeric success target until a pilot establishes measurement quality and a baseline distribution.
+The proposed pilot's primary outcome is the distribution of paired, goal-specific change between a baseline and its comparable unassisted retry. Do not choose a numeric success target or label a direction as improvement until a pilot establishes measurement quality, repeatability, context, and a baseline distribution.
 
 The in-progress platform attempts only coarse room/summary-save/delete/consent aggregates for operations and funnel health. D1 rollups and Analytics Engine writes are both best-effort and can miss events. They do not copy coaching measurements into telemetry or measure learning outcomes. A pilot would still need explicit consent and a separate study design with paired outcomes and participant/facilitator ratings.
 
@@ -366,5 +366,5 @@ If any answer feels weak, reread only that section.
 | Cloudflare stores the full coaching session | IndexedDB stores local summaries and all artifacts; explicit backup may send only the compact summary to D1 |
 | Durable Object endpoint | Public Worker API routed through an internal Durable Object binding |
 | Pages deployment | Worker with Static Assets and a Durable Object |
-| Progress proves improvement | Progress shows descriptive standalone history; paired validation is next |
+| Progress proves improvement | Progress shows explicitly linked raw baseline/retry measurements, descriptive deltas, and signal limitations; improvement and learning remain unvalidated |
 | Validated, accurate, or fair | Work-in-progress engineering defaults that still require formal validation |

@@ -291,6 +291,7 @@ async function runPracticeFlow(browser, origin) {
   await page.goto(`${origin}/practice`);
   await page.waitForSelector("[data-coach-setup]");
   assert(normalizeHyphenatedText(await page.locator("body").innerText()).includes("on device"), "Practice setup must disclose on-device processing");
+  await page.getByRole("radio", { name: /Single coached attempt/ }).check();
   const retentionCheckbox = page.getByLabel("Optional full session retention").getByRole("checkbox");
   assert(!(await retentionCheckbox.isChecked()), "Raw audio/full transcript retention must be opt-in");
   await page.getByLabel("Optional transcript analysis").getByRole("checkbox").check();
@@ -318,7 +319,9 @@ async function runPracticeFlow(browser, origin) {
   const serialized = JSON.stringify(summaries);
   assert(!serialized.includes("Um basically"), "Stored summaries must not contain the full transcript");
   assert(!serialized.includes("data:audio") && !serialized.includes("audioBlob"), "Stored summaries must not contain audio");
-  assert(JSON.stringify(Object.keys(summary).sort()) === JSON.stringify(["advice", "analysisSchemaVersion", "artifacts", "createdAt", "goal", "id", "metrics", "scenario", "targetDurationMs"].sort()), "Stored summary must use the reviewed top-level allowlist");
+  assert(JSON.stringify(Object.keys(summary).sort()) === JSON.stringify(["advice", "analysisSchemaVersion", "artifacts", "baselineAttemptId", "createdAt", "feedbackMode", "goal", "id", "attemptRole", "metrics", "practiceLoopId", "scenario", "targetDurationMs"].sort()), "Stored summary must use the reviewed top-level allowlist");
+  assert(summary.attemptRole === "standalone" && summary.feedbackMode === "live-cues", "Single coached attempts must remain explicit standalone/live-cue records");
+  assert(summary.practiceLoopId === null && summary.baselineAttemptId === null, "Standalone attempts must not claim a practice-loop relationship");
   assert(!("segments" in summary.metrics) && !("transcript" in summary.metrics) && !("frames" in summary.metrics), "Stored metrics must exclude timelines, raw transcripts, and live frames");
   assert(summary.metrics.transcriptMetrics?.fillerOccurrences?.some((item) => item.phrase === "um"), "Consented derived filler patterns should be retained locally for analysis");
   assert(summary.artifacts.transcriptMayBePartial === true, "Summary metadata must preserve the partial-transcript warning without storing full text there");
@@ -369,30 +372,129 @@ async function runPracticeFlow(browser, origin) {
     }
   }
   assert(reloadedProgress.toLocaleLowerCase().includes("interview answer"), `Progress must survive a reload; storage=${reloadStorageDebug}; got ${JSON.stringify(reloadedProgress)}`);
-  await page.evaluate(async (sessionId) => {
-    const database = await new Promise((resolve, reject) => {
-      const request = indexedDB.open("nonstoptalk-coaching", 2);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-    try {
-      await new Promise((resolve, reject) => {
-        const transaction = database.transaction("session-artifacts", "readwrite");
-        transaction.objectStore("session-artifacts").delete(sessionId);
-        transaction.oncomplete = resolve;
-        transaction.onerror = () => reject(transaction.error);
-      });
-    } finally {
-      database.close();
-    }
-  }, summary.id);
-  await page.getByRole("button", { name: "Download recording" }).click();
-  await page.waitForFunction(() => document.querySelector("#toast")?.textContent === "That saved session artifact is unavailable.");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete saved artifacts" }).click();
+  await page.waitForFunction(() => document.querySelector("#toast")?.textContent?.includes("compact summary remains"));
+  assert((await storedSummaries(page)).length === 1, "Per-attempt artifact deletion must preserve the compact summary");
+  assert((await storedArtifacts(page)).length === 0, "Per-attempt artifact deletion must remove the selected local artifact");
+  assert(await page.getByRole("button", { name: "Download recording" }).count() === 0, "Deleted recording controls must disappear after metadata is updated");
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Delete local history" }).click();
   await page.waitForSelector(".empty-progress");
   assert((await storedSummaries(page)).length === 0, "Deleting local history must clear summaries");
   assert((await storedArtifacts(page)).length === 0, "Deleting local history must clear full artifacts");
+  await context.close();
+}
+
+async function runPracticeLoopFlow(browser, origin) {
+  const context = await browser.newContext();
+  await context.addInitScript(syntheticCoachAudio);
+  const page = await context.newPage();
+  const pageErrors = [];
+  const apiRequests = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.startsWith("/api/")) apiRequests.push(request.url());
+  });
+
+  await page.goto(`${origin}/practice`);
+  await page.waitForSelector("[data-coach-setup]");
+  assert(await page.getByRole("radio", { name: /Baseline \+ unassisted retry/ }).isChecked(),
+    "The deliberate baseline/retry loop should be the default practice format");
+  await page.getByRole("button", { name: /Calibrate microphone/ }).click();
+  await page.waitForSelector("[data-coach-live]", { timeout: 12_000 });
+  assert(await page.getByText("No live coaching cues.", { exact: true }).isVisible(),
+    "A paired baseline must explicitly hide coaching cues until review");
+  assert(await page.locator("[data-coach-tip]").count() === 0, "A paired baseline must not mount the live-tip surface");
+  assert(await page.locator("[data-coach-meter]").count() === 0, "A paired baseline must not reveal the live input meter");
+  assert(await page.locator(".live-stats").count() === 0, "A paired baseline must not reveal live measurements");
+  await page.waitForTimeout(650);
+  await page.locator("[data-coach-stop]").click();
+  await page.waitForSelector("[data-coach-review]");
+  assert(await page.getByRole("button", { name: /Prepare unassisted retry/ }).isVisible(),
+    "A baseline review must offer its explicit unassisted retry");
+
+  let summaries = await storedSummaries(page);
+  assert(summaries.length === 1, `Expected one saved loop baseline, got ${summaries.length}`);
+  const baseline = summaries[0];
+  assert(typeof baseline.practiceLoopId === "string" && baseline.practiceLoopId.length > 0,
+    "A loop baseline needs a non-empty opaque loop ID");
+  assert(baseline.baselineAttemptId === baseline.id, "A loop baseline must self-identify as the paired baseline");
+  assert(baseline.attemptRole === "baseline" && baseline.feedbackMode === "review-only",
+    "A loop baseline must persist its review-only relationship metadata");
+
+  await page.getByRole("link", { name: "View progress" }).click();
+  await page.waitForSelector("[data-coach-progress]");
+  assert(await page.locator("[data-practice-loop]").count() === 1,
+    "Progress must render the saved baseline as one explicit practice loop");
+  assert(await page.getByRole("button", { name: "Complete unassisted retry" }).isVisible(),
+    "An incomplete loop must expose a resumable retry action");
+  await page.reload();
+  await page.waitForSelector("[data-coach-progress]");
+  await page.getByRole("button", { name: "Complete unassisted retry" }).click();
+  await page.waitForSelector("[data-coach-setup]");
+
+  const setup = page.locator("[data-coach-setup]");
+  assert(await setup.locator('select[name="scenario"]').isDisabled(), "A resumed retry must lock the baseline scenario");
+  assert(await setup.locator('select[name="goal"]').isDisabled(), "A resumed retry must lock the baseline goal");
+  assert(await setup.locator('select[name="duration"]').isDisabled(), "A resumed retry must lock the baseline duration");
+  assert(await setup.locator('select[name="scenario"]').inputValue() === baseline.scenario,
+    "A resumed retry must restore the baseline scenario");
+  assert(await setup.locator('select[name="goal"]').inputValue() === baseline.goal,
+    "A resumed retry must restore the baseline goal");
+  assert(Number(await setup.locator('select[name="duration"]').inputValue()) * 1_000 === baseline.targetDurationMs,
+    "A resumed retry must restore the baseline target duration");
+  assert(!(await page.getByLabel("Optional transcript analysis").getByRole("checkbox").isChecked()),
+    "A resumed retry must not silently re-enable transcript analysis");
+  assert(!(await page.getByLabel("Optional full session retention").getByRole("checkbox").isChecked()),
+    "A resumed retry must not silently re-enable full-session retention");
+  assert(!(await page.getByLabel("Optional cloud summary backup").getByRole("checkbox").isChecked()),
+    "A resumed retry must not silently re-enable cloud backup");
+
+  await page.getByRole("button", { name: /Calibrate for retry/ }).click();
+  await page.waitForSelector("[data-coach-live]", { timeout: 12_000 });
+  assert(await page.getByText("No live coaching cues.", { exact: true }).isVisible(),
+    "The retry must remain unassisted after resuming from Progress");
+  assert(await page.locator("[data-coach-tip], [data-coach-meter], .live-stats").count() === 0,
+    "The retry must not mount any live coaching feedback surface");
+  await page.waitForTimeout(650);
+  await page.locator("[data-coach-stop]").click();
+  await page.waitForSelector("[data-coach-review]");
+  await page.waitForSelector("[data-coach-comparison]");
+  const comparisonText = (await page.locator("[data-coach-comparison]").innerText()).toLocaleLowerCase();
+  assert(comparisonText.includes("limited evidence"),
+    "Short smoke attempts should be labeled as limited evidence instead of implying improvement");
+  assert(comparisonText.includes("descriptive change"),
+    "Paired measurements must describe the delta without turning it into a score");
+
+  summaries = await storedSummaries(page);
+  assert(summaries.length === 2, `Expected one baseline and one linked retry, got ${summaries.length}`);
+  const retry = summaries.find((item) => item.id !== baseline.id);
+  assert(retry?.practiceLoopId === baseline.practiceLoopId, "The retry must retain the baseline loop ID");
+  assert(retry?.baselineAttemptId === baseline.id, "The retry must point to the exact baseline, never a recent substitute");
+  assert(retry?.attemptRole === "retry" && retry?.feedbackMode === "review-only",
+    "The retry must persist review-only relationship metadata");
+  assert(retry?.scenario === baseline.scenario && retry?.goal === baseline.goal && retry?.targetDurationMs === baseline.targetDurationMs,
+    "A comparable retry must preserve the baseline scenario, goal, and target duration");
+
+  await page.getByRole("link", { name: "View progress" }).click();
+  await page.waitForSelector("[data-coach-progress]");
+  assert(await page.locator("[data-practice-loop]").count() === 1,
+    "Progress must group a baseline and retry into one practice loop");
+  assert(await page.locator("[data-practice-loop] [data-coach-comparison]").count() === 1,
+    "The linked goal comparison must survive in Progress");
+  const progressText = (await page.locator("[data-coach-progress]").innerText()).toLocaleLowerCase();
+  assert(!progressText.includes("latest ratio shift") && !progressText.includes("average speaking ratio"),
+    "Progress must not compare unrelated attempts through global ratio aggregates");
+  await page.reload();
+  await page.waitForSelector("[data-practice-loop] [data-coach-comparison]");
+  assert((await storedSummaries(page)).length === 2, "The complete practice loop must survive a reload");
+  assert(apiRequests.length === 0, `The default local-first loop unexpectedly called the backend: ${apiRequests.join(", ")}`);
+  assert(pageErrors.length === 0, `Practice-loop flow emitted errors: ${JSON.stringify(pageErrors)}`);
+
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete local history" }).click();
+  await page.waitForSelector(".empty-progress");
   await context.close();
 }
 
@@ -543,8 +645,11 @@ async function runLegacyProgressFlow(browser, origin) {
   await page.goto(`${origin}/progress`);
   await page.waitForSelector("[data-coach-progress]");
   const progressMetrics = page.locator(".progress-metrics .review-metric strong");
-  assert(await progressMetrics.nth(1).innerText() === "60%", "Progress averages should exclude legacy records without a valid speaking ratio");
-  assert(await progressMetrics.nth(2).innerText() === "—", "Progress should not invent a latest-ratio shift from missing or non-numeric metrics");
+  assert(await progressMetrics.nth(0).innerText() === "3", "All legacy summaries should remain visible as independent attempts");
+  assert(await progressMetrics.nth(1).innerText() === "0", "Legacy summaries must not invent completed practice loops");
+  assert(await progressMetrics.nth(2).innerText() === "0", "Legacy summaries must not invent baselines awaiting retry");
+  assert(await page.locator("[data-coach-comparison]").count() === 0,
+    "Legacy summaries must not be paired by recency or compared without explicit relationship metadata");
   assert(pageErrors.length === 0, `Legacy progress flow emitted errors: ${JSON.stringify(pageErrors)}`);
   await context.close();
 }
@@ -740,6 +845,7 @@ try {
   await waitForServer(`${origin}/practice`, child, () => logs);
   browser = await launchBrowser();
   await runPracticeFlow(browser, origin);
+  await runPracticeLoopFlow(browser, origin);
   await runDefaultRetentionFlow(browser, origin);
   await runTranscriptFinalizationTimeoutFlow(browser, origin);
   await runVersionOneMigrationFlow(browser, origin);
