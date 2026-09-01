@@ -4,6 +4,7 @@ import {
   createPracticeLoop,
   createRetryState,
   groupPracticeLoops,
+  hasPersistedAttempt,
   normalizeAttemptRelationship,
   relationshipForSummary,
 } from "./coach-loop.js";
@@ -343,8 +344,11 @@ function renderPracticeReview() {
   const relationship = normalizeAttemptRelationship(practice.completedSummary || {});
   const baselineReview = relationship.valid && relationship.attemptRole === "baseline";
   const retryReview = relationship.valid && relationship.attemptRole === "retry";
+  const baselinePersisted = baselineReview && hasPersistedAttempt(practice.saved, practice.cloudSaved);
   const primaryAction = baselineReview
-    ? `<button class="button primary" type="button" data-command="coach-retry">Prepare unassisted retry <span aria-hidden="true">→</span></button>`
+    ? baselinePersisted
+      ? `<button class="button primary" type="button" data-command="coach-retry">Prepare unassisted retry <span aria-hidden="true">→</span></button>`
+      : `<button class="button primary" type="button" data-command="coach-new-loop">Try baseline again <span aria-hidden="true">↻</span></button>`
     : retryReview
       ? `<button class="button primary" type="button" data-command="coach-new-loop">Start a new baseline <span aria-hidden="true">↻</span></button>`
       : `<button class="button primary" type="button" data-command="coach-again">Try again <span aria-hidden="true">↻</span></button>`;
@@ -360,7 +364,9 @@ function renderPracticeReview() {
         <article class="advice-card focus"><span>02 · Focus next</span><h2>${escapeHTML(advice.focus)}</h2><p>${escapeHTML(advice.focusEvidence)}</p></article>
         <article class="advice-card drill"><span>03 · Drill</span><h2>${escapeHTML(advice.drill)}</h2><p>${escapeHTML(advice.drillDetail)}</p></article>
       </div>
-      ${retryReview ? renderGoalComparison(practice.comparison) : baselineReview ? `<section class="panel loop-next-step"><p class="eyebrow">Next step</p><h2>Review one change, then repeat without live cues.</h2><p>The retry keeps this scenario, goal, and target length so the comparison stays interpretable.</p></section>` : ""}
+      ${retryReview ? renderGoalComparison(practice.comparison) : baselineReview ? baselinePersisted
+        ? `<section class="panel loop-next-step"><p class="eyebrow">Next step</p><h2>Review one change, then repeat without live cues.</h2><p>The retry keeps this scenario, goal, and target length so the comparison stays interpretable.</p></section>`
+        : `<section class="panel loop-next-step"><p class="eyebrow">Baseline not saved</p><h2>Save a baseline before the paired retry.</h2><p>This review exists only in memory. Try the baseline again so a later retry cannot become an orphan after navigation or reload.</p></section>` : ""}
       <section class="panel evidence-panel">
         <div class="section-head"><div><p class="eyebrow">Evidence</p><h2>What the browser measured</h2></div><span>${escapeHTML(confidenceLabel(report.audioConfidence))}</span></div>
         <div class="metric-grid">
@@ -1806,6 +1812,12 @@ async function handleClick(event) {
     } else if (command === "coach-stop") {
       await finishCoachingSession("manual");
     } else if (command === "coach-retry") {
+      if (!hasPersistedAttempt(practice.saved, practice.cloudSaved)) {
+        practice.artifactWarning ||= "The baseline must be saved locally or online before starting its paired retry.";
+        renderPractice();
+        announce("The baseline was not saved. Try the baseline again before starting a paired retry.");
+        return;
+      }
       const baseline = practice.completedSummary;
       const retry = createRetryState(baseline);
       practice = freshPracticeState({ ...practice.setup, format: "loop" }, { ...retry, baselineSummary: baseline });

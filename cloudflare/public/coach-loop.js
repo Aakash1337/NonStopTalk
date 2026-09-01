@@ -17,6 +17,11 @@ const MINIMUM_COMPARISON_DURATION_MS = 15_000;
 const MAXIMUM_TARGET_DURATION_MS = 180_000;
 const MINIMUM_COMPARISON_COVERAGE = 0.75;
 
+/** A paired retry is recoverable only after its baseline exists in durable storage. */
+export function hasPersistedAttempt(localSaved = false, cloudSaved = false) {
+  return localSaved === true || cloudSaved === true;
+}
+
 export function createPracticeLoop(idFactory = randomOpaqueId) {
   const practiceLoopId = normalizeOpaqueId(idFactory(), "practiceLoopId");
   return {

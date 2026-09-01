@@ -6,10 +6,19 @@ import {
   createPracticeLoop,
   createRetryState,
   groupPracticeLoops,
+  hasPersistedAttempt,
   normalizeAttemptRelationship,
   relationshipForSummary,
   validateComparablePair,
 } from "./coach-loop.js";
+
+test("a paired retry requires its baseline to be persisted locally or online", () => {
+  assert.equal(hasPersistedAttempt(false, false), false);
+  assert.equal(hasPersistedAttempt(true, false), true);
+  assert.equal(hasPersistedAttempt(false, true), true);
+  assert.equal(hasPersistedAttempt(true, true), true);
+  assert.equal(hasPersistedAttempt("yes", 1), false, "Only internal boolean save results may unlock a retry");
+});
 
 function summary(overrides = {}) {
   const base = {

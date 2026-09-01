@@ -674,7 +674,7 @@ npm run smoke
 
 What each coaching check demonstrates:
 
-- `test:coach` runs 33 tests across controlled frames/transcripts, the pure engine, legacy/explicit relationships, safe grouping, immutable comparisons, exact goal measures, and limited-evidence guardrails.
+- `test:coach` runs 34 tests across controlled frames/transcripts, the pure engine, legacy/explicit relationships, persistence gating, safe grouping, immutable comparisons, exact goal measures, and limited-evidence guardrails.
 - `smoke:coach` drives `/practice` with synthetic media through both the standalone live-cue path and the default baseline → Progress/reload/resume → review-only retry path. It covers local storage, comparison, artifact-only deletion, lifecycle behavior, and asserts that default/off local-first paths make no coaching-data API request.
 - `test:cloud-progress` checks the separate opt-in allowlist, relationship metadata/legacy compatibility, merged-history behavior, API calls, and preference state; platform tests cover Worker relationship validation, identity, expiry, analytics, and local-artifact stripping.
 - `smoke:platform` starts an isolated local Wrangler/D1 environment and exercises status, backup, relationship-field round trip and reserved D1 columns, export, aggregate analytics, privacy rejection, and cloud deletion.

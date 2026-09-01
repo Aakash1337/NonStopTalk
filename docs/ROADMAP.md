@@ -26,7 +26,7 @@ Implemented prototype scope:
 - Compact session summaries in origin-scoped IndexedDB in the current browser profile, including consented derived filler/repetition patterns
 - Separate, off-by-default retention of the attempt recording and available captured transcript in an origin-local artifact store, with individual downloads and per-attempt artifact-only deletion; finalization errors/timeouts mark retained text as possibly partial in Review and Progress, artifacts are excluded from summary JSON export, and deletion preserves the compact attempt/pair
 - No coaching audio or captured-transcript upload; the independent compact-summary backup boundary is described in the platform section below
-- Thirty-three deterministic coaching/loop tests and browser smoke flows covering the single coached format, the default baseline → Progress/reload/resume → unassisted-retry format, safe grouping/comparison, per-attempt artifact deletion, and no coaching-data API request when backup is off
+- Thirty-four deterministic coaching/loop tests and browser smoke flows covering the single coached format, the default baseline → Progress/reload/resume → unassisted-retry format, baseline persistence gating, safe grouping/comparison, per-attempt artifact deletion, and no coaching-data API request when backup is off
 
 This prototype demonstrates the technical and interaction loop. It does not yet establish measurement accuracy across devices, learning outcomes, clinical value, accessibility conformance, or accent/language fairness.
 
