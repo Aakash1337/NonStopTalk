@@ -306,6 +306,10 @@ class FakeCleanupD1 {
 	heartbeatWrites = 0;
 	heartbeatBindings: unknown[] = [];
 	heartbeatQuery = "";
+	cleanupStatementQueries: string[][] = [];
+	cleanupStatementBindings: unknown[][][] = [];
+	backlogQuery = "";
+	backlogBindings: unknown[] = [];
 
 	constructor({
 		failCleanup = false,
@@ -339,6 +343,9 @@ class FakeCleanupD1 {
 
 	async batch(statements: D1PreparedStatement[]): Promise<D1Result<unknown>[]> {
 		this.cleanupBatches += 1;
+		const cleanupStatements = statements as unknown as FakeCleanupStatement[];
+		this.cleanupStatementQueries.push(cleanupStatements.map((statement) => statement.query));
+		this.cleanupStatementBindings.push(cleanupStatements.map((statement) => statement.bindings));
 		if (this.failCleanup) throw new Error("cleanup unavailable");
 		return statements.map(() => fakeResult(this.cleanupChanges));
 	}
@@ -414,6 +421,8 @@ class FakeCleanupStatement {
 		}
 		assert.match(this.query, /AS has_more/u);
 		this.database.backlogChecks += 1;
+		this.database.backlogQuery = this.query;
+		this.database.backlogBindings = this.bindings;
 		if (this.database.failBacklogCheck) throw new Error("backlog check unavailable");
 		return { has_more: this.database.backlogAfterBudget ? 1 : 0 } as T;
 	}
@@ -661,6 +670,52 @@ test("unsupported schemas block cleanup before any deletion or heartbeat write",
 	assert.equal(database.backlogChecks, 0);
 	assert.equal(database.heartbeatAttempts, 0);
 	assert.equal(database.heartbeatWrites, 0);
+});
+
+test("schema-5 cleanup never prepares SQL for the schema-6 receipt table", async () => {
+	const database = new FakeCleanupD1({
+		schemaVersion: 5,
+		cleanupChanges: 500,
+		backlogAfterBudget: false,
+	});
+	await runPlatformCleanup({ PLATFORM_DB: database as unknown as D1Database });
+
+	assert.equal(database.cleanupStatementQueries.length, 20);
+	assert(database.cleanupStatementQueries.every((queries) => queries.length === 5));
+	assert(database.cleanupStatementQueries.every(
+		(queries) => queries.every((query) => !query.includes("room_milestone_receipts")),
+	));
+	assert.doesNotMatch(database.backlogQuery, /room_milestone_receipts/u);
+	assert.equal(database.backlogBindings.length, 5);
+});
+
+test("schema-6 cleanup guards, aggregates, and probes expired receipt work", async (t) => {
+	const completionLogs: Record<string, unknown>[] = [];
+	t.mock.method(console, "log", (value: unknown) => {
+		if (typeof value === "object" && value !== null) {
+			completionLogs.push(value as Record<string, unknown>);
+		}
+	});
+	const database = new FakeCleanupD1({
+		schemaVersion: 6,
+		cleanupChanges: 500,
+		backlogAfterBudget: false,
+	});
+	await runPlatformCleanup({ PLATFORM_DB: database as unknown as D1Database });
+
+	assert.equal(database.cleanupStatementQueries.length, 20);
+	assert(database.cleanupStatementQueries.every((queries) => queries.length === 6));
+	for (const queries of database.cleanupStatementQueries) {
+		assert.match(queries[5] ?? "", /DELETE FROM room_milestone_receipts/u);
+		assert.match(queries[5] ?? "", /receipt\.expires_at <= \?/u);
+		assert.match(queries[5] ?? "", /FROM platform_meta[\s\S]*schema_version = 6/u);
+	}
+	assert.equal(database.cleanupStatementBindings[0]?.[5]?.length, 2);
+	assert.match(database.backlogQuery, /FROM room_milestone_receipts AS receipt/u);
+	assert.match(database.backlogQuery, /FROM platform_meta[\s\S]*schema_version = 6/u);
+	assert.equal(database.backlogBindings.length, 6);
+	const completed = completionLogs.find((record) => record.event === "platform_cleanup_completed");
+	assert.equal(completed?.roomMilestoneReceipts, 10_000);
 });
 
 test("cleanup revalidates the schema before every later D1 step", async (t) => {

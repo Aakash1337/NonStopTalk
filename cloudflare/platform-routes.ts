@@ -429,24 +429,32 @@ export async function runPlatformCleanup(
 	scheduledAt = new Date(),
 	clock: () => Date = () => new Date(),
 ): Promise<void> {
-	const deleted = { coachingSessions: 0, consentRecords: 0, devices: 0, syncProfiles: 0, roomFacts: 0 };
+	const deleted = {
+		coachingSessions: 0,
+		consentRecords: 0,
+		devices: 0,
+		syncProfiles: 0,
+		roomFacts: 0,
+		roomMilestoneReceipts: 0,
+	};
 	let hasMore = false;
 	let batches = 0;
 	while (batches < MAX_CLEANUP_BATCHES_PER_RUN) {
-		await requireSupportedPlatformSchema(env.PLATFORM_DB);
-		const chunk = await cleanupExpiredData(env.PLATFORM_DB, scheduledAt);
+		const schemaVersion = await requireSupportedPlatformSchema(env.PLATFORM_DB);
+		const chunk = await cleanupExpiredData(env.PLATFORM_DB, schemaVersion, scheduledAt);
 		batches += 1;
 		deleted.coachingSessions += chunk.coachingSessions;
 		deleted.consentRecords += chunk.consentRecords;
 		deleted.devices += chunk.devices;
 		deleted.syncProfiles += chunk.syncProfiles;
 		deleted.roomFacts += chunk.roomFacts;
+		deleted.roomMilestoneReceipts += chunk.roomMilestoneReceipts;
 		hasMore = chunk.hasMore;
 		if (!hasMore) break;
 	}
 	if (hasMore && batches === MAX_CLEANUP_BATCHES_PER_RUN) {
-		await requireSupportedPlatformSchema(env.PLATFORM_DB);
-		hasMore = await hasExpiredPlatformData(env.PLATFORM_DB, scheduledAt);
+		const schemaVersion = await requireSupportedPlatformSchema(env.PLATFORM_DB);
+		hasMore = await hasExpiredPlatformData(env.PLATFORM_DB, schemaVersion, scheduledAt);
 	}
 	const observedCompletion = clock();
 	const completedAt = observedCompletion.getTime() < scheduledAt.getTime()
