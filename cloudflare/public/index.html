@@ -10,6 +10,7 @@
   <script src="/app.js" type="module"></script>
 </head>
 <body>
+  <a class="skip-link" href="#app">Skip to main content</a>
   <header class="site-header">
     <a class="brand" href="/" data-home>NonStopTalk</a>
     <nav class="primary-nav" aria-label="Primary navigation">
@@ -19,7 +20,7 @@
     </nav>
     <span class="live-pill">On-device + live</span>
   </header>
-  <main id="app" class="shell">
+  <main id="app" class="shell" tabindex="-1">
     <section class="loading-card" role="status">Loading NonStopTalk…</section>
   </main>
   <div id="announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>

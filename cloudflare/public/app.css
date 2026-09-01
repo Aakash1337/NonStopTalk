@@ -21,6 +21,10 @@ button, input, select, textarea { font: inherit; }
 button, a { -webkit-tap-highlight-color: transparent; }
 a { color: inherit; }
 
+.skip-link { position: fixed; top: .75rem; left: .75rem; z-index: 100; padding: .7rem 1rem; border: 2px solid var(--acid); border-radius: .7rem; background: var(--ink); color: #111; font-weight: 800; text-decoration: none; transform: translateY(calc(-100% - 1rem)); }
+.skip-link:focus { transform: translateY(0); }
+#app:focus-visible, #app h1[tabindex="-1"]:focus-visible { outline: 3px solid rgba(213,255,79,.8); outline-offset: 6px; }
+
 .site-header { max-width: 1180px; margin: auto; padding: 1.25rem clamp(1rem, 4vw, 2rem); display: flex; justify-content: space-between; align-items: center; }
 .brand { color: var(--ink); text-decoration: none; font-size: 1.25rem; font-weight: 900; letter-spacing: -.04em; }
 .primary-nav { display: flex; align-items: center; gap: .3rem; padding: .25rem; border: 1px solid var(--line); border-radius: 999px; background: rgba(16,17,15,.72); }
@@ -65,7 +69,9 @@ textarea { resize: vertical; line-height: 1.5; }
 .inline > label, .inline > input { flex: 1; }
 
 .room-head { flex-wrap: wrap; border-bottom: 1px solid var(--line); padding-bottom: 1rem; }
-.room-code { font: 900 clamp(1.7rem, 6vw, 3.5rem)/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .12em; }
+.room-code { margin: 0; max-width: none; font: 900 clamp(1.7rem, 6vw, 3.5rem)/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .12em; }
+.room-state-title { margin-top: 0; margin-bottom: 1rem; max-width: none; font-size: clamp(2.2rem, 8vw, 4.5rem); line-height: 1; letter-spacing: -.055em; }
+.room-next-title { font-size: clamp(2.5rem, 8vw, 6rem); }
 .room-meta { color: var(--muted); }
 .notice { padding: .8rem 1rem; border: 1px solid #665c2b; background: #292714; border-radius: .75rem; margin-bottom: 1rem; }
 .notice.error { border-color: #744239; background: #2b1916; color: #ffc0b5; }
@@ -89,7 +95,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .topic-model-actions .hint { max-width: 48rem; margin: 0; }
 
 .turn-card { min-height: 31rem; padding: clamp(1.25rem, 4vw, 3rem); display: grid; align-content: center; text-align: center; }
-.turn-card h1 { margin-inline: auto; max-width: 18ch; font-size: clamp(2.2rem, 7vw, 5.5rem); line-height: .98; }
+.turn-card .room-state-title { margin-inline: auto; max-width: 18ch; font-size: clamp(2.2rem, 7vw, 5.5rem); line-height: .98; }
 .turn-meta { display: flex; justify-content: center; gap: 1rem; color: var(--muted); }
 .timer { font: 900 clamp(5rem, 19vw, 12rem)/.9 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: -.08em; margin: 1.25rem 0; }
 .meter { height: .65rem; width: min(24rem, 80%); margin: 0 auto 1rem; overflow: hidden; background: #0d0e0c; border-radius: 999px; }
@@ -97,7 +103,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .action-row { justify-content: center; flex-wrap: wrap; }
 .score-callout { color: var(--acid); font-size: clamp(1.4rem, 4vw, 2.4rem); font-weight: 900; }
 .winner { padding: clamp(2rem, 7vw, 6rem); text-align: center; }
-.winner h1 { max-width: none; }
+.winner .room-state-title { font-size: clamp(3rem, 9vw, 7.2rem); line-height: .85; letter-spacing: -.075em; }
 .history { display: grid; gap: .6rem; }
 .history-item { border-top: 1px solid var(--line); padding-top: .6rem; color: var(--muted); }
 .loading-card { padding: 4rem 2rem; text-align: center; color: var(--muted); }

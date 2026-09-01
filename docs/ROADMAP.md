@@ -124,6 +124,10 @@ Implemented work includes:
 - Go unit, handler, race, vet, and Playwright smoke validation
 - TypeScript game/route tests and a Wrangler deploy dry run
 - Deterministic coaching-engine tests and a Cloudflare-SPA coaching smoke flow
+- Automated axe-core WCAG rule scans across the public landing, practice,
+  progress, room-lobby, ready, active-turn, and coaching review states, plus
+  keyboard focus, skip-link, reduced-motion, and 320-pixel reflow checks; this
+  is regression coverage, not a claim of formal accessibility conformance
 - D1 migrations, platform API/repository tests, compact-summary client tests, configured/degraded capability status, and bounded scheduled anonymous-data cleanup
 - Expand-only schema-v4 sync-profile tables and one-device/one-profile backfill while device-owned session queries remain the rollback-safe authority
 - Host-authorized Cloudflare topic generation with separate provider adapters, per-attempt consent, aggregate daily cost controls, and deterministic failure fallback

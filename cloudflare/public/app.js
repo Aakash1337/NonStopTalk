@@ -91,7 +91,7 @@ async function loadRoute() {
     return;
   }
   roomCode = match[1].toUpperCase();
-  document.title = `${roomCode} · NonStopTalk`;
+  document.title = `Room ${roomCode} · NonStopTalk`;
   app.innerHTML = `<section class="loading-card" role="status">Opening room ${escapeHTML(roomCode)}…</section>`;
   try {
     const payload = await api(`/api/rooms/${roomCode}/state`);
@@ -313,9 +313,9 @@ function renderPracticeLive() {
           <p class="eyebrow">${escapeHTML(scenario.name)}</p>
           <h1>${escapeHTML(scenario.prompt)}</h1>
           <p class="goal-line"><strong>Focus:</strong> ${escapeHTML(goal.detail)}</p>
-          <div class="coach-timer" data-coach-timer aria-label="${remaining} seconds remaining">${remaining}</div>
-          ${reviewOnly ? `<div class="review-only-status" role="status"><span aria-hidden="true">●</span><strong>Microphone connected</strong><small>Measurements stay hidden until review so this attempt remains unassisted.</small></div>` : `<div class="coach-meter" aria-label="Live microphone level"><span data-coach-meter style="width:${Math.round((live.level || 0) * 100)}%"></span><i data-coach-threshold></i></div>
-          <div class="live-stats" aria-label="Current measurements">
+          <div class="coach-timer" data-coach-timer role="timer" aria-live="off" aria-label="${remaining} seconds remaining">${remaining}</div>
+          ${reviewOnly ? `<div class="review-only-status" role="status"><span aria-hidden="true">●</span><strong>Microphone connected</strong><small>Measurements stay hidden until review so this attempt remains unassisted.</small></div>` : `<div class="coach-meter" role="meter" aria-label="Live microphone level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round((live.level || 0) * 100)}"><span data-coach-meter style="width:${Math.round((live.level || 0) * 100)}%"></span><i data-coach-threshold></i></div>
+          <div class="live-stats" role="group" aria-label="Current measurements">
             <div><span data-coach-speaking>${formatPercent(live.speakingRatio)}</span><small>speaking</small></div>
             <div><span data-coach-pauses>${live.pauseCount ?? 0}</span><small>pauses</small></div>
             <div><span data-coach-level>${levelLabel(live.level)}</span><small>input</small></div>
@@ -530,6 +530,7 @@ async function beginCoachingSession(values) {
   }, loop);
   practice.phase = "permission";
   renderPractice();
+  focusMainHeading();
   const token = Symbol("coaching-run");
   pendingCoachingToken = token;
   let stream;
@@ -614,6 +615,7 @@ async function beginCoachingSession(values) {
     practice.phase = "setup";
     practice.error = microphoneErrorMessage(error);
     renderPractice();
+    focusMainHeading();
     announce(practice.error);
   }
 }
@@ -726,12 +728,15 @@ async function activateCoachingAttempt(run) {
     if (practice.setup.retainArtifacts) startArtifactRecorder(run);
     if (practice.setup.transcriptConsent) startLocalRecognition(run);
     renderPractice();
+    focusMainHeading();
     announce("Calibration complete. Your practice attempt has started.");
   } catch (error) {
     stopCoachingLifecycle();
     practice.phase = "setup";
     practice.error = error?.message || "Calibration could not find a clear speaking level. Try again closer to the microphone.";
     renderPractice();
+    focusMainHeading();
+    announce(practice.error);
   }
 }
 
@@ -877,7 +882,10 @@ async function finishCoachingSession(reason = "manual") {
     coachingRun = null;
     practice = freshPracticeState(practice.setup);
     practice.error = "This attempt could not be analyzed. Please calibrate and try again.";
-    if (isPracticeRoute()) renderPractice();
+    if (isPracticeRoute()) {
+      renderPractice();
+      focusMainHeading();
+    }
     throw error;
   }
   practice.report = report;
@@ -939,6 +947,7 @@ async function finishCoachingSession(reason = "manual") {
   if (!isPracticeRoute()) return;
   practice.phase = "review";
   renderPractice();
+  focusMainHeading();
   announce("Your attempt review is ready.");
 }
 
@@ -969,7 +978,10 @@ function failCoachingRun(run, message) {
   stopCoachingLifecycle();
   practice.phase = "setup";
   practice.error = message;
-  if (isPracticeRoute()) renderPractice();
+  if (isPracticeRoute()) {
+    renderPractice();
+    focusMainHeading();
+  }
   announce(message);
 }
 
@@ -1012,7 +1024,11 @@ function updateCoachingUI() {
   setText("[data-coach-pauses]", practice.live?.pauseCount ?? 0);
   setText("[data-coach-level]", levelLabel(practice.live?.level));
   const meter = document.querySelector("[data-coach-meter]");
-  if (meter) meter.style.width = `${Math.round((practice.live?.level || 0) * 100)}%`;
+  if (meter) {
+    const level = Math.round((practice.live?.level || 0) * 100);
+    meter.style.width = `${level}%`;
+    meter.parentElement?.setAttribute("aria-valuenow", String(level));
+  }
   const tip = document.querySelector("[data-coach-tip]");
   tip?.classList.toggle("is-visible", Boolean(practice.live?.tip));
   setText("[data-coach-tip-text]", practice.live?.tip?.text || "Listening for a useful pattern…");
@@ -1471,10 +1487,10 @@ function renderRoom() {
   const viewer = room.viewer;
   const current = room.players[room.currentPlayer];
   const header = `
-    <section class="room-head">
+    <section class="room-head" aria-labelledby="room-title">
       <div>
         <p class="eyebrow">Room code</p>
-        <div class="room-code">${escapeHTML(room.code)}</div>
+        <h1 class="room-code" id="room-title"><span class="sr-only">Room </span>${escapeHTML(room.code)}</h1>
       </div>
       <div class="action-row">
         <button class="button ghost small" type="button" data-command="copy-room">Copy invite</button>
@@ -1486,7 +1502,7 @@ function renderRoom() {
     app.innerHTML = `${header}
       <section class="panel stack" style="max-width:34rem;margin:2rem auto">
         <p class="eyebrow">Join ${escapeHTML(room.code)}</p>
-        <h1 style="font-size:clamp(2.2rem,8vw,4.5rem)">Take a seat.</h1>
+        <h2 class="room-state-title">Take a seat.</h2>
         <p class="room-meta">${room.players.length} of ${room.maxPlayers} seats are currently filled.</p>
         ${room.phase === "setup" ? `<form class="stack" data-join-current-room>
           <label>Your name <input name="name" maxlength="40" autocomplete="nickname" required autofocus></label>
@@ -1563,7 +1579,8 @@ function renderSetup() {
           <div class="section-head"><div><p class="eyebrow">Topic editor</p><h2>Custom list</h2></div><span>One per line</span></div>
           <form class="stack" data-room-action>
             <input type="hidden" name="type" value="custom-topics">
-            <textarea name="topics" rows="7" maxlength="20000">${escapeHTML(room.topics.join("\n"))}</textarea>
+            <label class="sr-only" for="room-custom-topics">Custom topics, one per line</label>
+            <textarea id="room-custom-topics" name="topics" rows="7" maxlength="20000">${escapeHTML(room.topics.join("\n"))}</textarea>
             <div class="action-row" style="justify-content:flex-start"><button class="button" type="submit">Use custom list</button></div>
           </form>
         </div>
@@ -1627,7 +1644,7 @@ function renderGame(current) {
     const last = room.lastTurn;
     return `<section class="room-grid">
       <div class="panel wide" style="text-align:center;padding:clamp(2rem,7vw,6rem)">
-        ${last ? `<p class="eyebrow">Turn scored</p><div class="score-callout">${escapeHTML(last.playerName)} earned ${last.score} points</div><p class="hint">${last.spokenSeconds} of ${last.duration} seconds${last.completed ? ` · ${room.completionBonus}-point completion bonus` : ""}</p>` : `<p class="eyebrow">Round ${room.currentRound}</p><h1 style="max-width:none;font-size:clamp(2.5rem,8vw,6rem)">${escapeHTML(current?.name || "Next player")} is up.</h1>`}
+        ${last ? `<p class="eyebrow">Turn scored</p><div class="score-callout">${escapeHTML(last.playerName)} earned ${last.score} points</div><p class="hint">${last.spokenSeconds} of ${last.duration} seconds${last.completed ? ` · ${room.completionBonus}-point completion bonus` : ""}</p>` : `<p class="eyebrow">Round ${room.currentRound}</p><h2 class="room-state-title room-next-title">${escapeHTML(current?.name || "Next player")} is up.</h2>`}
         ${canStart ? `<button class="button primary" type="button" data-command="start-turn">${last ? "Next turn" : "Draw topic"}</button>` : `<p class="hint">Waiting for ${escapeHTML(current?.name || "the next player")} or the host.</p>`}
       </div>
       <aside class="panel wide"><div class="section-head"><h2>Scoreboard</h2><span>${room.completedTurns.length} turns</span></div>${renderScores(true)}</aside>
@@ -1640,8 +1657,8 @@ function renderGame(current) {
     <div class="turn-card">
       <div class="turn-meta"><span>Round ${turn.round} of ${room.settings.rounds}</span><span>${escapeHTML(turn.playerName)}${viewer.playerId === turn.playerId ? " (you)" : ""}</span></div>
       <p class="eyebrow" style="margin-top:2rem">Topic</p>
-      <h1>${escapeHTML(turn.topic)}</h1>
-      <div class="timer" data-timer>${remaining}</div>
+      <h2 class="room-state-title">${escapeHTML(turn.topic)}</h2>
+      <div class="timer" data-timer role="timer" aria-live="off" aria-label="${remaining} seconds remaining">${remaining}</div>
       <div class="meter" aria-hidden="true"><span data-meter></span></div>
       <p class="hint" data-voice>${turn.begunAt === null ? `Silence limit: ${turn.silence}s` : `${escapeHTML(turn.playerName)} is speaking`}</p>
       ${isDriver ? renderTurnControls(turn) : `<p class="hint">The score arrives when the turn ends.</p>`}
@@ -1670,7 +1687,7 @@ function renderTurnControls(turn) {
 function renderWinner() {
   return `<section class="winner">
     <p class="eyebrow">Winner</p>
-    <h1>${escapeHTML(room.winner?.name || "Game over")}</h1>
+    <h2 class="room-state-title">${escapeHTML(room.winner?.name || "Game over")}</h2>
     <p class="score-callout">${room.winner?.score ?? 0} points</p>
     <div style="max-width:34rem;margin:2rem auto">${renderScores(true)}</div>
     ${room.viewer.isHost ? `<button class="button primary" type="button" data-command="reset">Play again</button>` : `<p class="hint">Waiting for the host to set up another game.</p>`}
@@ -1768,7 +1785,7 @@ async function handleClick(event) {
     return;
   }
   const home = event.target.closest("[data-home]");
-  if (home) {
+  if (home && isUnmodifiedPrimaryClick) {
     event.preventDefault();
     navigate("/");
     return;
@@ -1809,12 +1826,14 @@ async function handleClick(event) {
       stopCoachingLifecycle();
       practice = freshPracticeState(practice.setup);
       renderPractice();
+      focusMainHeading();
     } else if (command === "coach-stop") {
       await finishCoachingSession("manual");
     } else if (command === "coach-retry") {
       if (!hasPersistedAttempt(practice.saved, practice.cloudSaved)) {
         practice.artifactWarning ||= "The baseline must be saved locally or online before starting its paired retry.";
         renderPractice();
+        focusMainHeading();
         announce("The baseline was not saved. Try the baseline again before starting a paired retry.");
         return;
       }
@@ -1822,16 +1841,16 @@ async function handleClick(event) {
       const retry = createRetryState(baseline);
       practice = freshPracticeState({ ...practice.setup, format: "loop" }, { ...retry, baselineSummary: baseline });
       renderPractice();
-      document.querySelector("[data-coach-setup]")?.scrollIntoView({ block: "start" });
+      focusMainHeading();
       announce("Unassisted retry setup is ready. The baseline scenario, goal, and length are locked.");
     } else if (command === "coach-new-loop") {
       practice = freshPracticeState({ ...practice.setup, format: "loop" });
       renderPractice();
-      document.querySelector("[data-coach-setup]")?.scrollIntoView({ block: "start" });
+      focusMainHeading();
     } else if (command === "coach-again") {
       practice = freshPracticeState(practice.setup);
       renderPractice();
-      document.querySelector("[data-coach-setup]")?.scrollIntoView({ block: "start" });
+      focusMainHeading();
     } else if (command === "coach-export") {
       await exportCoachingSummaries();
     } else if (command === "coach-download-audio") {
@@ -2013,6 +2032,7 @@ function updateClock() {
   if (!turn || !timer) return;
   const remaining = remainingSeconds(turn);
   timer.textContent = String(remaining);
+  timer.setAttribute("aria-label", `${remaining} seconds remaining`);
   if (controller?.turnId === turn.id && remaining <= 0 && !controller.submitting) {
     finishTurn(true, false, turn.duration).catch((error) => showToast(error.message));
   }
@@ -2042,12 +2062,22 @@ function acceptRoom(next) {
   // update has already rendered.
   if (room && next.version < room.version) return;
   const previous = room;
+  const routeHeadingHadFocus = app.contains(document.activeElement)
+    && document.activeElement.matches("h1[tabindex='-1']");
   const focusedDraft = captureFocusedDraft();
   const announcement = roomAnnouncement(previous, next);
   room = next;
   clockOffset = room.serverNow - Date.now();
   renderRoom();
-  restoreFocusedDraft(focusedDraft);
+  if (routeHeadingHadFocus) {
+    const heading = app.querySelector("h1");
+    if (heading) {
+      heading.tabIndex = -1;
+      heading.focus({ preventScroll: true });
+    }
+  } else {
+    restoreFocusedDraft(focusedDraft);
+  }
   announce(announcement);
   if (room.viewer.isMember) connectSocket();
   if (!clockTimer) clockTimer = window.setInterval(updateClock, 200);
@@ -2164,11 +2194,17 @@ function navigate(path) {
 function focusRouteHeading() {
   if (!routeFocusRequested) return;
   routeFocusRequested = false;
-  const heading = app.querySelector("h1");
+  const heading = focusMainHeading();
   if (!heading) return;
+  announce(`${heading.textContent.trim()} page.`);
+}
+
+function focusMainHeading() {
+  const heading = app.querySelector("h1");
+  if (!heading) return null;
   heading.tabIndex = -1;
   heading.focus({ preventScroll: false });
-  announce(`${heading.textContent.trim()} page.`);
+  return heading;
 }
 
 function updatePrimaryNavigation() {
