@@ -35,6 +35,21 @@ const ROOM_DELETE_RETRY_MS = 60 * 60 * 1000;
 const HOST_HTTP_PRESENCE_BUCKET_MS = 15_000;
 const ROOM_MILESTONES_HEADER = "X-NonStopTalk-Room-Milestones";
 const MODEL_TOPICS_ROUTE = "/api/v1/models/topics";
+const ADMIN_ANALYTICS_DOCUMENT = "/admin/analytics";
+const ADMIN_ANALYTICS_CSP = [
+	"default-src 'none'",
+	"script-src 'self'",
+	"script-src-attr 'none'",
+	"style-src 'self'",
+	"style-src-attr 'none'",
+	"connect-src 'self'",
+	"img-src 'self' data:",
+	"base-uri 'none'",
+	"form-action 'none'",
+	"frame-ancestors 'none'",
+	"object-src 'none'",
+	"worker-src 'none'",
+].join("; ");
 
 /**
  * Wrangler generates the declared Cloudflare bindings in
@@ -362,6 +377,9 @@ export default {
 		const requestId = crypto.randomUUID();
 		try {
 			const url = new URL(request.url);
+			if (url.pathname === ADMIN_ANALYTICS_DOCUMENT || url.pathname.startsWith(`${ADMIN_ANALYTICS_DOCUMENT}/`)) {
+				return serveAdminAnalyticsDocument(request, env, requestId);
+			}
 			if (!url.pathname.startsWith("/api/")) return env.ASSETS.fetch(request);
 
 		if (!sameOrigin(request)) {
@@ -428,7 +446,13 @@ export default {
 				? withIdentityCookie(model.response, identity, request, true)
 				: model.response;
 		}
-		const platform = await handlePlatformRoute(request, env, identity.token, requestId);
+		const platform = await handlePlatformRoute(
+			request,
+			env,
+			identity.token,
+			requestId,
+			(task) => ctx.waitUntil(task),
+		);
 		if (platform) {
 			return platform.refreshIdentity
 				? withIdentityCookie(platform.response, identity, request, true)
@@ -527,6 +551,51 @@ export default {
 		);
 	},
 } satisfies ExportedHandler<WorkerEnv>;
+
+async function serveAdminAnalyticsDocument(
+	request: Request,
+	env: WorkerEnv,
+	requestId: string,
+): Promise<Response> {
+	let response: Response;
+	if (request.method !== "GET" && request.method !== "HEAD") {
+		response = new Response("Method not allowed.", {
+			status: 405,
+			headers: { Allow: "GET, HEAD", "Content-Type": "text/plain; charset=utf-8" },
+		});
+	} else if ([
+		ADMIN_ANALYTICS_DOCUMENT,
+		`${ADMIN_ANALYTICS_DOCUMENT}/`,
+		`${ADMIN_ANALYTICS_DOCUMENT}/index.html`,
+	].includes(new URL(request.url).pathname)) {
+		const assetURL = new URL("/admin/analytics/index.html", request.url);
+		response = await env.ASSETS.fetch(new Request(assetURL, {
+			method: request.method,
+			headers: { Accept: "text/html" },
+		}));
+	} else response = new Response("Not found.", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+	const headers = new Headers(response.headers);
+	// Cloudflare Web Analytics documents this exact cache directive as an
+	// opt-out from automatic beacon injection. This token-bearing document must
+	// never execute the public site's third-party RUM script.
+	headers.set("Cache-Control", "public, max-age=0, must-revalidate, no-transform");
+	headers.set("Content-Security-Policy", ADMIN_ANALYTICS_CSP);
+	headers.set("Permissions-Policy", "camera=(), geolocation=(), microphone=()");
+	headers.set("Referrer-Policy", "no-referrer");
+	headers.set("Strict-Transport-Security", "max-age=31536000");
+	headers.set("Cross-Origin-Opener-Policy", "same-origin");
+	headers.set("Cross-Origin-Resource-Policy", "same-origin");
+	headers.set("X-Content-Type-Options", "nosniff");
+	headers.set("X-Frame-Options", "DENY");
+	headers.set("X-Permitted-Cross-Domain-Policies", "none");
+	headers.set("X-Robots-Tag", "noindex, nofollow, noarchive");
+	headers.set("X-Request-ID", requestId);
+	return new Response(response.body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers,
+	});
+}
 
 function safeWorkerErrorName(error: unknown): string {
 	return error instanceof Error && error.name ? error.name : "UnknownError";

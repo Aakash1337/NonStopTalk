@@ -36,6 +36,7 @@ go test -race ./...
 go vet ./...
 npm run test:coach
 npm run test:cloud-progress
+npm run test:admin
 npm run check:cloudflare-types
 npm run typecheck:cloudflare
 npm run test:cloudflare
@@ -44,6 +45,7 @@ npm run check:cloudflare
 npm run check:cloudflare-staging
 npm run check:cloudflare-startup
 npm run smoke:platform
+npm run smoke:admin
 ```
 
 The GitHub workflow runs the same checks plus all browser smoke suites. A
@@ -164,6 +166,37 @@ A healthy response has:
 The probe proves configuration and D1 readiness. It cannot prove Workers Paid
 entitlement for GLM 5.3 Flash. The first consented call still fails closed to a
 deterministic topic draft if the account cannot run that model.
+
+## Operator analytics dashboard
+
+Open `https://dontstoptalking.org/admin/analytics` directly. It is deliberately
+absent from public navigation. Enter the same numeric `ANALYTICS_ADMIN_TOKEN`
+configured as a Worker secret; do not put it in the URL, a bookmark, a shell
+argument, a screenshot, or a ticket. The page clears the password field before
+requesting data and does not retain the token after the two requests finish.
+Refreshing data requires entering it again.
+
+The dashboard requests the protected product and model endpoints once each for
+90 UTC days, then computes its 1/7/30/90-day views locally. It refuses to render
+when source windows, row invariants, product totals, global model totals, or
+provider/global reconciliation disagree. Event ratios are not cohorts and may
+cross a selected window boundary. The current UTC day is partial. An em dash
+means a rate or latency has no denominator. `reserved - completed` is the model
+reconciliation guardrail; investigate an unexpected nonzero value before
+enabling or expanding provider spend.
+
+A request that straddles 00:00 UTC can rarely see adjacent source windows and
+fail closed with a source-consistency error. Re-enter the token and retry after
+the rollover; the dashboard deliberately does not auto-retry or show a partial
+mix of the two extracts.
+
+This document intentionally differs from public pages: the Worker routes it
+first, returns `Cache-Control: public, max-age=0, must-revalidate, no-transform`,
+allows only same-origin scripts and connections, sends no referrer, and marks
+the page noindex. `no-transform` prevents Cloudflare's automatically injected
+Web Analytics beacon from entering the token-bearing document. The production
+smoke probe verifies the document and headers without possessing or exercising
+the admin secret.
 
 Useful read-only commands:
 

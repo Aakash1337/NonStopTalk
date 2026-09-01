@@ -100,6 +100,8 @@ New saves are rejected when an anonymous browser identity already owns 250 cloud
 
 Analytics Engine receives the same coarse event vocabulary for inexpensive time-series exploration. D1 rollups provide a small protected readout for the admin API, but both paths are best-effort: D1 writes fail open, room-triggered writes run through the Durable Object's `waitUntil`, and events can be missed. Neither store is an audit log, billing ledger, or delivery-exact source of truth.
 
+The implemented operator surface at `/admin/analytics` uses the same bearer guard and no new service. It concurrently requests one 90-day product extract and one 90-day model-usage extract, validates their matching UTC windows and row invariants, reconciles API totals against daily/global/provider rows, then derives 1/7/30/90-day views locally. Event ratios are labeled as non-cohort operating signals, zero denominators stay unavailable, and the current UTC day is disclosed as partial. The token-bearing page is a separate document with no public navigation link, no storage, a self-only script/connect policy, and a `no-transform` response that prevents automatic Cloudflare Web Analytics injection.
+
 Model usage is a separate cost-control path rather than product telemetry. Its D1 reservation/check must succeed before an external request; if it cannot, generation falls back to deterministic topics. `MODEL_DAILY_CALL_LIMIT` defaults to 100 aggregate external attempts per UTC day. The usage state aggregates reservations/completions, successes/failures, provider/model/task, input/output/total/cached-input/reasoning token totals, total latency, and timestamps—not the host theme, generated topics, identities, or room/member/authentication tokens. `GET /api/v1/admin/model-usage?days=30` exposes global totals plus daily global/provider rows for those operational aggregates, without prompts, responses, room data, or identity. A failed/timed-out call without returned usage is counted but contributes zero token totals, so this operational view can undercount vendor-billed inference.
 
 ## Analytics contract
@@ -149,8 +151,8 @@ Exit: a user can sign in on a second device, see consented summaries, export the
 
 - Persist finished-game and turn facts to D1 without moving live authority out of Durable Objects.
 - Add idempotency keys and a Durable Object outbox for milestone delivery.
-- Add a small admin dashboard over the protected API.
-- Add staging/production environments, preview database, migration checks, alarms, and incident runbooks.
+- **Implemented:** add a small, protected, source-reconciled admin dashboard without a new dependency or service.
+- **Implemented:** add isolated staging/production environments, migration checks, cleanup/room alarms, deployment smoke probes, and incident runbooks.
 
 Exit: deployments are repeatable, game outcomes are queryable across rooms, and support can diagnose failures without reading private room content.
 
