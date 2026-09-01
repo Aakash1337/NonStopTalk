@@ -257,11 +257,16 @@ Use this order:
    same object's successful state read, successful join, and first
    `database-unavailable` delivery failure plus attempt-1 retry schedule. The D1
    baseline must remain unchanged immediately and through the bounded observation
-   window. Real-time tail delivery may coalesce a later alarm before the helper
-   evaluates attempt 1; such evidence is accepted only when every additional
-   alarm belongs to the same object and is a contiguous attempt-2, attempt-3, ...
-   `database-unavailable` retry. A missing attempt 1, a duplicate or gap, another
-   object, another failure, or a terminal record fails closed. Those facts
+   window. The local reader may accumulate a later, separate alarm document
+   before the helper next evaluates attempt 1; matching-object evidence is
+   accepted only when it is a contiguous attempt-2, attempt-3, ...
+   `database-unavailable` retry. Because a
+   version-filtered tail can also receive an already-scheduled alarm from an
+   older room, the helper structurally validates but does not use a valid
+   other-object retry. It can neither satisfy nor invalidate the seeded-room
+   chain, and any unique D1 effect remains guarded by the exact aggregate deltas.
+   A missing attempt 1, a duplicate or gap on the proved object, another failure,
+   a malformed retry, or a terminal record fails closed. Those facts
    establish one pending local `joined` row; a timed wait or a fresh random
    object is never accepted as proof. Sampling, truncation, exceptions,
    terminal/unexpected outbox logs, concurrent room mutations, cleanup,

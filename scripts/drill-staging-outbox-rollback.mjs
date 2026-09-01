@@ -817,6 +817,44 @@ function isAlarmTrace(document) {
 		&& document.event.cron === undefined;
 }
 
+function faultRetryAlarmEvidence(document) {
+	if (!isAlarmTrace(document)) return null;
+	const logs = traceLogRecords(document);
+	const outboxLogs = logs.filter((record) => (
+		typeof record.event === "string"
+		&& record.event.startsWith("room_milestone_outbox_")
+	));
+	if (outboxLogs.length === 0) return null;
+	if (!isSuccessfulDurableObjectTrace(document)) {
+		return fail("A fault-version outbox alarm did not have successful Room Durable Object metadata.");
+	}
+	if (unexpectedTraceLogCount(document) !== 0) {
+		return fail("A fault-version outbox alarm emitted an unexpected log.");
+	}
+	if (outboxLogs.some((record) => (
+		record.event !== "room_milestone_outbox_delivery_failed"
+		&& record.event !== "room_milestone_outbox_retry_scheduled"
+	))) return fail("A fault-version outbox alarm emitted an unexpected or terminal outbox event.");
+	const deliveryFailed = outboxLogs.filter((record) => (
+		record.event === "room_milestone_outbox_delivery_failed"
+	));
+	const retryScheduled = outboxLogs.filter((record) => (
+		record.event === "room_milestone_outbox_retry_scheduled"
+	));
+	if (
+		outboxLogs.length !== 2
+		|| deliveryFailed.length !== 1
+		|| retryScheduled.length !== 1
+		|| retryScheduled[0].failure !== "database-unavailable"
+		|| !safeInteger(retryScheduled[0].attemptCount)
+		|| retryScheduled[0].attemptCount < 1
+	) return fail("A fault-version retry alarm was split or incomplete.");
+	return {
+		durableObjectId: document.durableObjectId,
+		attemptCount: retryScheduled[0].attemptCount,
+	};
+}
+
 function assertSafeTailDocuments(documents, version) {
 	const checkedVersion = requireVersionId(version, "tailed");
 	if (!Array.isArray(documents)) return fail("The staging tail trace stream is malformed.");
@@ -966,6 +1004,15 @@ export function findFaultSeededJoinProof(documents, version, expectedProofDigest
 	const joins = [];
 	const retryAlarms = [];
 	for (const [index, document] of documents.entries()) {
+		// A version-filtered tail can include an already-scheduled alarm from an
+		// older room after the fault version becomes active. Validate its shape so
+		// terminal or malformed background activity still fails closed, but never
+		// let another Durable Object satisfy or invalidate the seeded-room chain.
+		const retryAlarm = faultRetryAlarmEvidence(document);
+		if (
+			retryAlarm
+			&& durableObjectProofDigest(retryAlarm.durableObjectId) === checkedDigest
+		) retryAlarms.push({ index, ...retryAlarm });
 		if (!isSuccessfulDurableObjectTrace(document)) continue;
 		const pathname = traceRequestPathname(document);
 		const method = document.event.request?.method;
@@ -987,36 +1034,6 @@ export function findFaultSeededJoinProof(documents, version, expectedProofDigest
 			assertTraceHasNoLogs(document, "The fault-version seeded-room join emitted an unexpected log.");
 			joins.push({ index, durableObjectId: document.durableObjectId });
 		}
-		if (!isAlarmTrace(document)) continue;
-		const logs = traceLogRecords(document);
-		const outboxLogs = logs.filter((record) => (
-			typeof record.event === "string"
-			&& record.event.startsWith("room_milestone_outbox_")
-		));
-		if (outboxLogs.length === 0) continue;
-		if (unexpectedTraceLogCount(document) !== 0) {
-			return fail("The seeded-room fault alarm emitted an unexpected log.");
-		}
-		const deliveryFailed = outboxLogs.filter((record) => (
-			record.event === "room_milestone_outbox_delivery_failed"
-		));
-		const retryScheduled = outboxLogs.filter((record) => (
-			record.event === "room_milestone_outbox_retry_scheduled"
-		));
-		if (
-			digest !== checkedDigest
-			|| outboxLogs.length !== 2
-			|| deliveryFailed.length !== 1
-			|| retryScheduled.length !== 1
-			|| retryScheduled[0].failure !== "database-unavailable"
-			|| !safeInteger(retryScheduled[0].attemptCount)
-			|| retryScheduled[0].attemptCount < 1
-		) return fail("The seeded-room first retry evidence was split, unrelated, or incomplete.");
-		retryAlarms.push({
-			index,
-			durableObjectId: document.durableObjectId,
-			attemptCount: retryScheduled[0].attemptCount,
-		});
 	}
 	if (joins.length > 1) {
 		return fail("The seeded-room fault proof was ambiguous.");
@@ -1045,6 +1062,8 @@ export function findFaultTraceProof(documents, version) {
 	const creates = [];
 	const retryAlarms = [];
 	for (const [index, document] of documents.entries()) {
+		const retryAlarm = faultRetryAlarmEvidence(document);
+		if (retryAlarm) retryAlarms.push({ index, ...retryAlarm });
 		if (!isSuccessfulDurableObjectTrace(document)) continue;
 		const request = document.event.request;
 		if (isObject(request) && request.method === "POST") {
@@ -1065,52 +1084,19 @@ export function findFaultTraceProof(documents, version) {
 				creates.push({ index, durableObjectId: document.durableObjectId });
 			}
 		}
-		if (!isAlarmTrace(document)) continue;
-		const logs = traceLogRecords(document);
-		const outboxLogs = logs.filter((record) => (
-			typeof record.event === "string"
-			&& record.event.startsWith("room_milestone_outbox_")
-		));
-		if (unexpectedTraceLogCount(document) !== 0) {
-			return fail("The fault alarm emitted an unexpected log.");
-		}
-		if (outboxLogs.some((record) => (
-			record.event !== "room_milestone_outbox_delivery_failed"
-			&& record.event !== "room_milestone_outbox_retry_scheduled"
-		))) return fail("The fault alarm emitted an unexpected or terminal outbox event.");
-		const deliveryFailed = outboxLogs.filter((record) => (
-			record.event === "room_milestone_outbox_delivery_failed"
-		));
-		const retryScheduled = outboxLogs.filter((record) => (
-			record.event === "room_milestone_outbox_retry_scheduled"
-		));
-		if (outboxLogs.length > 0) {
-			if (
-				outboxLogs.length !== 2
-				|| deliveryFailed.length !== 1
-				|| retryScheduled.length !== 1
-				|| retryScheduled[0].failure !== "database-unavailable"
-				|| !safeInteger(retryScheduled[0].attemptCount)
-				|| retryScheduled[0].attemptCount < 1
-			) {
-				return fail("The fault retry evidence was split or incomplete.");
-			}
-			retryAlarms.push({
-				index,
-				durableObjectId: document.durableObjectId,
-				attemptCount: retryScheduled[0].attemptCount,
-			});
-		}
 	}
 	if (creates.length > 1) return fail("Concurrent staging room creation made the fault proof ambiguous.");
 	if (creates.length === 0 || retryAlarms.length === 0) return null;
 	const create = creates[0];
+	const matchingRetryAlarms = retryAlarms.filter((alarm) => (
+		alarm.durableObjectId === create.durableObjectId
+	));
+	if (matchingRetryAlarms.length === 0) return null;
 	if (
-		retryAlarms[0].attemptCount !== 1
-		|| retryAlarms.some((alarm, index) => (
-			alarm.durableObjectId !== create.durableObjectId
-			|| alarm.index <= create.index
-			|| (index > 0 && alarm.attemptCount !== retryAlarms[index - 1].attemptCount + 1)
+		matchingRetryAlarms[0].attemptCount !== 1
+		|| matchingRetryAlarms.some((alarm, index) => (
+			alarm.index <= create.index
+			|| (index > 0 && alarm.attemptCount !== matchingRetryAlarms[index - 1].attemptCount + 1)
 		))
 	) return fail("The fault retry was not caused by the one created Durable Object.");
 	return durableObjectProofDigest(create.durableObjectId);
