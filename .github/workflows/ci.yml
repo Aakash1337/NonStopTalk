@@ -39,6 +39,7 @@ jobs:
       - run: npm run test:coach
       - run: npm run test:cloud-progress
       - run: npm run test:admin
+      - run: npm run test:production-monitor
       - run: npm run check:cloudflare-types
       - run: npm run typecheck:cloudflare
       - run: npm run test:cloudflare
@@ -48,6 +49,7 @@ jobs:
       - run: npm run check:cloudflare-startup
       - run: npm run smoke:platform
       - run: npx playwright install --with-deps chromium
+      - run: npm run smoke:accessibility
       - run: npm run smoke:coach
       - run: npm run smoke:admin
       - run: npm run smoke

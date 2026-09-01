@@ -7,12 +7,24 @@ import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
+import AxeBuilder from "@axe-core/playwright";
 import { chromium } from "playwright";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+async function assertNoAxeViolations(page, label) {
+  const result = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"])
+    .analyze();
+  assert(result.violations.length === 0, `${label} has axe violations: ${JSON.stringify(result.violations.map((violation) => ({
+    id: violation.id,
+    impact: violation.impact,
+    nodes: violation.nodes.map((node) => node.target),
+  })))}`);
 }
 
 function normalizeHyphenatedText(value) {
@@ -298,12 +310,26 @@ async function runPracticeFlow(browser, origin) {
   await retentionCheckbox.check();
   await page.getByRole("button", { name: /Calibrate microphone/ }).click();
   await page.waitForSelector("[data-coach-calibration]");
+  assert(await page.locator("[data-coach-calibration] h1").evaluate((heading) => document.activeElement === heading),
+    "Starting calibration must move focus to its status heading");
   await page.waitForSelector("[data-coach-live]", { timeout: 12_000 });
+  assert(await page.locator("[data-coach-live] h1").evaluate((heading) => document.activeElement === heading),
+    "Starting an attempt must move focus to its prompt heading");
+  assert(await page.locator("[data-coach-timer]").getAttribute("role") === "timer",
+    "The coaching countdown must expose timer semantics");
+  assert(await page.locator(".coach-meter").getAttribute("role") === "meter",
+    "The microphone level must expose meter semantics");
+  await assertNoAxeViolations(page, "Live coaching view");
   await page.waitForTimeout(3_200);
   const meterWidth = await page.locator("[data-coach-meter]").evaluate((element) => Number.parseFloat(element.style.width));
   assert(meterWidth > 0, `Expected a live input meter, got ${meterWidth}`);
+  assert(Number(await page.locator(".coach-meter").getAttribute("aria-valuenow")) > 0,
+    "The microphone meter must update its accessible value");
   await page.locator("[data-coach-stop]").click();
   await page.waitForSelector("[data-coach-review]");
+  assert(await page.locator("[data-coach-review] h1").evaluate((heading) => document.activeElement === heading),
+    "Completing an attempt must move focus to its review heading");
+  await assertNoAxeViolations(page, "Coaching review");
   await page.waitForSelector("[data-coach-timeline] .voice");
   await page.waitForSelector("[data-coach-timeline] .pause");
   await page.waitForSelector("[data-coach-grounding]");

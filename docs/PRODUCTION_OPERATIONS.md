@@ -37,6 +37,7 @@ go vet ./...
 npm run test:coach
 npm run test:cloud-progress
 npm run test:admin
+npm run test:production-monitor
 npm run check:cloudflare-types
 npm run typecheck:cloudflare
 npm run test:cloudflare
@@ -45,10 +46,13 @@ npm run check:cloudflare
 npm run check:cloudflare-staging
 npm run check:cloudflare-startup
 npm run smoke:platform
+npm run smoke:accessibility
+npm run smoke:coach
 npm run smoke:admin
+npm run smoke
 ```
 
-The GitHub workflow runs the same checks plus all browser smoke suites. A
+The GitHub workflow runs this same verification matrix. A
 production deploy should come from a reviewed, green `main` commit. Workers
 Builds uses the repository root and `npm run deploy` as its deploy command.
 That command applies production migrations, deploys in strict mode, then runs
@@ -63,6 +67,16 @@ npm run smoke:production
 
 Set `NONSTOPTALK_PRODUCTION_ORIGIN` to probe another HTTPS environment. The
 probe never creates a room, changes consent, or writes a coaching record.
+
+The `Production health` GitHub Actions workflow runs this same probe at minutes
+17 and 47 of every hour and supports manual dispatch. It installs no packages,
+uses no repository or Cloudflare secrets, has read-only repository permission,
+and stops after five minutes. GitHub reports a failed probe in Actions and sends
+scheduled-workflow notifications to the current schedule actor (initial
+creator, a later cron editor, or the user who re-enables it); do not assume
+repository watchers receive them. The probe itself retries each public GET up
+to five times before failing, which absorbs a short network interruption
+without concealing a sustained outage.
 
 ## Staging promotion
 
@@ -90,12 +104,13 @@ request.
    in the same transaction.
 3. Keep every migration compatible with the currently deployed Worker. D1 is
    migrated before code when deployment automation applies both.
-   The compatibility Worker released before migration `0004` accepts and
-   reports schema markers 3 and 4, so that expand migration can land without a
-   readiness outage and the same Worker remains a safe code rollback on schema
-   4. The matching schema-v4 Worker requires marker 4 because it writes the new
-   tables. Do not widen a compatibility window without another compatibility
-   release and explicit old/new Worker tests.
+   The current compatibility Worker accepts and reports schema markers 4 and 5
+   while using only the schema-v4 contract. Release it before migration `0005`
+   so that the additive migration can land without a readiness outage and the
+   same Worker remains a safe code rollback on schema 5. The matching feature
+   Worker may require marker 5 only after the migration is applied. Do not
+   widen a compatibility window without another compatibility release and
+   explicit old/new Worker tests.
 4. Exercise a fresh database and every supported upgrade path through
    `npm run smoke:platform`.
 5. Apply production migrations with `npm run db:migrate:remote`. Wrangler asks
@@ -249,10 +264,20 @@ Worker code emits one JSON object per operational event. Search by the stable
 | `analytics_engine_write_failed` | Analytics Engine delivery failed | D1 rollup may still exist |
 | `model_usage_reconciliation_failed` | A completed model attempt was not reconciled | Keep providers disabled until cost counters are understood |
 
-For the pilot stage, configure an external HTTPS monitor for the status endpoint
-at five-minute intervals and alert only after two consecutive failures. Alert
-on a non-200 response, `status != ok`, or a non-empty degraded list. Keep model
-providers offline during a D1 or budget-control incident.
+The scheduled GitHub workflow is the zero-secret, cheap-first baseline. It runs
+twice per hour and checks the public pages, the isolated dashboard document,
+security headers, and the canonical status response. GitHub schedules are
+best-effort: runs can be delayed or dropped during load, and public-repository
+schedules are automatically disabled after 60 days without repository activity.
+The cron actor should periodically verify recent runs and re-enable the workflow
+after a long inactive period. Actions notifications are not an uptime SLA. For
+an attended launch or a service with a response-time commitment, add an
+independent HTTPS monitor for the status endpoint at five-minute intervals and
+alert only after two consecutive failures. Alert on a non-200 response,
+`status != ok`, or a non-empty degraded list. Keep model providers offline
+during a D1 or budget-control incident. See GitHub's current
+[schedule-event notes](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
+and [scheduled-run troubleshooting](https://docs.github.com/en/actions/how-tos/troubleshoot-workflows#scheduled-workflows-running-at-unexpected-times).
 
 Tail only when actively diagnosing; live tails can contain operational request
 paths and should not be left running unattended:

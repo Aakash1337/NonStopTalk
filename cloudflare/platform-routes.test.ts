@@ -266,28 +266,30 @@ function usageRow(overrides: Partial<ModelUsageTestRow> = {}): ModelUsageTestRow
 	};
 }
 
-test("platform status requires and reports the schema-v4 identity foundation", async () => {
-	const handled = await handlePlatformRoute(
-		new Request("https://nonstoptalk.test/api/v1/platform/status"),
-		{
-			PLATFORM_DB: new FakeStatusD1(4) as unknown as D1Database,
-			ANALYTICS_ADMIN_TOKEN: "1".repeat(64),
-			ROOM_FACT_HASH_KEY: "2".repeat(64),
-		},
-		"3".repeat(64),
-		"status-schema-4",
-		noDeferredTasks,
-	);
+test("platform status reports every reviewed additive-schema compatibility marker", async () => {
+	for (const schemaVersion of [4, 5]) {
+		const handled = await handlePlatformRoute(
+			new Request("https://nonstoptalk.test/api/v1/platform/status"),
+			{
+				PLATFORM_DB: new FakeStatusD1(schemaVersion) as unknown as D1Database,
+				ANALYTICS_ADMIN_TOKEN: "1".repeat(64),
+				ROOM_FACT_HASH_KEY: "2".repeat(64),
+			},
+			"3".repeat(64),
+			`status-schema-${schemaVersion}`,
+			noDeferredTasks,
+		);
 
-	assert(handled);
-	assert.equal(handled.response.status, 200);
-	const body = await handled.response.json() as { status: string; schemaVersion: number };
-	assert.equal(body.status, "ok");
-	assert.equal(body.schemaVersion, 4);
+		assert(handled);
+		assert.equal(handled.response.status, 200);
+		const body = await handled.response.json() as { status: string; schemaVersion: number };
+		assert.equal(body.status, "ok");
+		assert.equal(body.schemaVersion, schemaVersion);
+	}
 });
 
 test("platform status rejects schema markers outside the reviewed compatibility window", async () => {
-	for (const schemaVersion of [2, 3, 5]) {
+	for (const schemaVersion of [2, 3, 6]) {
 		const handled = await handlePlatformRoute(
 			new Request("https://nonstoptalk.test/api/v1/platform/status"),
 			{ PLATFORM_DB: new FakeStatusD1(schemaVersion) as unknown as D1Database },

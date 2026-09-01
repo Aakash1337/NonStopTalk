@@ -24,7 +24,10 @@ const MAX_ANALYTICS_DAYS = 180;
 const PLATFORM_STATUS_CACHE_MS = 60_000;
 const MAX_CLEANUP_BATCHES_PER_RUN = 20;
 const MIN_PLATFORM_SCHEMA_VERSION = 4;
-const MAX_PLATFORM_SCHEMA_VERSION = 4;
+// Keep the next additive schema marker readable before its migration lands.
+// Deployment automation applies D1 migrations before Worker code, so this
+// compatibility window must reach production ahead of schema v5.
+const MAX_PLATFORM_SCHEMA_VERSION = 5;
 
 interface DatabaseReadiness {
 	expiresAt: number;

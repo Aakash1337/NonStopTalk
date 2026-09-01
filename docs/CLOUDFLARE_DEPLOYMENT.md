@@ -93,6 +93,14 @@ npx wrangler secret put GEMINI_API_KEY    # optional Gemma 4 31B escalation
 
 `npm run deploy` applies pending production D1 migrations, deploys in Wrangler strict mode, and probes `https://dontstoptalking.org`. The configured Worker name is `nonstoptalk`; its Workers.dev route remains available as a diagnostic fallback.
 
+GitHub's `Production health` workflow repeats the same read-only production
+probe every 30 minutes and on manual dispatch. It does not install dependencies
+or receive Cloudflare credentials, so it cannot deploy, migrate, or write
+production data. A failed run is visible in Actions, but GitHub schedules and
+their actor-scoped notifications are only a best-effort pilot signal; see the
+production runbook for auto-disable, notification, and independent-monitoring
+guidance.
+
 `npm run check:cloudflare` performs a strict Wrangler dry run. It validates the TypeScript bundle, assets, and declared bindings without changing a Cloudflare account. `db:create` is a one-time environment step; D1 migrations are append-only and run before code in both deployment scripts.
 
 `wrangler.jsonc` assigns account-local production namespace IDs `6677867`–`6677869` and separate staging IDs `6677870`–`6677872` for room creation, general API work, and topic-model requests. If another Worker in the same account already uses any value, choose independent positive integers.
@@ -206,7 +214,7 @@ The `v1` migration creates `RoomDurableObject` with the SQLite backend required 
 
 ## D1 migrations and platform secrets
 
-Files in `cloudflare/migrations` are append-only. Apply them locally with `npm run db:migrate:local` and remotely with `npm run db:migrate:remote`. Migration `0003_model_usage.sql` advances the platform schema to version 3 and adds the aggregate-only `model_usage_daily` reservation/reconciliation table. Migration `0004_sync_profiles.sql` then expands D1 with `sync_profiles` and `sync_profile_devices`, backfills one opaque profile per existing device, and leaves `coaching_sessions` and every device-owned query unchanged. Apply v4 before deploying Worker code that writes the new tables. Rollback remains safe because the previously deployed Worker accepts schema 4 and ignores these additive tables; do not contract the device-owned schema until later compatibility releases and retention/deletion validation are complete.
+Files in `cloudflare/migrations` are append-only. Apply them locally with `npm run db:migrate:local` and remotely with `npm run db:migrate:remote`. Migration `0003_model_usage.sql` advances the platform schema to version 3 and adds the aggregate-only `model_usage_daily` reservation/reconciliation table. Migration `0004_sync_profiles.sql` then expands D1 with `sync_profiles` and `sync_profile_devices`, backfills one opaque profile per existing device, and leaves `coaching_sessions` and every device-owned query unchanged. The current Worker uses the schema-v4 contract but accepts additive markers 4 and 5; deploy that compatibility window before adding or applying migration `0005`. A later schema-v5 feature Worker may require marker 5 only after both staging and production have migrated. This sequencing keeps the compatibility Worker usable as a code rollback after the additive migration. Do not contract the device-owned schema until later compatibility releases and retention/deletion validation are complete.
 
 Production also needs the created D1 UUID in `wrangler.jsonc`; set the protected bearer value with `npx wrangler secret put ANALYTICS_ADMIN_TOKEN` and a separate random room-fact key with `npx wrangler secret put ROOM_FACT_HASH_KEY`, never in source control. Numeric-only secrets work: generate each independently with a password manager's cryptographic numeric generator or, on Linux, `LC_ALL=C tr -dc '0-9' </dev/urandom | head -c 64`, then paste the 64 digits into Wrangler's hidden prompt. Optional Z.AI and Gemini keys are likewise Wrangler secrets and are required only for their enabled topic tier. Without the room key, coarse room-event totals continue best-effort but linkable D1 room facts are deliberately skipped. `GET` or `HEAD` on `/api/v1/platform/status` checks D1 and reports non-secret configured or degraded capabilities, including admin analytics, keyed room facts, and routine/escalated topic-provider readiness.
 

@@ -187,13 +187,15 @@ npm run test:cloudflare
 npm run test:coach
 npm run test:cloud-progress
 npm run test:admin
+npm run test:production-monitor
 npm run check:cloudflare
+npm run smoke:accessibility
 npm run smoke:coach
 npm run smoke:admin
 npm run smoke:platform
 ```
 
-`test:coach` runs 34 deterministic measurement, continuity, transcript-analysis, retrieval, grounding-safety, advice, relationship, grouping, persistence-gating, and paired-comparison tests without a microphone. `smoke:coach` drives synthetic media through the single coached path and the default review-only baseline → Progress/reload → locked unassisted-retry path; it checks that local-first attempts make no coaching-data API request, and covers local storage, per-attempt artifact deletion, lifecycle, review, and comparison behavior. `test:cloud-progress` checks the separate opt-in client's summary allowlist, relationship metadata, legacy compatibility, merge behavior, API calls, and preference state. `test:admin` validates dashboard source reconciliation, UTC windows, request/token boundaries, empty data, and hostile display text. `smoke:admin` exercises the isolated document, strict headers, two-request authorization flow, 320px layout, keyboard focus, and absence of third-party requests or persistence. `smoke:platform` starts a local Wrangler/D1 instance and exercises status, summary backup, relationship-column persistence, export, analytics, privacy, and deletion boundaries.
+`test:coach` runs 34 deterministic measurement, continuity, transcript-analysis, retrieval, grounding-safety, advice, relationship, grouping, persistence-gating, and paired-comparison tests without a microphone. `smoke:coach` drives synthetic media through the single coached path and the default review-only baseline → Progress/reload → locked unassisted-retry path; it checks that local-first attempts make no coaching-data API request, and covers local storage, per-attempt artifact deletion, lifecycle, review, and comparison behavior. `test:cloud-progress` checks the separate opt-in client's summary allowlist, relationship metadata, legacy compatibility, merge behavior, API calls, and preference state. `test:admin` validates dashboard source reconciliation, UTC windows, request/token boundaries, empty data, and hostile display text. `smoke:admin` exercises the isolated document, strict headers, two-request authorization flow, 320px layout, keyboard focus, and absence of third-party requests or persistence. `smoke:accessibility` runs automated axe WCAG-rule scans plus heading, focus, title, skip-link, reduced-motion, and narrow-layout assertions across the public routes and core room states; it is regression coverage, not formal conformance certification. `test:production-monitor` prevents the scheduled read-only health workflow from gaining secrets, mutation commands, unpinned actions, or unbounded runtime. `smoke:platform` starts a local Wrangler/D1 instance and exercises status, summary backup, relationship-column persistence, export, analytics, privacy, and deletion boundaries.
 
 ## Architecture
 
