@@ -924,6 +924,17 @@ try {
   const expiredProfile = "9".repeat(64);
   const expiredMembership = "8".repeat(64);
   const expiredRoom = "e".repeat(64);
+  const expiredPendingReceipt = "a".repeat(64);
+  const expiredAppliedReceipt = "b".repeat(64);
+  const activeReceipt = "c".repeat(64);
+  const receiptRetentionMs = 90 * 24 * 60 * 60 * 1_000;
+  const receiptFixtureTime = Date.now();
+  const expiredReceiptExpiresAt = new Date(receiptFixtureTime - 60_000).toISOString();
+  const expiredReceiptReceivedAt = new Date(
+    Date.parse(expiredReceiptExpiresAt) - receiptRetentionMs,
+  ).toISOString();
+  const activeReceiptReceivedAt = new Date(receiptFixtureTime).toISOString();
+  const activeReceiptExpiresAt = new Date(receiptFixtureTime + receiptRetentionMs).toISOString();
   const quotaToken = "a".repeat(64);
   const quotaDevice = createHash("sha256").update(quotaToken).digest("hex");
   const quotaSummary = completeSummary("quota-001");
@@ -972,6 +983,21 @@ try {
           '2025-02-01T00:00:00.000Z', 1, 'created', 'setup', 0, 0, 1, 60,
           'everyday', 0, 0, 0, 0
         );
+        INSERT INTO room_milestone_receipts (
+          event_id, payload_hash, received_at, applied_at, expires_at
+        ) VALUES
+          (
+            '${expiredPendingReceipt}', '${"d".repeat(64)}', '${expiredReceiptReceivedAt}',
+            NULL, '${expiredReceiptExpiresAt}'
+          ),
+          (
+            '${expiredAppliedReceipt}', '${"e".repeat(64)}', '${expiredReceiptReceivedAt}',
+            '${expiredReceiptReceivedAt}', '${expiredReceiptExpiresAt}'
+          ),
+          (
+            '${activeReceipt}', '${"f".repeat(64)}', '${activeReceiptReceivedAt}',
+            NULL, '${activeReceiptExpiresAt}'
+          );
         WITH digits(value) AS (
           VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
         ), sequence(value) AS (
@@ -1511,6 +1537,10 @@ try {
         (SELECT COUNT(*) FROM sync_profiles
           WHERE profile_id = '${expiredProfile}') AS profiles,
         (SELECT COUNT(*) FROM room_facts WHERE expires_at <= '2025-02-01T00:00:00.000Z') AS rooms,
+        (SELECT COUNT(*) FROM room_milestone_receipts
+          WHERE event_id IN ('${expiredPendingReceipt}', '${expiredAppliedReceipt}')) AS expiredReceipts,
+        (SELECT COUNT(*) FROM room_milestone_receipts
+          WHERE event_id = '${activeReceipt}' AND expires_at > '${new Date(scheduledTime).toISOString()}') AS activeReceipts,
         (SELECT cleanup_scheduled_at FROM platform_maintenance WHERE id = 1) AS cleanupScheduledAt,
         (SELECT cleanup_completed_at FROM platform_maintenance WHERE id = 1) AS cleanupCompletedAt,
         (SELECT cleanup_backlog FROM platform_maintenance WHERE id = 1) AS cleanupBacklog`,
@@ -1529,6 +1559,8 @@ try {
     && cleaned?.memberships === 0
     && cleaned?.profiles === 0
     && cleaned?.rooms === 0
+    && cleaned?.expiredReceipts === 0
+    && cleaned?.activeReceipts === 1
     && cleaned?.cleanupBacklog === 0
     && typeof cleaned?.cleanupScheduledAt === "string"
     && typeof cleaned?.cleanupCompletedAt === "string"

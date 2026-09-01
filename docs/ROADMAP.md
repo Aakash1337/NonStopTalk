@@ -75,7 +75,7 @@ The first incremental platform slice is being built without replacing the playab
 - Anonymous browser ownership stored as a token digest, with one UTC-day-bucketed device lease lasting at least 30 and less than 31 days after cloud use, a new-save guard once 250 summaries exist, preservation of valid unexpired legacy rows, and bounded cleanup that can continue a backlog on later cron runs
 - A schema-v4 identity expansion with opaque `sync_profiles` and `sync_profile_devices`: one internal profile per browser for now, no exposed profile credential, and no change to device-owned sessions, API behavior, consent, or retention
 - A schema-v5 singleton heartbeat that makes daily cleanup failures and bounded-run backlog visible through privacy-safe public readiness, using one D1 write per successful run and no new service or secret
-- A schema-v6 additive, privacy-minimal `room_milestone_receipts` table that starts empty and is unused by the current 5/6 bridge; it does not yet provide a receiver, outbox, retries, cleanup, or durable delivery
+- A schema-v6 additive, privacy-minimal `room_milestone_receipts` table, strict internal canonical receiver, and bounded receipt expiry cleanup. The receiver is unhooked from normal rooms; marker-5 cleanup never prepares receipt SQL, and there is no outbox, retry, dead-letter path, or durable delivery
 - Coarse privacy-safe product events attempted best-effort in both D1 daily rollups and Analytics Engine; D1 supplies protected aggregate product-analytics and model-usage operational readouts, not audit or billing truth
 - A protected, dependency-free `/admin/analytics` operator document that validates and reconciles those daily aggregates, derives 1/7/30/90-day views locally, keeps its numeric bearer token out of storage/URLs/output, and blocks public-site browser telemetry on the token-bearing page
 - Server-authoritative room milestones plus coarse summary-save/delete/consent timing/count values; no page-view, presence-tick, per-person, speaking-ratio, transcript-pattern, or advice telemetry
@@ -84,7 +84,7 @@ The first incremental platform slice is being built without replacing the playab
 - Modular separation among Durable Object room authority, D1 repositories, identity, coaching backup, analytics, and topic providers
 - Local coaching and gameplay that continue to work when D1 or analytics is unavailable
 
-This phase remains free-or-cheap by default: it uses existing Cloudflare primitives, keeps routine generation offline unless enabled, makes the larger model an explicit escalation, and caps aggregate external calls. The identity foundation adds only two small D1 metadata rows per browser; cleanup health adds one global row and one write per successful day. The dormant receipt foundation adds one empty table/index and no service, binding, secret, provider call, user row, or runtime write. Accounts, cross-device authentication/progress, external coaching AI, Queue-backed work, and R2 media storage remain later phases. The next identity slice may add bilateral numeric-code linking only with a separate `IDENTITY_HASH_KEY` and explicit consent on both browsers; it must not silently grant cloud-summary consent. See the [Web platform plan](WEB_PLATFORM_PLAN.md).
+This phase remains free-or-cheap by default: it uses existing Cloudflare primitives, keeps routine generation offline unless enabled, makes the larger model an explicit escalation, and caps aggregate external calls. The identity foundation adds only two small D1 metadata rows per browser; cleanup health adds one global row and one write per successful day. The receipt foundation adds one table/index and no service, binding, secret, provider call, or user row. Explicit internal receiver/test calls can write receipts and schema-6 cleanup can delete expired rows, but normal room traffic adds no receipt write. Accounts, cross-device authentication/progress, external coaching AI, Queue-backed work, and R2 media storage remain later phases. The next identity slice may add bilateral numeric-code linking only with a separate `IDENTITY_HASH_KEY` and explicit consent on both browsers; it must not silently grant cloud-summary consent. See the [Web platform plan](WEB_PLATFORM_PLAN.md).
 
 ## 5. Content, sharing, and retention — Implemented locally
 
@@ -139,7 +139,7 @@ Implemented work includes:
 - D1 migrations, platform API/repository tests, compact-summary client tests, configured/degraded capability status, and bounded scheduled anonymous-data cleanup
 - Expand-only schema-v4 sync-profile tables and one-device/one-profile backfill while device-owned session queries remain the rollback-safe authority
 - Schema-v5 cleanup heartbeat with monotonic cron timestamps, backlog/staleness readiness, and twice-hourly read-only production monitoring
-- A deployed schema-5/6 compatibility bridge plus the additive schema-v6 milestone-receipt foundation, with physical-upgrade, rollback, constraint, and same-process schema-skew tests
+- A deployed schema-5/6 compatibility bridge plus the additive schema-v6 milestone-receipt table, strict unhooked receiver, and bounded expiry cleanup, with canonical-payload, replay/conflict, post-commit analytics, physical-upgrade, rollback, constraint, and schema-skew tests
 - Host-authorized Cloudflare topic generation with separate provider adapters, per-attempt consent, aggregate daily cost controls, and deterministic failure fallback
 - A separate-document operator analytics dashboard with strict CSP/no-transform isolation, source-quality tests, and narrow/mobile browser smoke coverage
 - Separate production/staging databases, analytics datasets, rate limits, secrets, cron schedules, deployment probes, migration checks, and production incident/recovery guidance
@@ -150,7 +150,7 @@ Remaining hardening:
 - Expansion of the automated cross-edition contract beyond the implemented core rules
 - Broader browser/device testing
 - Formal security and accessibility reviews
-- Receipt-gated idempotent milestone ingestion plus a Durable Object SQLite outbox, alarm retries, dead-letter handling, and bounded receipt cleanup
+- A Durable Object SQLite milestone outbox, alarm retries, dead-letter handling, and normal-room activation of the implemented receipt-gated receiver
 
 ## 8. Explicit product backlog
 
@@ -168,4 +168,4 @@ These are future ideas, not current features:
 - Semantic structure, relevance, concision, and answer-completeness coaching
 - Server-side or external coaching analysis beyond the implemented theme-only topic adapters; any such path requires separate consent and privacy design
 - Queue-backed provider jobs and R2 media storage; neither is part of the first platform slice
-- Receipt-gated milestone receiver and Durable Object outbox/retry delivery; the current schema-v6 table is only a dormant foundation
+- Durable Object outbox/retry/dead-letter delivery and normal-room activation of the implemented internal schema-6 receiver; normal traffic remains best-effort until that later cutover

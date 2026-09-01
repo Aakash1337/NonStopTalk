@@ -310,6 +310,7 @@ export interface CleanupResult {
 	devices: number;
 	syncProfiles: number;
 	roomFacts: number;
+	roomMilestoneReceipts: number;
 	hasMore: boolean;
 }
 
@@ -1558,62 +1559,80 @@ export function createPlatformStore(db: D1Database, options: PlatformStoreOption
 /** Delete expired anonymous detail while retaining non-identifying daily totals. */
 export async function cleanupExpiredData(
 	db: D1Database,
+	schemaVersion: 5 | 6,
 	now: Date | string = new Date(),
 	limit = RETENTION_CLEANUP_BATCH_SIZE,
 ): Promise<CleanupResult> {
 	const timestamp = dateInput(now, "now").toISOString();
 	const boundedLimit = finite(limit, "cleanup limit", 1, 1_000, true);
+	const statements = [
+		db
+			.prepare(`DELETE FROM coaching_sessions WHERE rowid IN (
+				SELECT session.rowid
+				FROM coaching_sessions AS session
+				JOIN devices AS device ON device.device_key = session.device_key
+				WHERE device.expires_at <= ? LIMIT ?
+			)`)
+			.bind(timestamp, boundedLimit),
+		db
+			.prepare(`DELETE FROM consent_records WHERE rowid IN (
+				SELECT consent.rowid
+				FROM consent_records AS consent
+				JOIN devices AS device ON device.device_key = consent.device_key
+				WHERE device.expires_at <= ? LIMIT ?
+			)`)
+			.bind(timestamp, boundedLimit),
+		db
+			.prepare(`DELETE FROM devices WHERE rowid IN (
+				SELECT device.rowid FROM devices AS device
+				WHERE device.expires_at <= ?
+					AND NOT EXISTS (
+						SELECT 1 FROM coaching_sessions AS session
+						WHERE session.device_key = device.device_key
+					)
+					AND NOT EXISTS (
+						SELECT 1 FROM consent_records AS consent
+						WHERE consent.device_key = device.device_key
+					)
+				LIMIT ?
+			)`)
+			.bind(timestamp, boundedLimit),
+		db
+			.prepare(`DELETE FROM sync_profiles WHERE rowid IN (
+				SELECT profile.rowid
+				FROM sync_profiles AS profile
+				WHERE profile.expires_at <= ?
+					AND NOT EXISTS (
+						SELECT 1 FROM sync_profile_devices AS membership
+						WHERE membership.profile_id = profile.profile_id
+					)
+				LIMIT ?
+			)`)
+			.bind(timestamp, boundedLimit),
+		db
+			.prepare(`DELETE FROM room_facts WHERE rowid IN (
+				SELECT rowid FROM room_facts WHERE expires_at <= ? LIMIT ?
+			)`)
+			.bind(timestamp, boundedLimit),
+	];
+	if (schemaVersion === 6) {
+		statements.push(
+			db
+				.prepare(`DELETE FROM room_milestone_receipts WHERE rowid IN (
+					SELECT receipt.rowid
+					FROM room_milestone_receipts AS receipt
+					WHERE receipt.expires_at <= ?
+						AND EXISTS (
+							SELECT 1 FROM platform_meta
+							WHERE id = 1 AND schema_version = 6
+						)
+					LIMIT ?
+				)`)
+				.bind(timestamp, boundedLimit),
+		);
+	}
 	const results = await databaseOperation("clean up expired platform data", () =>
-		db.batch([
-			db
-				.prepare(`DELETE FROM coaching_sessions WHERE rowid IN (
-					SELECT session.rowid
-					FROM coaching_sessions AS session
-					JOIN devices AS device ON device.device_key = session.device_key
-					WHERE device.expires_at <= ? LIMIT ?
-				)`)
-				.bind(timestamp, boundedLimit),
-			db
-				.prepare(`DELETE FROM consent_records WHERE rowid IN (
-					SELECT consent.rowid
-					FROM consent_records AS consent
-					JOIN devices AS device ON device.device_key = consent.device_key
-					WHERE device.expires_at <= ? LIMIT ?
-				)`)
-				.bind(timestamp, boundedLimit),
-			db
-				.prepare(`DELETE FROM devices WHERE rowid IN (
-					SELECT device.rowid FROM devices AS device
-					WHERE device.expires_at <= ?
-						AND NOT EXISTS (
-							SELECT 1 FROM coaching_sessions AS session
-							WHERE session.device_key = device.device_key
-						)
-						AND NOT EXISTS (
-							SELECT 1 FROM consent_records AS consent
-							WHERE consent.device_key = device.device_key
-						)
-					LIMIT ?
-				)`)
-				.bind(timestamp, boundedLimit),
-			db
-				.prepare(`DELETE FROM sync_profiles WHERE rowid IN (
-					SELECT profile.rowid
-					FROM sync_profiles AS profile
-					WHERE profile.expires_at <= ?
-						AND NOT EXISTS (
-							SELECT 1 FROM sync_profile_devices AS membership
-							WHERE membership.profile_id = profile.profile_id
-						)
-					LIMIT ?
-				)`)
-				.bind(timestamp, boundedLimit),
-			db
-				.prepare(`DELETE FROM room_facts WHERE rowid IN (
-					SELECT rowid FROM room_facts WHERE expires_at <= ? LIMIT ?
-				)`)
-				.bind(timestamp, boundedLimit),
-		]),
+		db.batch(statements),
 	);
 	const deleted = {
 		coachingSessions: resultChanges(results[0]),
@@ -1621,6 +1640,7 @@ export async function cleanupExpiredData(
 		devices: resultChanges(results[2]),
 		syncProfiles: resultChanges(results[3]),
 		roomFacts: resultChanges(results[4]),
+		roomMilestoneReceipts: schemaVersion === 6 ? resultChanges(results[5]) : 0,
 	};
 	return {
 		...deleted,
@@ -1631,9 +1651,24 @@ export async function cleanupExpiredData(
 /** Resolve the conservative full-batch signal after the invocation budget is spent. */
 export async function hasExpiredPlatformData(
 	db: D1Database,
+	schemaVersion: 5 | 6,
 	now: Date | string = new Date(),
 ): Promise<boolean> {
 	const timestamp = dateInput(now, "now").toISOString();
+	const receiptBacklogSql = schemaVersion === 6
+		? ` OR EXISTS (
+			SELECT 1 FROM room_milestone_receipts AS receipt
+			WHERE receipt.expires_at <= ?
+				AND EXISTS (
+					SELECT 1 FROM platform_meta
+					WHERE id = 1 AND schema_version = 6
+				)
+			LIMIT 1
+		)`
+		: "";
+	const bindings = schemaVersion === 6
+		? [timestamp, timestamp, timestamp, timestamp, timestamp, timestamp]
+		: [timestamp, timestamp, timestamp, timestamp, timestamp];
 	const row = await databaseOperation("check for an expired platform-data backlog", () =>
 		db
 			.prepare(`SELECT CASE WHEN
@@ -1667,9 +1702,9 @@ export async function hasExpiredPlatformData(
 					LIMIT 1
 				) OR EXISTS (
 					SELECT 1 FROM room_facts WHERE expires_at <= ? LIMIT 1
-				)
+				)${receiptBacklogSql}
 				THEN 1 ELSE 0 END AS has_more`)
-			.bind(timestamp, timestamp, timestamp, timestamp, timestamp)
+			.bind(...bindings)
 			.first<{ has_more: number }>(),
 	);
 	if (!row || ![0, 1].includes(row.has_more)) {

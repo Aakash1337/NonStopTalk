@@ -35,7 +35,7 @@ Browser SPA
           +-- Room Durable Object (authoritative live room state + WebSockets)
           +-- D1 platform store (summaries, consent, internal profile mappings,
           |                      room facts, daily rollups, model-usage budget,
-          |                      dormant milestone-receipt foundation)
+          |                      unhooked milestone receiver + receipt cleanup)
           +-- Analytics Engine (best-effort time-series events)
           +-- Workers Logs/Traces (runtime health)
           +-- topic-provider adapter
@@ -82,7 +82,7 @@ Anonymous cloud progress is deliberately transitional. Its access cookie is not 
 
 Schema v5 makes that cron observable with one initialized `platform_maintenance` singleton. A successful invocation advances its scheduled/completed heartbeat only after every attempted batch succeeds and stores one backlog bit; an older delayed event cannot regress a newer heartbeat. Status returns only `ready`, `stale`, or `backlog`, never its timestamps or deletion counts. The migration supplies the initial grace heartbeat, and status becomes degraded when the daily schedule is more than 36 hours old or an exact final probe finds eligible rows still remaining after the 20-batch run budget. This adds one tiny D1 write per successful day and, only at that full-budget boundary, one small existence read; it needs no service, secret, model call, or user record.
 
-Schema v6 is an additive, behavior-preserving receipt foundation. `room_milestone_receipts` starts empty and permits only opaque lowercase 256-bit event IDs/payload hashes plus canonical UTC receipt, optional application, and exact 90-day expiry timestamps. The schema-5/6 bridge never reads or writes it and continues using the schema-v5 application contract. Milestone delivery therefore remains best-effort; an idempotent receiver, Durable Object outbox, retries, cleanup, and durable-delivery semantics are separate future releases.
+Schema v6 is an additive receipt foundation. `room_milestone_receipts` starts empty and permits only opaque lowercase 256-bit event IDs/payload hashes plus canonical UTC receipt, optional application, and exact 90-day expiry timestamps. The Worker includes a strict internal schema-6 receiver that can receipt-gate one canonical D1 application, plus bounded schema-6 expiry cleanup. Marker-5 cleanup never prepares receipt-table SQL. Neither path is connected to ordinary room delivery: normal rooms still use the response-header plus best-effort `waitUntil` path and do not insert receipts. A Durable Object outbox, retries, dead-letter handling, and end-to-end durable-delivery semantics remain future work.
 
 Schema v4 is Stage 1 of that identity transition and is deliberately behavior-preserving. `sync_profiles` stores an opaque internal profile and lifecycle metadata; `sync_profile_devices` maps one current device digest to one profile. Existing devices are backfilled one-to-one, and new browsers still receive separate profiles. `coaching_sessions`, consent receipts, authorization, the API response shape, and every visible backup/list/export/delete flow remain device-owned and unchanged. Device deletion cascades the membership, and bounded retention cleanup removes an expired orphan profile. This introduces no visible profile, account, linking, recovery, cross-device access, data upload, or new consent behavior.
 
@@ -101,11 +101,11 @@ New saves are rejected when an anonymous browser identity already owns 250 cloud
 | `coaching_sessions` | Allowlisted compact measurement/advice summary | Audio, samples, recording, captured transcript |
 | `consent_records` | Versioned proof of the summary-backup choice | Form text, media |
 | `room_facts` | Room lifecycle counts keyed by an operator-secret HMAC of the short room code | Raw room code, player names and member tokens |
-| `room_milestone_receipts` | Dormant idempotency-receipt foundation for a future milestone receiver | Room codes, names, topics, member/authentication tokens, IP data, audio, transcripts, coaching content |
+| `room_milestone_receipts` | Idempotency receipts for the unhooked internal schema-6 milestone receiver; normally empty and subject to bounded expiry cleanup | Room codes, names, topics, member/authentication tokens, IP data, audio, transcripts, coaching content |
 | `analytics_daily` | Queryable best-effort daily event rollups | Per-person identifiers |
 | `model_usage_daily` | Aggregate UTC-day provider attempts, model-token totals, and latency used to enforce and monitor the external-call ceiling | Theme and generated-topic text, room/player identity, room/member/authentication tokens, audio, transcripts |
 
-Analytics Engine receives the same coarse event vocabulary for inexpensive time-series exploration. D1 rollups provide a small protected readout for the admin API, but both paths are best-effort: D1 writes fail open, room-triggered writes run through the Durable Object's `waitUntil`, and events can be missed. Neither store is an audit log, billing ledger, or delivery-exact source of truth.
+Analytics Engine receives the same coarse event vocabulary for inexpensive time-series exploration. D1 rollups provide a small protected readout for the admin API, but the normal room paths are best-effort: D1 writes fail open, room-triggered writes run through the Durable Object's `waitUntil`, and events can be missed. The unhooked internal receiver receipt-gates its D1 batch, then offers Analytics Engine one best-effort post-commit opportunity only for a newly applied event; that opportunity is not retried after a failure or interruption. Neither store is an audit log, billing ledger, or delivery-exact source of truth.
 
 The implemented operator surface at `/admin/analytics` uses the same bearer guard and no new service. It concurrently requests one 90-day product extract and one 90-day model-usage extract, validates their matching UTC windows and row invariants, reconciles API totals against daily/global/provider rows, then derives 1/7/30/90-day views locally. Event ratios are labeled as non-cohort operating signals, zero denominators stay unavailable, and the current UTC day is disclosed as partial. The token-bearing page is a separate document with no public navigation link, no storage, a self-only script/connect policy, and a `no-transform` response that prevents automatic Cloudflare Web Analytics injection.
 
@@ -157,8 +157,8 @@ Exit: a user can sign in on a second device, see consented summaries, export the
 ### Phase 3 — normalized game history and product operations
 
 - Persist finished-game and turn facts to D1 without moving live authority out of Durable Objects.
-- **Foundation implemented:** add the constrained schema-v6 milestone-receipt table without activating delivery.
-- **Still future:** add the receipt-gated D1 receiver plus Durable Object outbox, alarm retry, dead-letter, and bounded cleanup lifecycle.
+- **Internal foundation implemented:** add the constrained schema-v6 milestone-receipt table, strict canonical receiver, and bounded receipt cleanup without activating normal room delivery.
+- **Still future:** connect a Durable Object SQLite outbox, alarm retry, and dead-letter lifecycle to that internal receiver.
 - **Implemented:** add a small, protected, source-reconciled admin dashboard without a new dependency or service.
 - **Implemented:** add isolated staging/production environments, migration checks, cleanup heartbeat/room alarms, deployment smoke probes, and incident runbooks.
 
@@ -177,7 +177,7 @@ Partial exit reached: topic providers can be enabled, disabled, or replaced with
 
 ## Cost controls
 
-- Do not write D1 on socket presence ticks or page views. Persist summaries and consent changes, attempt coarse room-milestone/analytics aggregates, and retain aggregate provider-budget counters. The dormant receipt foundation adds no runtime write.
+- Do not write D1 on socket presence ticks or page views. Persist summaries and consent changes, attempt coarse room-milestone/analytics aggregates, and retain aggregate provider-budget counters. Normal room traffic does not write receipts; only explicit internal receiver/test calls can insert them, and schema-6 cleanup can delete expired rows.
 - Keep one day-bucketed inactivity lease per anonymous device, reject new saves once 250 summaries exist without forcibly deleting valid legacy rows, bound each cleanup run so unusual backlogs cannot monopolize Worker execution, and spend only one small heartbeat write after a successful daily cleanup.
 - Keep the Stage-1 identity expansion to two small metadata rows per browser and the existing bounded cleanup; it requires no additional Cloudflare product, model call, email sender, or paid plan.
 - Use Analytics Engine for high-volume exploratory telemetry because writes are non-blocking and sampled at scale; never depend on it for billing or user-visible state.

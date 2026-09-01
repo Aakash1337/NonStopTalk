@@ -62,6 +62,19 @@ That command applies production migrations, deploys in strict mode, then runs
 the retrying read-only production probe. Direct dashboard edits can conflict
 with strict mode and should be reconciled into `wrangler.jsonc` before retrying.
 
+For the internal receiver and receipt-cleanup release, the green test gate must
+prove all of the following without adding a public receiver route: canonical
+payload rejection and hashing; one first D1 application; no repeated D1 or
+Analytics Engine effect for an exact replay; conflict on event-ID reuse with a
+different payload; fail-closed receipt behavior on marker 5; marker-5 cleanup
+that never prepares receipt SQL; and marker-6 cleanup that deletes only expired
+receipts and includes any remainder in the bounded backlog result. A failed
+Analytics Engine write remains non-fatal and is not retried.
+
+This is a code-only release over the existing schema-6 table. It adds no D1
+migration, binding, secret, Queue, or alarm configuration, so the normal
+`npm run deploy` sequence remains unchanged.
+
 After deployment, run the read-only production probe:
 
 ```sh
@@ -105,6 +118,12 @@ against a host that is not the designated HTTPS staging Workers.dev hostname.
 It never sends audio, transcript text, user content, or an external model
 request.
 
+The staging probe does not invoke the internal room-milestone receiver and is not
+an end-to-end durable-delivery test. Before promotion, use the local unit/runtime
+gate above to exercise the primitive and cleanup. An ordinary staging multiplayer
+smoke must continue to use the legacy best-effort milestone path; if receipt-row
+counts are inspected before and after that smoke, they must not increase.
+
 ## Migration discipline
 
 1. Never edit a migration that has reached any shared environment.
@@ -124,19 +143,25 @@ request.
    `0006_room_milestone_receipts.sql` was added. Migration 0006 is additive and
    schema-only: it creates an empty, privacy-minimal receipt table, advances the
    marker to 6, and preserves all schema-v5 tables, columns, constraints, queries,
-   and records. Every platform route, scheduled cleanup, and model-budget
-   operation in the bridge continues to use only the schema-v5 SQL contract.
-   Each logical D1 operation performs an uncached singleton marker read first, so
-   unsupported markers fail closed immediately without a Worker restart.
+   and records. Existing platform routes continue to use the schema-v5 SQL
+   contract. The internal room-milestone receiver and receipt expiry cleanup are
+   isolated schema-6-only paths. Each logical D1 operation performs an uncached
+   singleton marker read first; marker-5 cleanup never prepares receipt-table SQL,
+   and unsupported markers fail closed immediately without a Worker restart.
 
-   The receipt table is dormant in this release: no receiver, Durable Object
-   outbox, retry loop, receipt cleanup, or durable/exact-delivery claim is active.
-   It permits only opaque lowercase 256-bit IDs/hashes and canonical UTC
-   receipt/application/exact-90-day-expiry timestamps. After applying migration
-   0006, roll code back only to the reviewed schema-5/6 bridge—not an older Worker
-   that requires exact marker 5. Keep probes compatible with both markers until
-   the receiver/outbox rollout and rollback window finish, then contract to exact
-   marker 6.
+   The internal receiver is deliberately not connected to the normal room path.
+   Normal room traffic retains its best-effort header plus `waitUntil` fan-out and
+   does not insert receipts. An explicit internal invocation can receipt-gate one
+   D1 application; schema-6 cleanup removes expired receipts in the existing
+   bounded cleanup lifecycle. Analytics Engine receives only one best-effort
+   post-commit opportunity for a newly applied event. There is no Durable Object
+   outbox, retry loop, dead-letter path, or end-to-end durable/exact-delivery
+   claim. The table permits only opaque lowercase 256-bit IDs/hashes and canonical
+   UTC receipt/application/exact-90-day-expiry timestamps. After applying
+   migration 0006, roll code back only to the reviewed schema-5/6 bridge—not an
+   older Worker that requires exact marker 5. Keep probes compatible with both
+   markers until the future outbox rollout and rollback window finish, then
+   contract to exact marker 6.
 4. Exercise a fresh database and every supported upgrade path through
    `npm run smoke:platform`.
 5. Apply production migrations with `npm run db:migrate:remote`. Wrangler asks
@@ -378,6 +403,13 @@ or migration record during incident response. On schema 6, the reviewed
 schema-5/6 bridge is the rollback floor; do not roll back to a Worker that
 requires exact marker 5.
 
+Because normal rooms do not call the internal receiver, rolling this code-only
+release back to that bridge does not change their existing best-effort milestone
+path. It does pause receipt expiry cleanup; any rows created by explicit internal
+or test use remain until compatible cleanup is deployed again. Do not contract
+the Worker or probes to exact marker 6 before the future outbox activation and
+its rollback window are complete.
+
 ## Retention checks
 
 The Worker cron runs daily at 03:17 UTC. Anonymous cloud-summary ownership uses
@@ -399,10 +431,14 @@ redeploy does not invoke `scheduled()`, and the local Wrangler test URL is not a
 production trigger. Deploy any required fix, verify the configured Cron Trigger,
 wait for its next scheduled run, and then rerun `npm run smoke:production`.
 
-Schema v6 also defines `room_milestone_receipts`, but the migration-only release
-leaves it empty and the bridge never reads or writes it. Receipt cleanup is
-therefore intentionally inactive. The exact-90-day receiver and bounded cleanup
-must be deployed before any receipt row is accepted.
+Schema v6 defines `room_milestone_receipts`, and scheduled cleanup actively
+removes expired rows from it within the same bounded run budget. The final
+backlog probe includes receipt work only on marker 6. Marker-5 cleanup never
+prepares SQL that names the table. Normal room traffic does not invoke the
+internal receiver, so it does not create receipt rows; rows appear only after an
+explicit internal invocation or test fixture. Public cleanup status still
+exposes only the shared `ready`, `stale`, or `backlog` result, not receipt counts
+or timestamps.
 
 Quarterly, verify:
 
