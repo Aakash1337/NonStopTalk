@@ -56,8 +56,8 @@ for (const pathname of ["/", "/practice", "/progress"]) {
     `${pathname} must permit only same-origin browser connections`);
   const scriptSources = contentSecurityPolicySources(contentSecurityPolicy, "script-src");
   assert(scriptSources.length === 2
-    && scriptSources.includes("'self'")
-    && scriptSources.includes("https://static.cloudflareinsights.com"),
+    && scriptSources[0] === "'self'"
+    && scriptSources[1] === "https://static.cloudflareinsights.com",
     `${pathname} must permit only same-origin scripts and the configured Cloudflare Web Analytics beacon origin`);
 }
 
