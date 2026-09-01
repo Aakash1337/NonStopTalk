@@ -228,7 +228,7 @@ try {
     () => auxiliaryLogs,
   );
   const legacyStatusPayload = await legacyStatus.json();
-  assert(legacyStatus.status === 503, "A schema-v1 database must not report ready to the schema-v4 Worker");
+  assert(legacyStatus.status === 503, "A schema-v1 database must not report ready to the schema-v5 Worker");
   assert(legacyStatusPayload.error?.code === "DATABASE_UNAVAILABLE", "Schema skew needs a stable status error");
   await stopAndWait(auxiliaryChild);
   auxiliaryChild = undefined;
@@ -300,6 +300,38 @@ try {
   const rejectedMigration = JSON.parse(rejectedMigrationCheck.stdout)[0]?.results?.[0];
   assert(rejectedMigration?.schemaVersion === 2 && rejectedMigration?.profileTables === 0,
     `The rejected profile migration must leave schema v2 untouched: ${JSON.stringify(rejectedMigration)}`);
+
+  const rejectedOutOfOrderHeartbeatMigration = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--file", path.join(root, "cloudflare", "migrations", "0005_cleanup_heartbeat.sql"),
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  assert(rejectedOutOfOrderHeartbeatMigration.status !== 0,
+    "The cleanup-heartbeat migration must reject a schema-v2 database");
+  const rejectedHeartbeatCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--command", `SELECT
+        schema_version AS schemaVersion,
+        (SELECT COUNT(*) FROM sqlite_master
+          WHERE type = 'table' AND name IN (
+            'platform_maintenance', '_migration_0005_schema_guard'
+          )) AS heartbeatTables
+      FROM platform_meta WHERE id = 1`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (rejectedHeartbeatCheck.status !== 0) {
+    throw new Error(`Could not verify the rejected out-of-order heartbeat migration.\n${rejectedHeartbeatCheck.stdout}\n${rejectedHeartbeatCheck.stderr}`);
+  }
+  const rejectedHeartbeat = JSON.parse(rejectedHeartbeatCheck.stdout)[0]?.results?.[0];
+  assert(rejectedHeartbeat?.schemaVersion === 2 && rejectedHeartbeat?.heartbeatTables === 0,
+    `The rejected heartbeat migration must leave schema v2 untouched: ${JSON.stringify(rejectedHeartbeat)}`);
 
   const modelUsageUpgrade = spawnSync(
     process.execPath,
@@ -507,6 +539,54 @@ try {
     throw new Error(`Could not clean the profile-cascade fixture.\n${profileCascade.stdout}\n${profileCascade.stderr}`);
   }
 
+  const heartbeatUpgrade = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--file", path.join(root, "cloudflare", "migrations", "0005_cleanup_heartbeat.sql"),
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (heartbeatUpgrade.status !== 0) {
+    throw new Error(`The v4-to-v5 cleanup-heartbeat migration failed.\n${heartbeatUpgrade.stdout}\n${heartbeatUpgrade.stderr}`);
+  }
+  const heartbeatUpgradeCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--command", `SELECT
+        schema_version AS schemaVersion,
+        (SELECT COUNT(*) FROM platform_maintenance WHERE id = 1) AS heartbeatRows,
+        (SELECT cleanup_backlog FROM platform_maintenance WHERE id = 1) AS cleanupBacklog,
+        (SELECT cleanup_scheduled_at IS NOT NULL AND cleanup_completed_at IS NOT NULL
+          FROM platform_maintenance WHERE id = 1) AS initialized,
+        (SELECT COUNT(*) FROM pragma_table_info('platform_maintenance')) AS heartbeatColumns,
+        (SELECT COUNT(*) FROM pragma_table_info('platform_maintenance')
+          WHERE "notnull" = 1) AS heartbeatNotNullColumns,
+        (SELECT COUNT(*) FROM devices) AS devices,
+        (SELECT COUNT(*) FROM coaching_sessions) AS summaries,
+        (SELECT COUNT(*) FROM sqlite_master
+          WHERE type = 'table' AND name = '_migration_0005_schema_guard') AS migrationScratchTables
+      FROM platform_meta WHERE id = 1`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (heartbeatUpgradeCheck.status !== 0) {
+    throw new Error(`Could not verify the v4-to-v5 heartbeat migration.\n${heartbeatUpgradeCheck.stdout}\n${heartbeatUpgradeCheck.stderr}`);
+  }
+  const heartbeatUpgradeResult = JSON.parse(heartbeatUpgradeCheck.stdout)[0]?.results?.[0];
+  assert(heartbeatUpgradeResult?.schemaVersion === 5
+    && heartbeatUpgradeResult?.heartbeatRows === 1
+    && heartbeatUpgradeResult?.cleanupBacklog === 0
+    && heartbeatUpgradeResult?.initialized === 1
+    && heartbeatUpgradeResult?.heartbeatColumns === 4
+    && heartbeatUpgradeResult?.heartbeatNotNullColumns === 4
+    && heartbeatUpgradeResult?.devices === 2
+    && heartbeatUpgradeResult?.summaries === 251
+    && heartbeatUpgradeResult?.migrationScratchTables === 0,
+  `Schema v5 must add only one initialized cleanup heartbeat without changing user data: ${JSON.stringify(heartbeatUpgradeResult)}`);
+
   const migration = spawnSync(
     process.execPath,
     [wrangler, "d1", "migrations", "apply", "PLATFORM_DB", "--local", "--persist-to", stateDirectory],
@@ -515,6 +595,43 @@ try {
   if (migration.status !== 0) {
     throw new Error(`Local D1 migration failed.\n${migration.stdout}\n${migration.stderr}`);
   }
+
+  const initialHeartbeatCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+      "--command", `SELECT
+        meta.schema_version AS schemaVersion,
+        maintenance.cleanup_scheduled_at AS cleanupScheduledAt,
+        maintenance.cleanup_completed_at AS cleanupCompletedAt,
+        maintenance.cleanup_backlog AS cleanupBacklog
+      FROM platform_meta AS meta
+      JOIN platform_maintenance AS maintenance ON maintenance.id = meta.id
+      WHERE meta.id = 1`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (initialHeartbeatCheck.status !== 0) {
+    throw new Error(`Could not verify the fresh cleanup heartbeat.\n${initialHeartbeatCheck.stdout}\n${initialHeartbeatCheck.stderr}`);
+  }
+  const initialHeartbeat = JSON.parse(initialHeartbeatCheck.stdout)[0]?.results?.[0];
+  assert(initialHeartbeat?.schemaVersion === 5
+    && typeof initialHeartbeat?.cleanupScheduledAt === "string"
+    && typeof initialHeartbeat?.cleanupCompletedAt === "string"
+    && initialHeartbeat?.cleanupBacklog === 0,
+  `Fresh schema v5 must start inside its first-cron grace window: ${JSON.stringify(initialHeartbeat)}`);
+  const malformedHeartbeat = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+      "--command", `UPDATE platform_maintenance
+        SET cleanup_scheduled_at = '${"z".repeat(24)}' WHERE id = 1;`,
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  assert(malformedHeartbeat.status !== 0,
+    "Schema v5 must reject a non-canonical heartbeat timestamp before it can block monotonic repair");
 
   const expiredDevice = "f".repeat(64);
   const expiredProfile = "9".repeat(64);
@@ -568,8 +685,17 @@ try {
           '2025-02-01T00:00:00.000Z', 1, 'created', 'setup', 0, 0, 1, 60,
           'everyday', 0, 0, 0, 0
         );
-        WITH RECURSIVE sequence(value) AS (
-          VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 500
+        WITH digits(value) AS (
+          VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
+        ), sequence(value) AS (
+          SELECT ones.value
+            + (10 * tens.value)
+            + (100 * hundreds.value)
+            + (1000 * thousands.value)
+          FROM digits AS ones
+          CROSS JOIN digits AS tens
+          CROSS JOIN digits AS hundreds
+          CROSS JOIN digits AS thousands
         )
         INSERT INTO room_facts (
           room_key, first_observed_at, last_observed_at, expires_at, state_version,
@@ -580,7 +706,7 @@ try {
           printf('%064x', value), '2025-01-01T00:00:00.000Z', '2025-01-02T00:00:00.000Z',
           '2025-02-01T00:00:00.000Z', 1, 'created', 'setup', 0, 0, 1, 60,
           'everyday', 0, 0, 0, 0
-        FROM sequence;
+        FROM sequence WHERE value BETWEEN 1 AND 9999;
         INSERT INTO devices (device_key, created_at, last_seen_at, expires_at)
         VALUES ('${quotaDevice}', '2026-08-01T00:00:00.000Z', '2026-08-02T00:00:00.000Z', '2099-01-01T00:00:00.000Z');
         INSERT INTO consent_records (
@@ -688,7 +814,9 @@ try {
   const status = await request("/api/v1/platform/status");
   assert(status.response.ok, `Platform status failed (${status.response.status})`);
   assert(status.payload.status === "ok", "Configured platform status should be ok");
-  assert(status.payload.schemaVersion === 4, "Platform status should report the profile-foundation D1 schema");
+  assert(status.payload.schemaVersion === 5, "Platform status should report the cleanup-heartbeat D1 schema");
+  assert(status.payload.capabilities?.retentionCleanup?.status === "ready",
+    "Platform status should report a current, backlog-free retention cleanup heartbeat");
   assert(status.payload.capabilities?.cloudProgress?.newSaveLimit === 250, "Platform status should report the anonymous new-save cap");
   assert(status.payload.capabilities?.topicGeneration?.routine?.status === "offline",
     "Platform status should disclose the disabled-by-default routine provider without exposing a key");
@@ -1020,9 +1148,14 @@ try {
   assert(finalAnalytics.payload.totals.coaching_summary_deleted.value === 1, "Deleted-summary aggregate has the wrong value");
   assert(finalAnalytics.payload.totals.cloud_consent_revoked.events === 1, "Consent revocation transition was not recorded once");
 
-  const scheduled = await fetch(`${origin}/cdn-cgi/local/scheduled`);
+  const scheduledTime = Date.now();
+  const scheduled = await fetch(
+    `${origin}/cdn-cgi/handler/scheduled?format=json&time=${scheduledTime}`,
+  );
   assert(scheduled.ok, `Scheduled cleanup trigger failed (${scheduled.status})`);
-  await delay(250);
+  const scheduledOutcome = await scheduled.json();
+  assert(scheduledOutcome.outcome === "ok",
+    `Scheduled cleanup did not settle successfully: ${JSON.stringify(scheduledOutcome)}`);
   await stopAndWait(child);
   child = undefined;
 
@@ -1038,7 +1171,10 @@ try {
           WHERE membership_id = '${expiredMembership}') AS memberships,
         (SELECT COUNT(*) FROM sync_profiles
           WHERE profile_id = '${expiredProfile}') AS profiles,
-        (SELECT COUNT(*) FROM room_facts WHERE expires_at <= '2025-02-01T00:00:00.000Z') AS rooms`,
+        (SELECT COUNT(*) FROM room_facts WHERE expires_at <= '2025-02-01T00:00:00.000Z') AS rooms,
+        (SELECT cleanup_scheduled_at FROM platform_maintenance WHERE id = 1) AS cleanupScheduledAt,
+        (SELECT cleanup_completed_at FROM platform_maintenance WHERE id = 1) AS cleanupCompletedAt,
+        (SELECT cleanup_backlog FROM platform_maintenance WHERE id = 1) AS cleanupBacklog`,
       "--json",
     ],
     { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
@@ -1053,10 +1189,15 @@ try {
     && cleaned?.summaries === 0
     && cleaned?.memberships === 0
     && cleaned?.profiles === 0
-    && cleaned?.rooms === 0,
+    && cleaned?.rooms === 0
+    && cleaned?.cleanupBacklog === 0
+    && typeof cleaned?.cleanupScheduledAt === "string"
+    && typeof cleaned?.cleanupCompletedAt === "string"
+    && cleaned.cleanupScheduledAt === new Date(scheduledTime).toISOString()
+    && cleaned.cleanupCompletedAt !== initialHeartbeat.cleanupCompletedAt,
     `Scheduled cleanup left expired rows behind: ${JSON.stringify(cleaned)}`);
 
-  console.log("Cloud platform D1/API privacy, profile-foundation, and retention smoke test passed.");
+  console.log("Cloud platform D1/API privacy, profile-foundation, cleanup-heartbeat, and retention smoke test passed.");
 } catch (error) {
   if (logs.trim()) console.error(`Wrangler output captured before failure:\n${logs.trim()}`);
   if (auxiliaryLogs.trim()) console.error(`Auxiliary Wrangler output captured before failure:\n${auxiliaryLogs.trim()}`);

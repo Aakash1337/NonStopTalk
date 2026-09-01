@@ -38,6 +38,7 @@ npm run test:coach
 npm run test:cloud-progress
 npm run test:admin
 npm run test:production-monitor
+npm run test:deployment-contract
 npm run check:cloudflare-types
 npm run typecheck:cloudflare
 npm run test:cloudflare
@@ -91,7 +92,7 @@ npm run deploy:staging
 
 That command applies only staging migrations, deploys with strict mode, checks
 the public pages and status API, writes one synthetic compact baseline summary,
-verifies its schema-v4 profile-foundation and relationship round-trips, and
+verifies its schema-v5 cleanup heartbeat, profile-foundation, and relationship round-trips, and
 deletes the device-scoped cloud history. The mutating probe refuses to run
 against a host that is not the designated HTTPS staging Workers.dev hostname.
 It never sends audio, transcript text, user content, or an external model
@@ -104,13 +105,15 @@ request.
    in the same transaction.
 3. Keep every migration compatible with the currently deployed Worker. D1 is
    migrated before code when deployment automation applies both.
-   The current compatibility Worker accepts and reports schema markers 4 and 5
-   while using only the schema-v4 contract. Release it before migration `0005`
-   so that the additive migration can land without a readiness outage and the
-   same Worker remains a safe code rollback on schema 5. The matching feature
-   Worker may require marker 5 only after the migration is applied. Do not
-   widen a compatibility window without another compatibility release and
-   explicit old/new Worker tests.
+   The compatibility release accepted schema markers 4 and 5 while using only
+   the schema-v4 contract. Migration `0005_cleanup_heartbeat.sql` is additive,
+   and the matching feature Worker requires marker 5. The earlier compatibility
+   Worker remains schema/data-compatible as an emergency code rollback after
+   migration 0005, but it does not report `retentionCleanup`; the strict smoke
+   probe and twice-hourly monitor will intentionally fail during that temporary
+   loss of observability. Fix forward promptly. Before any schema 6 migration,
+   repeat the same compatibility-release sequence and explicit old/new Worker
+   tests.
 4. Exercise a fresh database and every supported upgrade path through
    `npm run smoke:platform`.
 5. Apply production migrations with `npm run db:migrate:remote`. Wrangler asks
@@ -174,7 +177,7 @@ A healthy response has:
 - HTTP 200 and `status: "ok"`;
 - the API and D1 schema versions expected by the deployed code;
 - an empty `degradedCapabilities` array;
-- ready cloud progress, room facts, and aggregate admin analytics;
+- ready cloud progress, retention cleanup, room facts, and aggregate admin analytics;
 - Analytics Engine enabled;
 - either offline or ready topic-provider tiers.
 
@@ -357,6 +360,19 @@ one roughly 30-day device lease; pseudonymous room facts expire after 90 days.
 Cleanup is bounded and can continue a backlog on the next run. Raw audio,
 recordings, and captured transcript text are not present in D1 and remain in the
 user's browser only when separately retained.
+
+Schema v5 stores one non-sensitive cleanup heartbeat row. A successful cron
+updates it only after all attempted batches succeed and records whether expired
+rows remain after the 20-batch invocation budget. Public status exposes only
+`ready`, `stale`, or `backlog`; it never returns deletion counts, timestamps,
+identities, or content. The migration timestamp supplies the first-run grace
+heartbeat. A heartbeat becomes stale after 36 hours, so a normal daily run has
+12 hours of scheduling grace before the twice-hourly production probe fails.
+If status reports `backlog`, confirm the next cron clears it. If it reports
+`stale`, inspect cron history and `platform_cleanup_failed`. A production
+redeploy does not invoke `scheduled()`, and the local Wrangler test URL is not a
+production trigger. Deploy any required fix, verify the configured Cron Trigger,
+wait for its next scheduled run, and then rerun `npm run smoke:production`.
 
 Quarterly, verify:
 

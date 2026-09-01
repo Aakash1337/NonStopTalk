@@ -73,11 +73,13 @@ GET     /api/v1/admin/model-usage?days=30
 POST    /api/v1/models/topics
 ```
 
-Every new API response includes a request ID and a no-store policy. Mutations require same-origin requests. Both admin endpoints require the same `ANALYTICS_ADMIN_TOKEN` bearer secret. Progress ownership remains the SHA-256 digest of the existing high-entropy browser token; the raw token is not stored in D1. Schema v4 also assigns an opaque internal sync profile, but its ID is never returned or accepted for access. The public status route verifies D1 readiness and returns top-level `status` (`ok` or `degraded`), `apiVersion`, `schemaVersion`, and `degradedCapabilities`. Its non-secret `capabilities` object reports cloud-progress status, retention, and `newSaveLimit`; keyed-room-fact status; aggregate-analytics delivery/admin-read/Analytics-Engine configuration; and only non-secret topic-provider availability/degradation.
+Every new API response includes a request ID and a no-store policy. Mutations require same-origin requests. Both admin endpoints require the same `ANALYTICS_ADMIN_TOKEN` bearer secret. Progress ownership remains the SHA-256 digest of the existing high-entropy browser token; the raw token is not stored in D1. Schema v4 also assigns an opaque internal sync profile, but its ID is never returned or accepted for access. The public status route verifies D1 readiness and returns top-level `status` (`ok` or `degraded`), `apiVersion`, `schemaVersion`, and `degradedCapabilities`. Its non-secret `capabilities` object reports cloud-progress status, retention, and `newSaveLimit`; retention-cleanup health; keyed-room-fact status; aggregate-analytics delivery/admin-read/Analytics-Engine configuration; and only non-secret topic-provider availability/degradation.
 
 `POST /api/v1/models/topics` is host-only and setup-only. It accepts a room code for authorization, a routine/escalated tier, an explicit consent boolean, and a trimmed theme capped at 200 characters. The normalized theme is the only host or room content forwarded to a model. Fixed instructions and model settings accompany it, but room authorization fields and NonStopTalk request IDs never leave the Worker. The response is a bounded editable topic draft plus provider/fallback metadata; applying that draft remains an ordinary room action. There is at most one external call, no retry, and no automatic escalation. A configured external request without consent is rejected before budget reservation or provider contact. Missing credentials/bindings, invalid provider selectors, unavailable/exhausted D1 budget, provider errors, timeouts, or invalid output return the deterministic draft. Public status reports invalid or incomplete provider configuration as degraded; authorization and input failures remain explicit errors. Status checks binding shape, not Workers Paid entitlement, so a denied first GLM-5.3 request can still fail closed. Provider output is materialized before the 64 KiB validation bound; a timeout stops local waiting, but an upstream that ignores abort may still complete and bill.
 
 Anonymous cloud progress is deliberately transitional. Its access cookie is not an account or recovery credential. Cloud use refreshes one device-level lease, bucketed to a UTC day and lasting at least 30 days (and less than 31 days), for all of that browser's summaries. Ordinary reads do not rewrite each summary merely to renew retention. The daily cleanup deletes bounded batches of expired detail, continues within a capped run budget, and leaves any remaining backlog for the next cron. Clearing the browser cookie can make a backup unreachable before cleanup. A real account will eventually adopt these records into a durable user identity.
+
+Schema v5 makes that cron observable with one initialized `platform_maintenance` singleton. A successful invocation advances its scheduled/completed heartbeat only after every attempted batch succeeds and stores one backlog bit; an older delayed event cannot regress a newer heartbeat. Status returns only `ready`, `stale`, or `backlog`, never its timestamps or deletion counts. The migration supplies the initial grace heartbeat, and status becomes degraded when the daily schedule is more than 36 hours old or an exact final probe finds eligible rows still remaining after the 20-batch run budget. This adds one tiny D1 write per successful day and, only at that full-budget boundary, one small existence read; it needs no service, secret, model call, or user record.
 
 Schema v4 is Stage 1 of that identity transition and is deliberately behavior-preserving. `sync_profiles` stores an opaque internal profile and lifecycle metadata; `sync_profile_devices` maps one current device digest to one profile. Existing devices are backfilled one-to-one, and new browsers still receive separate profiles. `coaching_sessions`, consent receipts, authorization, the API response shape, and every visible backup/list/export/delete flow remain device-owned and unchanged. Device deletion cascades the membership, and bounded retention cleanup removes an expired orphan profile. This introduces no visible profile, account, linking, recovery, cross-device access, data upload, or new consent behavior.
 
@@ -92,6 +94,7 @@ New saves are rejected when an anonymous browser identity already owns 250 cloud
 | `devices` | Anonymous owner key and expiry | Cookie token, IP, user agent |
 | `sync_profiles` | Opaque internal profile lifecycle/generation; one profile per browser in Stage 1 | Credentials, content, names, IP, user agent |
 | `sync_profile_devices` | Internal device-to-profile membership and lifecycle | Raw cookie token, content, consent |
+| `platform_maintenance` | Singleton scheduled-cleanup heartbeat and backlog bit | User/content identifiers, deletion counts, secrets |
 | `coaching_sessions` | Allowlisted compact measurement/advice summary | Audio, samples, recording, captured transcript |
 | `consent_records` | Versioned proof of the summary-backup choice | Form text, media |
 | `room_facts` | Room lifecycle counts keyed by an operator-secret HMAC of the short room code | Raw room code, player names and member tokens |
@@ -129,7 +132,7 @@ Server-authoritative room events are preferred over browser events. A coaching-s
 - Add D1 migrations and local migration commands.
 - Add strict summary validation at both browser and Worker boundaries.
 - Add opt-in cloud summary create/list/delete/export.
-- Add a single device-level, day-bucketed anonymous-data lease, a 250-existing-summary new-save guard, and bounded scheduled cleanup with backlog continuation.
+- Add a single device-level, day-bucketed anonymous-data lease, a 250-existing-summary new-save guard, bounded scheduled cleanup with backlog continuation, and a one-row cleanup heartbeat.
 - Add server-authoritative room lifecycle events, room facts, and best-effort daily counters.
 - Add a protected analytics summary endpoint and a public status response that distinguishes configured from degraded capabilities without exposing secrets.
 - Add request IDs, tests, deployment steps, and privacy copy.
@@ -152,7 +155,7 @@ Exit: a user can sign in on a second device, see consented summaries, export the
 - Persist finished-game and turn facts to D1 without moving live authority out of Durable Objects.
 - Add idempotency keys and a Durable Object outbox for milestone delivery.
 - **Implemented:** add a small, protected, source-reconciled admin dashboard without a new dependency or service.
-- **Implemented:** add isolated staging/production environments, migration checks, cleanup/room alarms, deployment smoke probes, and incident runbooks.
+- **Implemented:** add isolated staging/production environments, migration checks, cleanup heartbeat/room alarms, deployment smoke probes, and incident runbooks.
 
 Exit: deployments are repeatable, game outcomes are queryable across rooms, and support can diagnose failures without reading private room content.
 
@@ -170,7 +173,7 @@ Partial exit reached: topic providers can be enabled, disabled, or replaced with
 ## Cost controls
 
 - Do not write D1 on socket presence ticks or page views. Persist only summaries, consent changes, room milestones, analytics increments, and aggregate provider-budget counters.
-- Keep one day-bucketed inactivity lease per anonymous device, reject new saves once 250 summaries exist without forcibly deleting valid legacy rows, and bound each cleanup run so unusual backlogs cannot monopolize Worker execution.
+- Keep one day-bucketed inactivity lease per anonymous device, reject new saves once 250 summaries exist without forcibly deleting valid legacy rows, bound each cleanup run so unusual backlogs cannot monopolize Worker execution, and spend only one small heartbeat write after a successful daily cleanup.
 - Keep the Stage-1 identity expansion to two small metadata rows per browser and the existing bounded cleanup; it requires no additional Cloudflare product, model call, email sender, or paid plan.
 - Use Analytics Engine for high-volume exploratory telemetry because writes are non-blocking and sampled at scale; never depend on it for billing or user-visible state.
 - Keep raw coaching artifacts in IndexedDB. Add R2 only if users explicitly request cloud media storage and a storage/egress budget is approved.

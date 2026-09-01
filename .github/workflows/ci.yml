@@ -40,6 +40,7 @@ jobs:
       - run: npm run test:cloud-progress
       - run: npm run test:admin
       - run: npm run test:production-monitor
+      - run: npm run test:deployment-contract
       - run: npm run check:cloudflare-types
       - run: npm run typecheck:cloudflare
       - run: npm run test:cloudflare

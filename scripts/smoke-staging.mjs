@@ -79,7 +79,8 @@ try {
   const status = await request("/api/v1/platform/status");
   assert.equal(status.response.status, 200, "Staging status must be healthy before a write probe.");
   assert.equal(status.payload.status, "ok");
-  assert.equal(status.payload.schemaVersion, 4);
+  assert.equal(status.payload.schemaVersion, 5);
+  assert.equal(status.payload.capabilities?.retentionCleanup?.status, "ready");
 
   const suffix = crypto.randomBytes(12).toString("hex");
   const sessionId = `staging-${suffix}`;
