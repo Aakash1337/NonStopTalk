@@ -23,6 +23,24 @@ import {
 	type ModelRouteBindings,
 } from "./model-routes";
 import { logWorkerEvent } from "./observability";
+import {
+	acknowledgeRoomMilestone,
+	deadLetterExpiredRoomMilestone,
+	deadLetterRoomMilestone,
+	initializeRoomMilestoneOutbox,
+	purgeExpiredRoomMilestoneDeadLetters,
+	readNextRoomMilestoneAlarmAt,
+	readRoomMilestoneOutboxHead,
+	readRoomMilestoneOutboxMetadata,
+	recordRoomMilestoneRetry,
+	type RoomMilestoneOutboxHead,
+	type RoomMilestoneRetryFailure,
+} from "./room-milestone-outbox";
+import { normalizeRoomMilestoneDeliveryV1 } from "./room-milestone-contract";
+import {
+	receiveRoomMilestone,
+	type RoomMilestoneReceiveResult,
+} from "./room-milestone-receiver";
 import { parseRoomRoute } from "./routes";
 
 const TOKEN_COOKIE = "nonstoptalk_token";
@@ -32,6 +50,8 @@ const MAX_ROOM_SOCKETS = 64;
 const MAX_SOCKETS_PER_TOKEN = 4;
 const ROOM_IDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const ROOM_DELETE_RETRY_MS = 60 * 60 * 1000;
+const ROOM_MILESTONE_ALARM_MIN_DELAY_MS = 1_000;
+const ROOM_MILESTONE_WATCHDOG_MS = 2 * 60 * 1000;
 const HOST_HTTP_PRESENCE_BUCKET_MS = 15_000;
 const ROOM_MILESTONES_HEADER = "X-NonStopTalk-Room-Milestones";
 const MODEL_TOPICS_ROUTE = "/api/v1/models/topics";
@@ -71,6 +91,19 @@ interface TokenIdentity {
 export class RoomDurableObject extends DurableObject<WorkerEnv> {
 	constructor(ctx: DurableObjectState, env: WorkerEnv) {
 		super(ctx, env);
+		// Missing and ordinary best-effort rooms stay read-only here. An object
+		// that already has a future outbox is repaired using only local SQLite,
+		// and its one alarm is reconciled before any handler runs under this bridge.
+		this.ctx.blockConcurrencyWhile(async () => {
+			const room = this.load();
+			if (!room || !this.hasRoomMilestoneOutbox()) return;
+			await this.ctx.storage.transaction(async (transaction) => {
+				const current = this.load();
+				if (!current) return;
+				initializeRoomMilestoneOutbox(this.ctx.storage.sql);
+				await this.reconcileRoomAlarm(current, transaction);
+			});
+		});
 	}
 
 	private initializeSchema(): void {
@@ -223,12 +256,150 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 
 	async alarm(): Promise<void> {
 		const room = this.load();
-		if (!room) return;
+		if (!room) {
+			await this.deleteRoomStorage();
+			return;
+		}
 		const expiresAt = room.updatedAt + ROOM_IDLE_TTL_MS;
-		if (Date.now() < expiresAt) {
+		const now = Date.now();
+		// The room's privacy expiry outranks telemetry. Normally every queued
+		// event reaches its seven-day terminal deadline well before this point.
+		if (now >= expiresAt) {
+			await this.expireRoom();
+			return;
+		}
+		if (!this.hasRoomMilestoneOutbox()) {
 			await this.ctx.storage.setAlarm(expiresAt);
 			return;
 		}
+		initializeRoomMilestoneOutbox(this.ctx.storage.sql);
+
+		await this.ctx.storage.transaction(async (transaction) => {
+			purgeExpiredRoomMilestoneDeadLetters(this.ctx.storage.sql, now);
+			await this.reconcileRoomAlarm(room, transaction);
+		});
+
+		const head = readRoomMilestoneOutboxHead(this.ctx.storage.sql);
+		if (!head || head.nextAttemptAtMs > now) return;
+		if (head.deadlineAtMs <= now) {
+			await this.finalizeExpiredMilestone(head, now);
+			return;
+		}
+
+		try {
+			const delivery = normalizeRoomMilestoneDeliveryV1({
+				eventId: head.eventId,
+				payloadJson: head.payloadJson,
+			});
+			if (delivery.payload.milestone !== head.milestone) {
+				throw new Error("Milestone payload does not match its queue metadata.");
+			}
+			if (
+				delivery.payload.roomInstanceId
+				!== readRoomMilestoneOutboxMetadata(this.ctx.storage.sql).roomInstanceId
+			) throw new Error("Milestone payload belongs to another room lifecycle.");
+		} catch {
+			await this.finalizeInvalidMilestone(head, now);
+			return;
+		}
+
+		// Persist a wake before external D1 work. If the invocation is interrupted
+		// after D1 commits but before local ACK, this immutable delivery is replayed
+		// and the receipt receiver classifies it as a duplicate.
+		await this.ctx.storage.setAlarm(Math.min(
+			now + ROOM_MILESTONE_WATCHDOG_MS,
+			head.deadlineAtMs,
+			expiresAt,
+		));
+
+		let result: RoomMilestoneReceiveResult;
+		try {
+			result = await receiveRoomMilestone(
+				this.env,
+				{ eventId: head.eventId, payloadJson: head.payloadJson },
+				new Date(now),
+			);
+		} catch (error) {
+			await this.finalizeMilestoneRetry(head, "database-unavailable", Date.now());
+			logWorkerEvent("warn", "room_milestone_outbox_delivery_failed", {
+				error: safeWorkerErrorName(error),
+			});
+			return;
+		}
+
+		if (result.outcome === "applied" || result.outcome === "duplicate") {
+			await this.finalizeMilestoneAcknowledgement(head);
+			return;
+		}
+		if (result.outcome === "conflict") {
+			await this.finalizeMilestoneConflict(head, Date.now());
+			return;
+		}
+		await this.finalizeMilestoneRetry(head, "receiver-invariant", Date.now());
+	}
+
+	private async finalizeMilestoneAcknowledgement(head: RoomMilestoneOutboxHead): Promise<void> {
+		await this.ctx.storage.transaction(async (transaction) => {
+			acknowledgeRoomMilestone(this.ctx.storage.sql, head);
+			const room = this.load();
+			if (room) await this.reconcileRoomAlarm(room, transaction);
+			else await transaction.deleteAlarm();
+		});
+	}
+
+	private async finalizeMilestoneConflict(head: RoomMilestoneOutboxHead, now: number): Promise<void> {
+		await this.ctx.storage.transaction(async (transaction) => {
+			deadLetterRoomMilestone(this.ctx.storage.sql, head, "conflict", now);
+			const room = this.load();
+			if (room) await this.reconcileRoomAlarm(room, transaction);
+			else await transaction.deleteAlarm();
+		});
+		logWorkerEvent("warn", "room_milestone_outbox_dead_lettered", { reason: "conflict" });
+	}
+
+	private async finalizeExpiredMilestone(head: RoomMilestoneOutboxHead, now: number): Promise<void> {
+		await this.ctx.storage.transaction(async (transaction) => {
+			deadLetterExpiredRoomMilestone(this.ctx.storage.sql, head, now);
+			const room = this.load();
+			if (room) await this.reconcileRoomAlarm(room, transaction);
+			else await transaction.deleteAlarm();
+		});
+		logWorkerEvent("warn", "room_milestone_outbox_dead_lettered", { reason: "deadline-exceeded" });
+	}
+
+	private async finalizeInvalidMilestone(head: RoomMilestoneOutboxHead, now: number): Promise<void> {
+		await this.ctx.storage.transaction(async (transaction) => {
+			deadLetterRoomMilestone(this.ctx.storage.sql, head, "invalid-payload", now);
+			const room = this.load();
+			if (room) await this.reconcileRoomAlarm(room, transaction);
+			else await transaction.deleteAlarm();
+		});
+		logWorkerEvent("warn", "room_milestone_outbox_dead_lettered", { reason: "invalid-payload" });
+	}
+
+	private async finalizeMilestoneRetry(
+		head: RoomMilestoneOutboxHead,
+		failure: RoomMilestoneRetryFailure,
+		now: number,
+	): Promise<void> {
+		let outcome: ReturnType<typeof recordRoomMilestoneRetry> | undefined;
+		await this.ctx.storage.transaction(async (transaction) => {
+			outcome = recordRoomMilestoneRetry(this.ctx.storage.sql, head, failure, now);
+			const room = this.load();
+			if (room) await this.reconcileRoomAlarm(room, transaction);
+			else await transaction.deleteAlarm();
+		});
+		if (outcome?.outcome === "retry") {
+			logWorkerEvent("warn", "room_milestone_outbox_retry_scheduled", {
+				failure,
+				attemptCount: outcome.attemptCount,
+			});
+		} else if (outcome?.outcome === "dead-lettered") {
+			logWorkerEvent("warn", "room_milestone_outbox_dead_lettered", { reason: outcome.reason });
+		}
+	}
+
+	private async expireRoom(): Promise<void> {
 		for (const socket of this.ctx.getWebSockets()) {
 			try {
 				socket.close(1001, "Room expired after 30 days of inactivity");
@@ -236,6 +407,10 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 				// The socket is already closed.
 			}
 		}
+		await this.deleteRoomStorage();
+	}
+
+	private async deleteRoomStorage(): Promise<void> {
 		try {
 			await this.ctx.storage.deleteAll();
 		} catch (error) {
@@ -275,21 +450,43 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 		return row ? (JSON.parse(row.json) as RoomState) : null;
 	}
 
+	private hasRoomMilestoneOutbox(): boolean {
+		return Boolean(this.ctx.storage.sql
+			.exec<{ name: string }>(
+				"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'room_milestone_outbox'",
+			)
+			.toArray()[0]);
+	}
+
 	private save(room: RoomState): void {
 		this.ctx.storage.sql.exec(
 			"INSERT INTO room_state (id, json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json",
 			JSON.stringify(room),
 		);
 		this.ctx.waitUntil(
-			this.ctx.storage
-				.setAlarm(room.updatedAt + ROOM_IDLE_TTL_MS)
+			this.reconcileRoomAlarm(room, this.ctx.storage)
 				.catch((error: unknown) => {
-					logWorkerEvent("error", "room_expiry_schedule_failed", {
+					logWorkerEvent("error", "room_alarm_schedule_failed", {
 						error: safeWorkerErrorName(error),
 					});
 					throw error;
 				}),
 		);
+	}
+
+	private async reconcileRoomAlarm(
+		room: RoomState,
+		alarms: Pick<DurableObjectStorage, "setAlarm"> | Pick<DurableObjectTransaction, "setAlarm">,
+	): Promise<void> {
+		const outboxAt = this.hasRoomMilestoneOutbox()
+			? readNextRoomMilestoneAlarmAt(this.ctx.storage.sql)
+			: null;
+		const expiresAt = room.updatedAt + ROOM_IDLE_TTL_MS;
+		const requestedAt = outboxAt === null ? expiresAt : Math.min(expiresAt, outboxAt);
+		// A FIFO follower can already be due when its predecessor is ACKed. Give
+		// the platform an explicit future timestamp so replacing the currently
+		// running alarm cannot be mistaken for leaving it unscheduled.
+		await alarms.setAlarm(Math.max(Date.now() + ROOM_MILESTONE_ALARM_MIN_DELAY_MS, requestedAt));
 	}
 
 	private onlineTokens(except?: WebSocket): Set<string> {
