@@ -162,6 +162,12 @@ try {
         INSERT INTO devices (device_key, created_at, last_seen_at, expires_at) VALUES
           ('${legacyActiveDevice}', '2026-01-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z'),
           ('${legacyExpiredDevice}', '2025-01-01T00:00:00.000Z', '2025-01-02T00:00:00.000Z', '2025-02-01T00:00:00.000Z');
+        INSERT INTO consent_records (
+          device_key, purpose, policy_version, granted, granted_at, revoked_at, updated_at
+        ) VALUES (
+          '${legacyActiveDevice}', 'cloud_summary', 'cloud-summary-v1', 1,
+          '2026-01-01T00:00:00.000Z', NULL, '2026-08-01T00:00:00.000Z'
+        );
         INSERT INTO coaching_sessions (
           device_key, session_id, analysis_schema_version, client_created_at,
           received_at, updated_at, expires_at, scenario, goal, target_duration_ms,
@@ -222,7 +228,7 @@ try {
     () => auxiliaryLogs,
   );
   const legacyStatusPayload = await legacyStatus.json();
-  assert(legacyStatus.status === 503, "A schema-v1 database must not report ready to the schema-v3 Worker");
+  assert(legacyStatus.status === 503, "A schema-v1 database must not report ready to the schema-v4 Worker");
   assert(legacyStatusPayload.error?.code === "DATABASE_UNAVAILABLE", "Schema skew needs a stable status error");
   await stopAndWait(auxiliaryChild);
   auxiliaryChild = undefined;
@@ -262,6 +268,245 @@ try {
     "The device-lease migration must not revive expired legacy summaries");
   assert(upgraded?.expiryColumns === 0, "The device-lease migration must remove per-summary expiry");
 
+  const rejectedOutOfOrderProfileMigration = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--file", path.join(root, "cloudflare", "migrations", "0004_sync_profiles.sql"),
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  assert(rejectedOutOfOrderProfileMigration.status !== 0,
+    "The profile foundation migration must reject a schema-v2 database");
+  const rejectedMigrationCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--command", `SELECT
+        schema_version AS schemaVersion,
+        (SELECT COUNT(*) FROM sqlite_master
+          WHERE type = 'table' AND name IN (
+            'sync_profiles', 'sync_profile_devices',
+            '_migration_0004_schema_guard', '_migration_0004_profile_backfill'
+          )) AS profileTables
+      FROM platform_meta WHERE id = 1`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (rejectedMigrationCheck.status !== 0) {
+    throw new Error(`Could not verify the rejected out-of-order profile migration.\n${rejectedMigrationCheck.stdout}\n${rejectedMigrationCheck.stderr}`);
+  }
+  const rejectedMigration = JSON.parse(rejectedMigrationCheck.stdout)[0]?.results?.[0];
+  assert(rejectedMigration?.schemaVersion === 2 && rejectedMigration?.profileTables === 0,
+    `The rejected profile migration must leave schema v2 untouched: ${JSON.stringify(rejectedMigration)}`);
+
+  const modelUsageUpgrade = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--file", path.join(root, "cloudflare", "migrations", "0003_model_usage.sql"),
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (modelUsageUpgrade.status !== 0) {
+    throw new Error(`The v2-to-v3 migration failed.\n${modelUsageUpgrade.stdout}\n${modelUsageUpgrade.stderr}`);
+  }
+
+  const profileUpgrade = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--file", path.join(root, "cloudflare", "migrations", "0004_sync_profiles.sql"),
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (profileUpgrade.status !== 0) {
+    throw new Error(`The v3-to-v4 profile foundation migration failed.\n${profileUpgrade.stdout}\n${profileUpgrade.stderr}`);
+  }
+  const profileUpgradeCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--command", `SELECT
+        schema_version AS schemaVersion,
+        (SELECT COUNT(*) FROM devices) AS devices,
+        (SELECT COUNT(*) FROM consent_records) AS consents,
+        (SELECT COUNT(*) FROM coaching_sessions) AS summaries,
+        (SELECT COUNT(*) FROM sync_profiles) AS profiles,
+        (SELECT COUNT(*) FROM sync_profile_devices) AS memberships,
+        (SELECT COUNT(*) FROM sync_profile_devices AS membership
+          JOIN sync_profiles AS profile ON profile.profile_id = membership.profile_id
+          JOIN devices AS device ON device.device_key = membership.device_key
+          WHERE profile.created_at <> device.created_at
+            OR profile.last_seen_at <> device.last_seen_at
+            OR profile.expires_at <> device.expires_at
+            OR profile.sync_generation <> 1
+            OR membership.joined_at <> device.created_at
+            OR membership.last_seen_at <> device.last_seen_at) AS backfillMismatches,
+        (SELECT COUNT(*) FROM sync_profile_devices AS membership
+          WHERE membership.profile_id = membership.membership_id
+            OR membership.profile_id = membership.device_key
+            OR membership.membership_id = membership.device_key
+            OR EXISTS (
+              SELECT 1 FROM devices AS candidate
+              WHERE candidate.device_key IN (membership.profile_id, membership.membership_id)
+            )) AS reusedIdentifiers,
+        (SELECT COUNT(*) FROM sync_profile_devices AS membership
+          JOIN sync_profiles AS profile ON profile.profile_id = membership.profile_id
+          WHERE length(profile.profile_id) <> 64
+            OR profile.profile_id GLOB '*[^0-9a-f]*'
+            OR length(membership.membership_id) <> 64
+            OR membership.membership_id GLOB '*[^0-9a-f]*') AS invalidIdentifiers,
+        (SELECT COUNT(*) FROM pragma_table_info('devices')) AS deviceColumns,
+        (SELECT COUNT(*) FROM pragma_table_info('consent_records')) AS consentColumns,
+        (SELECT COUNT(*) FROM pragma_table_info('coaching_sessions')) AS summaryColumns,
+        (SELECT COUNT(*) FROM pragma_table_info('sync_profiles')) AS profileColumns,
+        (SELECT COUNT(*) FROM pragma_table_info('sync_profile_devices')) AS membershipColumns,
+        (SELECT "notnull" FROM pragma_table_info('sync_profiles')
+          WHERE name = 'profile_id') AS profileIdNotNull,
+        (SELECT "notnull" FROM pragma_table_info('sync_profile_devices')
+          WHERE name = 'membership_id') AS membershipIdNotNull,
+        (SELECT COUNT(*) FROM pragma_table_info('coaching_sessions')
+          WHERE (name = 'device_key' AND pk = 1) OR (name = 'session_id' AND pk = 2)) AS summaryPrimaryKeyColumns,
+        (SELECT COUNT(*) FROM pragma_foreign_key_list('coaching_sessions')
+          WHERE "table" = 'devices' AND "from" = 'device_key' AND "to" = 'device_key'
+            AND on_delete = 'CASCADE') AS summaryDeviceCascades,
+        (SELECT COUNT(*) FROM pragma_foreign_key_list('sync_profile_devices')
+          WHERE "table" = 'sync_profiles' AND "from" = 'profile_id' AND "to" = 'profile_id'
+            AND on_delete = 'CASCADE') AS membershipProfileCascades,
+        (SELECT COUNT(*) FROM pragma_foreign_key_list('sync_profile_devices')
+          WHERE "table" = 'devices' AND "from" = 'device_key' AND "to" = 'device_key'
+            AND on_delete = 'CASCADE') AS membershipDeviceCascades,
+        (SELECT COUNT(*) FROM pragma_index_list('sync_profiles')
+          WHERE name = 'sync_profiles_expires_at_idx') AS profileExpiryIndexes,
+        (SELECT COUNT(*) FROM pragma_index_list('sync_profile_devices')
+          WHERE name = 'sync_profile_devices_profile_idx') AS membershipProfileIndexes,
+        (SELECT COUNT(*) FROM pragma_index_list('sync_profile_devices')
+          WHERE "unique" = 1 AND origin = 'u') AS membershipDeviceUniqueIndexes,
+        (SELECT COUNT(*) FROM sqlite_master
+          WHERE type = 'table' AND name LIKE '_migration_0004_%') AS migrationScratchTables
+      FROM platform_meta WHERE id = 1`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (profileUpgradeCheck.status !== 0) {
+    throw new Error(`Could not verify the v3-to-v4 profile migration.\n${profileUpgradeCheck.stdout}\n${profileUpgradeCheck.stderr}`);
+  }
+  const profileUpgradeResult = JSON.parse(profileUpgradeCheck.stdout)[0]?.results?.[0];
+  assert(profileUpgradeResult?.schemaVersion === 4, "The profile migration must advance the schema marker to 4");
+  assert(profileUpgradeResult?.devices === 2
+    && profileUpgradeResult?.profiles === profileUpgradeResult.devices
+    && profileUpgradeResult?.memberships === profileUpgradeResult.devices,
+  `Every existing device must receive exactly one profile membership: ${JSON.stringify(profileUpgradeResult)}`);
+  assert(profileUpgradeResult?.consents === 1 && profileUpgradeResult?.summaries === 251,
+    "The profile migration must preserve existing consent and coaching rows");
+  assert(profileUpgradeResult?.backfillMismatches === 0
+    && profileUpgradeResult?.reusedIdentifiers === 0
+    && profileUpgradeResult?.invalidIdentifiers === 0,
+  `Profile backfill identifiers and lease timestamps must be independent and exact: ${JSON.stringify(profileUpgradeResult)}`);
+  assert(profileUpgradeResult?.deviceColumns === 4
+    && profileUpgradeResult?.consentColumns === 7
+    && profileUpgradeResult?.summaryColumns === 19
+    && profileUpgradeResult?.profileColumns === 5
+    && profileUpgradeResult?.membershipColumns === 5
+    && profileUpgradeResult?.profileIdNotNull === 1
+    && profileUpgradeResult?.membershipIdNotNull === 1
+    && profileUpgradeResult?.summaryPrimaryKeyColumns === 2
+    && profileUpgradeResult?.summaryDeviceCascades === 1
+    && profileUpgradeResult?.membershipProfileCascades === 1
+    && profileUpgradeResult?.membershipDeviceCascades === 1,
+  `Schema v4 must not contract or reshape the v3 device/consent/session contract: ${JSON.stringify(profileUpgradeResult)}`);
+  assert(profileUpgradeResult?.profileExpiryIndexes === 1
+    && profileUpgradeResult?.membershipProfileIndexes === 1
+    && profileUpgradeResult?.membershipDeviceUniqueIndexes === 1
+    && profileUpgradeResult?.migrationScratchTables === 0,
+  `Profile indexes or migration cleanup are incomplete: ${JSON.stringify(profileUpgradeResult)}`);
+
+  const legacyV3WriteDevice = "d".repeat(64);
+  const legacyV3WriteProfile = "1".repeat(64);
+  const legacyV3WriteMembership = "2".repeat(64);
+  const legacyV3Write = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--command", `
+        INSERT INTO devices (device_key, created_at, last_seen_at, expires_at)
+        VALUES ('${legacyV3WriteDevice}', '2026-08-10T00:00:00.000Z',
+          '2026-08-11T00:00:00.000Z', '2099-01-01T00:00:00.000Z');
+        INSERT INTO consent_records (
+          device_key, purpose, policy_version, granted, granted_at, revoked_at, updated_at
+        ) VALUES (
+          '${legacyV3WriteDevice}', 'cloud_summary', 'cloud-summary-v1', 1,
+          '2026-08-10T00:00:00.000Z', NULL, '2026-08-11T00:00:00.000Z'
+        ) ON CONFLICT(device_key, purpose) DO UPDATE SET updated_at = excluded.updated_at;
+        INSERT INTO coaching_sessions (
+          device_key, session_id, analysis_schema_version, client_created_at,
+          received_at, updated_at, scenario, goal, target_duration_ms, duration_ms,
+          speaking_ratio, pause_count, audio_confidence, transcript_metrics_used, summary_json
+        ) VALUES (
+          '${legacyV3WriteDevice}', 'legacy-v3-write', 2, '2026-08-10T00:00:00.000Z',
+          '2026-08-11T00:00:00.000Z', '2026-08-11T00:00:00.000Z', 'interview',
+          'pauses', 45000, 44000, 0.7, 4, 'high', 0, '{}'
+        ) ON CONFLICT(device_key, session_id) DO NOTHING;
+        INSERT INTO sync_profiles (
+          profile_id, created_at, last_seen_at, expires_at, sync_generation
+        ) VALUES (
+          '${legacyV3WriteProfile}', '2026-08-10T00:00:00.000Z',
+          '2026-08-11T00:00:00.000Z', '2099-01-01T00:00:00.000Z', 1
+        );
+        INSERT INTO sync_profile_devices (
+          membership_id, profile_id, device_key, joined_at, last_seen_at
+        ) VALUES (
+          '${legacyV3WriteMembership}', '${legacyV3WriteProfile}', '${legacyV3WriteDevice}',
+          '2026-08-10T00:00:00.000Z', '2026-08-11T00:00:00.000Z'
+        );
+        DELETE FROM devices WHERE device_key = '${legacyV3WriteDevice}';
+      `,
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (legacyV3Write.status !== 0) {
+    throw new Error(`Schema v4 broke the schema-v3 SQL contract.\n${legacyV3Write.stdout}\n${legacyV3Write.stderr}`);
+  }
+  const legacyV3CascadeCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--command", `SELECT
+        (SELECT COUNT(*) FROM devices WHERE device_key = '${legacyV3WriteDevice}') AS devices,
+        (SELECT COUNT(*) FROM consent_records WHERE device_key = '${legacyV3WriteDevice}') AS consents,
+        (SELECT COUNT(*) FROM coaching_sessions WHERE device_key = '${legacyV3WriteDevice}') AS summaries,
+        (SELECT COUNT(*) FROM sync_profile_devices WHERE device_key = '${legacyV3WriteDevice}') AS memberships,
+        (SELECT COUNT(*) FROM sync_profiles WHERE profile_id = '${legacyV3WriteProfile}') AS profiles`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (legacyV3CascadeCheck.status !== 0) {
+    throw new Error(`Could not verify schema-v4 device cascades.\n${legacyV3CascadeCheck.stdout}\n${legacyV3CascadeCheck.stderr}`);
+  }
+  const legacyV3Cascade = JSON.parse(legacyV3CascadeCheck.stdout)[0]?.results?.[0];
+  assert(legacyV3Cascade?.devices === 0
+    && legacyV3Cascade?.consents === 0
+    && legacyV3Cascade?.summaries === 0
+    && legacyV3Cascade?.memberships === 0
+    && legacyV3Cascade?.profiles === 1,
+  `Device deletion must preserve v3 cascades and remove its membership only: ${JSON.stringify(legacyV3Cascade)}`);
+
+  const profileCascade = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", upgradeStateDirectory,
+      "--command", `DELETE FROM sync_profiles WHERE profile_id = '${legacyV3WriteProfile}';`,
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (profileCascade.status !== 0) {
+    throw new Error(`Could not clean the profile-cascade fixture.\n${profileCascade.stdout}\n${profileCascade.stderr}`);
+  }
+
   const migration = spawnSync(
     process.execPath,
     [wrangler, "d1", "migrations", "apply", "PLATFORM_DB", "--local", "--persist-to", stateDirectory],
@@ -272,6 +517,8 @@ try {
   }
 
   const expiredDevice = "f".repeat(64);
+  const expiredProfile = "9".repeat(64);
+  const expiredMembership = "8".repeat(64);
   const expiredRoom = "e".repeat(64);
   const quotaToken = "a".repeat(64);
   const quotaDevice = createHash("sha256").update(quotaToken).digest("hex");
@@ -298,6 +545,18 @@ try {
           '${expiredDevice}', 'expired-smoke-summary', 2, '2025-01-01T00:00:00.000Z',
           '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z', 'interview', 'pauses',
           45000, 44000, 0.7, 4, 'high', 0, '{}'
+        );
+        INSERT INTO sync_profiles (
+          profile_id, created_at, last_seen_at, expires_at, sync_generation
+        ) VALUES (
+          '${expiredProfile}', '2025-01-01T00:00:00.000Z',
+          '2025-01-02T00:00:00.000Z', '2025-02-01T00:00:00.000Z', 1
+        );
+        INSERT INTO sync_profile_devices (
+          membership_id, profile_id, device_key, joined_at, last_seen_at
+        ) VALUES (
+          '${expiredMembership}', '${expiredProfile}', '${expiredDevice}',
+          '2025-01-01T00:00:00.000Z', '2025-01-02T00:00:00.000Z'
         );
         INSERT INTO room_facts (
           room_key, first_observed_at, last_observed_at, expires_at, state_version,
@@ -429,7 +688,7 @@ try {
   const status = await request("/api/v1/platform/status");
   assert(status.response.ok, `Platform status failed (${status.response.status})`);
   assert(status.payload.status === "ok", "Configured platform status should be ok");
-  assert(status.payload.schemaVersion === 3, "Platform status should report the supported D1 schema");
+  assert(status.payload.schemaVersion === 4, "Platform status should report the profile-foundation D1 schema");
   assert(status.payload.capabilities?.cloudProgress?.newSaveLimit === 250, "Platform status should report the anonymous new-save cap");
   assert(status.payload.capabilities?.topicGeneration?.routine?.status === "offline",
     "Platform status should disclose the disabled-by-default routine provider without exposing a key");
@@ -508,6 +767,53 @@ try {
   });
   assert(retried.response.status === 200, `Idempotent summary retry failed (${retried.response.status})`);
   assert(retried.payload.created === false, "Idempotent summary retry must not create a second record");
+
+  const cookieSeparator = cookie.indexOf("=");
+  assert(cookieSeparator > 0, "Cloud progress must establish an anonymous browser cookie");
+  const browserToken = cookie.slice(cookieSeparator + 1);
+  assert(browserToken.length > 0, "Cloud progress must establish an anonymous browser token");
+  const browserDeviceKey = createHash("sha256").update(browserToken).digest("hex");
+  const identityFoundationCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+      "--command", `SELECT
+        (SELECT COUNT(*) FROM sync_profile_devices
+          WHERE device_key = '${quotaDevice}') AS quotaMemberships,
+        (SELECT COUNT(*) FROM sync_profile_devices
+          WHERE device_key = '${browserDeviceKey}') AS browserMemberships,
+        (SELECT COUNT(DISTINCT profile_id) FROM sync_profile_devices
+          WHERE device_key IN ('${quotaDevice}', '${browserDeviceKey}')) AS distinctProfiles,
+        (SELECT COUNT(*) FROM sync_profile_devices AS membership
+          JOIN sync_profiles AS profile ON profile.profile_id = membership.profile_id
+          JOIN devices AS device ON device.device_key = membership.device_key
+          WHERE membership.device_key IN ('${quotaDevice}', '${browserDeviceKey}')
+            AND (profile.created_at <> device.created_at
+              OR profile.last_seen_at <> device.last_seen_at
+              OR profile.expires_at <> device.expires_at
+              OR membership.joined_at <> device.created_at
+              OR membership.last_seen_at <> device.last_seen_at
+              OR profile.sync_generation <> 1)) AS leaseMismatches,
+        (SELECT COUNT(*) FROM sync_profile_devices AS membership
+          WHERE membership.device_key IN ('${quotaDevice}', '${browserDeviceKey}')
+            AND (membership.profile_id = membership.membership_id
+              OR membership.profile_id = membership.device_key
+              OR membership.membership_id = membership.device_key)) AS reusedIdentifiers
+      `,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (identityFoundationCheck.status !== 0) {
+    throw new Error(`Could not verify runtime profile provisioning.\n${identityFoundationCheck.stdout}\n${identityFoundationCheck.stderr}`);
+  }
+  const identities = JSON.parse(identityFoundationCheck.stdout)[0]?.results?.[0];
+  assert(identities?.quotaMemberships === 1
+    && identities?.browserMemberships === 1
+    && identities?.distinctProfiles === 2,
+  `Existing and new devices must each self-heal to one independent profile: ${JSON.stringify(identities)}`);
+  assert(identities?.leaseMismatches === 0 && identities?.reusedIdentifiers === 0,
+    `Runtime-created profile metadata must match its device lease and use independent IDs: ${JSON.stringify(identities)}`);
 
   const listed = await request("/api/v1/progress/sessions");
   assert(listed.response.ok, `Summary list failed (${listed.response.status})`);
@@ -607,6 +913,36 @@ try {
   const repeatedDelete = await request("/api/v1/progress/sessions", { method: "DELETE" });
   assert(repeatedDelete.payload.deletedCount === 0, "Repeated cloud delete must not invent deleted records");
   assert(repeatedDelete.payload.consentRevoked === false, "Repeated cloud delete must not invent consent transitions");
+  const identityAfterDeleteCheck = spawnSync(
+    process.execPath,
+    [
+      wrangler, "d1", "execute", "PLATFORM_DB", "--local", "--persist-to", stateDirectory,
+      "--command", `SELECT
+        (SELECT COUNT(*) FROM devices WHERE device_key = '${browserDeviceKey}') AS devices,
+        (SELECT COUNT(*) FROM sync_profile_devices
+          WHERE device_key = '${browserDeviceKey}') AS memberships,
+        (SELECT COUNT(*) FROM sync_profiles AS profile
+          JOIN sync_profile_devices AS membership ON membership.profile_id = profile.profile_id
+          WHERE membership.device_key = '${browserDeviceKey}') AS profiles,
+        (SELECT COUNT(*) FROM coaching_sessions
+          WHERE device_key = '${browserDeviceKey}') AS summaries,
+        (SELECT COUNT(*) FROM consent_records
+          WHERE device_key = '${browserDeviceKey}' AND purpose = 'cloud_summary'
+            AND granted = 0 AND revoked_at IS NOT NULL) AS revokedConsents`,
+      "--json",
+    ],
+    { cwd: root, env: offlineWranglerEnv({ CI: "1", NO_COLOR: "1" }), encoding: "utf8" },
+  );
+  if (identityAfterDeleteCheck.status !== 0) {
+    throw new Error(`Could not verify identity preservation after progress deletion.\n${identityAfterDeleteCheck.stdout}\n${identityAfterDeleteCheck.stderr}`);
+  }
+  const identityAfterDelete = JSON.parse(identityAfterDeleteCheck.stdout)[0]?.results?.[0];
+  assert(identityAfterDelete?.devices === 1
+    && identityAfterDelete?.memberships === 1
+    && identityAfterDelete?.profiles === 1
+    && identityAfterDelete?.summaries === 0
+    && identityAfterDelete?.revokedConsents === 1,
+  `Deleting progress must retain the active anonymous identity foundation: ${JSON.stringify(identityAfterDelete)}`);
   const finalAnalytics = await request("/api/v1/admin/analytics?days=1", {
     headers: { Authorization: `Bearer ${adminToken}` },
   });
@@ -628,6 +964,10 @@ try {
         (SELECT COUNT(*) FROM devices WHERE device_key = '${expiredDevice}') AS devices,
         (SELECT COUNT(*) FROM consent_records WHERE device_key = '${expiredDevice}') AS consents,
         (SELECT COUNT(*) FROM coaching_sessions WHERE device_key = '${expiredDevice}') AS summaries,
+        (SELECT COUNT(*) FROM sync_profile_devices
+          WHERE membership_id = '${expiredMembership}') AS memberships,
+        (SELECT COUNT(*) FROM sync_profiles
+          WHERE profile_id = '${expiredProfile}') AS profiles,
         (SELECT COUNT(*) FROM room_facts WHERE expires_at <= '2025-02-01T00:00:00.000Z') AS rooms`,
       "--json",
     ],
@@ -638,10 +978,15 @@ try {
   }
   const cleanupPayload = JSON.parse(cleanupCheck.stdout);
   const cleaned = cleanupPayload[0]?.results?.[0];
-  assert(cleaned?.devices === 0 && cleaned?.consents === 0 && cleaned?.summaries === 0 && cleaned?.rooms === 0,
+  assert(cleaned?.devices === 0
+    && cleaned?.consents === 0
+    && cleaned?.summaries === 0
+    && cleaned?.memberships === 0
+    && cleaned?.profiles === 0
+    && cleaned?.rooms === 0,
     `Scheduled cleanup left expired rows behind: ${JSON.stringify(cleaned)}`);
 
-  console.log("Cloud platform D1/API privacy and retention smoke test passed.");
+  console.log("Cloud platform D1/API privacy, profile-foundation, and retention smoke test passed.");
 } catch (error) {
   if (logs.trim()) console.error(`Wrangler output captured before failure:\n${logs.trim()}`);
   if (auxiliaryLogs.trim()) console.error(`Auxiliary Wrangler output captured before failure:\n${auxiliaryLogs.trim()}`);

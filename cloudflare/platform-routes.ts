@@ -23,7 +23,7 @@ const DEFAULT_ANALYTICS_DAYS = 30;
 const MAX_ANALYTICS_DAYS = 180;
 const PLATFORM_STATUS_CACHE_MS = 60_000;
 const MAX_CLEANUP_BATCHES_PER_RUN = 20;
-const MIN_PLATFORM_SCHEMA_VERSION = 3;
+const MIN_PLATFORM_SCHEMA_VERSION = 4;
 const MAX_PLATFORM_SCHEMA_VERSION = 4;
 
 interface DatabaseReadiness {
@@ -397,7 +397,7 @@ export async function recordProductEvent(
 }
 
 export async function runPlatformCleanup(env: PlatformBindings, now = new Date()): Promise<void> {
-	const deleted = { coachingSessions: 0, consentRecords: 0, devices: 0, roomFacts: 0 };
+	const deleted = { coachingSessions: 0, consentRecords: 0, devices: 0, syncProfiles: 0, roomFacts: 0 };
 	let hasMore = false;
 	let batches = 0;
 	while (batches < MAX_CLEANUP_BATCHES_PER_RUN) {
@@ -406,6 +406,7 @@ export async function runPlatformCleanup(env: PlatformBindings, now = new Date()
 		deleted.coachingSessions += chunk.coachingSessions;
 		deleted.consentRecords += chunk.consentRecords;
 		deleted.devices += chunk.devices;
+		deleted.syncProfiles += chunk.syncProfiles;
 		deleted.roomFacts += chunk.roomFacts;
 		hasMore = chunk.hasMore;
 		if (!hasMore) break;
