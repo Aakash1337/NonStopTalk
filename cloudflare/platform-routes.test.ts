@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { handlePlatformRoute } from "./platform-routes.ts";
+import {
+	RETENTION_CLEANUP_STALE_MS,
+	classifyRetentionCleanupStatus,
+	handlePlatformRoute,
+	runPlatformCleanup,
+} from "./platform-routes.ts";
+import { recordCleanupHeartbeat } from "./platform.ts";
 
 const noDeferredTasks = (task: Promise<void>): void => {
 	void task.catch(() => undefined);
@@ -214,7 +220,7 @@ class FakeModelUsageStatement {
 
 	async first<T>(): Promise<T | null> {
 		assert.match(this.#query, /SELECT schema_version FROM platform_meta/u);
-		return { schema_version: 4 } as T;
+		return { schema_version: 5 } as T;
 	}
 
 	async all<T>(): Promise<D1Result<T>> {
@@ -228,19 +234,160 @@ class FakeModelUsageStatement {
 }
 
 class FakeStatusD1 {
-	constructor(readonly schemaVersion: number) {}
+	readonly schemaVersion: number;
+	readonly heartbeat: { scheduledAt: string | null; completedAt: string | null; backlog: boolean };
+
+	constructor(
+		schemaVersion: number,
+		heartbeat?: { scheduledAt: string | null; completedAt: string | null; backlog: boolean },
+	) {
+		this.schemaVersion = schemaVersion;
+		const currentTimestamp = new Date().toISOString();
+		this.heartbeat = heartbeat ?? {
+			scheduledAt: currentTimestamp,
+			completedAt: currentTimestamp,
+			backlog: false,
+		};
+	}
 
 	prepare(query: string): D1PreparedStatement {
-		assert.match(query, /SELECT schema_version FROM platform_meta/u);
-		return new FakeStatusStatement(this.schemaVersion) as unknown as D1PreparedStatement;
+		return new FakeStatusStatement(this, query) as unknown as D1PreparedStatement;
 	}
 }
 
 class FakeStatusStatement {
-	constructor(readonly schemaVersion: number) {}
+	readonly database: FakeStatusD1;
+	readonly query: string;
+
+	constructor(database: FakeStatusD1, query: string) {
+		this.database = database;
+		this.query = query;
+	}
 
 	async first<T>(): Promise<T | null> {
-		return { schema_version: this.schemaVersion } as T;
+		if (/SELECT schema_version FROM platform_meta/u.test(this.query)) {
+			return { schema_version: this.database.schemaVersion } as T;
+		}
+		if (/FROM platform_maintenance WHERE id = 1/u.test(this.query)) {
+			return {
+				cleanup_scheduled_at: this.database.heartbeat.scheduledAt,
+				cleanup_completed_at: this.database.heartbeat.completedAt,
+				cleanup_backlog: this.database.heartbeat.backlog ? 1 : 0,
+			} as T;
+		}
+		throw new Error(`Unexpected status query: ${this.query}`);
+	}
+}
+
+class FakeCleanupD1 {
+	readonly failCleanup: boolean;
+	readonly cleanupChanges: number;
+	readonly backlogAfterBudget: boolean;
+	readonly failBacklogCheck: boolean;
+	readonly failHeartbeat: boolean;
+	cleanupBatches = 0;
+	backlogChecks = 0;
+	heartbeatAttempts = 0;
+	heartbeatWrites = 0;
+	heartbeatBindings: unknown[] = [];
+	heartbeatQuery = "";
+
+	constructor({
+		failCleanup = false,
+		cleanupChanges = 0,
+		backlogAfterBudget = true,
+		failBacklogCheck = false,
+		failHeartbeat = false,
+	}: {
+		failCleanup?: boolean;
+		cleanupChanges?: number;
+		backlogAfterBudget?: boolean;
+		failBacklogCheck?: boolean;
+		failHeartbeat?: boolean;
+	} = {}) {
+		this.failCleanup = failCleanup;
+		this.cleanupChanges = cleanupChanges;
+		this.backlogAfterBudget = backlogAfterBudget;
+		this.failBacklogCheck = failBacklogCheck;
+		this.failHeartbeat = failHeartbeat;
+	}
+
+	prepare(query: string): D1PreparedStatement {
+		return new FakeCleanupStatement(this, query) as unknown as D1PreparedStatement;
+	}
+
+	async batch(statements: D1PreparedStatement[]): Promise<D1Result<unknown>[]> {
+		this.cleanupBatches += 1;
+		if (this.failCleanup) throw new Error("cleanup unavailable");
+		return statements.map(() => fakeResult(this.cleanupChanges));
+	}
+}
+
+class FakeCleanupStatement {
+	readonly database: FakeCleanupD1;
+	readonly query: string;
+	bindings: unknown[] = [];
+
+	constructor(database: FakeCleanupD1, query: string) {
+		this.database = database;
+		this.query = query;
+	}
+
+	bind(...values: unknown[]): FakeCleanupStatement {
+		this.bindings = values;
+		return this;
+	}
+
+	async run<T>(): Promise<D1Result<T>> {
+		assert.match(this.query, /INSERT INTO platform_maintenance/u);
+		assert.match(this.query, /strftime\('%Y-%m-%dT%H:%M:%fZ'/u);
+		assert.match(this.query, /excluded\.cleanup_scheduled_at >= platform_maintenance\.cleanup_scheduled_at/u);
+		assert.match(this.query, /platform_maintenance\.cleanup_backlog = 0/u);
+		this.database.heartbeatAttempts += 1;
+		this.database.heartbeatQuery = this.query;
+		if (this.database.failHeartbeat) throw new Error("heartbeat unavailable");
+		const currentScheduledAt = this.database.heartbeatBindings[0];
+		const currentCompletedAt = this.database.heartbeatBindings[1];
+		const nextScheduledAt = this.bindings[0];
+		const nextCompletedAt = this.bindings[1];
+		const canonicalTimestamp = (value: unknown): value is string => {
+			if (typeof value !== "string") return false;
+			const parsed = Date.parse(value);
+			return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+		};
+		const currentScheduleIsCanonical = canonicalTimestamp(currentScheduledAt);
+		const currentIsCanonical = currentScheduleIsCanonical && canonicalTimestamp(currentCompletedAt);
+		if (
+			canonicalTimestamp(nextScheduledAt)
+			&& canonicalTimestamp(nextCompletedAt)
+			&& (
+				!currentScheduleIsCanonical
+				|| nextScheduledAt >= currentScheduledAt
+			)
+		) {
+			this.database.heartbeatWrites += 1;
+			if (currentIsCanonical && nextScheduledAt === currentScheduledAt) {
+				this.database.heartbeatBindings = [
+					nextScheduledAt,
+					nextCompletedAt >= currentCompletedAt ? nextCompletedAt : currentCompletedAt,
+					currentScheduledAt === nextScheduledAt
+						&& (this.database.heartbeatBindings[2] === 0 || this.bindings[2] === 0)
+						? 0
+						: this.bindings[2],
+				];
+			} else {
+				this.database.heartbeatBindings = this.bindings;
+			}
+			return fakeResult(1) as D1Result<T>;
+		}
+		return fakeResult(0) as D1Result<T>;
+	}
+
+	async first<T>(): Promise<T | null> {
+		assert.match(this.query, /AS has_more/u);
+		this.database.backlogChecks += 1;
+		if (this.database.failBacklogCheck) throw new Error("backlog check unavailable");
+		return { has_more: this.database.backlogAfterBudget ? 1 : 0 } as T;
 	}
 }
 
@@ -266,8 +413,8 @@ function usageRow(overrides: Partial<ModelUsageTestRow> = {}): ModelUsageTestRow
 	};
 }
 
-test("platform status reports every reviewed additive-schema compatibility marker", async () => {
-	for (const schemaVersion of [4, 5]) {
+test("platform status reports the cleanup-heartbeat schema", async () => {
+	for (const schemaVersion of [5]) {
 		const handled = await handlePlatformRoute(
 			new Request("https://nonstoptalk.test/api/v1/platform/status"),
 			{
@@ -288,8 +435,8 @@ test("platform status reports every reviewed additive-schema compatibility marke
 	}
 });
 
-test("platform status rejects schema markers outside the reviewed compatibility window", async () => {
-	for (const schemaVersion of [2, 3, 6]) {
+test("platform status rejects schema markers outside its exact feature schema", async () => {
+	for (const schemaVersion of [2, 3, 4, 6]) {
 		const handled = await handlePlatformRoute(
 			new Request("https://nonstoptalk.test/api/v1/platform/status"),
 			{ PLATFORM_DB: new FakeStatusD1(schemaVersion) as unknown as D1Database },
@@ -306,9 +453,227 @@ test("platform status rejects schema markers outside the reviewed compatibility 
 	}
 });
 
+test("cleanup heartbeat classification covers never, current, stale, backlog, and clock corruption", () => {
+	const now = new Date("2026-09-01T12:00:00.000Z");
+	assert.equal(classifyRetentionCleanupStatus({ scheduledAt: null, completedAt: null, backlog: false }, now), "stale");
+	assert.equal(classifyRetentionCleanupStatus({
+		scheduledAt: "2026-09-01T11:59:00.000Z",
+		completedAt: "2026-09-01T11:59:00.000Z",
+		backlog: false,
+	}, now), "ready");
+	assert.equal(classifyRetentionCleanupStatus({
+		scheduledAt: "2026-09-01T11:59:00.000Z",
+		completedAt: "2026-09-01T11:59:00.000Z",
+		backlog: true,
+	}, now), "backlog");
+	assert.equal(classifyRetentionCleanupStatus({
+		scheduledAt: new Date(now.getTime() - RETENTION_CLEANUP_STALE_MS).toISOString(),
+		completedAt: new Date(now.getTime() - RETENTION_CLEANUP_STALE_MS).toISOString(),
+		backlog: false,
+	}, now), "ready");
+	assert.equal(classifyRetentionCleanupStatus({
+		scheduledAt: new Date(now.getTime() - RETENTION_CLEANUP_STALE_MS - 1).toISOString(),
+		completedAt: new Date(now.getTime() - RETENTION_CLEANUP_STALE_MS - 1).toISOString(),
+		backlog: false,
+	}, now), "stale");
+	assert.equal(classifyRetentionCleanupStatus({
+		scheduledAt: "not-a-timestamp",
+		completedAt: "not-a-timestamp",
+		backlog: false,
+	}, now), "stale");
+	assert.equal(classifyRetentionCleanupStatus({
+		scheduledAt: "2026-09-01T12:06:00.000Z",
+		completedAt: "2026-09-01T12:06:00.000Z",
+		backlog: false,
+	}, now), "stale");
+});
+
+test("platform status exposes only cleanup health and degrades for stale or backlogged work", async () => {
+	for (const scenario of [
+		{
+			status: "stale",
+			scheduledAt: "2000-01-01T00:00:00.000Z",
+			completedAt: "2000-01-01T00:00:00.000Z",
+			backlog: false,
+		},
+		{
+			status: "backlog",
+			scheduledAt: new Date().toISOString(),
+			completedAt: new Date().toISOString(),
+			backlog: true,
+		},
+	] as const) {
+		const handled = await handlePlatformRoute(
+			new Request("https://nonstoptalk.test/api/v1/platform/status"),
+			{
+				PLATFORM_DB: new FakeStatusD1(5, scenario) as unknown as D1Database,
+				ANALYTICS_ADMIN_TOKEN: "1".repeat(64),
+				ROOM_FACT_HASH_KEY: "2".repeat(64),
+			},
+			"3".repeat(64),
+			`cleanup-${scenario.status}`,
+			noDeferredTasks,
+		);
+
+		assert(handled);
+		assert.equal(handled.response.status, 200);
+		const body = await handled.response.json() as {
+			status: string;
+			degradedCapabilities: string[];
+			capabilities: { retentionCleanup: Record<string, unknown> };
+		};
+		assert.equal(body.status, "degraded");
+		assert.deepEqual(body.degradedCapabilities, ["retentionCleanup"]);
+		assert.deepEqual(body.capabilities.retentionCleanup, { status: scenario.status });
+	}
+});
+
+test("cleanup failure never advances the heartbeat", async () => {
+	const database = new FakeCleanupD1({ failCleanup: true });
+	await assert.rejects(
+		runPlatformCleanup({ PLATFORM_DB: database as unknown as D1Database }),
+		/clean up expired platform data/u,
+	);
+	assert.equal(database.cleanupBatches, 1);
+	assert.equal(database.heartbeatAttempts, 0);
+	assert.equal(database.heartbeatWrites, 0);
+});
+
+test("final backlog-probe and heartbeat-write failures cannot advance cleanup health", async () => {
+	const failedProbe = new FakeCleanupD1({
+		cleanupChanges: 500,
+		failBacklogCheck: true,
+	});
+	await assert.rejects(
+		runPlatformCleanup({ PLATFORM_DB: failedProbe as unknown as D1Database }),
+		/check for an expired platform-data backlog/u,
+	);
+	assert.equal(failedProbe.cleanupBatches, 20);
+	assert.equal(failedProbe.backlogChecks, 1);
+	assert.equal(failedProbe.heartbeatAttempts, 0);
+
+	const failedHeartbeat = new FakeCleanupD1({ failHeartbeat: true });
+	await assert.rejects(
+		runPlatformCleanup({ PLATFORM_DB: failedHeartbeat as unknown as D1Database }),
+		/record the platform cleanup heartbeat/u,
+	);
+	assert.equal(failedHeartbeat.cleanupBatches, 1);
+	assert.equal(failedHeartbeat.heartbeatAttempts, 1);
+	assert.equal(failedHeartbeat.heartbeatWrites, 0);
+});
+
+test("cleanup records a successful bounded run and its remaining-backlog flag", async () => {
+	const completedAt = new Date("2026-09-01T03:17:00.000Z");
+	for (const scenario of [
+		{ changes: 0, remaining: true, expectedBatches: 1, expectedChecks: 0, expectedBacklog: 0 },
+		{ changes: 500, remaining: true, expectedBatches: 20, expectedChecks: 1, expectedBacklog: 1 },
+		{ changes: 500, remaining: false, expectedBatches: 20, expectedChecks: 1, expectedBacklog: 0 },
+	]) {
+		const database = new FakeCleanupD1({
+			cleanupChanges: scenario.changes,
+			backlogAfterBudget: scenario.remaining,
+		});
+		await runPlatformCleanup(
+			{ PLATFORM_DB: database as unknown as D1Database },
+			completedAt,
+			() => completedAt,
+		);
+		assert.equal(database.cleanupBatches, scenario.expectedBatches);
+		assert.equal(database.backlogChecks, scenario.expectedChecks);
+		assert.equal(database.heartbeatWrites, 1);
+		assert.deepEqual(database.heartbeatBindings, [
+			completedAt.toISOString(),
+			completedAt.toISOString(),
+			scenario.expectedBacklog,
+		]);
+	}
+});
+
+test("an older delayed cleanup event cannot regress a newer heartbeat", async () => {
+	const database = new FakeCleanupD1();
+	const newer = new Date("2026-09-02T03:17:00.000Z");
+	const older = new Date("2026-09-01T03:17:00.000Z");
+	await runPlatformCleanup(
+		{ PLATFORM_DB: database as unknown as D1Database },
+		newer,
+		() => newer,
+	);
+	await runPlatformCleanup(
+		{ PLATFORM_DB: database as unknown as D1Database },
+		older,
+		() => newer,
+	);
+	assert.equal(database.heartbeatAttempts, 2);
+	assert.equal(database.heartbeatWrites, 1);
+	assert.equal(database.heartbeatBindings[0], newer.toISOString());
+});
+
+test("equal-schedule retries merge completion/backlog and repair malformed stored timestamps", async () => {
+	const database = new FakeCleanupD1();
+	const scheduledAt = new Date("2026-09-02T03:17:00.000Z");
+	const earlierCompletion = new Date("2026-09-02T03:18:00.000Z");
+	const laterCompletion = new Date("2026-09-02T03:19:00.000Z");
+	database.heartbeatBindings = ["z".repeat(24), "z".repeat(24), 1];
+	await recordCleanupHeartbeat(
+		database as unknown as D1Database,
+		scheduledAt,
+		laterCompletion,
+		true,
+	);
+	await recordCleanupHeartbeat(
+		database as unknown as D1Database,
+		scheduledAt,
+		earlierCompletion,
+		false,
+	);
+	assert.deepEqual(database.heartbeatBindings, [
+		scheduledAt.toISOString(),
+		laterCompletion.toISOString(),
+		0,
+	], "An earlier duplicate must preserve completion while a cleared backlog dominates.");
+
+	const newestCompletion = new Date("2026-09-02T03:20:00.000Z");
+	await recordCleanupHeartbeat(
+		database as unknown as D1Database,
+		scheduledAt,
+		newestCompletion,
+		true,
+	);
+	assert.equal(database.heartbeatWrites, 3);
+	assert.equal(database.heartbeatBindings[1], newestCompletion.toISOString());
+	assert.equal(database.heartbeatBindings[2], 0, "A later duplicate must not reintroduce cleared backlog.");
+
+	database.heartbeatBindings = [scheduledAt.toISOString(), "z".repeat(24), 1];
+	await recordCleanupHeartbeat(
+		database as unknown as D1Database,
+		scheduledAt,
+		newestCompletion,
+		false,
+	);
+	assert.deepEqual(database.heartbeatBindings, [
+		scheduledAt.toISOString(),
+		newestCompletion.toISOString(),
+		0,
+	], "An equal-schedule retry must replace a malformed completion timestamp.");
+
+	const newerSchedule = new Date("2026-09-03T03:17:00.000Z");
+	database.heartbeatBindings = [newerSchedule.toISOString(), "z".repeat(24), 1];
+	await recordCleanupHeartbeat(
+		database as unknown as D1Database,
+		scheduledAt,
+		newestCompletion,
+		false,
+	);
+	assert.deepEqual(database.heartbeatBindings, [
+		newerSchedule.toISOString(),
+		"z".repeat(24),
+		1,
+	], "An older delayed event must not regress a valid newer schedule while completion awaits repair.");
+});
+
 test("admin analytics configuration requires a numeric high-entropy token", async () => {
 	const weakToken = "letters-are-not-the-reviewed-secret-format";
-	const database = new FakeStatusD1(4) as unknown as D1Database;
+	const database = new FakeStatusD1(5) as unknown as D1Database;
 	const status = await handlePlatformRoute(
 		new Request("https://nonstoptalk.test/api/v1/platform/status"),
 		{

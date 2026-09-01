@@ -6,9 +6,13 @@ import {
 	analyticsEventFromRoomMilestone,
 	cleanupExpiredData,
 	createPlatformStore,
+	hasExpiredPlatformData,
 	mapAnalyticsEvent,
 	mapPublicRoomStateToFact,
+	readCleanupHeartbeat,
+	recordCleanupHeartbeat,
 	type AnalyticsEventInput,
+	type CleanupHeartbeat,
 	type RoomMilestone,
 } from "./platform";
 import {
@@ -23,10 +27,9 @@ const DEFAULT_ANALYTICS_DAYS = 30;
 const MAX_ANALYTICS_DAYS = 180;
 const PLATFORM_STATUS_CACHE_MS = 60_000;
 const MAX_CLEANUP_BATCHES_PER_RUN = 20;
-const MIN_PLATFORM_SCHEMA_VERSION = 4;
-// Keep the next additive schema marker readable before its migration lands.
-// Deployment automation applies D1 migrations before Worker code, so this
-// compatibility window must reach production ahead of schema v5.
+export const RETENTION_CLEANUP_STALE_MS = 36 * 60 * 60 * 1_000;
+const MAX_HEARTBEAT_CLOCK_SKEW_MS = 5 * 60 * 1_000;
+const MIN_PLATFORM_SCHEMA_VERSION = 5;
 const MAX_PLATFORM_SCHEMA_VERSION = 5;
 
 interface DatabaseReadiness {
@@ -71,10 +74,14 @@ export async function handlePlatformRoute(
 			const roomFactsReady = isSecureRoomFactKey(env.ROOM_FACT_HASH_KEY);
 			const adminAnalyticsReady = isSecureAdminToken(env.ANALYTICS_ADMIN_TOKEN);
 			const topicGeneration = topicGenerationCapability(env);
+			const retentionCleanupStatus = classifyRetentionCleanupStatus(
+				await readCleanupHeartbeat(env.PLATFORM_DB),
+			);
 			const degradedCapabilities = [
 				...(roomFactsReady ? [] : ["roomFacts"]),
 				...(adminAnalyticsReady ? [] : ["adminAnalytics"]),
 				...(topicGeneration.status === "degraded" ? ["topicGeneration"] : []),
+				...(retentionCleanupStatus === "ready" ? [] : ["retentionCleanup"]),
 			];
 			return result(
 				platformJson(
@@ -89,6 +96,7 @@ export async function handlePlatformRoute(
 								newSaveLimit: MAX_ACTIVE_COACHING_SUMMARIES,
 							},
 							roomFacts: { status: roomFactsReady ? "ready" : "disabled" },
+							retentionCleanup: { status: retentionCleanupStatus },
 							topicGeneration,
 							aggregateAnalytics: {
 								status: adminAnalyticsReady ? "ready" : "write-only",
@@ -416,12 +424,16 @@ function deferProductEvents(
 	})());
 }
 
-export async function runPlatformCleanup(env: PlatformBindings, now = new Date()): Promise<void> {
+export async function runPlatformCleanup(
+	env: PlatformBindings,
+	scheduledAt = new Date(),
+	clock: () => Date = () => new Date(),
+): Promise<void> {
 	const deleted = { coachingSessions: 0, consentRecords: 0, devices: 0, syncProfiles: 0, roomFacts: 0 };
 	let hasMore = false;
 	let batches = 0;
 	while (batches < MAX_CLEANUP_BATCHES_PER_RUN) {
-		const chunk = await cleanupExpiredData(env.PLATFORM_DB, now);
+		const chunk = await cleanupExpiredData(env.PLATFORM_DB, scheduledAt);
 		batches += 1;
 		deleted.coachingSessions += chunk.coachingSessions;
 		deleted.consentRecords += chunk.consentRecords;
@@ -431,8 +443,39 @@ export async function runPlatformCleanup(env: PlatformBindings, now = new Date()
 		hasMore = chunk.hasMore;
 		if (!hasMore) break;
 	}
+	if (hasMore && batches === MAX_CLEANUP_BATCHES_PER_RUN) {
+		hasMore = await hasExpiredPlatformData(env.PLATFORM_DB, scheduledAt);
+	}
+	const observedCompletion = clock();
+	const completedAt = observedCompletion.getTime() < scheduledAt.getTime()
+		? scheduledAt
+		: observedCompletion;
+	await recordCleanupHeartbeat(env.PLATFORM_DB, scheduledAt, completedAt, hasMore);
 	logWorkerEvent("info", "platform_cleanup_completed", { ...deleted, batches, hasMore });
 	if (hasMore) logWorkerEvent("warn", "platform_cleanup_budget_exhausted", { batches });
+}
+
+export type RetentionCleanupStatus = "ready" | "stale" | "backlog";
+
+export function classifyRetentionCleanupStatus(
+	heartbeat: CleanupHeartbeat,
+	now: Date | string = new Date(),
+): RetentionCleanupStatus {
+	const observedAt = now instanceof Date ? now.getTime() : new Date(now).getTime();
+	const scheduledAt = heartbeat.scheduledAt === null ? Number.NaN : Date.parse(heartbeat.scheduledAt);
+	const completedAt = heartbeat.completedAt === null ? Number.NaN : Date.parse(heartbeat.completedAt);
+	if (
+		!Number.isFinite(observedAt)
+		|| !Number.isFinite(scheduledAt)
+		|| !Number.isFinite(completedAt)
+		|| scheduledAt > completedAt
+		|| scheduledAt > observedAt + MAX_HEARTBEAT_CLOCK_SKEW_MS
+		|| completedAt > observedAt + MAX_HEARTBEAT_CLOCK_SKEW_MS
+		|| observedAt - scheduledAt > RETENTION_CLEANUP_STALE_MS
+	) {
+		return "stale";
+	}
+	return heartbeat.backlog ? "backlog" : "ready";
 }
 
 function result(response: Response, refreshIdentity: boolean): PlatformRouteResult {

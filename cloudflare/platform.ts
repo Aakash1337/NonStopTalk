@@ -313,6 +313,18 @@ export interface CleanupResult {
 	hasMore: boolean;
 }
 
+export interface CleanupHeartbeat {
+	scheduledAt: string | null;
+	completedAt: string | null;
+	backlog: boolean;
+}
+
+interface CleanupHeartbeatRow {
+	cleanup_scheduled_at: string;
+	cleanup_completed_at: string | null;
+	cleanup_backlog: number;
+}
+
 export interface PlatformStoreOptions {
 	now?: () => Date;
 	roomHashKey?: string;
@@ -1614,6 +1626,122 @@ export async function cleanupExpiredData(
 		...deleted,
 		hasMore: Object.values(deleted).some((count) => count >= boundedLimit),
 	};
+}
+
+/** Resolve the conservative full-batch signal after the invocation budget is spent. */
+export async function hasExpiredPlatformData(
+	db: D1Database,
+	now: Date | string = new Date(),
+): Promise<boolean> {
+	const timestamp = dateInput(now, "now").toISOString();
+	const row = await databaseOperation("check for an expired platform-data backlog", () =>
+		db
+			.prepare(`SELECT CASE WHEN
+				EXISTS (
+					SELECT 1 FROM coaching_sessions AS session
+					JOIN devices AS device ON device.device_key = session.device_key
+					WHERE device.expires_at <= ? LIMIT 1
+				) OR EXISTS (
+					SELECT 1 FROM consent_records AS consent
+					JOIN devices AS device ON device.device_key = consent.device_key
+					WHERE device.expires_at <= ? LIMIT 1
+				) OR EXISTS (
+					SELECT 1 FROM devices AS device
+					WHERE device.expires_at <= ?
+						AND NOT EXISTS (
+							SELECT 1 FROM coaching_sessions AS session
+							WHERE session.device_key = device.device_key
+						)
+						AND NOT EXISTS (
+							SELECT 1 FROM consent_records AS consent
+							WHERE consent.device_key = device.device_key
+						)
+					LIMIT 1
+				) OR EXISTS (
+					SELECT 1 FROM sync_profiles AS profile
+					WHERE profile.expires_at <= ?
+						AND NOT EXISTS (
+							SELECT 1 FROM sync_profile_devices AS membership
+							WHERE membership.profile_id = profile.profile_id
+						)
+					LIMIT 1
+				) OR EXISTS (
+					SELECT 1 FROM room_facts WHERE expires_at <= ? LIMIT 1
+				)
+				THEN 1 ELSE 0 END AS has_more`)
+			.bind(timestamp, timestamp, timestamp, timestamp, timestamp)
+			.first<{ has_more: number }>(),
+	);
+	if (!row || ![0, 1].includes(row.has_more)) {
+		throw new PlatformError("DATABASE_UNAVAILABLE", "The platform cleanup backlog could not be checked.");
+	}
+	return row.has_more === 1;
+}
+
+/** Read only the non-sensitive state needed to judge scheduled cleanup health. */
+export async function readCleanupHeartbeat(db: D1Database): Promise<CleanupHeartbeat> {
+	const row = await databaseOperation("read the platform cleanup heartbeat", () =>
+		db
+			.prepare(`SELECT cleanup_scheduled_at, cleanup_completed_at, cleanup_backlog
+				FROM platform_maintenance WHERE id = 1`)
+			.first<CleanupHeartbeatRow>(),
+	);
+	if (!row || ![0, 1].includes(row.cleanup_backlog)) {
+		throw new PlatformError("DATABASE_UNAVAILABLE", "The platform cleanup heartbeat is unavailable.");
+	}
+	return {
+		scheduledAt: row.cleanup_scheduled_at,
+		completedAt: row.cleanup_completed_at,
+		backlog: row.cleanup_backlog === 1,
+	};
+}
+
+/** Advance the heartbeat only after every cleanup batch in this invocation succeeds. */
+export async function recordCleanupHeartbeat(
+	db: D1Database,
+	scheduledAt: Date | string,
+	completedAt: Date | string,
+	backlog: boolean,
+): Promise<void> {
+	const scheduledTimestamp = dateInput(scheduledAt, "cleanup scheduled time").toISOString();
+	const completedTimestamp = dateInput(completedAt, "cleanup completion time").toISOString();
+	await databaseOperation("record the platform cleanup heartbeat", () =>
+		db
+			.prepare(`INSERT INTO platform_maintenance (
+					id, cleanup_scheduled_at, cleanup_completed_at, cleanup_backlog
+				) VALUES (1, ?, ?, ?)
+				ON CONFLICT(id) DO UPDATE SET
+					cleanup_scheduled_at = excluded.cleanup_scheduled_at,
+					cleanup_completed_at = CASE
+						WHEN excluded.cleanup_scheduled_at = platform_maintenance.cleanup_scheduled_at
+							AND strftime(
+								'%Y-%m-%dT%H:%M:%fZ',
+								platform_maintenance.cleanup_completed_at
+							) IS platform_maintenance.cleanup_completed_at
+							AND platform_maintenance.cleanup_completed_at > excluded.cleanup_completed_at
+						THEN platform_maintenance.cleanup_completed_at
+						ELSE excluded.cleanup_completed_at
+					END,
+					cleanup_backlog = CASE
+						WHEN excluded.cleanup_scheduled_at = platform_maintenance.cleanup_scheduled_at
+							AND strftime(
+								'%Y-%m-%dT%H:%M:%fZ',
+								platform_maintenance.cleanup_completed_at
+							) IS platform_maintenance.cleanup_completed_at
+							AND (
+								platform_maintenance.cleanup_backlog = 0
+								OR excluded.cleanup_backlog = 0
+							)
+						THEN 0
+						ELSE excluded.cleanup_backlog
+					END
+				WHERE
+					strftime('%Y-%m-%dT%H:%M:%fZ', platform_maintenance.cleanup_scheduled_at)
+						IS NOT platform_maintenance.cleanup_scheduled_at
+					OR excluded.cleanup_scheduled_at >= platform_maintenance.cleanup_scheduled_at`)
+			.bind(scheduledTimestamp, completedTimestamp, backlog ? 1 : 0)
+			.run(),
+	);
 }
 
 function summaryFromRow(row: CoachingSummaryRow): CoachingSummary {

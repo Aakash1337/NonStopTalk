@@ -19,6 +19,7 @@
     "test:cloud-progress": "node --test cloudflare/public/cloud-progress.test.js",
     "test:admin": "node --test cloudflare/public/admin-analytics.test.js",
     "test:production-monitor": "node --test scripts/production-health-workflow.test.mjs",
+    "test:deployment-contract": "node --test scripts/deployment-contract.test.mjs",
     "test:cloudflare": "tsx --test cloudflare/*.test.ts",
     "test:cloudflare-runtime": "tsc -p cloudflare/runtime-tests/tsconfig.json && vitest run --config vitest.worker.config.ts",
     "types:cloudflare": "wrangler types cloudflare/worker-configuration.d.ts --include-runtime false",

@@ -114,10 +114,11 @@ const statusResponse = await get("/api/v1/platform/status", "application/json");
 const status = await statusResponse.json();
 assert(status.status === "ok", `platform status is ${String(status.status || "unavailable")}`);
 assert(status.apiVersion === "v1", "production API version is not v1");
-assert(Number.isSafeInteger(status.schemaVersion) && status.schemaVersion > 0, "production schema version is invalid");
+assert(status.schemaVersion === 5, "production schema version is not the cleanup-heartbeat schema");
 assert(Array.isArray(status.degradedCapabilities) && status.degradedCapabilities.length === 0,
   `production reports degraded capabilities: ${JSON.stringify(status.degradedCapabilities)}`);
 assert(status.capabilities?.cloudProgress?.status === "ready", "cloud progress is not ready");
+assert(status.capabilities?.retentionCleanup?.status === "ready", "retention cleanup is not ready");
 assert(status.capabilities?.roomFacts?.status === "ready", "room facts are not ready");
 assert(status.capabilities?.aggregateAnalytics?.status === "ready", "aggregate analytics is not ready");
 assert(statusResponse.headers.get("cache-control") === "no-store", "platform status must not be cached");

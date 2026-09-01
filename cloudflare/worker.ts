@@ -542,9 +542,9 @@ export default {
 			return withRequestId(response, requestId);
 		}
 	},
-	async scheduled(_controller: ScheduledController, env: WorkerEnv, ctx: ExecutionContext): Promise<void> {
+	async scheduled(controller: ScheduledController, env: WorkerEnv, ctx: ExecutionContext): Promise<void> {
 		ctx.waitUntil(
-			runPlatformCleanup(env).catch((error: unknown) => {
+			runPlatformCleanup(env, new Date(controller.scheduledTime)).catch((error: unknown) => {
 				logWorkerEvent("error", "platform_cleanup_failed", { error: safeWorkerErrorName(error) });
 				throw error;
 			}),
