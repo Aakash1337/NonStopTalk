@@ -70,6 +70,15 @@ const CREATED_DO_ID = "a".repeat(64);
 const OTHER_DO_ID = "b".repeat(64);
 const execFileAsync = promisify(execFile);
 
+function captureThrown(action, expectedMessage) {
+	let captured;
+	assert.throws(action, (error) => {
+		captured = error;
+		return expectedMessage.test(error.message);
+	});
+	return captured;
+}
+
 function snapshot(overrides = {}) {
 	return {
 		receiptCount: 7,
@@ -522,15 +531,45 @@ test("fault trace proof requires one 201 create and one same-object first retry 
 		retryAlarmAtAttempt(1, { durableObjectId: OTHER_DO_ID }),
 		retryAlarmAtAttempt(2),
 	], FAULT_VERSION), /not caused by the one created/u);
-	assert.throws(() => findFaultTraceProof([
+	const splitRetryError = captureThrown(() => findFaultTraceProof([
 		createTrace(),
-		retryAlarmTrace({ logs: [{ event: "room_milestone_outbox_delivery_failed" }] }),
+		retryAlarmTrace({ logs: [{
+			event: "room_milestone_outbox_delivery_failed",
+			roomCode: "PRIVATE-ROOM-CANARY",
+			eventId: "PRIVATE-EVENT-CANARY",
+			payload: "PRIVATE-PAYLOAD-CANARY",
+			header: "PRIVATE-HEADER-CANARY",
+			cookie: "PRIVATE-COOKIE-CANARY",
+			timestamp: "PRIVATE-TIMESTAMP-CANARY",
+		}] }),
 		retryAlarmTrace({ logs: [{
 			event: "room_milestone_outbox_retry_scheduled",
 			failure: "database-unavailable",
 			attemptCount: 1,
 		}] }),
 	], FAULT_VERSION), /split or incomplete/u);
+	assert.match(splitRetryError.message, /Safe retry shape: \{"outboxLogCount":1,"deliveryFailedCount":1,"retryScheduledCount":0,"databaseUnavailable":false,"attemptCountKind":"ambiguous-record-count"\}/u);
+	assert.deepEqual(
+		Object.keys(JSON.parse(splitRetryError.message.split("Safe retry shape: ")[1])),
+		[
+			"outboxLogCount",
+			"deliveryFailedCount",
+			"retryScheduledCount",
+			"databaseUnavailable",
+			"attemptCountKind",
+		],
+	);
+	assert.ok(splitRetryError.message.length < 512);
+	assert.doesNotMatch(splitRetryError.message, new RegExp([
+		CREATED_DO_ID,
+		OTHER_DO_ID,
+		"PRIVATE-ROOM-CANARY",
+		"PRIVATE-EVENT-CANARY",
+		"PRIVATE-PAYLOAD-CANARY",
+		"PRIVATE-HEADER-CANARY",
+		"PRIVATE-COOKIE-CANARY",
+		"PRIVATE-TIMESTAMP-CANARY",
+	].join("|"), "u"));
 	assert.equal(findFaultTraceProof([
 		createTrace({ entrypoint: "AnotherObject" }),
 		retryAlarmTrace(),
@@ -675,7 +714,7 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 		retryAlarmAtAttempt(1, { durableObjectId: OTHER_DO_ID }),
 		retryAlarmAtAttempt(2),
 	], FAULT_VERSION, seedProof), /sequential first-retry/u);
-	assert.throws(() => findFaultSeededJoinProof([
+	const wrongFailureError = captureThrown(() => findFaultSeededJoinProof([
 		stateTrace(),
 		joinTrace(),
 		retryAlarmTrace(),
@@ -683,11 +722,13 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 			{ event: "room_milestone_outbox_delivery_failed" },
 			{
 				event: "room_milestone_outbox_retry_scheduled",
-				failure: "receiver-invariant",
+				failure: "private-failure-value",
 				attemptCount: 2,
 			},
 		] }),
 	], FAULT_VERSION, seedProof), /split or incomplete/u);
+	assert.match(wrongFailureError.message, /Safe retry shape: \{"outboxLogCount":2,"deliveryFailedCount":1,"retryScheduledCount":1,"databaseUnavailable":false,"attemptCountKind":"positive-safe-integer"\}/u);
+	assert.doesNotMatch(wrongFailureError.message, /private-failure-value/u);
 	assert.throws(() => findFaultSeededJoinProof([
 		stateTrace(),
 		joinTrace(),
@@ -706,6 +747,38 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 			logs: [{ event: "room_milestone_outbox_delivery_failed" }],
 		}),
 	], FAULT_VERSION, seedProof), /split or incomplete/u);
+	for (const [attemptCount, expectedKind] of [
+		[undefined, "missing"],
+		[null, "null"],
+		[[], "array"],
+		[{}, "object"],
+		["private-attempt-value", "string"],
+		[false, "boolean"],
+		[0, "zero"],
+		[-1, "negative-safe-integer"],
+		[1.5, "fractional-number"],
+		[Number.MAX_SAFE_INTEGER + 1, "unsafe-integer-number"],
+		[Number.POSITIVE_INFINITY, "non-finite-number"],
+		[1n, "bigint"],
+		[Symbol("private-attempt-value"), "symbol"],
+		[() => "private-attempt-value", "function"],
+	]) {
+		const retryRecord = {
+			event: "room_milestone_outbox_retry_scheduled",
+			failure: "database-unavailable",
+			...(attemptCount === undefined ? {} : { attemptCount }),
+		};
+		const invalidAttemptError = captureThrown(() => findFaultSeededJoinProof([
+			stateTrace(),
+			joinTrace(),
+			retryAlarmTrace({ logs: [
+				{ event: "room_milestone_outbox_delivery_failed" },
+				retryRecord,
+			] }),
+		], FAULT_VERSION, seedProof), /split or incomplete/u);
+		assert.match(invalidAttemptError.message, new RegExp(`"attemptCountKind":"${expectedKind}"`, "u"));
+		assert.doesNotMatch(invalidAttemptError.message, /private-attempt-value/u);
+	}
 	assert.throws(() => findFaultSeededJoinProof([
 		stateTrace(),
 		joinTrace(),

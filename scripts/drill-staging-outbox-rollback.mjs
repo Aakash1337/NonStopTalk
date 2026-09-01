@@ -817,6 +817,39 @@ function isAlarmTrace(document) {
 		&& document.event.cron === undefined;
 }
 
+function retryAttemptValueKind(retryScheduled) {
+	if (retryScheduled.length !== 1) return "ambiguous-record-count";
+	const value = retryScheduled[0].attemptCount;
+	if (value === undefined) return "missing";
+	if (value === null) return "null";
+	if (Array.isArray(value)) return "array";
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) return "non-finite-number";
+		if (!Number.isInteger(value)) return "fractional-number";
+		if (!Number.isSafeInteger(value)) return "unsafe-integer-number";
+		if (value > 0) return "positive-safe-integer";
+		return value === 0 ? "zero" : "negative-safe-integer";
+	}
+	if (isObject(value)) return "object";
+	if (typeof value === "string") return "string";
+	if (typeof value === "boolean") return "boolean";
+	if (typeof value === "bigint") return "bigint";
+	if (typeof value === "symbol") return "symbol";
+	if (typeof value === "function") return "function";
+	return "other";
+}
+
+function safeFaultRetryShape(outboxLogs, deliveryFailed, retryScheduled) {
+	return {
+		outboxLogCount: outboxLogs.length,
+		deliveryFailedCount: deliveryFailed.length,
+		retryScheduledCount: retryScheduled.length,
+		databaseUnavailable: retryScheduled.length === 1
+			&& retryScheduled[0].failure === "database-unavailable",
+		attemptCountKind: retryAttemptValueKind(retryScheduled),
+	};
+}
+
 function faultRetryAlarmEvidence(document) {
 	if (!isAlarmTrace(document)) return null;
 	const logs = traceLogRecords(document);
@@ -848,7 +881,11 @@ function faultRetryAlarmEvidence(document) {
 		|| retryScheduled[0].failure !== "database-unavailable"
 		|| !safeInteger(retryScheduled[0].attemptCount)
 		|| retryScheduled[0].attemptCount < 1
-	) return fail("A fault-version retry alarm was split or incomplete.");
+	) return fail(
+		`A fault-version retry alarm was split or incomplete. Safe retry shape: ${JSON.stringify(
+			safeFaultRetryShape(outboxLogs, deliveryFailed, retryScheduled),
+		)}`,
+	);
 	return {
 		durableObjectId: document.durableObjectId,
 		attemptCount: retryScheduled[0].attemptCount,

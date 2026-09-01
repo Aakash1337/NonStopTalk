@@ -280,11 +280,14 @@ Use this order:
    likewise remain only in the running `prepare` process and are discarded when
    that operation ends. A seed timeout reports only six numeric projected-trace
    counts so an operator can distinguish attachment, create, alarm, and
-   correlation gaps without exposing proof data. Only after the full fault proof
-   succeeds does `prepare`
-   write a checkpoint: its mode-0600 body contains exactly seven aggregate
-   counters, and its opaque filename digests bind the reviewed versions and
-   Durable Object without exposing private values.
+   correlation gaps without exposing proof data. If a retry record is malformed,
+   the failure reports only three bounded record counts, a boolean for the
+   expected failure enum,
+   and a categorical attempt-count type. It never reports raw attempt values,
+   identifiers, or log content. Only after the full fault proof succeeds does
+   `prepare` write a checkpoint: its mode-0600 body contains exactly seven
+   aggregate counters, and its opaque filename digests bind the reviewed versions
+   and Durable Object without exposing private values.
 
    Start `verify` in the first terminal **while the fault version is still at
    100%**. It attaches the pinned Release-A JSON tail, requires that same
