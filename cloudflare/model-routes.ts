@@ -9,6 +9,7 @@ import {
 	type TopicProviderDescription,
 } from "./model-provider";
 import { logWorkerEvent } from "./observability";
+import { requireSupportedPlatformSchema } from "./platform-schema";
 
 const TOPIC_ROUTE = "/api/v1/models/topics";
 const MAX_MODEL_BODY_BYTES = 16 * 1024;
@@ -263,6 +264,7 @@ export async function handleModelRoute(
 		const reservationDay = utcDay(reservationTime);
 		let reserved: boolean;
 		try {
+			await requireSupportedPlatformSchema(env.PLATFORM_DB);
 			reserved = await reserveDailyCall(
 				env.PLATFORM_DB,
 				reservationDay,

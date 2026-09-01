@@ -33,6 +33,12 @@ class FakeD1 {
 	readonly providers = new Map<string, UsageRow>();
 	readonly bindingLog: unknown[][] = [];
 	failReservation = false;
+	schemaVersion: unknown;
+	markerReads = 0;
+
+	constructor(schemaVersion: unknown = 5) {
+		this.schemaVersion = schemaVersion;
+	}
 
 	prepare(query: string): D1PreparedStatement {
 		return new FakeStatement(this, query) as unknown as D1PreparedStatement;
@@ -116,6 +122,12 @@ class FakeStatement {
 
 	run(): Promise<D1Result<unknown>> {
 		return Promise.resolve(this.execute());
+	}
+
+	async first<T>(): Promise<T | null> {
+		assert.equal(this.#query, "SELECT schema_version FROM platform_meta WHERE id = 1");
+		this.#database.markerReads += 1;
+		return { schema_version: this.#database.schemaVersion } as T;
 	}
 
 	execute(): D1Result<unknown> {
@@ -262,6 +274,7 @@ test("offline is the zero-external default and does not reserve model budget", a
 	assert.equal(body.externalProvider, null);
 	assert.equal(body.topicGeneration, 7);
 	assert.equal(handled.response.headers.get("Cache-Control"), "no-store");
+	assert.equal(database.markerReads, 0, "offline generation must not consume D1 readiness reads");
 });
 
 test("a selected external provider requires provider-aware consent before reservation", async () => {
@@ -283,6 +296,34 @@ test("a selected external provider requires provider-aware consent before reserv
 	assert.equal(database.global.size, 0);
 	const body = await payload(handled.response);
 	assert.equal((body.error as { code: string }).code, "EXTERNAL_CONSENT_REQUIRED");
+});
+
+test("an unsupported schema blocks remote reservation and provider delivery", async () => {
+	const database = new FakeD1(7);
+	let calls = 0;
+	const handled = await handleModelRoute(
+		topicRequest({ externalConsent: true }),
+		modelEnv(database),
+		"token",
+		"request-unsupported-schema",
+		routeDeps({
+			describeProvider: (_env, tier) => remoteDescription(tier),
+			generateTopics: async (_env, input) => {
+				calls += 1;
+				return generatedResult(input.tier);
+			},
+		}),
+	);
+	assert(handled);
+	assert.equal(handled.response.status, 200);
+	assert.equal(calls, 0);
+	assert.equal(database.markerReads, 1);
+	assert.equal(database.global.size, 0);
+	assert.equal(database.providers.size, 0);
+	assert.equal(database.bindingLog.length, 0);
+	const body = await payload(handled.response);
+	assert.equal(body.provider, "offline");
+	assert.equal(body.fallbackCode, "MODEL_BUDGET_UNAVAILABLE");
 });
 
 test("Workers AI GLM 5.3 is accepted for consent disclosure, normalized output, and telemetry", async () => {

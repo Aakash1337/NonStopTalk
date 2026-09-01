@@ -94,7 +94,7 @@ npm run deploy:staging
 
 That command applies only staging migrations, deploys with strict mode, checks
 the public pages and status API, writes one synthetic compact baseline summary,
-verifies its schema-v5 cleanup heartbeat, profile-foundation, and relationship round-trips, and
+verifies its reviewed schema-5/6 cleanup-heartbeat contract, profile-foundation, and relationship round-trips, and
 deletes the device-scoped cloud history. The mutating probe refuses to run
 against a host that is not the designated HTTPS staging Workers.dev hostname.
 It never sends audio, transcript text, user content, or an external model
@@ -118,7 +118,9 @@ request.
    The current compatibility-only release adds no migration. It accepts and
    reports only schema markers 5 and 6 while every platform route, scheduled
    cleanup, and model-budget operation continues to read and write only the
-   schema-v5 SQL contract. Markers below 5 or above 6 fail closed. Deploy and
+   schema-v5 SQL contract. Each logical D1 operation performs an uncached
+   singleton marker read first, so unsupported markers fail closed immediately
+   without a Worker restart. Deploy and
    verify this bridge on marker 5 before adding or applying migration `0006`.
    That migration must be additive and preserve all schema-v5 tables, columns,
    constraints, and behavior so this Worker remains a safe code rollback on

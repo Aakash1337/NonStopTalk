@@ -21,25 +21,14 @@ import {
 	type TopicProviderBindings,
 } from "./model-provider";
 import { logWorkerEvent } from "./observability";
+import { requireSupportedPlatformSchema } from "./platform-schema";
 
 const MAX_PLATFORM_BODY_BYTES = 66 * 1024;
 const DEFAULT_ANALYTICS_DAYS = 30;
 const MAX_ANALYTICS_DAYS = 180;
-const PLATFORM_STATUS_CACHE_MS = 60_000;
 const MAX_CLEANUP_BATCHES_PER_RUN = 20;
 export const RETENTION_CLEANUP_STALE_MS = 36 * 60 * 60 * 1_000;
 const MAX_HEARTBEAT_CLOCK_SKEW_MS = 5 * 60 * 1_000;
-// Expand phase for migration 0006: both markers use only the schema-5 SQL
-// contract until the separately deployed schema-6 feature release.
-const MIN_PLATFORM_SCHEMA_VERSION = 5;
-const MAX_PLATFORM_SCHEMA_VERSION = 6;
-
-interface DatabaseReadiness {
-	expiresAt: number;
-	schemaVersion: number;
-}
-
-const databaseReadiness = new WeakMap<D1Database, DatabaseReadiness>();
 
 export interface PlatformBindings extends TopicProviderBindings {
 	PLATFORM_DB: D1Database;
@@ -72,7 +61,7 @@ export async function handlePlatformRoute(
 			if (request.method !== "GET" && request.method !== "HEAD") {
 				return result(methodNotAllowed(requestId, "GET, HEAD"), false);
 			}
-			const schemaVersion = await assertDatabaseReady(env.PLATFORM_DB);
+			const schemaVersion = await requireSupportedPlatformSchema(env.PLATFORM_DB);
 			const roomFactsReady = isSecureRoomFactKey(env.ROOM_FACT_HASH_KEY);
 			const adminAnalyticsReady = isSecureAdminToken(env.ANALYTICS_ADMIN_TOKEN);
 			const topicGeneration = topicGenerationCapability(env);
@@ -118,8 +107,9 @@ export async function handlePlatformRoute(
 		}
 
 		if (url.pathname === "/api/v1/progress/sessions") {
-			const store = createPlatformStore(env.PLATFORM_DB);
 			if (request.method === "GET") {
+				await requireSupportedPlatformSchema(env.PLATFORM_DB);
+				const store = createPlatformStore(env.PLATFORM_DB);
 				const limit = parsePositiveInteger(url.searchParams.get("limit"), 50, 100);
 				const page = await store.listCoachingSummaries(browserToken, {
 					limit,
@@ -131,6 +121,8 @@ export async function handlePlatformRoute(
 				requireExactMutationOrigin(request);
 				const body = await readPlatformJson(request);
 				assertExactBodyKeys(body, ["session"]);
+				await requireSupportedPlatformSchema(env.PLATFORM_DB);
+				const store = createPlatformStore(env.PLATFORM_DB);
 				const saved = await store.saveConsentedCoachingSummary(
 					browserToken,
 					body.session,
@@ -154,6 +146,8 @@ export async function handlePlatformRoute(
 			}
 			if (request.method === "DELETE") {
 				requireExactMutationOrigin(request);
+				await requireSupportedPlatformSchema(env.PLATFORM_DB);
+				const store = createPlatformStore(env.PLATFORM_DB);
 				const deleted = await store.clearCoachingSummaries(browserToken);
 				const analyticsEvents: AnalyticsEventInput[] = [];
 				if (deleted.deletedCount > 0) {
@@ -173,6 +167,7 @@ export async function handlePlatformRoute(
 
 		if (url.pathname === "/api/v1/progress/export") {
 			if (request.method !== "GET") return result(methodNotAllowed(requestId, "GET"), true);
+			await requireSupportedPlatformSchema(env.PLATFORM_DB);
 			const exported = await createPlatformStore(env.PLATFORM_DB).exportCoachingSummaries(browserToken);
 			return result(platformJson({ ...exported, requestId }, 200, requestId), true);
 		}
@@ -181,6 +176,7 @@ export async function handlePlatformRoute(
 			if (request.method !== "GET") return result(methodNotAllowed(requestId, "GET"), false);
 			await requireAdmin(request, env.ANALYTICS_ADMIN_TOKEN);
 			const days = parsePositiveInteger(url.searchParams.get("days"), DEFAULT_ANALYTICS_DAYS, MAX_ANALYTICS_DAYS);
+			await requireSupportedPlatformSchema(env.PLATFORM_DB);
 			const through = startOfUTCDay(new Date());
 			const from = new Date(through.getTime() - (days - 1) * 24 * 60 * 60 * 1000);
 			const rows = await createPlatformStore(env.PLATFORM_DB).listDailyAnalytics(
@@ -213,7 +209,7 @@ export async function handlePlatformRoute(
 		if (url.pathname === "/api/v1/admin/model-usage") {
 			if (request.method !== "GET") return result(methodNotAllowed(requestId, "GET"), false);
 			await requireAdmin(request, env.ANALYTICS_ADMIN_TOKEN);
-			await assertDatabaseReady(env.PLATFORM_DB);
+			await requireSupportedPlatformSchema(env.PLATFORM_DB);
 			const days = parsePositiveInteger(url.searchParams.get("days"), DEFAULT_ANALYTICS_DAYS, MAX_ANALYTICS_DAYS);
 			const through = startOfUTCDay(new Date());
 			const from = new Date(through.getTime() - (days - 1) * 24 * 60 * 60 * 1000);
@@ -365,9 +361,10 @@ export async function recordRoomMilestone(
 	milestone: RoomMilestone,
 	observedAt = new Date(),
 ): Promise<void> {
-	const store = createPlatformStore(env.PLATFORM_DB, { roomHashKey: env.ROOM_FACT_HASH_KEY });
 	const fact = mapPublicRoomStateToFact(publicRoomState, milestone, observedAt);
 	try {
+		await requireSupportedPlatformSchema(env.PLATFORM_DB);
+		const store = createPlatformStore(env.PLATFORM_DB, { roomHashKey: env.ROOM_FACT_HASH_KEY });
 		await store.upsertRoomFact(publicRoomState, milestone, observedAt);
 	} catch (error) {
 		logWorkerEvent("warn", "room_fact_write_failed", { milestone, error: safeErrorName(error) });
@@ -393,6 +390,7 @@ export async function recordProductEvent(
 		return;
 	}
 	try {
+		await requireSupportedPlatformSchema(env.PLATFORM_DB);
 		await createPlatformStore(env.PLATFORM_DB).recordAnalyticsEvent(event, occurredAt);
 	} catch (error) {
 		logWorkerEvent("warn", "product_analytics_rollup_failed", {
@@ -431,6 +429,7 @@ export async function runPlatformCleanup(
 	scheduledAt = new Date(),
 	clock: () => Date = () => new Date(),
 ): Promise<void> {
+	await requireSupportedPlatformSchema(env.PLATFORM_DB);
 	const deleted = { coachingSessions: 0, consentRecords: 0, devices: 0, syncProfiles: 0, roomFacts: 0 };
 	let hasMore = false;
 	let batches = 0;
@@ -525,34 +524,6 @@ function methodNotAllowed(requestId: string, allow: string): Response {
 	);
 	response.headers.set("Allow", allow);
 	return response;
-}
-
-async function assertDatabaseReady(database: D1Database): Promise<number> {
-	const now = Date.now();
-	const cached = databaseReadiness.get(database);
-	if (cached && cached.expiresAt > now) return cached.schemaVersion;
-	try {
-		const marker = await database
-			.prepare("SELECT schema_version FROM platform_meta WHERE id = 1")
-			.first<{ schema_version: number }>();
-		if (
-			!marker
-			|| !Number.isSafeInteger(marker.schema_version)
-			|| marker.schema_version < MIN_PLATFORM_SCHEMA_VERSION
-			|| marker.schema_version > MAX_PLATFORM_SCHEMA_VERSION
-		) {
-			throw new Error("platform schema marker is missing or unsupported");
-		}
-		databaseReadiness.set(database, {
-			expiresAt: now + PLATFORM_STATUS_CACHE_MS,
-			schemaVersion: marker.schema_version,
-		});
-		return marker.schema_version;
-	} catch (error) {
-		throw new PlatformError("DATABASE_UNAVAILABLE", "The platform database has not been initialized.", {
-			cause: error,
-		});
-	}
 }
 
 async function readPlatformJson(request: Request): Promise<Record<string, unknown>> {
