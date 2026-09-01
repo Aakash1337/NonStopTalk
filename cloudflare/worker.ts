@@ -348,33 +348,42 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 	}
 
 	private async finalizeMilestoneConflict(head: RoomMilestoneOutboxHead, now: number): Promise<void> {
+		let finalized = false;
 		await this.ctx.storage.transaction(async (transaction) => {
-			deadLetterRoomMilestone(this.ctx.storage.sql, head, "conflict", now);
+			finalized = deadLetterRoomMilestone(this.ctx.storage.sql, head, "conflict", now);
 			const room = this.load();
 			if (room) await this.reconcileRoomAlarm(room, transaction);
 			else await transaction.deleteAlarm();
 		});
-		logWorkerEvent("warn", "room_milestone_outbox_dead_lettered", { reason: "conflict" });
+		if (finalized) {
+			logWorkerEvent("warn", "room_milestone_outbox_dead_lettered", { reason: "conflict" });
+		}
 	}
 
 	private async finalizeExpiredMilestone(head: RoomMilestoneOutboxHead, now: number): Promise<void> {
+		let finalized = false;
 		await this.ctx.storage.transaction(async (transaction) => {
-			deadLetterExpiredRoomMilestone(this.ctx.storage.sql, head, now);
+			finalized = deadLetterExpiredRoomMilestone(this.ctx.storage.sql, head, now);
 			const room = this.load();
 			if (room) await this.reconcileRoomAlarm(room, transaction);
 			else await transaction.deleteAlarm();
 		});
-		logWorkerEvent("warn", "room_milestone_outbox_dead_lettered", { reason: "deadline-exceeded" });
+		if (finalized) {
+			logWorkerEvent("warn", "room_milestone_outbox_dead_lettered", { reason: "deadline-exceeded" });
+		}
 	}
 
 	private async finalizeInvalidMilestone(head: RoomMilestoneOutboxHead, now: number): Promise<void> {
+		let finalized = false;
 		await this.ctx.storage.transaction(async (transaction) => {
-			deadLetterRoomMilestone(this.ctx.storage.sql, head, "invalid-payload", now);
+			finalized = deadLetterRoomMilestone(this.ctx.storage.sql, head, "invalid-payload", now);
 			const room = this.load();
 			if (room) await this.reconcileRoomAlarm(room, transaction);
 			else await transaction.deleteAlarm();
 		});
-		logWorkerEvent("warn", "room_milestone_outbox_dead_lettered", { reason: "invalid-payload" });
+		if (finalized) {
+			logWorkerEvent("warn", "room_milestone_outbox_dead_lettered", { reason: "invalid-payload" });
+		}
 	}
 
 	private async finalizeMilestoneRetry(

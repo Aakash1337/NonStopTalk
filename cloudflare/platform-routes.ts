@@ -92,9 +92,9 @@ export async function handlePlatformRoute(
 							topicGeneration,
 							aggregateAnalytics: {
 								status: adminAnalyticsReady ? "ready" : "write-only",
-								delivery: env.ROOM_MILESTONE_DELIVERY_MODE === "outbox"
-									? "durable-outbox"
-									: "best-effort",
+								// Release A can drain a future outbox but does not produce one.
+								// Configuration alone must never overstate the effective path.
+								delivery: "best-effort",
 								adminRead: adminAnalyticsReady,
 								analyticsEngine: env.PRODUCT_ANALYTICS ? "enabled" : "disabled",
 							},
