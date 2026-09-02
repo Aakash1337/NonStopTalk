@@ -8,7 +8,9 @@ import {
   normalizeAttemptRelationship,
   relationshipForSummary,
 } from "./coach-loop.js";
-import {
+import * as coachingStorage from "./coach-storage.js";
+
+const {
   clearCoachingSummaries,
   coachingStorageSchema,
   deleteCoachingArtifacts,
@@ -16,7 +18,7 @@ import {
   readCoachingSummaries,
   readCoachingSummary,
   saveCoachingSession,
-} from "./coach-storage.js";
+} = coachingStorage;
 
 const app = document.querySelector("#app");
 const announcer = document.querySelector("#announcer");
@@ -40,6 +42,7 @@ let coachEnginePromise = null;
 let routeFocusRequested = false;
 let practice = freshPracticeState();
 let progressSessions = [];
+let progressArtifactSessions = new Map();
 let pendingPracticeResume = null;
 
 const PRACTICE_SCENARIOS = [
@@ -1242,11 +1245,21 @@ function microphoneErrorMessage(error) {
 async function renderProgress(generation = routeGeneration) {
   app.innerHTML = `<section class="loading-card" role="status">Loading private progress…</section>`;
   let localSummaries = [];
+  let artifactUsage = null;
   let cloudSummaries = [];
   let storageError = "";
   let cloudError = "";
   try {
-    localSummaries = await readCoachingSummariesWithRetry();
+    if (typeof coachingStorage.readCoachingProgressSnapshot === "function") {
+      const snapshot = await readCoachingProgressSnapshotWithRetry();
+      localSummaries = Array.isArray(snapshot?.summaries) ? snapshot.summaries : [];
+      artifactUsage = snapshot?.artifactUsage || null;
+    } else {
+      // During static-asset propagation or a rollback, the current app can be
+      // paired briefly with the compatible Release-A storage module. Keep the
+      // history usable and omit only the newer aggregate lifecycle readout.
+      localSummaries = await readCoachingSummariesWithRetry();
+    }
   } catch {
     storageError = "Local progress storage is unavailable in this browser.";
   }
@@ -1261,6 +1274,11 @@ async function renderProgress(generation = routeGeneration) {
   if (generation !== routeGeneration || !/^\/progress\/?$/i.test(location.pathname)) return;
   const summaries = mergeCoachingSummaries(localSummaries, cloudSummaries);
   progressSessions = summaries;
+  progressArtifactSessions = new Map(
+    (Array.isArray(artifactUsage?.sessions) ? artifactUsage.sessions : [])
+      .filter((session) => typeof session?.id === "string" && session.id.length > 0)
+      .map((session) => [session.id, session]),
+  );
   const grouped = groupPracticeLoops(summaries);
   const completedLoops = grouped.loops.filter((loop) => loop.status === "complete").length;
   const awaitingRetry = grouped.loops.filter((loop) => loop.status === "awaiting-retry").length;
@@ -1282,11 +1300,67 @@ async function renderProgress(generation = routeGeneration) {
         <div class="section-head"><div><p class="eyebrow">Practice history</p><h2>Compare only linked attempts</h2></div><span>${historyItems}</span></div>
         ${summaries.length ? renderProgressHistory(grouped) : `<div class="empty-progress"><h2>No attempts yet.</h2><p>Complete a practice session and its metric summary will appear here.</p><a class="button" href="/practice" data-route>Build a baseline</a></div>`}
       </section>
+      ${renderArtifactStorageDashboard(artifactUsage, storageError)}
       <section class="storage-controls">
         <div><h2>Your data, your controls.</h2><p class="hint">JSON exports contain metrics, advice, and derived word patterns. Opted-in recordings and captured transcripts always stay in the separate local artifact store.${cloudEnabled ? " Compact online backup is enabled for summaries you choose to sync." : " Online backup is off. You can explicitly check for a prior anonymous backup if this browser's preference was cleared."}</p></div>
         <div class="action-row">${cloudEnabled ? "" : `<button class="button ghost" type="button" data-command="coach-check-cloud">Check online backups</button>`}<button class="button ghost" type="button" data-command="coach-export" ${summaries.length ? "" : "disabled"}>Export JSON</button><button class="button danger ghost" type="button" data-command="coach-delete" ${summaries.length || cloudEnabled ? "" : "disabled"}>${cloudEnabled ? summaries.length ? "Delete local + cloud history" : "Disable online backup" : "Delete local history"}</button></div>
       </section>
     </section>`;
+}
+
+function renderArtifactStorageDashboard(usage, storageError = "") {
+  const count = Number.isSafeInteger(usage?.artifactCount) && usage.artifactCount >= 0
+    ? usage.artifactCount
+    : null;
+  const logicalBytes = Number.isSafeInteger(usage?.logicalBytes) && usage.logicalBytes >= 0
+    ? usage.logicalBytes
+    : null;
+  const limitBytes = Number.isSafeInteger(usage?.limitBytes) && usage.limitBytes > 0
+    ? usage.limitBytes
+    : coachingStorageSchema.artifactMaxLogicalBytes;
+  const nextExpiresAtMs = Number.isSafeInteger(usage?.nextExpiresAtMs) && usage.nextExpiresAtMs >= 0
+    ? usage.nextExpiresAtMs
+    : null;
+  const legacyGraceCount = Number.isSafeInteger(usage?.legacyGraceCount) && usage.legacyGraceCount > 0
+    ? usage.legacyGraceCount
+    : 0;
+  const cleanedCount = Number.isSafeInteger(usage?.cleanedCount) && usage.cleanedCount > 0
+    ? usage.cleanedCount
+    : 0;
+
+  if (!usage || count === null || logicalBytes === null || !Number.isSafeInteger(limitBytes)) {
+    return `<section class="panel artifact-storage-card" data-artifact-usage="unavailable">
+      <div><p class="eyebrow">Local artifact storage</p><h2>Usage details unavailable</h2></div>
+      <p class="hint">${storageError
+        ? "This browser did not make its local coaching database available."
+        : "A compatible storage release is keeping your history usable while the newer lifecycle readout is unavailable."}</p>
+    </section>`;
+  }
+
+  const meterValue = Math.min(logicalBytes, limitBytes);
+  const overLimit = logicalBytes > limitBytes;
+  const remainingBytes = Math.max(0, limitBytes - logicalBytes);
+  const nextExpiry = nextExpiresAtMs === null
+    ? "No artifact retention deadline is currently active."
+    : `Earliest retention deadline: ${formatArtifactExpiry(nextExpiresAtMs)}.`;
+  const retainedLabel = count === 1 ? "1 attempt retains artifacts" : `${count} attempts retain artifacts`;
+  return `<section class="panel artifact-storage-card" data-artifact-usage="ready">
+    <div class="artifact-storage-head">
+      <div><p class="eyebrow">Recordings &amp; transcripts</p><h2>${escapeHTML(formatBytes(logicalBytes))} of ${escapeHTML(formatBytes(limitBytes))} app limit</h2></div>
+      <span>${escapeHTML(retainedLabel)}</span>
+    </div>
+    <progress value="${meterValue}" max="${limitBytes}" aria-label="${logicalBytes} bytes used of the ${limitBytes} byte NonStopTalk artifact limit">${meterValue} of ${limitBytes}</progress>
+    <div class="artifact-storage-details">
+      <p>Exact logical use: ${logicalBytes} ${logicalBytes === 1 ? "byte" : "bytes"}.</p>
+      <p>${escapeHTML(nextExpiry)}</p>
+      <p>${overLimit
+        ? `Usage is ${escapeHTML(formatBytes(logicalBytes - limitBytes))} (${logicalBytes - limitBytes} ${logicalBytes - limitBytes === 1 ? "byte" : "bytes"}) above the app limit; new artifact retention is blocked until it fits.`
+        : `${escapeHTML(formatBytes(remainingBytes))} remains under the app limit.`}</p>
+      ${legacyGraceCount ? `<p>${legacyGraceCount} migrated ${legacyGraceCount === 1 ? "artifact is" : "artifacts are"} in a one-time retention grace window. Existing content is not evicted, even when total usage is above the app limit.</p>` : ""}
+      ${cleanedCount ? `<p role="status">This visit removed ${cleanedCount} expired or invalid local ${cleanedCount === 1 ? "artifact" : "artifacts"}.</p>` : ""}
+    </div>
+    <p class="hint">Point-in-time usage counts exact recording Blob bytes plus UTF-8 transcript bytes; summaries and database overhead are excluded. This app limit is separate from the browser's quota. Artifacts are never uploaded, valid content is never evicted for a new save, and the browser may still clear site data earlier. An artifact becomes unavailable at its displayed retention deadline and is purged on a later coaching-storage access.</p>
+  </section>`;
 }
 
 function renderProgressHistory(grouped) {
@@ -1327,10 +1401,19 @@ function renderArtifactActions(item) {
   const artifacts = item.artifacts || {};
   if (!artifacts.audioStored && !artifacts.transcriptStored) return "";
   const id = escapeHTML(item.id);
+  const lifecycle = progressArtifactSessions.get(String(item.id || ""));
+  const retentionDetail = lifecycle
+    && Number.isSafeInteger(lifecycle.logicalBytes)
+    && lifecycle.logicalBytes >= 0
+    && Number.isSafeInteger(lifecycle.expiresAtMs)
+    && lifecycle.expiresAtMs >= 0
+    ? `${formatBytes(lifecycle.logicalBytes)} (${lifecycle.logicalBytes} ${lifecycle.logicalBytes === 1 ? "byte" : "bytes"}) stored locally · retention deadline ${formatArtifactExpiry(lifecycle.expiresAtMs)}${lifecycle.legacyGrace ? " · migrated retention grace" : ""}`
+    : "Local retention timing is temporarily unavailable.";
   return `<div class="artifact-actions" aria-label="Saved full session artifacts">
     ${artifacts.audioStored ? `<button class="button ghost small" type="button" data-command="coach-download-audio" data-session-id="${id}">Download recording</button>` : ""}
     ${artifacts.transcriptStored ? `<button class="button ghost small" type="button" data-command="coach-download-transcript" data-session-id="${id}">Download transcript</button>` : ""}
     <button class="button danger ghost small" type="button" data-command="coach-delete-artifacts" data-session-id="${id}">Delete saved artifacts</button>
+    <p class="artifact-retention-detail">${escapeHTML(retentionDetail)}</p>
     ${artifacts.transcriptMayBePartial ? `<p class="hint">Captured transcript may be partial; local recognition did not finalize cleanly.</p>` : ""}
   </div>`;
 }
@@ -1351,6 +1434,38 @@ async function readCoachingSummariesWithRetry() {
     await new Promise((resolve) => setTimeout(resolve, 50));
     return readCoachingSummaries();
   }
+}
+
+async function readCoachingProgressSnapshotWithRetry() {
+  try {
+    return await coachingStorage.readCoachingProgressSnapshot();
+  } catch {
+    // Match the bounded reload recovery used by the summary-only reader.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return coachingStorage.readCoachingProgressSnapshot();
+  }
+}
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "Unknown";
+  if (bytes < 1_024) return `${Math.round(bytes)} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let amount = bytes;
+  let unit = "B";
+  for (const candidate of units) {
+    amount /= 1_024;
+    unit = candidate;
+    if (amount < 1_024 || candidate === units[units.length - 1]) break;
+  }
+  const digits = amount >= 100 || Number.isInteger(amount) ? 0 : 1;
+  return `${amount.toFixed(digits)} ${unit}`;
+}
+
+function formatArtifactExpiry(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return "at an unavailable time";
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" }).format(date);
 }
 
 async function exportCoachingSummaries() {
@@ -1376,16 +1491,26 @@ async function exportCoachingSummaries() {
 }
 
 async function downloadCoachingArtifact(id, kind) {
+  const generation = routeGeneration;
   const artifact = await readCoachingArtifact(String(id || ""));
-  if (!artifact) throw new Error("That saved session artifact is unavailable.");
+  if (!artifact) {
+    await refreshProgressAfterArtifactChange(generation);
+    throw new Error("That saved session artifact is unavailable.");
+  }
   let blob;
   let extension;
   if (kind === "audio") {
-    if (!(artifact.audioBlob instanceof Blob)) throw new Error("This session has no saved recording.");
+    if (!(artifact.audioBlob instanceof Blob)) {
+      await refreshProgressAfterArtifactChange(generation);
+      throw new Error("This session has no saved recording.");
+    }
     blob = artifact.audioBlob;
     extension = audioFileExtension(artifact.audioMimeType || artifact.audioBlob.type);
   } else {
-    if (!artifact.transcript) throw new Error("This session has no saved full transcript.");
+    if (!artifact.transcript) {
+      await refreshProgressAfterArtifactChange(generation);
+      throw new Error("This session has no saved full transcript.");
+    }
     blob = new Blob([artifact.transcript], { type: "text/plain;charset=utf-8" });
     extension = "txt";
   }
@@ -1398,6 +1523,12 @@ async function downloadCoachingArtifact(id, kind) {
   anchor.remove();
   setTimeout(() => URL.revokeObjectURL(url), 0);
   showToast(`${kind === "audio" ? "Recording" : "Transcript"} download started.`);
+}
+
+async function refreshProgressAfterArtifactChange(generation) {
+  if (generation === routeGeneration && /^\/progress\/?$/i.test(location.pathname)) {
+    await renderProgress(generation);
+  }
 }
 
 function audioFileExtension(mimeType = "") {

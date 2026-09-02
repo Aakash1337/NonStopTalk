@@ -94,7 +94,7 @@ The active topic, timer, voice status, and score remain the centerpiece. Host co
 
 ### Progress
 
-Lead with explicit practice loops, completed-loop/awaiting-retry state, and goal-specific paired evidence. Keep legacy, standalone, malformed, duplicate, and orphan records visible without pairing them by recency. Compare the user with their own baseline, but do not label a raw direction as improvement, rank people, infer demographic traits, or collapse pause, pace, filler, and input-level measurements into an opaque universal quality score. When an attempt has opted-in artifacts, expose separate recording/transcript download and artifact-only deletion actions beside that attempt; JSON export must remain visibly distinct because it contains summaries and derived word patterns, not the full artifacts. The full-history delete action must say that it clears both stores for this site.
+Lead with explicit practice loops, completed-loop/awaiting-retry state, and goal-specific paired evidence. Keep legacy, standalone, malformed, duplicate, and orphan records visible without pairing them by recency. Compare the user with their own baseline, but do not label a raw direction as improvement, rank people, infer demographic traits, or collapse pause, pace, filler, and input-level measurements into an opaque universal quality score. When an attempt has opted-in artifacts, expose separate recording/transcript download and artifact-only deletion actions beside that attempt; JSON export must remain visibly distinct because it contains summaries and derived word patterns, not the full artifacts. After practice history, show a compact point-in-time artifact panel with exact logical use, the 128 MiB app limit, and absolute retention deadlines. Call it an app limit rather than browser space, disclose that browser quota is separate, and keep per-attempt policy metadata beside the corresponding download/delete controls. The full-history delete action must say that it clears all local coaching stores for this site.
 
 ## Core components
 
@@ -117,7 +117,7 @@ Practice and Progress:
 - Compact grounding label that says whether the retrieved coaching card supplied the retry drill or was context only because an evidence-safety rule supplied it
 - Actionable review card
 - Device-local attempt history and empty state
-- Per-attempt download and artifact-only deletion controls when retained artifacts exist, plus one confirmed action that clears summaries and artifacts; possibly partial transcripts carry a visible warning
+- Per-attempt download and artifact-only deletion controls when retained artifacts exist, a point-in-time exact logical-usage/retention panel, plus one confirmed action that clears summaries and artifacts; possibly partial transcripts carry a visible warning
 
 Play:
 

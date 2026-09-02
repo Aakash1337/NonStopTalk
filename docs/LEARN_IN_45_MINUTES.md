@@ -309,7 +309,7 @@ Checkpoint: Trace one Practice attempt and one Play action. Name exactly where e
 - optional strict on-device transcript-derived metrics;
 - local-first summaries, explicit loop grouping/comparison, export, artifact-only and all-local-store deletion, opted-in artifact downloads, and optional compact D1 backup;
 - Worker-with-Assets deployment and Durable Object multiplayer rooms;
-- 34 deterministic coaching/loop tests plus seven IndexedDB storage-contract tests (41 total), coaching/platform browser coverage, Worker tests, typechecking, Go checks, and Wrangler dry-run validation.
+- 34 deterministic coaching/loop tests plus eight IndexedDB storage-contract tests (42 total), coaching/platform browser coverage, Worker tests, typechecking, Go checks, and Wrangler dry-run validation.
 
 ### Not proven or not implemented
 
