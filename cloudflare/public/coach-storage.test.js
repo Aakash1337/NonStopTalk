@@ -120,6 +120,21 @@ test("summary scrubbing preserves compact analysis and loop relationships", () =
       transcriptMayBePartial: false,
     },
   });
+  assert.deepEqual(coachingStoragePolicy.summaryWithArtifactMetadata(summary, {
+    audioBlob: new Blob(["abc"], { type: "audio/webm" }),
+    audioMimeType: "audio/custom",
+    transcript: "captured",
+    transcriptMayBePartial: true,
+  }), {
+    ...summary,
+    artifacts: {
+      audioStored: true,
+      audioBytes: 3,
+      audioMimeType: "audio/custom",
+      transcriptStored: true,
+      transcriptMayBePartial: true,
+    },
+  }, "artifact-bearing saves must normalize truthful summary metadata");
 });
 
 test("quota detection follows a bounded nested cause chain", () => {

@@ -94,6 +94,23 @@ function summaryWithoutArtifacts(summary) {
   return { ...summary, artifacts: { ...EMPTY_ARTIFACT_METADATA } };
 }
 
+function summaryWithArtifactMetadata(summary, artifact) {
+  const hasAudioBlob = typeof globalThis.Blob === "function"
+    && artifact?.audioBlob instanceof globalThis.Blob;
+  const transcript = typeof artifact?.transcript === "string" ? artifact.transcript : "";
+  const declaredMimeType = typeof artifact?.audioMimeType === "string" ? artifact.audioMimeType : "";
+  return {
+    ...summary,
+    artifacts: {
+      audioStored: hasAudioBlob,
+      audioBytes: hasAudioBlob ? artifact.audioBlob.size : 0,
+      audioMimeType: hasAudioBlob ? declaredMimeType || artifact.audioBlob.type : "",
+      transcriptStored: transcript.length > 0,
+      transcriptMayBePartial: Boolean(transcript && artifact?.transcriptMayBePartial),
+    },
+  };
+}
+
 function summaryClaimsArtifacts(summary) {
   return summary?.artifacts?.audioStored === true || summary?.artifacts?.transcriptStored === true;
 }
@@ -397,10 +414,11 @@ function normalizedSaveRecords(summary, artifact) {
   if (artifactId !== sessionId) {
     throw new TypeError("Coaching summary and artifact IDs must match.");
   }
+  const normalizedArtifact = { ...artifact, id: sessionId };
   return {
     sessionId,
-    summary: { ...summary, id: sessionId },
-    artifact: { ...artifact, id: sessionId },
+    summary: summaryWithArtifactMetadata({ ...summary, id: sessionId }, normalizedArtifact),
+    artifact: normalizedArtifact,
   };
 }
 
@@ -435,7 +453,7 @@ function reconcileArtifactState(transaction, nowMs, done) {
   const summaries = transaction.objectStore(COACH_STORE);
   const artifacts = transaction.objectStore(COACH_ARTIFACT_STORE);
   const lifecycle = transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE);
-  const artifactKeysRequest = artifacts.getAllKeys();
+  const artifactBytesById = new Map();
   const summariesRequest = summaries.getAll();
   const lifecycleEntries = [];
   let completedReads = 0;
@@ -444,11 +462,6 @@ function reconcileArtifactState(transaction, nowMs, done) {
     completedReads += 1;
     if (completedReads !== 3) return;
     try {
-      const artifactIds = new Set();
-      for (const key of artifactKeysRequest.result) {
-        if (typeof key === "string" && key.length > 0) artifactIds.add(key);
-        else artifacts.delete(key);
-      }
       const artifactSummaryIds = new Set();
       for (const summary of summariesRequest.result) {
         if (typeof summary?.id === "string"
@@ -465,12 +478,14 @@ function reconcileArtifactState(transaction, nowMs, done) {
       for (const { key, value } of lifecycleEntries) {
         const validKey = typeof key === "string" && key.length > 0;
         const validRecord = validKey && isArtifactLifecycleRecord(value, key);
-        const artifactExists = validKey && artifactIds.has(key);
+        const artifactExists = validKey && artifactBytesById.has(key);
+        const artifactBytes = artifactExists ? artifactBytesById.get(key) : null;
         const summaryExists = validKey && artifactSummaryIds.has(key);
         if (!validRecord
           || value.retainedAtMs > nowMs
           || value.expiresAtMs <= nowMs
           || !artifactExists
+          || artifactBytes !== value.logicalBytes
           || !summaryExists) {
           lifecycle.delete(key);
           artifacts.delete(key);
@@ -482,14 +497,14 @@ function reconcileArtifactState(transaction, nowMs, done) {
           }
           continue;
         }
-        retainedById.set(key, value.logicalBytes);
-        const nextBytes = retainedBytes + value.logicalBytes;
+        retainedById.set(key, artifactBytes);
+        const nextBytes = retainedBytes + artifactBytes;
         if (!Number.isSafeInteger(nextBytes)) retainedBytesOverflow = true;
         else retainedBytes = nextBytes;
       }
 
-      for (const key of artifactKeysRequest.result) {
-        if (typeof key !== "string" || key.length === 0 || !retainedById.has(key)) {
+      for (const key of artifactBytesById.keys()) {
+        if (!retainedById.has(key)) {
           artifacts.delete(key);
           lifecycle.delete(key);
         }
@@ -507,7 +522,35 @@ function reconcileArtifactState(transaction, nowMs, done) {
     }
   };
 
-  artifactKeysRequest.onsuccess = finishRead;
+  // Stream artifact records so byte accounting is checked against the real
+  // Blob/transcript payload without materializing the complete blob store at
+  // once. Only the content-free ID/byte map survives each cursor step.
+  const artifactCursorRequest = artifacts.openCursor();
+  artifactCursorRequest.onsuccess = () => {
+    try {
+      const cursor = artifactCursorRequest.result;
+      if (!cursor) {
+        finishRead();
+        return;
+      }
+      const key = cursor.primaryKey;
+      const artifact = cursor.value;
+      const logicalBytes = typeof key === "string"
+        && key.length > 0
+        && artifact?.id === key
+        ? artifactLogicalBytes(artifact)
+        : null;
+      if (logicalBytes === null) {
+        cursor.delete();
+        lifecycle.delete(key);
+      } else {
+        artifactBytesById.set(key, logicalBytes);
+      }
+      cursor.continue();
+    } catch (error) {
+      abortTransaction(transaction, error);
+    }
+  };
   summariesRequest.onsuccess = finishRead;
   const lifecycleCursorRequest = lifecycle.openCursor();
   lifecycleCursorRequest.onsuccess = () => {
@@ -650,7 +693,14 @@ export async function readCoachingArtifact(id) {
                 try {
                   const artifact = artifactRequest.result;
                   const logicalBytes = artifactLogicalBytes(artifact);
-                  if (!artifact || artifact.id !== sessionId || logicalBytes !== record.logicalBytes) {
+                  const completedAtMs = Date.now();
+                  if (!Number.isSafeInteger(completedAtMs) || completedAtMs < 0) {
+                    throw new TypeError("The coaching artifact expiry time is invalid.");
+                  }
+                  if (!isActiveArtifactLifecycleRecord(record, sessionId, completedAtMs)
+                    || !artifact
+                    || artifact.id !== sessionId
+                    || logicalBytes !== record.logicalBytes) {
                     discardArtifact();
                     return;
                   }
@@ -725,4 +775,5 @@ export const coachingStoragePolicy = Object.freeze({
   isArtifactLifecycleRecord,
   isQuotaExceededError,
   summaryWithoutArtifacts,
+  summaryWithArtifactMetadata,
 });

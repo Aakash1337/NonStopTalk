@@ -220,10 +220,10 @@ async function runFreshSchemaAndTriad(browser, origin) {
           attemptRole: "standalone",
           feedbackMode: "live-cues",
           artifacts: {
-            audioStored: true,
-            audioBytes: 3,
-            audioMimeType: "audio/webm",
-            transcriptStored: true,
+            audioStored: false,
+            audioBytes: 0,
+            audioMimeType: "",
+            transcriptStored: false,
             transcriptMayBePartial: false,
           },
         };
@@ -257,6 +257,13 @@ async function runFreshSchemaAndTriad(browser, origin) {
     }]);
     assert.equal(result.snapshot.artifacts[0]?.audioSize, 3);
     assert.equal(result.snapshot.artifacts[0]?.transcript, "é🙂");
+    assert.deepEqual(result.snapshot.summaries[0]?.artifacts, {
+      audioStored: true,
+      audioBytes: 3,
+      audioMimeType: "audio/webm",
+      transcriptStored: true,
+      transcriptMayBePartial: false,
+    }, "artifact-bearing saves must commit truthful summary metadata atomically");
     assert.deepEqual(result.snapshot.lifecycle[0], {
       id: "fresh-triad",
       retainedAtMs,
@@ -562,6 +569,20 @@ async function runExpiryBoundary(browser, origin) {
         transcript: "kept until the boundary",
         transcriptMayBePartial: false,
       });
+      const crossingId = "crosses-during-read";
+      await storage.saveCoachingSession({
+        ...summary,
+        id: crossingId,
+        baselineAttemptId: crossingId,
+        advice: { focus: "Do not return content after the read crosses expiry" },
+      }, {
+        id: crossingId,
+        createdAt: summary.createdAt,
+        audioBlob: new Blob(["z"], { type: "audio/webm" }),
+        audioMimeType: "audio/webm",
+        transcript: "crossing",
+        transcriptMayBePartial: false,
+      });
       Date.now = () => retainedAtMs + 1_000;
       await storage.saveCoachingSession({
         ...summary,
@@ -577,10 +598,14 @@ async function runExpiryBoundary(browser, origin) {
         transcriptMayBePartial: false,
       });
       let before;
+      let crossing;
       let atBoundary;
       try {
         Date.now = () => retainedAtMs + retentionMs - 1;
         before = await storage.readCoachingArtifact(id);
+        let crossingClockMs = retainedAtMs + retentionMs - 1;
+        Date.now = () => crossingClockMs++;
+        crossing = await storage.readCoachingArtifact(crossingId);
         Date.now = () => retainedAtMs + retentionMs;
         atBoundary = await storage.readCoachingArtifact(id);
       } finally {
@@ -588,6 +613,7 @@ async function runExpiryBoundary(browser, origin) {
       }
       return {
         before: before ? { id: before.id, transcript: before.transcript } : null,
+        crossing: crossing ? { id: crossing.id } : null,
         atBoundary: atBoundary ? { id: atBoundary.id } : null,
         snapshot: await globalThis.__coachStorageSmoke.inspect(),
       };
@@ -595,6 +621,7 @@ async function runExpiryBoundary(browser, origin) {
 
     assert.equal(result.before?.id, "expiring-baseline");
     assert.equal(result.before?.transcript, "kept until the boundary");
+    assert.equal(result.crossing, null, "an artifact must not cross its deadline while its payload is read");
     assert.equal(result.atBoundary, null);
     assert.deepEqual(result.snapshot.artifacts.map((artifact) => artifact.id), ["healthy-after-boundary"]);
     assert.deepEqual(result.snapshot.lifecycle.map((record) => record.id), ["healthy-after-boundary"]);
@@ -604,6 +631,8 @@ async function runExpiryBoundary(browser, origin) {
     assert.equal(summary.baselineAttemptId, "expiring-baseline");
     assert.equal(summary.advice.focus, "Relationship survives expiry");
     assertEmptyArtifactMetadata(summary, "expiry must scrub only artifact metadata");
+    assertEmptyArtifactMetadata(byId(result.snapshot.summaries, "crosses-during-read"),
+      "a read that crosses expiry must scrub only artifact metadata");
     console.log("  exact 30-day expiry boundary and summary preservation passed");
   } finally {
     await context.close();
@@ -632,7 +661,13 @@ async function runCorruptionFailClosed(browser, origin) {
         transcript: id,
         transcriptMayBePartial: false,
       });
-      for (const id of ["healthy-ledger", "missing-ledger", "wrong-ledger", "stale-ledger"]) {
+      for (const id of [
+        "healthy-ledger",
+        "malformed-payload",
+        "missing-ledger",
+        "wrong-ledger",
+        "stale-ledger",
+      ]) {
         await storage.saveCoachingSession(makeSummary(id), makeArtifact(id));
       }
 
@@ -645,6 +680,14 @@ async function runCorruptionFailClosed(browser, origin) {
       const wrongRequest = lifecycle.get("wrong-ledger");
       wrongRequest.onsuccess = () => lifecycle.put({ ...wrongRequest.result, logicalBytes: wrongRequest.result.logicalBytes + 1 });
       artifacts.delete("stale-ledger");
+      artifacts.put({
+        id: "malformed-payload",
+        createdAt: "2026-09-02T00:00:00.000Z",
+        audioBlob: "not-a-blob",
+        audioMimeType: "audio/webm",
+        transcript: "",
+        transcriptMayBePartial: false,
+      });
       await helpers.transactionDone(transaction);
       database.close();
 
@@ -665,12 +708,77 @@ async function runCorruptionFailClosed(browser, origin) {
     assert.deepEqual(result.healthy, { id: "healthy-ledger", transcript: "healthy-ledger" });
     assert.deepEqual(result.snapshot.artifacts.map((artifact) => artifact.id), ["healthy-ledger"]);
     assert.deepEqual(result.snapshot.lifecycle.map((record) => record.id), ["healthy-ledger"]);
-    for (const id of ["missing-ledger", "wrong-ledger", "stale-ledger"]) {
+    for (const id of ["malformed-payload", "missing-ledger", "wrong-ledger", "stale-ledger"]) {
       const summary = byId(result.snapshot.summaries, id);
       assert.equal(summary.advice.focus, `Preserve ${id}`);
       assertEmptyArtifactMetadata(summary, `${id} must fail closed and preserve its compact summary`);
     }
-    console.log("  missing, mismatched, and stale lifecycle corruption fails closed");
+    console.log("  malformed, missing, mismatched, and stale artifact state fails closed");
+  } finally {
+    await context.close();
+  }
+}
+
+async function runLedgerByteMismatchReconciliation(browser, origin) {
+  const context = await createContext(browser, origin);
+  try {
+    const page = await openHome(context, origin);
+    const result = await page.evaluate(async () => {
+      const storage = await import("/coach-storage.js?storage-smoke=ledger-byte-mismatch");
+      const makeSummary = (id, bytes) => ({
+        id,
+        createdAt: "2026-09-02T00:00:00.000Z",
+        advice: { focus: `Preserve ${id}` },
+        artifacts: {
+          audioStored: true,
+          audioBytes: bytes,
+          audioMimeType: "audio/webm",
+          transcriptStored: false,
+          transcriptMayBePartial: false,
+        },
+      });
+      const makeArtifact = (id, contents) => ({
+        id,
+        createdAt: "2026-09-02T00:00:00.000Z",
+        audioBlob: new Blob([contents], { type: "audio/webm" }),
+        audioMimeType: "audio/webm",
+        transcript: "",
+        transcriptMayBePartial: false,
+      });
+      await storage.saveCoachingSession(
+        makeSummary("underreported-ledger", 2),
+        makeArtifact("underreported-ledger", "xx"),
+      );
+      await storage.saveCoachingSession(
+        makeSummary("healthy-ledger-control", 1),
+        makeArtifact("healthy-ledger-control", "h"),
+      );
+
+      const helpers = globalThis.__coachStorageSmoke;
+      const database = await helpers.openRaw();
+      const transaction = database.transaction("artifact-lifecycle", "readwrite");
+      const lifecycle = transaction.objectStore("artifact-lifecycle");
+      const request = lifecycle.get("underreported-ledger");
+      request.onsuccess = () => lifecycle.put({ ...request.result, logicalBytes: 1 });
+      await helpers.transactionDone(transaction);
+      database.close();
+
+      const candidate = await storage.saveCoachingSession(
+        makeSummary("after-ledger-reconciliation", 1),
+        makeArtifact("after-ledger-reconciliation", "n"),
+      );
+      return { candidate, snapshot: await helpers.inspect() };
+    });
+
+    assert.deepEqual(result.candidate, { summarySaved: true, artifactStatus: "stored" });
+    assert.equal(byId(result.snapshot.artifacts, "underreported-ledger"), undefined);
+    assert.equal(byId(result.snapshot.lifecycle, "underreported-ledger"), undefined);
+    assertEmptyArtifactMetadata(byId(result.snapshot.summaries, "underreported-ledger"),
+      "an underreported lifecycle row must fail closed during capacity reconciliation");
+    assert.equal(byId(result.snapshot.artifacts, "healthy-ledger-control")?.audioSize, 1);
+    assert.equal(byId(result.snapshot.lifecycle, "healthy-ledger-control")?.logicalBytes, 1);
+    assert.equal(byId(result.snapshot.artifacts, "after-ledger-reconciliation")?.audioSize, 1);
+    console.log("  streamed payload-byte validation rejects an underreported lifecycle ledger");
   } finally {
     await context.close();
   }
@@ -810,7 +918,7 @@ async function runCapBoundaries(browser, origin) {
       IDBObjectStore.prototype.getAll = function guardedGetAll(...args) {
         if (this.name === "session-artifacts") {
           artifactGetAllCalls += 1;
-          throw new Error("Artifact reconciliation must inventory keys without loading full blobs");
+          throw new Error("Artifact reconciliation must stream instead of loading the complete blob store");
         }
         return nativeArtifactGetAll.apply(this, args);
       };
@@ -874,8 +982,8 @@ async function runCapBoundaries(browser, origin) {
     assert.equal(result.replacementLifecycle.logicalBytes, 1,
       "a same-ID artifact replacement must subtract the prior ledger bytes before applying the cap");
     assert.equal(result.artifactGetAllCalls, 0,
-      "cap reconciliation must never load the complete artifact/blob store");
-    console.log("  native cap boundaries, same-ID replacement, and key-only blob inventory passed");
+      "cap reconciliation must never materialize the complete artifact/blob store at once");
+    console.log("  native cap boundaries, same-ID replacement, and streamed blob validation passed");
   } finally {
     await context.close();
   }
@@ -1480,6 +1588,7 @@ try {
   await withCaseDeadline("first-operation migration timing", runFirstOperationMigrationTiming(browser, origin));
   await withCaseDeadline("expiry boundary", runExpiryBoundary(browser, origin));
   await withCaseDeadline("corruption handling", runCorruptionFailClosed(browser, origin));
+  await withCaseDeadline("ledger byte mismatch", runLedgerByteMismatchReconciliation(browser, origin));
   await withCaseDeadline("summary-only cleanup", runSummaryOnlyRetentionCleanup(browser, origin));
   await withCaseDeadline("cap boundaries", runCapBoundaries(browser, origin));
   await withCaseDeadline("legacy over-cap migration", runLegacyOverCap(browser, origin));
