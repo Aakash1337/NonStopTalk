@@ -139,7 +139,7 @@ Implemented work includes:
   is regression coverage, not a claim of formal accessibility conformance
 - D1 migrations, platform API/repository tests, compact-summary client tests, configured/degraded capability status, and bounded scheduled anonymous-data cleanup
 - Expand-only schema-v4 sync-profile tables and one-device/one-profile backfill while device-owned session queries remain the rollback-safe authority
-- Schema-v5 cleanup heartbeat with monotonic cron timestamps, backlog/staleness readiness, and twice-hourly read-only production monitoring
+- Schema-v5 cleanup heartbeat with monotonic cron timestamps, backlog/staleness readiness, and a twice-hourly zero-secret read-only matrix that independently checks production `best-effort` and staging `durable-outbox` policy
 - A deployed schema-5/6 compatibility bridge plus the additive schema-v6 milestone-receipt table, strict internal receiver, bounded expiry cleanup, Release-A retry consumer, and configuration-gated Release-B normal-room producer, with canonical-payload, replay/conflict, post-commit analytics, physical-upgrade, rollback, FIFO retry/dead-letter, transaction replay, atomic alarm/state/event, capacity, exactly-one-routing, and schema-skew tests
 - Host-authorized Cloudflare topic generation with separate provider adapters, per-attempt consent, aggregate daily cost controls, and deterministic failure fallback
 - A separate-document operator analytics dashboard with strict CSP/no-transform isolation, source-quality tests, and narrow/mobile browser smoke coverage

@@ -1,11 +1,19 @@
 import process from "node:process";
 
+import {
+  assertExpectedAnalyticsDelivery,
+  resolveExpectedAnalyticsDelivery,
+} from "./smoke-production-policy.mjs";
 import { waitForPublicModuleGraph } from "./smoke-production-support.mjs";
 
 const configuredOrigin = process.argv[2]
   || process.env.NONSTOPTALK_PRODUCTION_ORIGIN
   || "https://dontstoptalking.org";
 const origin = new URL(configuredOrigin);
+const expectedAnalyticsDelivery = resolveExpectedAnalyticsDelivery(
+  process.argv[3],
+  process.env.NONSTOPTALK_EXPECTED_ANALYTICS_DELIVERY,
+);
 const WEB_ANALYTICS_ORIGIN = "https://static.cloudflareinsights.com";
 const PLATFORM_STATUS_ATTEMPTS = 5;
 const PLATFORM_STATUS_RETRY_MS = 1_000;
@@ -168,6 +176,10 @@ assert(status.capabilities?.cloudProgress?.status === "ready", "cloud progress i
 assert(status.capabilities?.retentionCleanup?.status === "ready", "retention cleanup is not ready");
 assert(status.capabilities?.roomFacts?.status === "ready", "room facts are not ready");
 assert(status.capabilities?.aggregateAnalytics?.status === "ready", "aggregate analytics is not ready");
+const observedAnalyticsDelivery = assertExpectedAnalyticsDelivery(
+  status.capabilities.aggregateAnalytics.delivery,
+  expectedAnalyticsDelivery,
+);
 assert(statusResponse.headers.get("cache-control") === "no-store", "platform status must not be cached");
 assert(Boolean(statusResponse.headers.get("x-request-id")), "platform status is missing its request ID");
 
@@ -176,6 +188,7 @@ console.log(JSON.stringify({
   origin: origin.origin,
   apiVersion: status.apiVersion,
   schemaVersion: status.schemaVersion,
+  analyticsDelivery: observedAnalyticsDelivery,
   checkedRoutes: [
     "/", "/practice", "/progress", "/app.js", "/coach-storage.js",
     "/admin/analytics", "/api/v1/platform/status",

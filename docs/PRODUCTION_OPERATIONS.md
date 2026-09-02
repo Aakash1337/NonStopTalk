@@ -103,7 +103,20 @@ After deployment, run the read-only production probe:
 npm run smoke:production
 ```
 
-Set `NONSTOPTALK_PRODUCTION_ORIGIN` to probe another HTTPS environment. The
+The expected delivery policy defaults to exact `best-effort`. To probe another
+HTTPS environment with a different reviewed policy, pass both values
+explicitly; the only accepted policies are `best-effort` and
+`durable-outbox`:
+
+```sh
+node scripts/smoke-production.mjs \
+  https://nonstoptalk-staging.aakashplays656.workers.dev \
+  durable-outbox
+```
+
+`NONSTOPTALK_PRODUCTION_ORIGIN` and
+`NONSTOPTALK_EXPECTED_ANALYTICS_DELIVERY` provide the equivalent environment
+interface; an explicit second command-line argument takes precedence. The
 probe never creates a room, changes consent, or writes a coaching record.
 
 The `Production health` GitHub Actions workflow runs this same probe at minutes
@@ -584,17 +597,28 @@ Worker code emits one JSON object per operational event. Search by the stable
 | `model_usage_reconciliation_failed` | A completed model attempt was not reconciled | Keep providers disabled until cost counters are understood |
 
 The scheduled GitHub workflow is the zero-secret, cheap-first baseline. It runs
-twice per hour and checks the public pages, the isolated dashboard document,
-security headers, and the canonical status response. GitHub schedules are
-best-effort: runs can be delayed or dropped during load, and public-repository
-schedules are automatically disabled after 60 days without repository activity.
-The cron actor should periodically verify recent runs and re-enable the workflow
-after a long inactive period. Actions notifications are not an uptime SLA. For
-an attended launch or a service with a response-time commitment, add an
-independent HTTPS monitor for the status endpoint at five-minute intervals and
-alert only after two consecutive failures. Alert on a non-200 response,
-`status != ok`, or a non-empty degraded list. Keep model providers offline
-during a D1 or budget-control incident. See GitHub's current
+twice per hour as one two-row matrix. The production row probes
+`https://dontstoptalking.org` and requires `best-effort` room-milestone
+delivery; the staging row probes the designated staging Workers.dev origin and
+requires `durable-outbox`. `fail-fast: false` lets either row report even when
+the other fails. Each row has a five-minute bound, checks the public pages, the
+isolated dashboard document, security headers, and canonical status response,
+and fails on a healthy-but-wrong delivery policy as well as normal readiness
+failures. It has read-only repository permission, persists no checkout
+credential, installs no dependency, possesses no secret, and makes no mutation.
+The manual dispatch uses the same fixed matrix; it cannot accept an arbitrary
+origin or relax the expected policy.
+
+GitHub schedules are best-effort: runs can be delayed or dropped during load,
+and public-repository schedules are automatically disabled after 60 days
+without repository activity. The cron actor should periodically verify recent
+runs and re-enable the workflow after a long inactive period. Actions
+notifications are not an uptime SLA. For an attended launch or a service with
+a response-time commitment, add an independent HTTPS monitor for each status
+endpoint at five-minute intervals and alert only after two consecutive
+failures. Alert on a non-200 response, `status != ok`, a non-empty degraded
+list, or delivery that differs from that environment's policy. Keep model
+providers offline during a D1 or budget-control incident. See GitHub's current
 [schedule-event notes](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
 and [scheduled-run troubleshooting](https://docs.github.com/en/actions/how-tos/troubleshoot-workflows#scheduled-workflows-running-at-unexpected-times).
 
@@ -698,7 +722,8 @@ rows remain after the 20-batch invocation budget. Public status exposes only
 `ready`, `stale`, or `backlog`; it never returns deletion counts, timestamps,
 identities, or content. The migration timestamp supplies the first-run grace
 heartbeat. A heartbeat becomes stale after 36 hours, so a normal daily run has
-12 hours of scheduling grace before the twice-hourly production probe fails.
+12 hours of scheduling grace before the production row in the twice-hourly
+health matrix fails.
 If status reports `backlog`, confirm the next cron clears it. If it reports
 `stale`, inspect cron history and `platform_cleanup_failed`. A production
 redeploy does not invoke `scheduled()`, and the local Wrangler test URL is not a
