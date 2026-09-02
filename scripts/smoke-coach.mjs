@@ -1,16 +1,32 @@
-import { spawn, spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import http from "node:http";
-import net from "node:net";
 import path from "node:path";
 import process from "node:process";
-import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 import AxeBuilder from "@axe-core/playwright";
 import { chromium } from "playwright";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const publicRoot = path.join(root, "cloudflare", "public");
+const assetContentTypes = new Map([
+  [".css", "text/css; charset=utf-8"],
+  [".html", "text/html; charset=utf-8"],
+  [".js", "text/javascript; charset=utf-8"],
+  [".json", "application/json; charset=utf-8"],
+  [".svg", "image/svg+xml"],
+]);
+const assetSecurityHeaders = {
+  "Cache-Control": "no-cache",
+  "Content-Security-Policy": "default-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self' blob:; script-src 'self' https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Resource-Policy": "same-origin",
+  "Permissions-Policy": "camera=(), geolocation=(), microphone=(self)",
+  "Referrer-Policy": "same-origin",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "X-Permitted-Cross-Domain-Policies": "none",
+};
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -35,54 +51,89 @@ function normalizeHyphenatedText(value) {
     .trim();
 }
 
-async function getFreePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      server.close(() => resolve(address.port));
-    });
+function sendAssetResponse(response, statusCode, body, contentType = "text/plain; charset=utf-8") {
+  response.writeHead(statusCode, {
+    ...assetSecurityHeaders,
+    "Content-Length": Buffer.byteLength(body),
+    "Content-Type": contentType,
   });
+  response.end(body);
 }
 
-async function readURL(url) {
-  return new Promise((resolve, reject) => {
-    const request = http.get(url, (response) => {
-      response.resume();
-      response.once("end", () => resolve(response.statusCode));
-    });
-    request.once("error", reject);
-    request.setTimeout(2_000, () => request.destroy(new Error(`Timed out loading ${url}`)));
-  });
-}
-
-async function waitForServer(url, child, output) {
-  const deadline = Date.now() + 60_000;
-  let lastError;
-  while (Date.now() < deadline) {
-    if (child.exitCode !== null) throw new Error(`Wrangler exited before startup (${child.exitCode}).\n${output()}`);
-    try {
-      if (await readURL(url) === 200) return;
-    } catch (error) {
-      lastError = error;
-    }
-    await delay(300);
-  }
-  throw new Error(`Wrangler did not start: ${lastError?.message || "timeout"}\n${output()}`);
-}
-
-function stopProcessTree(child) {
-  if (!child || child.killed) return;
-  if (process.platform === "win32") {
-    spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+async function serveStaticSpaAsset(request, response) {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    sendAssetResponse(response, 405, "Method not allowed");
     return;
   }
+
+  let pathname;
   try {
-    process.kill(-child.pid, "SIGTERM");
+    pathname = decodeURIComponent(new URL(request.url || "/", "http://127.0.0.1").pathname);
   } catch {
-    child.kill("SIGTERM");
+    sendAssetResponse(response, 400, "Bad request");
+    return;
   }
+
+  if (pathname === "/api" || pathname.startsWith("/api/")) {
+    sendAssetResponse(response, 404, "Not found");
+    return;
+  }
+
+  const assetPathname = pathname === "/" || path.extname(pathname) === ""
+    ? "/index.html"
+    : pathname;
+  const filePath = path.resolve(publicRoot, `.${assetPathname}`);
+  if (!filePath.startsWith(`${publicRoot}${path.sep}`)) {
+    sendAssetResponse(response, 404, "Not found");
+    return;
+  }
+
+  let body;
+  try {
+    body = await readFile(filePath);
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "EISDIR") {
+      sendAssetResponse(response, 404, "Not found");
+      return;
+    }
+    sendAssetResponse(response, 500, "Asset read failed");
+    return;
+  }
+
+  response.writeHead(200, {
+    ...assetSecurityHeaders,
+    "Content-Length": body.byteLength,
+    "Content-Type": assetContentTypes.get(path.extname(filePath)) || "application/octet-stream",
+  });
+  response.end(request.method === "HEAD" ? undefined : body);
+}
+
+async function startStaticSpaServer() {
+  const server = http.createServer((request, response) => {
+    void serveStaticSpaAsset(request, response);
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.removeListener("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  assert(address && typeof address !== "string", "The local asset server did not expose a TCP port");
+  return { origin: `http://127.0.0.1:${address.port}`, server };
+}
+
+async function stopStaticSpaServer(server) {
+  if (!server?.listening) return;
+  const closed = new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+  server.closeAllConnections?.();
+  await closed;
 }
 
 async function launchBrowser() {
@@ -2535,24 +2586,10 @@ async function runStalledCalibrationFlow(browser, origin) {
   await context.close();
 }
 
-const port = await getFreePort();
-const origin = `http://127.0.0.1:${port}`;
-const wrangler = path.join(root, "node_modules", "wrangler", "bin", "wrangler.js");
-let logs = "";
-const child = spawn(process.execPath, [wrangler, "dev", "--local", "--ip", "127.0.0.1", "--port", String(port)], {
-  cwd: root,
-  detached: process.platform !== "win32",
-  env: { ...process.env, NO_COLOR: "1" },
-  stdio: ["ignore", "pipe", "pipe"],
-});
-for (const stream of [child.stdout, child.stderr]) {
-  stream.setEncoding("utf8");
-  stream.on("data", (chunk) => { logs = `${logs}${chunk}`.slice(-20_000); });
-}
+const { origin, server } = await startStaticSpaServer();
 
 let browser;
 try {
-  await waitForServer(`${origin}/practice`, child, () => logs);
   browser = await launchBrowser();
   await runUnlabeledMicrophonePreviewFlow(browser, origin);
   await runMissingSelectedMicrophoneFallbackFlow(browser, origin);
@@ -2581,10 +2618,7 @@ try {
   await runStalledActiveFlow(browser, origin);
   await runStalledCalibrationFlow(browser, origin);
   console.log("Speech coaching browser smoke test passed.");
-} catch (error) {
-  if (logs.trim()) console.error(`Wrangler output captured before failure:\n${logs.trim()}`);
-  throw error;
 } finally {
   await browser?.close().catch(() => {});
-  stopProcessTree(child);
+  await stopStaticSpaServer(server);
 }
