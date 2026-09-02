@@ -26,6 +26,11 @@ const wrangler = path.join(root, "node_modules", "wrangler", "bin", "wrangler.js
 const WHOLE_SMOKE_TIMEOUT_MS = 180_000;
 const TOPIC = "A deterministic smoke-test topic";
 const IMPORTED_TOPICS = "Imported <strong>topic</strong>\nA second imported topic";
+const SOUND_STORAGE_KEY = "nonstoptalk.sound";
+const LEGACY_SOUND_STORAGE_KEY = "dont-stop-talking.sound";
+const SOUND_PREVIEW_RECIPE = [880];
+const SOUND_START_RECIPE = [660, 880];
+const SOUND_COMPLETED_RECIPE = [523, 659, 784];
 
 function boundedMessage(value) {
   return String(value instanceof Error ? value.message : value).slice(0, 500);
@@ -167,6 +172,7 @@ async function installSyntheticMicrophone(context, profile) {
       },
     ];
     let streamNumber = 0;
+    let audioContextNumber = 0;
     let releasePending = null;
 
     const harness = {
@@ -218,22 +224,63 @@ async function installSyntheticMicrophone(context, profile) {
       value: mediaDevices,
     });
 
+    class SyntheticAudioParam {
+      constructor(contextId, name, initialValue = 0) {
+        this.contextId = contextId;
+        this.name = name;
+        this.value = initialValue;
+      }
+
+      setValueAtTime(value, at) {
+        this.value = value;
+        events.push({ type: "audio-param-set", contextId: this.contextId, name: this.name, value, at });
+        return this;
+      }
+
+      linearRampToValueAtTime(value, at) {
+        this.value = value;
+        events.push({ type: "audio-param-linear-ramp", contextId: this.contextId, name: this.name, value, at });
+        return this;
+      }
+
+      exponentialRampToValueAtTime(value, at) {
+        this.value = value;
+        events.push({ type: "audio-param-exponential-ramp", contextId: this.contextId, name: this.name, value, at });
+        return this;
+      }
+
+      cancelScheduledValues(at) {
+        events.push({ type: "audio-param-cancel", contextId: this.contextId, name: this.name, at });
+        return this;
+      }
+    }
+
     class SyntheticAudioContext {
       constructor() {
+        this.contextId = `${microphoneProfile}-audio-context-${++audioContextNumber}`;
         this.state = "suspended";
-        events.push({ type: "audio-context-created" });
+        this.currentTime = 100;
+        this.destination = Object.freeze({
+          contextId: this.contextId,
+          syntheticAudioDestination: true,
+        });
+        events.push({ type: "audio-context-created", contextId: this.contextId });
       }
 
       async resume() {
         this.state = "running";
-        events.push({ type: "audio-context-resumed" });
+        events.push({ type: "audio-context-resumed", contextId: this.contextId });
       }
 
       createMediaStreamSource(stream) {
-        events.push({ type: "media-source-created", streamId: stream?.id || "" });
+        const contextId = this.contextId;
+        events.push({ type: "media-source-created", contextId, streamId: stream?.id || "" });
         return {
           connect() {
-            events.push({ type: "audio-graph-connected", streamId: stream?.id || "" });
+            events.push({ type: "audio-graph-connected", contextId, streamId: stream?.id || "" });
+          },
+          disconnect() {
+            events.push({ type: "media-source-disconnected", contextId, streamId: stream?.id || "" });
           },
         };
       }
@@ -245,23 +292,91 @@ async function installSyntheticMicrophone(context, profile) {
         };
       }
 
+      createOscillator() {
+        const contextId = this.contextId;
+        const oscillator = {
+          type: "sine",
+          frequency: new SyntheticAudioParam(contextId, "frequency", 440),
+          connect(target) {
+            events.push({
+              type: "oscillator-connected",
+              contextId,
+              targetContextId: target?.contextId || "",
+            });
+            return target;
+          },
+          disconnect() {
+            events.push({ type: "oscillator-disconnected", contextId });
+          },
+          start(at = 0) {
+            events.push({
+              type: "tone-start",
+              contextId,
+              frequency: oscillator.frequency.value,
+              oscillatorType: oscillator.type,
+              at,
+            });
+          },
+          stop(at = 0) {
+            events.push({ type: "tone-stop", contextId, at });
+          },
+        };
+        events.push({ type: "oscillator-created", contextId });
+        return oscillator;
+      }
+
+      createGain() {
+        const contextId = this.contextId;
+        const node = {
+          contextId,
+          gain: new SyntheticAudioParam(contextId, "gain", 1),
+          connect(target) {
+            events.push({
+              type: "gain-connected",
+              contextId,
+              targetContextId: target?.contextId || "",
+              destination: target?.syntheticAudioDestination === true,
+            });
+            return target;
+          },
+          disconnect() {
+            events.push({ type: "gain-disconnected", contextId });
+          },
+        };
+        events.push({ type: "gain-created", contextId });
+        return node;
+      }
+
       async close() {
+        if (this.state === "closed") return;
         this.state = "closed";
-        events.push({ type: "audio-context-closed" });
+        events.push({ type: "audio-context-closed", contextId: this.contextId });
       }
     }
     window.AudioContext = SyntheticAudioContext;
     window.webkitAudioContext = SyntheticAudioContext;
 
     const originalFetch = window.fetch.bind(window);
-    window.fetch = (input, init) => {
+    window.fetch = async (input, init) => {
       const url = new URL(typeof input === "string" ? input : input.url, location.href);
       let body = null;
       try { body = JSON.parse(init?.body || "null"); } catch { /* Only JSON room actions matter here. */ }
-      if (/^\/api\/rooms\/[A-HJ-NP-Z2-9]{6}\/action$/u.test(url.pathname)) {
+      const roomAction = /^\/api\/rooms\/[A-HJ-NP-Z2-9]{6}\/action$/u.test(url.pathname);
+      if (roomAction) {
         events.push({ type: "room-action", body });
       }
-      return originalFetch(input, init);
+      try {
+        const response = await originalFetch(input, init);
+        if (roomAction) {
+          events.push({ type: "room-action-response", body, status: response.status });
+        }
+        return response;
+      } catch (error) {
+        if (roomAction) {
+          events.push({ type: "room-action-error", body, name: error?.name || "Error" });
+        }
+        throw error;
+      }
     };
   }, { microphoneProfile: profile });
 }
@@ -276,6 +391,42 @@ async function readDownloadText(download) {
 
 function assertNoNewApiRequests(requests, before, label) {
   assert.deepEqual(requests.slice(before), [], `${label} unexpectedly contacted a site API.`);
+}
+
+function toneEvents(events) {
+  return events.filter((event) => event.type === "tone-start");
+}
+
+function toneFrequencies(events) {
+  return toneEvents(events).map((event) => event.frequency);
+}
+
+function eventIndex(events, predicate, label) {
+  const index = events.findIndex(predicate);
+  assert(index >= 0, `${label} was not recorded. Events: ${JSON.stringify(events)}`);
+  return index;
+}
+
+function assertStrictEventOrder(entries) {
+  for (let index = 1; index < entries.length; index += 1) {
+    assert(entries[index - 1][0] < entries[index][0],
+      `${entries[index - 1][1]} must precede ${entries[index][1]}.`);
+  }
+}
+
+async function readHarnessEvents(page, offset = 0) {
+  return page.evaluate((start) => window.__microphoneHarness.events.slice(start), offset);
+}
+
+async function harnessEventCount(page) {
+  return page.evaluate(() => window.__microphoneHarness.events.length);
+}
+
+async function waitForToneRecipe(page, offset, recipe, label, signal) {
+  return eventually(async () => {
+    const events = await readHarnessEvents(page, offset);
+    return toneFrequencies(events).length >= recipe.length ? events : null;
+  }, `${label} did not play`, signal);
 }
 
 async function eventually(check, label, signal, timeoutMs = 12_000) {
@@ -436,6 +587,7 @@ async function runBrowserFlow(origin, signal) {
     const hostTracker = trackBrowser(host, "host");
     const guestTracker = trackBrowser(guest, "guest");
     const hostApiRequests = trackApiRequests(host);
+    const guestApiRequests = trackApiRequests(guest);
     for (const page of [host, guest]) {
       page.setDefaultTimeout(12_000);
       page.setDefaultNavigationTimeout(20_000);
@@ -798,6 +950,209 @@ async function runBrowserFlow(origin, signal) {
     assert.equal(await guest.getByRole("button", { name: "Manual timer" }).count(), 0);
     assert.equal(await guest.getByRole("button", { name: "Mark complete" }).count(), 0);
 
+    // Sound is an optional driver-only browser preference. Disabling it is
+    // silent and local, survives a full reload, and never becomes a room
+    // mutation or a preference in another isolated browser identity.
+    let soundToggle = host.getByRole("button", { name: "Sound cues" });
+    assert.equal(await soundToggle.count(), 1,
+      "The current room driver must receive one sound-cue toggle.");
+    assert.equal(await soundToggle.getAttribute("aria-pressed"), "true",
+      "Sound cues must default on when no browser opt-out exists.");
+    assert.equal(await guest.getByRole("button", { name: "Sound cues" }).count(), 0,
+      "A spectator must not receive local turn-driver sound controls.");
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host)), [],
+      "Opening and drawing a turn must not autoplay a cue before the driver starts.");
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(guest)), [],
+      "Remote room setup must not autoplay sound in a spectator browser.");
+
+    requestCount = hostApiRequests.length;
+    let soundEventOffset = await harnessEventCount(host);
+    await soundToggle.click();
+    assert.equal(await soundToggle.getAttribute("aria-pressed"), "false");
+    assert.deepEqual(await host.evaluate(({ current, legacy }) => ({
+      current: localStorage.getItem(current),
+      legacy: localStorage.getItem(legacy),
+    }), { current: SOUND_STORAGE_KEY, legacy: LEGACY_SOUND_STORAGE_KEY }), {
+      current: "off",
+      legacy: null,
+    });
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host, soundEventOffset)), [],
+      "Disabling sound must not play a confirmation cue.");
+    assertNoNewApiRequests(hostApiRequests, requestCount, "Disabling browser-local sound cues");
+    assert.deepEqual(await guest.evaluate(({ current, legacy }) => ({
+      current: localStorage.getItem(current),
+      legacy: localStorage.getItem(legacy),
+    }), { current: SOUND_STORAGE_KEY, legacy: LEGACY_SOUND_STORAGE_KEY }), {
+      current: null,
+      legacy: null,
+    }, "The host sound preference must not cross isolated browser contexts.");
+
+    const socketCountBeforeSoundReload = hostTracker.sockets
+      .filter((socket) => new URL(socket.url).pathname === `/api/rooms/${code}/socket`).length;
+    await host.reload({ waitUntil: "domcontentloaded" });
+    await host.locator(".turn-card .room-state-title").filter({ hasText: TOPIC }).waitFor();
+    await waitForSocket(hostTracker, code, signal, socketCountBeforeSoundReload);
+    soundToggle = host.getByRole("button", { name: "Sound cues" });
+    assert.equal(await soundToggle.getAttribute("aria-pressed"), "false",
+      "The sound opt-out must survive a full active-turn reload.");
+    assert.equal(await host.evaluate((key) => localStorage.getItem(key), SOUND_STORAGE_KEY), "off");
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host)), [],
+      "Reloading directly into an active turn must not replay a cue.");
+
+    requestCount = hostApiRequests.length;
+    soundEventOffset = await harnessEventCount(host);
+    await soundToggle.click();
+    assert.equal(await soundToggle.getAttribute("aria-pressed"), "true");
+    assert.equal(await host.evaluate((key) => localStorage.getItem(key), SOUND_STORAGE_KEY), null,
+      "The default-on sound setting must be represented by removing the opt-out.");
+    const soundPreviewEvents = await waitForToneRecipe(
+      host,
+      soundEventOffset,
+      SOUND_PREVIEW_RECIPE,
+      "The user-activated sound preview",
+      signal,
+    );
+    assert.deepEqual(toneFrequencies(soundPreviewEvents), SOUND_PREVIEW_RECIPE,
+      "Enabling sound must play exactly one short preview cue.");
+    assertNoNewApiRequests(hostApiRequests, requestCount, "Enabling browser-local sound cues");
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(guest)), [],
+      "A sound preview must stay in the browser where the user enabled it.");
+
+    // A cue is confirmation of an authoritative action, not merely of a local
+    // click. Exercise both a rejected begin and an accepted response that
+    // arrives after SPA navigation invalidates the initiating room route.
+    const roomActionRoute = `**/api/rooms/${code}/action`;
+    const rejectedBeginHandler = async (route) => {
+      const action = route.request().postDataJSON();
+      if (action?.type !== "begin-turn") {
+        await route.continue();
+        return;
+      }
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "Synthetic rejected begin-turn." }),
+      });
+    };
+    await host.route(roomActionRoute, rejectedBeginHandler);
+    requestCount = hostApiRequests.length;
+    soundEventOffset = await harnessEventCount(host);
+    await host.getByRole("button", { name: "Manual timer" }).click();
+    await host.locator("#toast").filter({ hasText: "Synthetic rejected begin-turn." }).waitFor();
+    const rejectedBeginEvents = await eventually(async () => {
+      const events = await readHarnessEvents(host, soundEventOffset);
+      return events.some((event) => event.type === "room-action-response"
+        && event.body?.type === "begin-turn"
+        && event.status === 409) ? events : null;
+    }, "The rejected begin-turn response was not observed", signal);
+    assert.deepEqual(toneFrequencies(rejectedBeginEvents), [],
+      "A rejected begin-turn must not play a start cue.");
+    assert.equal(hostApiRequests.slice(requestCount)
+      .filter((request) => request.body?.type === "begin-turn").length, 1,
+    "The rejected manual start must make exactly one begin-turn attempt.");
+    assert.equal(await host.getByRole("button", { name: "End turn" }).count(), 0,
+      "A rejected begin-turn must not install a local timer controller.");
+    await host.unroute(roomActionRoute, rejectedBeginHandler);
+
+    let releaseAuthorityBeginResponse;
+    let observeAuthorityBeginRequest;
+    const authorityBeginResponseGate = new Promise((resolve) => { releaseAuthorityBeginResponse = resolve; });
+    const authorityBeginRequestObserved = new Promise((resolve) => { observeAuthorityBeginRequest = resolve; });
+    const authorityBeginHandler = async (route) => {
+      const action = route.request().postDataJSON();
+      if (action?.type !== "begin-turn") {
+        await route.continue();
+        return;
+      }
+      observeAuthorityBeginRequest();
+      await authorityBeginResponseGate;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ room: null }),
+      });
+    };
+    await host.route(roomActionRoute, authorityBeginHandler);
+    soundEventOffset = await harnessEventCount(host);
+    const authorityStartClick = host.getByRole("button", { name: "Manual timer" }).click();
+    await authorityBeginRequestObserved;
+    await postRoomAction(hostContext, origin, code, {
+      type: "transfer-host",
+      playerId: guestPlayerId,
+    });
+    await eventually(
+      () => host.getByRole("button", { name: "Mark complete" }).count().then((count) => count === 0),
+      "The initiating browser did not render its changed driver authority",
+      signal,
+    );
+    releaseAuthorityBeginResponse();
+    await authorityStartClick;
+    const authorityBeginEvents = await eventually(async () => {
+      const events = await readHarnessEvents(host, soundEventOffset);
+      return events.some((event) => event.type === "room-action-response"
+        && event.body?.type === "begin-turn"
+        && event.status === 200) ? events : null;
+    }, "The authority-stale begin-turn response was not observed", signal);
+    assert.deepEqual(toneFrequencies(authorityBeginEvents), [],
+      "A begin-turn response accepted after driver authority changes must not play a start cue.");
+    assert.equal(await host.getByRole("button", { name: "End turn" }).count(), 0,
+      "An authority-stale begin-turn response must not install a manual controller.");
+    await host.unroute(roomActionRoute, authorityBeginHandler);
+    await postRoomAction(guestContext, origin, code, {
+      type: "transfer-host",
+      playerId: hostPlayerId,
+    });
+    await host.getByRole("button", { name: "Mark complete" }).waitFor();
+
+    let releaseStaleBeginResponse;
+    let observeStaleBeginRequest;
+    const staleBeginResponseGate = new Promise((resolve) => { releaseStaleBeginResponse = resolve; });
+    const staleBeginRequestObserved = new Promise((resolve) => { observeStaleBeginRequest = resolve; });
+    const staleBeginHandler = async (route) => {
+      const action = route.request().postDataJSON();
+      if (action?.type !== "begin-turn") {
+        await route.continue();
+        return;
+      }
+      observeStaleBeginRequest();
+      await staleBeginResponseGate;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ room: null }),
+      });
+    };
+    await host.route(roomActionRoute, staleBeginHandler);
+    const socketCountBeforeStaleRoute = hostTracker.sockets
+      .filter((socket) => new URL(socket.url).pathname === `/api/rooms/${code}/socket`).length;
+    soundEventOffset = await harnessEventCount(host);
+    const staleStartClick = host.getByRole("button", { name: "Manual timer" }).click();
+    await staleBeginRequestObserved;
+    await host.getByRole("link", { name: "Home", exact: true }).click();
+    await host.getByRole("heading", { level: 1, name: "Find your voice." }).waitFor();
+    releaseStaleBeginResponse();
+    await staleStartClick;
+    const staleBeginEvents = await eventually(async () => {
+      const events = await readHarnessEvents(host, soundEventOffset);
+      return events.some((event) => event.type === "room-action-response"
+        && event.body?.type === "begin-turn"
+        && event.status === 200) ? events : null;
+    }, "The route-stale begin-turn response was not observed", signal);
+    assert.deepEqual(toneFrequencies(staleBeginEvents), [],
+      "A begin-turn response delivered after route invalidation must not play a start cue.");
+    assert.equal(await host.getByRole("button", { name: "End turn" }).count(), 0,
+      "A route-stale begin-turn response must not restore room controls on Home.");
+    await host.unroute(roomActionRoute, staleBeginHandler);
+    await host.goBack();
+    await host.getByRole("heading", { level: 1, name: `Room ${code}` }).waitFor();
+    await host.locator(".turn-card .room-state-title").filter({ hasText: TOPIC }).waitFor();
+    await waitForSocket(hostTracker, code, signal, socketCountBeforeStaleRoute);
+    const roomAfterStaleBegin = await readRoom(host, code);
+    assert.equal(roomAfterStaleBegin.payload.room?.activeTurn?.begunAt, null,
+      "The synthetic route-stale response must leave the authoritative turn unbegun.");
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host, soundEventOffset)), [],
+      "Returning to the unbegun room must not replay the invalidated start cue.");
+
     // The microphone preference is local to the current driver. It survives a
     // harmless room rerender, restores focus to the replacement opener, and
     // never creates a room action or exposes its device metadata to the guest.
@@ -821,6 +1176,7 @@ async function runBrowserFlow(origin, signal) {
 
     const hostSocketFramesBeforePickerRerender = hostTracker.sockets
       .reduce((total, socket) => total + socket.frames, 0);
+    soundEventOffset = await harnessEventCount(host);
     await postRoomAction(hostContext, origin, code, {
       type: "score",
       playerId: guestPlayerId,
@@ -836,6 +1192,8 @@ async function runBrowserFlow(origin, signal) {
       "A benign WebSocket rerender must not close the active microphone picker.");
     assert(await microphoneList.evaluate((control) => document.activeElement === control),
       "A benign WebSocket rerender must preserve focus inside the microphone picker.");
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host, soundEventOffset)), [],
+      "A remote benign WebSocket rerender must not replay a local sound cue.");
     await microphoneDialog.getByRole("button", { name: "Cancel" }).click();
     await microphoneDialog.waitFor({ state: "hidden" });
     microphoneOpener = host.getByRole("button", { name: "Choose microphone" });
@@ -920,22 +1278,69 @@ async function runBrowserFlow(origin, signal) {
     assert.equal(beforeMediaRelease.some((event) => event.type === "stream-ready"), false);
     assert.equal(beforeMediaRelease.some((event) => event.type === "room-action"), false,
       "begin-turn must not be attempted while microphone acquisition is pending.");
+    assert.deepEqual(toneFrequencies(beforeMediaRelease), [],
+      "A start cue must not play while microphone acquisition is pending.");
 
     await host.evaluate(() => window.__microphoneHarness.releasePendingUserMedia());
     await host.getByRole("button", { name: "End turn" }).waitFor();
-    const microphoneEvents = await host.evaluate((offset) =>
-      window.__microphoneHarness.events.slice(offset), microphoneEventOffset);
-    const eventIndex = (type) => microphoneEvents.findIndex((event) => event.type === type);
+    const microphoneEvents = await waitForToneRecipe(
+      host,
+      microphoneEventOffset,
+      SOUND_START_RECIPE,
+      "The accepted microphone start cue",
+      signal,
+    );
     const microphoneRequest = microphoneEvents.find((event) => event.type === "get-user-media");
     assert.deepEqual(microphoneRequest?.constraints, {
       audio: { deviceId: { exact: "host-mic" } },
       video: false,
     }, "The chosen opaque ID must become an exact audio device constraint.");
-    assert(eventIndex("stream-ready") >= 0);
-    assert(eventIndex("audio-context-resumed") > eventIndex("stream-ready"));
-    assert(eventIndex("audio-graph-connected") > eventIndex("audio-context-resumed"));
-    assert(eventIndex("room-action") > eventIndex("audio-graph-connected"),
-      "The room turn must begin only after the microphone audio graph is usable.");
+    assert.deepEqual(toneFrequencies(microphoneEvents), SOUND_START_RECIPE,
+      "A successful microphone start must play the two-tone start recipe exactly once.");
+    const mediaSource = microphoneEvents.find((event) => event.type === "media-source-created");
+    const startTones = toneEvents(microphoneEvents);
+    assert(mediaSource?.contextId, "The synthetic microphone graph must identify its AudioContext.");
+    assert(startTones.every((event) => event.contextId && event.contextId !== mediaSource.contextId),
+      "Sound cues must use a context independent from microphone analysis.");
+    assert.equal(new Set(startTones.map((event) => event.contextId)).size, 1,
+      "One successful start recipe must use one cue AudioContext.");
+    const cueContextId = startTones[0].contextId;
+    const streamReadyIndex = eventIndex(
+      microphoneEvents,
+      (event) => event.type === "stream-ready",
+      "usable microphone stream",
+    );
+    const microphoneResumeIndex = eventIndex(
+      microphoneEvents,
+      (event) => event.type === "audio-context-resumed" && event.contextId === mediaSource.contextId,
+      "microphone AudioContext resume",
+    );
+    const graphConnectedIndex = eventIndex(
+      microphoneEvents,
+      (event) => event.type === "audio-graph-connected" && event.contextId === mediaSource.contextId,
+      "microphone graph connection",
+    );
+    const beginRequestIndex = eventIndex(
+      microphoneEvents,
+      (event) => event.type === "room-action" && event.body?.type === "begin-turn",
+      "begin-turn request",
+    );
+    const beginResponseIndex = eventIndex(
+      microphoneEvents,
+      (event) => event.type === "room-action-response"
+        && event.body?.type === "begin-turn"
+        && event.status === 200,
+      "accepted begin-turn response",
+    );
+    assertStrictEventOrder([
+      [streamReadyIndex, "usable microphone stream"],
+      [microphoneResumeIndex, "microphone AudioContext resume"],
+      [graphConnectedIndex, "microphone graph connection"],
+      [beginRequestIndex, "begin-turn request"],
+      [beginResponseIndex, "accepted begin-turn response"],
+      [microphoneEvents.indexOf(startTones[0]), "first start tone"],
+      [microphoneEvents.indexOf(startTones[1]), "second start tone"],
+    ]);
     const microphoneStartRequests = hostApiRequests.slice(requestCount);
     assert.equal(microphoneStartRequests.length, 1,
       "Starting with a usable microphone must send exactly one room action.");
@@ -960,6 +1365,7 @@ async function runBrowserFlow(origin, signal) {
 
     const activeStreamId = microphoneEvents.find((event) => event.type === "stream-ready")?.streamId;
     assert(activeStreamId, "The selected microphone start must expose a synthetic active stream.");
+    const authoritySoundEventOffset = await harnessEventCount(host);
     await postRoomAction(hostContext, origin, code, {
       type: "transfer-host",
       playerId: guestPlayerId,
@@ -976,7 +1382,51 @@ async function runBrowserFlow(origin, signal) {
       playerId: hostPlayerId,
     });
     await host.getByRole("button", { name: "Mark complete" }).waitFor();
+    const authorityEvents = await readHarnessEvents(host, authoritySoundEventOffset);
+    assert.deepEqual(toneFrequencies(authorityEvents), [],
+      "Changing and restoring driver authority must not replay the start cue.");
+    assert(authorityEvents.some((event) =>
+      event.type === "audio-context-closed" && event.contextId === mediaSource.contextId),
+    "Losing driver authority must close the microphone analysis context.");
+    assert.equal(authorityEvents.some((event) =>
+      event.type === "audio-context-closed" && event.contextId === cueContextId), false,
+    "Microphone-controller cleanup must not close the independent cue context.");
 
+    // Manual timing is scoped to the same exact driver identity as microphone
+    // monitoring. A host transfer can leave this browser seated as the active
+    // player, but that authority transition must still retire the old local
+    // controller instead of letting it tick or submit under a stale identity.
+    const manualResumeEventOffset = await harnessEventCount(host);
+    await host.getByRole("button", { name: "Resume manual" }).click();
+    await host.getByRole("button", { name: "End turn" }).waitFor();
+    const manualResumeEvents = await waitForToneRecipe(
+      host,
+      manualResumeEventOffset,
+      SOUND_START_RECIPE,
+      "The accepted manual resume cue",
+      signal,
+    );
+    assert.deepEqual(toneFrequencies(manualResumeEvents), SOUND_START_RECIPE,
+      "A local manual resume must play one start recipe.");
+    const manualAuthorityEventOffset = await harnessEventCount(host);
+    const pageRequestsBeforeManualTransfer = hostApiRequests.length;
+    await postRoomAction(hostContext, origin, code, {
+      type: "transfer-host",
+      playerId: guestPlayerId,
+    });
+    await host.getByRole("button", { name: "Resume manual" }).waitFor();
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host, manualAuthorityEventOffset)), [],
+      "A stale manual controller must stop without emitting countdown or terminal cues.");
+    assert.equal(hostApiRequests.slice(pageRequestsBeforeManualTransfer)
+      .some((request) => request.body?.type === "submit-turn"), false,
+    "A manual controller retired by authority loss must not submit the turn.");
+    await postRoomAction(guestContext, origin, code, {
+      type: "transfer-host",
+      playerId: hostPlayerId,
+    });
+    await host.getByRole("button", { name: "Mark complete" }).waitFor();
+
+    const completionEventOffset = await harnessEventCount(host);
     await host.getByRole("button", { name: "Mark complete" }).click();
     await Promise.all([
       eventually(() => host.locator(".score-callout").textContent().then((text) => text?.trim() === "Cloud Host earned 35 points"),
@@ -984,6 +1434,39 @@ async function runBrowserFlow(origin, signal) {
       eventually(() => guest.locator(".score-callout").textContent().then((text) => text?.trim() === "Cloud Host earned 35 points"),
         "Guest score did not converge", signal),
     ]);
+    const completionEvents = await waitForToneRecipe(
+      host,
+      completionEventOffset,
+      SOUND_COMPLETED_RECIPE,
+      "The authoritative completed-turn cue",
+      signal,
+    );
+    const completionTones = toneEvents(completionEvents);
+    assert.deepEqual(toneFrequencies(completionEvents), SOUND_COMPLETED_RECIPE,
+      "One accepted completion must play the three-tone completed recipe exactly once.");
+    assert(completionTones.every((event) => event.contextId === cueContextId),
+      "The completed recipe must reuse the driver's independent cue context.");
+    const submitRequestIndex = eventIndex(
+      completionEvents,
+      (event) => event.type === "room-action" && event.body?.type === "submit-turn",
+      "completed submit-turn request",
+    );
+    const submitResponseIndex = eventIndex(
+      completionEvents,
+      (event) => event.type === "room-action-response"
+        && event.body?.type === "submit-turn"
+        && event.status === 200,
+      "accepted completed submit-turn response",
+    );
+    assertStrictEventOrder([
+      [submitRequestIndex, "completed submit-turn request"],
+      [submitResponseIndex, "accepted completed submit-turn response"],
+      [completionEvents.indexOf(completionTones[0]), "first completed tone"],
+      [completionEvents.indexOf(completionTones[1]), "second completed tone"],
+      [completionEvents.indexOf(completionTones[2]), "third completed tone"],
+    ]);
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(guest)), [],
+      "A spectator must not play another browser's start or completed cues.");
     assert.match(await host.locator(".panel.wide").first().textContent(), /10 of 10 seconds.*25-point completion bonus/su);
     const hostScore = host.locator(".score-row").filter({ hasText: "Cloud Host" }).locator(":scope > span").nth(1);
     assert.equal((await hostScore.textContent())?.trim(), "35 pts");
@@ -994,6 +1477,8 @@ async function runBrowserFlow(origin, signal) {
     await eventually(() => host.locator(".score-callout").textContent().then((text) => text?.trim() === "Cloud Host earned 35 points"),
       "Host score did not survive reload", signal);
     await waitForSocket(hostTracker, code, signal, socketCountBeforeReload);
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host)), [],
+      "Reloading an already-scored room must not replay its completed cue.");
     const persisted = await readRoom(host, code);
     assert.equal(persisted.status, 200);
     assert.equal(persisted.payload.room?.phase, "playing");
@@ -1010,6 +1495,10 @@ async function runBrowserFlow(origin, signal) {
     ]);
     assert.equal((await guest.locator(".turn-card .room-state-title").textContent())?.trim(), TOPIC);
     assert.equal((await host.locator(".turn-card .room-state-title").textContent())?.trim(), TOPIC);
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host)), [],
+      "The reloaded host must not cue when another browser draws the next turn.");
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(guest)), [],
+      "Drawing a topic must not be mistaken for starting its timer.");
 
     // This same non-host browser had no picker while spectating the first turn.
     // Once it becomes the active speaker, it receives an isolated local picker
@@ -1042,14 +1531,101 @@ async function runBrowserFlow(origin, signal) {
       signal,
     );
 
+    // The active speaker has an independent preference. Exercise both values so
+    // the start recipe below also proves that enabling confirmation is not
+    // confused with an authoritative begin-turn cue.
+    let guestSoundToggle = guest.getByRole("button", { name: "Sound cues" });
+    assert.equal(await guestSoundToggle.count(), 1,
+      "The non-host active speaker must receive local sound controls.");
+    assert.equal(await guestSoundToggle.getAttribute("aria-pressed"), "true");
+    assert.equal(await host.getByRole("button", { name: "Sound cues" }).getAttribute("aria-pressed"), "true",
+      "The host browser's sound preference must remain enabled independently.");
+    let guestRequestCount = guestApiRequests.length;
+    let guestSoundEventOffset = await harnessEventCount(guest);
+    await guestSoundToggle.click();
+    assert.equal(await guestSoundToggle.getAttribute("aria-pressed"), "false");
+    assert.equal(await guest.evaluate((key) => localStorage.getItem(key), SOUND_STORAGE_KEY), "off");
+    assert.equal(await host.evaluate((key) => localStorage.getItem(key), SOUND_STORAGE_KEY), null,
+      "One browser identity must not disable another browser's cues.");
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(guest, guestSoundEventOffset)), [],
+      "Disabling the active speaker's cues must remain silent.");
+    assertNoNewApiRequests(guestApiRequests, guestRequestCount, "Disabling guest-local sound cues");
+
+    guestRequestCount = guestApiRequests.length;
+    guestSoundEventOffset = await harnessEventCount(guest);
+    await guestSoundToggle.click();
+    assert.equal(await guestSoundToggle.getAttribute("aria-pressed"), "true");
+    assert.equal(await guest.evaluate((key) => localStorage.getItem(key), SOUND_STORAGE_KEY), null);
+    const guestPreviewEvents = await waitForToneRecipe(
+      guest,
+      guestSoundEventOffset,
+      SOUND_PREVIEW_RECIPE,
+      "The guest's user-activated sound preview",
+      signal,
+    );
+    assert.deepEqual(toneFrequencies(guestPreviewEvents), SOUND_PREVIEW_RECIPE);
+    assertNoNewApiRequests(guestApiRequests, guestRequestCount, "Enabling guest-local sound cues");
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host)), [],
+      "The host must not play a remote browser's sound preview.");
+
+    guestRequestCount = guestApiRequests.length;
+    const guestStartEventOffset = await harnessEventCount(guest);
     await guest.getByRole("button", { name: "Manual timer" }).click();
     const endTurn = guest.getByRole("button", { name: "End turn" });
     await endTurn.waitFor();
+    const guestStartEvents = await waitForToneRecipe(
+      guest,
+      guestStartEventOffset,
+      SOUND_START_RECIPE,
+      "The accepted manual start cue",
+      signal,
+    );
+    const guestStartTones = toneEvents(guestStartEvents);
+    assert.deepEqual(toneFrequencies(guestStartEvents), SOUND_START_RECIPE,
+      "The active guest's manual start must play the start recipe exactly once.");
+    const guestBeginRequestIndex = eventIndex(
+      guestStartEvents,
+      (event) => event.type === "room-action" && event.body?.type === "begin-turn",
+      "guest begin-turn request",
+    );
+    const guestBeginResponseIndex = eventIndex(
+      guestStartEvents,
+      (event) => event.type === "room-action-response"
+        && event.body?.type === "begin-turn"
+        && event.status === 200,
+      "accepted guest begin-turn response",
+    );
+    assertStrictEventOrder([
+      [guestBeginRequestIndex, "guest begin-turn request"],
+      [guestBeginResponseIndex, "accepted guest begin-turn response"],
+      [guestStartEvents.indexOf(guestStartTones[0]), "guest first start tone"],
+      [guestStartEvents.indexOf(guestStartTones[1]), "guest second start tone"],
+    ]);
+    assert.equal(guestApiRequests.slice(guestRequestCount)
+      .filter((request) => request.body?.type === "begin-turn").length, 1,
+    "The manual start must send exactly one begin-turn action.");
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host)), [],
+      "A host that did not start or resume the timer must not play the remote start cue.");
+
+    const ordinaryEndEventOffset = await harnessEventCount(guest);
     await endTurn.click();
     await Promise.all([
       host.locator(".winner").waitFor(),
       guest.locator(".winner").waitFor(),
     ]);
+    const ordinaryEndEvents = await readHarnessEvents(guest, ordinaryEndEventOffset);
+    const ordinaryEndResponseIndex = eventIndex(
+      ordinaryEndEvents,
+      (event) => event.type === "room-action-response"
+        && event.body?.type === "submit-turn"
+        && event.status === 200,
+      "accepted ordinary submit-turn response",
+    );
+    assert(ordinaryEndResponseIndex >= 0);
+    assert.deepEqual(toneFrequencies(ordinaryEndEvents), [],
+      "An ordinary End turn must not play completed or eliminated tones.");
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host)), [],
+      "Remote turn completion and the winner view must remain silent in the host browser.");
     assert.equal((await host.locator(".winner .room-state-title").textContent())?.trim(), "Cloud Host");
     assert.equal((await guest.locator(".winner .room-state-title").textContent())?.trim(), "Cloud Host");
     assert.equal((await host.locator(".winner .score-callout").textContent())?.trim(), "35 points");

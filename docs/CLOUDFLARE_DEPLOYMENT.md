@@ -71,6 +71,7 @@ npm run typecheck:cloudflare
 npm run test:cloudflare
 npm run test:setup-kits
 npm run test:microphone-selection
+npm run test:sound-cues
 npm run test:cloudflare-runtime
 npm run test:cloudflare-runtime-outbox
 npm run test:worker-runtime-runner
@@ -115,7 +116,7 @@ The one-time production exact-outbox activation canary completed on 2026-09-02. 
 GitHub's `Production health` workflow runs a fixed read-only matrix every 30
 minutes and on manual dispatch. It requires production and the isolated staging
 Worker to report `durable-outbox` and recursively derives the complete deployable
-`.js`/`.mjs` Static Assets manifest under `cloudflare/public` (currently ten
+`.js`/`.mjs` Static Assets manifest under `cloudflare/public` (currently eleven
 files). It requires canonical UTF-8 without a BOM and exact checked-out source,
 JavaScript MIME, `nosniff`, a nonempty non-HTML body, valid module syntax, and
 the reviewed per-path, per-file, file-count, and aggregate bounds. The existing
@@ -188,7 +189,7 @@ Each online room owns one Durable Object selected by its room code. The object s
 
 A room is deleted after 30 days without a state change. The alarm closes any remaining sockets and clears the object's storage. Production and staging use exact lowercase `outbox`, so each real milestone mutation atomically writes the room state, complete ordered event group, stable lifecycle metadata, and shared alarm. The consumer recognizes and drains a valid version-1 outbox during exact operation or a compatible rollback, one FIFO head per use of the object's shared alarm, with bounded persisted retry/dead-letter handling. Browser identity is an unguessable, HTTP-only cookie; clearing that cookie loses the corresponding seat/host identity.
 
-The repository's free online multiplayer source mirrors the core room, setup, topic, explicit browser-local microphone choice/manual timer, classic scoring, score override, standings, history, host transfer, and host-claim flows. The current driver shares the same opaque-ID-only microphone preference as Practice; selection is local and does not touch the room API, D1, Analytics Engine, or a model. It also produces editable topic drafts through deterministic templates or the optional provider boundary described below, supports host-only named device-local setup kits, and imports/exports custom-topic editor text. The remaining known Go-game parity gaps are the AI judge and sound cues.
+The repository's free online multiplayer source mirrors the core room, setup, topic, explicit browser-local microphone choice/manual timer, short sound cues, classic scoring, score override, standings, history, host transfer, and host-claim flows. The current driver shares the same opaque-ID-only microphone preference as Practice; selection is local and does not touch the room API, D1, Analytics Engine, or a model. Its separate sound preference defaults on, stores only an `off` opt-out in origin-local `localStorage`, synchronizes within the browser profile, and synthesizes bounded tones without fetching media or sending an application request. It also produces editable topic drafts through deterministic templates or the optional provider boundary described below, supports host-only named device-local setup kits, and imports/exports custom-topic editor text. The remaining known Go-game parity gap is the AI judge.
 
 Setup kits store their name, currently applied duration/silence/rounds, topic-pack choice, and custom topics unencrypted in best-effort `localStorage` for that origin/browser profile. They are unsynced and have no server recovery. The bounds are 25 kits, 40 Unicode code points per name, 500 custom topics of 200 code points each, 20,000 editor characters, 64 KiB per imported topic file before reading, and 512 KiB for the serialized store. Import fills only the editor draft until explicit use; an exported `nonstoptalk-topics.txt` file is outside app deletion/control. Deleting coaching history does not delete this separate game store.
 

@@ -149,12 +149,13 @@ Implemented work includes:
 - Host-authorized Cloudflare topic generation with separate provider adapters, per-attempt consent, aggregate daily cost controls, and deterministic failure fallback
 - Bounded Cloudflare setup-kit storage, plain-text topic transfer, one-action atomic apply, host/phase authorization, browser-storage failure handling, and guest topic privacy coverage
 - Shared Cloudflare Practice/Play microphone selection with opaque-ID-only browser persistence, memory-only labels, bounded unavailable-device fallback, driver/route race guards, and no application or analytics request
+- Driver-only Cloudflare game sound cues with the same short Web Audio recipes and browser-local opt-out as the Go edition, plus cross-tab preference synchronization, stale-route suppression, and no media or network dependency
 - A separate-document operator analytics dashboard with strict CSP/no-transform isolation, source-quality tests, and narrow/mobile browser smoke coverage
 - Separate production/staging databases, analytics datasets, rate limits, secrets, cron schedules, deployment probes, migration checks, and production incident/recovery guidance
 
 Remaining hardening:
 
-- Game-feature parity between the Go and Cloudflare editions; the remaining known gaps are the AI judge and sound cues
+- Game-feature parity between the Go and Cloudflare editions; the remaining known gap is the AI judge
 - Expansion of the automated cross-edition contract beyond the implemented core rules
 - Broader browser/device testing
 - Formal security and accessibility reviews

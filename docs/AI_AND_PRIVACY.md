@@ -241,7 +241,7 @@ When the speaker has consented to transcript-assisted judging, the selected exte
 
 - No account is required for the game or coaching prototype.
 - Multiplayer browser identity uses an HTTP-only room token cookie.
-- The local Go game keeps custom topic drafts, saved presets, microphone choice, and sound preference in local storage.
+- The local Go game keeps custom topic drafts, saved presets, microphone choice, and sound preference in local storage. The Cloudflare game also keeps its sound opt-out there; cues are synthesized locally for the current driver, fetch no media, and changing the preference makes no application, analytics, D1, Durable Object, or model request.
 - The Cloudflare game keeps its named setup-kit library in a separate unencrypted origin/browser-local `localStorage` key. Explicit Apply sends selected settings/topics—but not the kit name—into normal room Durable Object state and does no D1, Analytics Engine, provider, or cloud-backup work itself. Later ordinary room telemetry may include duration, rounds, and topic-pack ID in pseudonymous D1 facts; kit names and custom-topic text are never included.
 - The local web server stores room/session snapshots in `data/rooms.json` by default. They include rosters, settings, topics, scores, turns, and room history, but not transcripts or audio. Set `NONSTOPTALK_DATA_FILE=off` for memory-only rooms.
 - The Cloudflare edition stores multiplayer game state in a private SQLite-backed Durable Object for up to 30 idle days. Coaching summaries and full artifacts never enter that object.
