@@ -9,6 +9,7 @@ import {
 	parseD1Snapshot,
 	pollForExpectedDeltas,
 	requireStagingOrigin,
+	runPublicRoomLifecycle,
 	runStagingOutboxActivationSmoke,
 } from "./smoke-staging-outbox.mjs";
 
@@ -225,7 +226,7 @@ test("the public lifecycle uses isolated cookies, proves all state transitions, 
 			trace.push("create");
 			assert.equal(parsed.pathname, "/api/rooms");
 			assert.equal(headers.get("Cookie"), null);
-			assert.deepEqual(JSON.parse(init.body), { name: "Release B smoke host" });
+			assert.deepEqual(JSON.parse(init.body), { name: "Outbox canary host" });
 			apiStep += 1;
 			return jsonResponse({ room: publicRoom() }, 201, {
 				"Set-Cookie": `nonstoptalk_token=${HOST_TOKEN}; Path=/; HttpOnly; Secure`,
@@ -235,7 +236,7 @@ test("the public lifecycle uses isolated cookies, proves all state transitions, 
 			trace.push("join");
 			assert.equal(parsed.pathname, "/api/rooms/ABC234/join");
 			assert.equal(headers.get("Cookie"), null);
-			assert.deepEqual(JSON.parse(init.body), { name: "Release B smoke guest" });
+			assert.deepEqual(JSON.parse(init.body), { name: "Outbox canary guest" });
 			apiStep += 1;
 			return jsonResponse({
 				room: publicRoom({
@@ -282,8 +283,8 @@ test("the public lifecycle uses isolated cookies, proves all state transitions, 
 	});
 
 	assert.equal(apiStep, 9);
-	assert.equal(databaseCalls, 3);
-	assert.deepEqual(delays, [17]);
+	assert.equal(databaseCalls, 4);
+	assert.deepEqual(delays, [17, 17]);
 	assert.deepEqual(summary, {
 		status: "ok",
 		origin: STAGING_ORIGIN,
@@ -311,7 +312,70 @@ test("the public lifecycle uses isolated cookies, proves all state transitions, 
 		"snapshot-2",
 		"delay",
 		"snapshot-3",
+		"delay",
+		"snapshot-4",
 	]);
+});
+
+test("the requester rejects every origin-escaping or non-canary path before attaching identity", async () => {
+	let fetchCalls = 0;
+	const identity = { cookie: `nonstoptalk_token=${HOST_TOKEN}` };
+	const request = createStagingRequester({
+		fetchImpl: async () => {
+			fetchCalls += 1;
+			return jsonResponse({});
+		},
+	});
+	for (const pathname of [
+		"https://example.com/api/v1/platform/status",
+		"https://user:pass@example.com/api/v1/platform/status",
+		"//example.com/api/v1/platform/status",
+		"/\\example.com/api/v1/platform/status",
+		"/api/v1/platform/status?query=1",
+		"/api/v1/platform/status#fragment",
+		"/api/rooms/ABC234/action?query=1",
+		"/api/rooms/%41BC234/action",
+		"/not-an-api",
+	]) {
+		await assert.rejects(request(identity, pathname), /exact same-origin public API path/u);
+	}
+	await assert.rejects(
+		request(identity, "/api/v1/platform/status", { method: "DELETE" }),
+		/exact same-origin public API path/u,
+	);
+	assert.equal(fetchCalls, 0);
+	assert.equal(identity.cookie, `nonstoptalk_token=${HOST_TOKEN}`);
+});
+
+test("the lifecycle rejects a matching-shape action response from another room", async () => {
+	let step = 0;
+	const request = createStagingRequester({
+		fetchImpl: async () => {
+			step += 1;
+			if (step === 1) return jsonResponse({ room: publicRoom() }, 201, {
+				"Set-Cookie": `nonstoptalk_token=${HOST_TOKEN}; Path=/; HttpOnly; Secure`,
+			});
+			if (step === 2) return jsonResponse({
+				room: publicRoom({
+					version: 2,
+					players: [{ id: "p1", score: 0 }, { id: "p2", score: 0 }],
+					viewer: { isHost: false, isMember: true },
+				}),
+			}, 200, {
+				"Set-Cookie": `nonstoptalk_token=${GUEST_TOKEN}; Path=/; HttpOnly; Secure`,
+			});
+			return jsonResponse({
+				room: publicRoom({
+					code: "XYZ678",
+					version: 3,
+					phase: "playing",
+					players: [{ id: "p1", score: 0 }, { id: "p2", score: 0 }],
+				}),
+			});
+		},
+	});
+	await assert.rejects(runPublicRoomLifecycle(request), /different room/u);
+	assert.equal(step, 3);
 });
 
 test("the requester rejects either private milestone header before parsing a public response", async () => {
@@ -405,6 +469,7 @@ test("D1 polling is bounded, retries incomplete delivery, and stops on exact del
 		{ ...exact, receiptCount: exact.receiptCount - 2 },
 		{ ...exact, receiptCount: exact.receiptCount - 1 },
 		exact,
+		exact,
 	];
 	const delays = [];
 	let reads = 0;
@@ -415,8 +480,8 @@ test("D1 polling is bounded, retries incomplete delivery, and stops on exact del
 		attempts: 3,
 		delayMs: 11,
 	}), exact);
-	assert.equal(reads, 3);
-	assert.deepEqual(delays, [11, 11]);
+	assert.equal(reads, 4);
+	assert.deepEqual(delays, [11, 11, 11]);
 
 	reads = 0;
 	const exhaustedDelays = [];
@@ -452,4 +517,18 @@ test("D1 polling is bounded, retries incomplete delivery, and stops on exact del
 		/overlapped the isolated Release B lifecycle/u,
 	);
 	assert.equal(reads, 1);
+
+	reads = 0;
+	const provisional = [exact, { ...exact, gameFinishedCount: exact.gameFinishedCount + 1 }];
+	await assert.rejects(
+		pollForExpectedDeltas({
+			baseline,
+			readSnapshot: async () => provisional[reads++],
+			delay: async () => undefined,
+			attempts: 1,
+			delayMs: 0,
+		}),
+		/overlapped the isolated Release B lifecycle/u,
+	);
+	assert.equal(reads, 2);
 });

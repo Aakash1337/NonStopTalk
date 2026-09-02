@@ -23,7 +23,7 @@ jobs:
         include:
           - environment: production
             origin: https://dontstoptalking.org
-            expected_delivery: best-effort
+            expected_delivery: durable-outbox
           - environment: staging
             origin: https://nonstoptalk-staging.aakashplays656.workers.dev
             expected_delivery: durable-outbox

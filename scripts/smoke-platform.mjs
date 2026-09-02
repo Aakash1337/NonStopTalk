@@ -8,11 +8,14 @@ import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
+import { LOCAL_BEST_EFFORT_DELIVERY_WRANGLER_ARGS } from "./smoke-local-worker-policy.mjs";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const wrangler = path.join(root, "node_modules", "wrangler", "bin", "wrangler.js");
 const adminToken = "6".repeat(64);
 const roomFactHashKey = "local-room-fact-hmac-key-32-characters-minimum";
-const offlineModelWranglerArgs = [
+const localWorkerPolicyWranglerArgs = [
+  ...LOCAL_BEST_EFFORT_DELIVERY_WRANGLER_ARGS,
   "--var", "TOPIC_ROUTINE_PROVIDER:offline",
   "--var", "TOPIC_ESCALATION_PROVIDER:off",
 ];
@@ -209,7 +212,7 @@ try {
       "--persist-to", upgradeStateDirectory,
       "--var", `ANALYTICS_ADMIN_TOKEN:${adminToken}`,
       "--var", `ROOM_FACT_HASH_KEY:${roomFactHashKey}`,
-      ...offlineModelWranglerArgs,
+      ...localWorkerPolicyWranglerArgs,
     ],
     {
       cwd: root,
@@ -1055,7 +1058,7 @@ try {
     [
       wrangler, "dev", "--local", "--ip", "127.0.0.1", "--port", String(degradedPort),
       "--persist-to", stateDirectory,
-      ...offlineModelWranglerArgs,
+      ...localWorkerPolicyWranglerArgs,
     ],
     {
       cwd: root,
@@ -1091,7 +1094,7 @@ try {
       "--persist-to", stateDirectory,
       "--var", `ANALYTICS_ADMIN_TOKEN:${adminToken}`,
       "--var", `ROOM_FACT_HASH_KEY:${roomFactHashKey}`,
-      ...offlineModelWranglerArgs,
+      ...localWorkerPolicyWranglerArgs,
     ],
     {
       cwd: root,

@@ -14,6 +14,7 @@ import {
   startCaptured,
   terminateProcessTree,
 } from "./smoke-process-support.mjs";
+import { LOCAL_BEST_EFFORT_DELIVERY_WRANGLER_ARGS } from "./smoke-local-worker-policy.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const wrangler = path.join(root, "node_modules", "wrangler", "bin", "wrangler.js");
@@ -1863,6 +1864,7 @@ const { child, output } = startCaptured(process.execPath, [
   "127.0.0.1",
   "--port",
   String(port),
+  ...LOCAL_BEST_EFFORT_DELIVERY_WRANGLER_ARGS,
 ], {
   cwd: root,
   env: isolatedChildEnv(),

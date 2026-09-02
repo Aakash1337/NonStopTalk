@@ -33,10 +33,9 @@
 	// them in version control prevents a deploy from silently discarding values
 	// that were set only in the dashboard. API credentials remain secrets.
 	"vars": {
-		// The committed rollout remains on the existing header + waitUntil path.
-		// This build produces durable rows only after the separate exact `outbox`
-		// opt-in and can still drain them in this safe rollback posture.
-		"ROOM_MILESTONE_DELIVERY_MODE": "best-effort",
+		// Production uses the reviewed durable room outbox. Local smoke launchers
+		// explicitly override this to best-effort where that behavior is under test.
+		"ROOM_MILESTONE_DELIVERY_MODE": "outbox",
 		"TOPIC_ROUTINE_PROVIDER": "offline",
 		"TOPIC_ESCALATION_PROVIDER": "off",
 		"MODEL_DAILY_CALL_LIMIT": "100"
@@ -130,8 +129,8 @@
 				"binding": "CF_VERSION_METADATA"
 			},
 			"vars": {
-				// Staging is the isolated operational proof lane for the reviewed
-				// Release-B producer. Production remains best-effort above.
+				// Staging remains the isolated operational proof lane for the same
+				// reviewed durable room-outbox policy without sharing resources.
 				"ROOM_MILESTONE_DELIVERY_MODE": "outbox",
 				"TOPIC_ROUTINE_PROVIDER": "offline",
 				"TOPIC_ESCALATION_PROVIDER": "off",

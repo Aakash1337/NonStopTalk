@@ -58,6 +58,7 @@ npm run test:worker-runtime-runner
 npm run test:smoke-support
 npm run test:staging-outbox-smoke
 npm run test:staging-outbox-rollback-drill
+npm run test:production-outbox-smoke
 npm run check:cloudflare-types
 npm run typecheck:cloudflare
 npm run test:cloudflare
@@ -92,7 +93,8 @@ D1 or Analytics Engine effect for an exact replay; conflict on event-ID reuse
 with a different payload; fail-closed receipt behavior on marker 5; marker-5
 cleanup that never prepares receipt SQL; marker-6 cleanup that deletes only
 expired receipts and includes any remainder in the bounded backlog result;
-ordinary best-effort rooms that create neither local outbox tables nor receipts;
+the explicit best-effort compatibility lane creating neither local outbox tables
+nor receipts;
 exact-mode room state, complete milestone group, and alarm persistence in one
 local transaction; stable lifecycle/event entropy across a transaction replay;
 all-or-drop final-turn pairs at the queue boundary; no legacy dual delivery;
@@ -100,16 +102,17 @@ and FIFO one-at-a-time drain, persisted bounded retry, and privacy-minimal
 dead-letter handling for a version-1 local outbox. A failed Analytics Engine
 write remains non-fatal and is not retried.
 
-Production remains explicitly configured
-`ROOM_MILESTONE_DELIVERY_MODE=best-effort`: ordinary production traffic retains
-the header plus `waitUntil` path and creates no local outbox tables or receipt
-rows. Staging intentionally selects the exact, case-sensitive value `outbox`
-and currently reports healthy `durable-outbox` delivery. In exact mode, a
+The committed production and staging configurations select the exact,
+case-sensitive `ROOM_MILESTONE_DELIVERY_MODE=outbox` value. Staging reports
+healthy `durable-outbox`; production must report the same after deployment and
+before the attended canary. In exact mode, a
 milestone-producing mutation commits room state, the complete canonical event
 group (or bounded all-or-drop counter), and the shared alarm atomically before
-the response or WebSocket broadcast. This release adds no D1 migration,
-Cloudflare service, binding, Queue, paid product, or separate alarm
-configuration. Progress/consent analytics and Analytics Engine remain
+the response or WebSocket broadcast. The activation adds no D1 migration,
+Cloudflare service, binding, secret, Queue, model, paid product, fixed monthly
+cost, or separate alarm configuration. It reuses bounded room-local Durable
+Object SQLite and the existing alarm and creates one exact-90-day D1 receipt per
+delivered milestone. Progress/consent D1 analytics and Analytics Engine remain
 best-effort in both environments. On 2026-09-02, the staging drill proved one
 pending Release-B joined event drained exactly once after rollback to Release A,
 proved an independent Release-A legacy control, restored Release B, and repeated
@@ -121,7 +124,7 @@ After deployment, run the read-only production probe:
 npm run smoke:production
 ```
 
-The expected delivery policy defaults to exact `best-effort`. To probe another
+The expected delivery policy defaults to exact `durable-outbox`. To probe another
 HTTPS environment with a different reviewed policy, pass both values
 explicitly; the only accepted policies are `best-effort` and
 `durable-outbox`:
@@ -187,24 +190,31 @@ and is not an end-to-end durable-delivery test. Before promotion, use both local
 runtime lanes above to exercise the receiver, cleanup, bridge, and exact
 producer. Because staging now runs exact `outbox`, follow a staging deployment
 with `npm run smoke:staging-outbox` in a quiet window and require the exact
-receipt, room-fact, and rollup deltas described below. Production's ordinary
-best-effort multiplayer path remains the no-outbox/no-receipt control.
+receipt, room-fact, and rollup deltas described below. The isolated local
+best-effort runtime remains the no-outbox/no-receipt compatibility control;
+production is exact.
 
-### Room-milestone outbox activation
+### Room-milestone outbox activation and attended production canary
 
-Treat exact-mode activation as a separate configuration release after the
-producer-capable Worker has already run safely in `best-effort`. An exact room
+Staging completed its separate exact-mode configuration activation after the
+producer-capable Worker ran safely in `best-effort`. The committed production
+configuration prepares the corresponding full-version activation, which is not
+considered proved until its attended canary passes. An exact room
 claims ownership with a comma-only v1 sentinel in the existing private milestone
 header only after that object version owns delivery. Release A already parses
 the sentinel as an empty event list and removes the header; Release B recognizes
 it as authoritative. An older/best-effort object returns real milestone values
-for the legacy fallback. This
-covers unavoidable Cloudflare propagation skew in both directions. Still avoid
+for the legacy fallback. This covers unavoidable Cloudflare propagation skew in
+both directions. Still avoid
 an intentional gradual deployment, traffic split, or mixed-configuration
 rollout so activation evidence and rollback remain unambiguous. Activate and
 roll back one complete environment/version at a time.
 
-Use this order:
+The following order records the completed staging proof, remains the template
+for a new environment, and ends with the current production release gate. Its
+pinned production-`best-effort` precondition and staging version IDs describe
+the dated 2026-09-02 drill; they are historical evidence, not current production
+policy.
 
 1. Confirm staging is on the reviewed Release-B code, D1 reports schema exactly
    6, and its independent `ROOM_FACT_HASH_KEY` secret has 32 through 1,024 UTF-8
@@ -220,9 +230,11 @@ Use this order:
    drives isolated synthetic create/join/start/two-turn finish/reset traffic,
    rejects leaked private protocol headers, and bounded-polls fixed aggregate-only
    D1 queries for seven receipts, one room fact, and the exact rollup deltas.
-   The privacy-minimal schema intentionally has no probe correlation ID, so any
-   concurrent staging write or cleanup makes this check fail closed. Discard
-   that run, restore a quiet window, and start again from a fresh baseline;
+   Unexpected aggregate movement fails the check, but the privacy-minimal schema
+   intentionally has no probe correlation ID: a permanently missing synthetic
+   event plus an unrelated identical event could theoretically substitute. The
+   quiet window is therefore part of the evidence. Discard any overlapped or
+   ambiguous run, restore a quiet window, and start again from a fresh baseline;
    never loosen the exact-delta assertions to force a pass.
    Local runtime tests separately prove strict FIFO head order and an empty drained
    queue because Durable Object SQLite has no public inspection route. Confirm
@@ -247,7 +259,7 @@ Use this order:
    npx wrangler versions deploy <FAULT_UUID>@100% --env staging --message "Staging receiver-fault rollback drill" --yes
    ```
 
-   The generator hard-requires production `best-effort` plus staging `outbox`
+   The generator hard-requires production `outbox` plus staging `outbox`
    and writes a mode-0600, Git-ignored config whose only semantic change is an
    explicit empty `env.staging.d1_databases`. `validate-fault` requires the pinned
    Release-B candidate alone at 100%, authenticates both reviewed script etags,
@@ -395,12 +407,30 @@ Use this order:
    after a checkpoint exists, preserve that checkpoint for diagnosis and restore
    the candidate first. Remove only the two narrowly named Git-ignored files
    after the result is resolved. Never select a pre-Release-A version.
-5. Only after the staging activation and rollback drill pass, make a separate
-   production configuration change. Reconfirm schema 6, the secure production
-   room-fact key, zero pending migrations, the exact version, and recent cleanup
-   health; then deploy the entire production version without an intentional traffic split.
-   Compare the same bounded receipt/rollup/fact deltas and watch outbox retry,
-   dead-letter, drop, D1, and room-error events.
+5. The production activation must follow that staging gate as one complete
+   reviewed version without an intentional traffic split. For this activation release,
+   independently verify that the prior healthy Worker version
+   `58df8c9f-b4d7-4f3e-b15c-32dfec579355` is still deployable, that the new
+   version alone is at 100%, and that schema 6, the secure production room-fact
+   key, zero pending migrations, cleanup health, and read-only
+   `durable-outbox` status are all ready. Then run the target-locked canary
+   attended:
+
+   ```sh
+   npm run smoke:production-outbox -- 58df8c9f-b4d7-4f3e-b15c-32dfec579355
+   ```
+
+   The canary accepts only the exact production origin and production D1
+   resources, creates one synthetic room lifecycle, and compares exact bounded
+   receipt/rollup/fact deltas with a delayed confirmation. This is an attended
+   quiet-window aggregate proof, not per-event cryptographic attribution: a
+   permanently missing canary event plus an unrelated identical event could
+   theoretically substitute. Do not put it on a schedule or run it concurrently
+   with another aggregate-mutating probe. Watch outbox retry, dead-letter, drop,
+   D1, and room-error events while it runs. Its UUID argument is the
+   release-specific immediate code-rollback bookmark, not a permanent constant
+   and not a D1 Time Travel bookmark; every later release must record and pass a
+   freshly reviewed rollback version.
 
 If the room-fact key is missing or outside its byte boundary after activation,
 public status changes to `degraded-outbox`, but the receiver still applies and
@@ -434,12 +464,10 @@ Treat key readiness as a hard pre-activation and ongoing operational gate.
    singleton marker read first; marker-5 cleanup never prepares receipt-table SQL,
    and unsupported markers fail closed immediately without a Worker restart.
 
-   Production's committed `best-effort` mode retains the header plus
-   `waitUntil` fan-out, initializes no local outbox schema, and does not insert
-   receipts. Staging's committed exact `outbox` mode atomically persists each
+   The committed production and staging exact `outbox` modes atomically persist each
    milestone-producing room mutation with all canonical events or one bounded
    drop decision and the alarm. The internal receiver receipt-gates one staging
-   D1 application; schema-6 cleanup removes expired receipts in the existing
+   or production D1 application; schema-6 cleanup removes expired receipts in the existing
    bounded cleanup lifecycle. Analytics Engine receives only one best-effort
    post-commit opportunity for a newly applied event in either environment.
 
@@ -522,8 +550,8 @@ A healthy response has:
 - an empty `degradedCapabilities` array;
 - ready cloud progress, retention cleanup, room facts, and aggregate admin analytics;
 - Analytics Engine enabled;
-- room-milestone analytics `delivery: "best-effort"` in production and
-  `delivery: "durable-outbox"` in healthy staging. Release B reports the latter
+- room-milestone analytics `delivery: "durable-outbox"` in healthy production
+  and staging. Release B reports it
   only when its producer is compiled, the mode is exact `outbox`, the schema is
   exactly 6, and `ROOM_FACT_HASH_KEY` is secure. An
   exact-mode schema/key mismatch reports `degraded-outbox` and adds
@@ -612,20 +640,20 @@ Worker code emits one JSON object per operational event. Search by the stable
 | `room_alarm_schedule_failed` | The shared room-expiry/outbox alarm could not be renewed | Check Durable Object incidents and repeat activity |
 | `room_expiry_delete_failed` | An expired room could not be deleted; a retry was scheduled | Check Durable Object storage and confirm a later retry succeeds |
 | `worker_request_failed` | An unexpected edge/API dependency failed behind a request ID | Correlate request ID and Worker version; check dependent services |
-| `room_milestone_delivery_failed` | Best-effort D1/analytics milestone failed | Do not interrupt play; inspect aggregate impact |
+| `room_milestone_delivery_failed` | The conditional best-effort compatibility path failed | Do not interrupt play; inspect aggregate impact and unexpected delivery policy |
 | `room_milestone_outbox_dropped` | An exact-mode event group was dropped for bounded capacity or canonicalization reasons while gameplay committed | Check only reason/count and queue health; do not dump room state or payloads |
 | `room_milestone_outbox_retry_scheduled` | The bridge/consumer persisted another bounded attempt; this is the single post-commit failure record | Check D1/schema/key health; later FIFO events remain blocked behind the head |
 | `room_milestone_outbox_retry_stale` | A retry compare-and-swap did not own the current FIFO head | Treat it as non-proof observability; investigate repeated occurrences without exposing the room or event ID |
 | `room_milestone_outbox_dead_lettered` | A head reached a terminal conflict, validation failure, deadline, or attempt limit | Investigate the reason field without dumping private Durable Object storage |
-| `product_analytics_rollup_failed` | Best-effort D1 telemetry write failed | Do not treat analytics as a ledger |
+| `product_analytics_rollup_failed` | A best-effort progress/consent D1 telemetry write failed | Do not treat analytics as a ledger |
 | `analytics_engine_write_failed` | Analytics Engine delivery failed | D1 rollup may still exist |
 | `model_usage_reconciliation_failed` | A completed model attempt was not reconciled | Keep providers disabled until cost counters are understood |
 
 The scheduled GitHub workflow is the zero-secret, cheap-first baseline. It runs
 twice per hour as one two-row matrix. The production row probes
-`https://dontstoptalking.org` and requires `best-effort` room-milestone
-delivery; the staging row probes the designated staging Workers.dev origin and
-requires `durable-outbox`. `fail-fast: false` lets either row report even when
+`https://dontstoptalking.org`, the staging row probes the designated staging
+Workers.dev origin, and both require `durable-outbox` room-milestone delivery.
+`fail-fast: false` lets either row report even when
 the other fails. Each row has a five-minute bound, checks the public pages, the
 isolated dashboard document, security headers, and canonical status response,
 and fails on a healthy-but-wrong delivery policy as well as normal readiness
@@ -719,19 +747,34 @@ new schema or fix forward. Do not delete a D1 database, Durable Object namespace
 or migration record during incident response. Marker 6 already excludes Workers
 that require exact marker 5.
 
-Production has not crossed the exact-mode boundary and still uses the ordinary
-best-effort path. Staging has produced version-1 exact-mode rows, so Release A is
-already its minimum safe rollback floor. After any other environment produces
-even one such row, the same floor applies there: deploy Release A or a newer
-compatible bridge with `best-effort` so existing rows continue to drain while
-new milestones use the legacy path. The ownership response keeps ordinary
+Staging has crossed the exact-mode boundary and can contain version-1 local
+outbox rows. The production activation crosses that boundary as soon as its
+deployed code can create a row, so this release must treat Release A as the
+minimum safe code rollback floor for both environments. For this activation
+release, the independently reviewed immediate
+production code-rollback version is
+`58df8c9f-b4d7-4f3e-b15c-32dfec579355`. Reconfirm that exact version and its
+resource bindings before use, then an attended activation-related rollback is:
+
+```sh
+npx wrangler rollback 58df8c9f-b4d7-4f3e-b15c-32dfec579355 --message "Rollback production outbox activation" --yes
+```
+
+This release-specific bookmark is not permanent configuration and is not a D1
+Time Travel bookmark. A compatible rollback may intentionally restore
+`best-effort`: existing rows continue to drain through the Release-A-compatible
+consumer while new milestones use the legacy path. During that incident window,
+the twice-hourly production monitor will fail its normal `durable-outbox` policy
+check by design; use an attended read-only probe with explicit expected
+`best-effort`, repair or fix forward, and restore exact mode only after D1 and
+queue health are understood. The ownership response keeps ordinary
 Release-A/Release-B propagation skew safe, but avoid an intentional
 mixed-configuration rollback and never select a pre-Release-A Worker; it can
 overwrite the shared alarm and strand rows. Do not delete the namespace, local
-tables, pending rows, or dead letters as a rollback technique. The staging
-rollback drill completed successfully on 2026-09-02. Production activation is
-still a separate review and deployment decision; repeat the read-only
-status/receipt/rollup checks after any real rollback.
+tables, pending rows, receipts, or dead letters as a rollback technique. The
+staging rollback drill completed successfully on 2026-09-02; repeat the
+read-only status and appropriate aggregate checks after any real rollback, then
+rerun the exact attended canary only after exact mode is restored.
 
 ## Retention checks
 

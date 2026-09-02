@@ -399,10 +399,10 @@ test("coordinates fail closed on production, another Worker, malformed IDs, or u
 
 test("fault config generation changes only staging PLATFORM_DB and writes mode 0600", async () => {
 	const source = `{
-		// Production stays best effort.
+		// Production uses the reviewed exact outbox policy.
 		"name": "nonstoptalk",
 		"main": "cloudflare/worker.ts",
-		"vars": { "ROOM_MILESTONE_DELIVERY_MODE": "best-effort" },
+		"vars": { "ROOM_MILESTONE_DELIVERY_MODE": "outbox" },
 		"d1_databases": [{ "binding": "PLATFORM_DB", "database_id": "production" }],
 		"env": {
 			"staging": {
@@ -419,7 +419,7 @@ test("fault config generation changes only staging PLATFORM_DB and writes mode 0
 	assert.doesNotThrow(() => assertOnlyReceiverFaultConfigChange(candidate, fault));
 	assert.throws(() => assertOnlyReceiverFaultConfigChange(candidate, {
 		...fault,
-		vars: { ROOM_MILESTONE_DELIVERY_MODE: "outbox" },
+		vars: { ROOM_MILESTONE_DELIVERY_MODE: "best-effort" },
 	}), /remove only staging PLATFORM_DB|Production/u);
 
 	const directory = await mkdtemp(join(tmpdir(), "nonstoptalk-fault-config-test-"));

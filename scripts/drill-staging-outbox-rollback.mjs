@@ -308,8 +308,8 @@ function expectedStagingD1(config) {
 	if (config.name !== "nonstoptalk") {
 		return fail("The source configuration is not the reviewed NonStopTalk Worker.");
 	}
-	if (config.vars?.ROOM_MILESTONE_DELIVERY_MODE !== "best-effort") {
-		return fail("Production must remain explicitly configured for best-effort delivery.");
+	if (config.vars?.ROOM_MILESTONE_DELIVERY_MODE !== "outbox") {
+		return fail("Production must remain explicitly configured for exact outbox delivery.");
 	}
 	const staging = config.env?.staging;
 	if (!isObject(staging) || staging.name !== STAGING_WORKER) {
@@ -342,8 +342,8 @@ export function assertOnlyReceiverFaultConfigChange(candidate, fault) {
 	if (!isDeepStrictEqual(expected, fault)) {
 		return fail("The receiver-fault configuration may remove only staging PLATFORM_DB.");
 	}
-	if (fault.vars?.ROOM_MILESTONE_DELIVERY_MODE !== "best-effort") {
-		return fail("Production must remain explicitly configured for best-effort delivery.");
+	if (fault.vars?.ROOM_MILESTONE_DELIVERY_MODE !== "outbox") {
+		return fail("Production must remain explicitly configured for exact outbox delivery.");
 	}
 	if (fault.env?.staging?.vars?.ROOM_MILESTONE_DELIVERY_MODE !== "outbox") {
 		return fail("The receiver-fault staging configuration must remain exact outbox.");
