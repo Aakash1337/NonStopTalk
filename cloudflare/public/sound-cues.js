@@ -36,6 +36,8 @@ const SOUND_CUE_RECIPES = Object.freeze({
 	),
 });
 
+const RESOLVED_JUDGE_STATUSES = new Set(["done", "failed", "skipped"]);
+
 function tone(frequency, delay, duration, type = "sine", gain = 0.08) {
 	return Object.freeze({ frequency, delay, duration, type, gain });
 }
@@ -58,6 +60,82 @@ function defaultAudioContextConstructor() {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Track one local turn-finalization intent. It is armed before the room action
+ * so an action that commits but loses its HTTP response can still be confirmed
+ * by WebSocket state. A finished room waits for every pending review because
+ * any earlier bonus can still change the winner. Resolution is therefore
+ * driven by accepted room state rather than by the original request promise.
+ */
+export function createDeferredFinalCueTracker() {
+	let pending = null;
+
+	function clear() {
+		const hadPending = Boolean(pending);
+		pending = null;
+		return hadPending;
+	}
+
+	function arm({ roomCode, routeGeneration, turnId } = {}) {
+		const normalizedRoomCode = typeof roomCode === "string" ? roomCode.trim() : "";
+		const normalizedTurnId = typeof turnId === "string" ? turnId.trim() : "";
+		if (!normalizedRoomCode || !normalizedTurnId || !Number.isSafeInteger(routeGeneration)) {
+			throw new TypeError("A room code, route generation, and turn ID are required.");
+		}
+		pending = Object.freeze({
+			roomCode: normalizedRoomCode,
+			routeGeneration,
+			turnId: normalizedTurnId,
+		});
+		return pending;
+	}
+
+	function consume({ roomCode, routeGeneration, phase, completedTurns } = {}) {
+		if (!pending) return "";
+		if (roomCode !== pending.roomCode || routeGeneration !== pending.routeGeneration) {
+			clear();
+			return "";
+		}
+		if (!Array.isArray(completedTurns) || !["playing", "finished"].includes(phase)) {
+			clear();
+			return "";
+		}
+		const turn = completedTurns.find((candidate) => candidate?.id === pending.turnId);
+		// An unrelated state update can beat the action response. It is not proof
+		// that the exact turn failed to commit, so retain the intent until the
+		// action rejects definitively, the turn appears, or lifecycle teardown.
+		// A finished room cannot later accept this missing turn, however, so that
+		// terminal snapshot is definitive and must not leak speculative intent.
+		if (!turn) {
+			if (phase === "finished") clear();
+			return "";
+		}
+
+		if (phase === "finished"
+			&& completedTurns.some((candidate) => candidate?.judge?.status === "pending")) return "";
+
+		const judgeStatus = turn.judge?.status;
+		if (judgeStatus !== undefined
+			&& judgeStatus !== "pending"
+			&& !RESOLVED_JUDGE_STATUSES.has(judgeStatus)) {
+			clear();
+			return "";
+		}
+
+		clear();
+		if (turn.eliminated) return SOUND_CUE_NAMES.ELIMINATED;
+		if (turn.completed) return SOUND_CUE_NAMES.COMPLETED;
+		return "";
+	}
+
+	return Object.freeze({
+		arm,
+		consume,
+		clear,
+		get pendingTurnId() { return pending?.turnId ?? ""; },
+	});
 }
 
 /**

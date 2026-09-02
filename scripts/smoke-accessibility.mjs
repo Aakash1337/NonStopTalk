@@ -78,6 +78,13 @@ const syntheticAccessibilityMicrophones = () => {
 
   window.AudioContext = SilentAudioContext;
   window.webkitAudioContext = SilentAudioContext;
+
+  class LocalSpeechRecognitionCapability {
+    constructor() { this.processLocally = false; }
+    abort() {}
+  }
+  window.SpeechRecognition = LocalSpeechRecognitionCapability;
+  window.webkitSpeechRecognition = LocalSpeechRecognitionCapability;
 };
 
 async function getFreePort() {
@@ -348,6 +355,24 @@ async function runAccessibilityFlow(browser, origin) {
   await assertSinglePageStructure(page, "Room lobby");
   await assertNoAxeViolations(page, "Room lobby");
 
+  const judgeSetting = page.getByRole("checkbox", { name: /Offer the offline relevance judge/u });
+  assert(await judgeSetting.count() === 1,
+    "The host judge setting must expose one labeled checkbox");
+  assert(!await judgeSetting.isChecked(), "The optional judge must begin disabled");
+  await judgeSetting.check();
+  const applyJudgeSetting = page.getByRole("button", { name: "Apply judge setting" });
+  await applyJudgeSetting.click();
+  await page.getByRole("checkbox", { name: /Offer the offline relevance judge/u }).waitFor();
+  assert(await page.getByRole("checkbox", { name: /Offer the offline relevance judge/u }).isChecked(),
+    "The accepted judge setting must remain visibly enabled after the room rerender");
+  await page.waitForFunction(() => document.querySelector("#announcer")?.textContent?.includes(
+    "The offline relevance judge is now available.",
+  ));
+  await page.waitForFunction(() => document.activeElement?.matches('[data-setup-focus="judge-apply"]'));
+  assert(await applyJudgeSetting.evaluate((button) => document.activeElement === button),
+    "Applying the privacy-sensitive judge setting must preserve keyboard focus through the room rerender");
+  await assertNoAxeViolations(page, "Room lobby with offline judge enabled");
+
   // Enter submits the local save form, then focus lands on the replacement
   // button instead of disappearing when the panel rerenders.
   const kitName = page.getByLabel("Kit name");
@@ -396,6 +421,15 @@ async function runAccessibilityFlow(browser, origin) {
   await assertNoAxeViolations(page, "Room ready state");
   await page.getByRole("button", { name: "Draw topic" }).click();
   await page.locator(".turn-card .room-state-title").waitFor();
+  const judgeChoices = page.locator('[data-turn-judge-choice] input[name="turnJudgeChoice"]');
+  assert(await judgeChoices.count() === 2,
+    "The exact speaker must receive two labeled per-turn judge choices");
+  assert(await page.getByRole("radio", { name: /Classic scoring/u }).count() === 1,
+    "Classic scoring must be an accessible radio choice");
+  assert(await page.getByRole("radio", { name: /Use on-device transcription/u }).count() === 1,
+    "On-device transcription must be an accessible radio choice");
+  assert((await judgeChoices.evaluateAll((controls) => controls.filter((control) => control.checked).length)) === 0,
+    "A fresh turn must not imply transcript consent");
   assert(await page.locator("[data-timer]").getAttribute("role") === "timer",
     "The multiplayer countdown must expose timer semantics");
   assert((await page.locator("[data-timer]").getAttribute("aria-label"))?.endsWith(" seconds remaining"),

@@ -1,0 +1,178 @@
+{
+	"schemaVersion": 1,
+	"constants": {
+		"maxBonus": 20,
+		"maxFeedbackCodePoints": 500,
+		"offlineConfidence": 0.3,
+		"feedback": {
+			"no-keywords": "Offline judge: none of the topic's key words came up, so only a small bonus.",
+			"partial-keywords": "Offline judge: you hit some of the topic's key words, but wandered.",
+			"topic-keywords": "Offline judge: you touched on the topic's key words."
+		}
+	},
+	"cases": {
+		"offlineGrades": [
+			{
+				"id": "empty-transcript",
+				"topic": "Any topic here",
+				"transcript": "",
+				"expected": {
+					"relevance": 0,
+					"confidence": 0.3,
+					"feedbackCode": "no-keywords",
+					"bonus": 0
+				}
+			},
+			{
+				"id": "length-only-credit",
+				"topic": "Ocean storms",
+				"transcript": "cars go fast on roads",
+				"expected": {
+					"relevance": 0.05,
+					"confidence": 0.3,
+					"feedbackCode": "no-keywords",
+					"bonus": 1
+				}
+			},
+			{
+				"id": "partial-keyword-overlap",
+				"topic": "Breakfast pancakes syrup",
+				"transcript": "Pancakes are warm and filling for a lazy morning",
+				"expected": {
+					"relevance": 0.3233333333333333,
+					"confidence": 0.3,
+					"feedbackCode": "partial-keywords",
+					"bonus": 6
+				}
+			},
+			{
+				"id": "all-keywords",
+				"topic": "Breakfast pancakes syrup",
+				"transcript": "Breakfast pancakes syrup are delicious",
+				"expected": {
+					"relevance": 0.75,
+					"confidence": 0.3,
+					"feedbackCode": "topic-keywords",
+					"bonus": 15
+				}
+			},
+			{
+				"id": "half-overlap-is-strong",
+				"topic": "Ocean storms",
+				"transcript": "Ocean is calm today",
+				"expected": {
+					"relevance": 0.39,
+					"confidence": 0.3,
+					"feedbackCode": "topic-keywords",
+					"bonus": 8
+				}
+			},
+			{
+				"id": "length-credit-caps-at-thirty-words",
+				"topic": "the and about",
+				"transcript": "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone twentytwo twentythree twentyfour twentyfive twentysix twentyseven twentyeight twentynine thirty thirtyone thirtytwo thirtythree thirtyfour thirtyfive",
+				"expected": {
+					"relevance": 0.3,
+					"confidence": 0.3,
+					"feedbackCode": "no-keywords",
+					"bonus": 6
+				}
+			},
+			{
+				"id": "case-and-edge-punctuation",
+				"topic": "(Cloudflare), workers!",
+				"transcript": "CLOUDFLARE; workers.",
+				"expected": {
+					"relevance": 0.72,
+					"confidence": 0.3,
+					"feedbackCode": "topic-keywords",
+					"bonus": 14
+				}
+			},
+			{
+				"id": "utf8-byte-length-keyword",
+				"topic": "猫咪",
+				"transcript": "猫咪",
+				"expected": {
+					"relevance": 0.71,
+					"confidence": 0.3,
+					"feedbackCode": "topic-keywords",
+					"bonus": 14
+				}
+			},
+			{
+				"id": "duplicate-keywords-deduplicate",
+				"topic": "Ocean ocean OCEAN",
+				"transcript": "ocean",
+				"expected": {
+					"relevance": 0.71,
+					"confidence": 0.3,
+					"feedbackCode": "topic-keywords",
+					"bonus": 14
+				}
+			},
+			{
+				"id": "go-next-line-whitespace",
+				"topic": "alpha\u0085bravo",
+				"transcript": "alpha\u0085bravo",
+				"expected": {
+					"relevance": 0.72,
+					"confidence": 0.3,
+					"feedbackCode": "topic-keywords",
+					"bonus": 14
+				}
+			},
+			{
+				"id": "go-simple-lowercase",
+				"topic": "İDEA",
+				"transcript": "idea",
+				"expected": {
+					"relevance": 0.71,
+					"confidence": 0.3,
+					"feedbackCode": "topic-keywords",
+					"bonus": 14
+				}
+			}
+		],
+		"validVerdicts": [
+			{
+				"id": "canonical",
+				"input": { "relevance": 0.82, "confidence": 0.74, "feedback": "Focused and clear." },
+				"expected": { "relevance": 0.82, "confidence": 0.74, "feedback": "Focused and clear." }
+			},
+			{
+				"id": "trim-feedback",
+				"input": { "relevance": 0, "confidence": 1, "feedback": "  Concise.  " },
+				"expected": { "relevance": 0, "confidence": 1, "feedback": "Concise." }
+			}
+		],
+		"invalidVerdicts": [
+			{ "id": "null", "input": null },
+			{ "id": "array", "input": [] },
+			{ "id": "missing-confidence", "input": { "relevance": 0.5, "feedback": "Good." } },
+			{ "id": "extra-property", "input": { "relevance": 0.5, "confidence": 0.5, "feedback": "Good.", "score": 10 } },
+			{ "id": "numeric-string", "input": { "relevance": "0.5", "confidence": 0.5, "feedback": "Good." } },
+			{ "id": "negative-relevance", "input": { "relevance": -0.01, "confidence": 0.5, "feedback": "Good." } },
+			{ "id": "confidence-over-one", "input": { "relevance": 0.5, "confidence": 1.01, "feedback": "Good." } },
+			{ "id": "empty-feedback", "input": { "relevance": 0.5, "confidence": 0.5, "feedback": "   " } },
+			{ "id": "multiline-feedback", "input": { "relevance": 0.5, "confidence": 0.5, "feedback": "First line.\nSecond line." } }
+		],
+		"bonuses": [
+			{ "relevance": 0, "expected": 0 },
+			{ "relevance": 0.024, "expected": 0 },
+			{ "relevance": 0.025, "expected": 1 },
+			{ "relevance": 0.5, "expected": 10 },
+			{ "relevance": 0.975, "expected": 20 },
+			{ "relevance": 1, "expected": 20 }
+		],
+		"confidenceLabels": [
+			{ "confidence": null, "expected": "" },
+			{ "confidence": 0, "expected": "low confidence" },
+			{ "confidence": 0.3999, "expected": "low confidence" },
+			{ "confidence": 0.4, "expected": "medium confidence" },
+			{ "confidence": 0.7499, "expected": "medium confidence" },
+			{ "confidence": 0.75, "expected": "high confidence" },
+			{ "confidence": 1, "expected": "high confidence" }
+		]
+	}
+}

@@ -4,13 +4,26 @@ import {
 	GameError,
 	applyAction,
 	beginTopicGeneration,
+	claimJudgeReview,
 	createRoomState,
+	expireJudgeReviews,
 	joinRoom,
+	nextJudgeReviewDeadline,
 	publicRoomState,
+	resolveJudgeReview,
 	setHostOnline,
 	type Action,
+	type JudgeReviewResolution,
 	type RoomState,
 } from "./game";
+import {
+	normalizeJudgeVerdict,
+} from "./judge";
+import {
+	handleJudgeRoute,
+	isJudgeClaimId,
+	isJudgeTurnId,
+} from "./judge-routes";
 import {
 	mapPublicRoomStateToFact,
 	type PublicRoomFactDraft,
@@ -109,15 +122,18 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 	constructor(ctx: DurableObjectState, env: WorkerEnv) {
 		super(ctx, env);
 		// Missing and ordinary best-effort rooms stay read-only here. An object
-		// that already has a version-1 outbox is repaired using only local SQLite,
-		// and its one alarm is reconciled before any handler runs under this bridge.
+		// that already has a version-1 outbox, or has pending judge work, repairs
+		// its one alarm before any handler runs. This also closes an old-version
+		// rollback window that could otherwise leave a review provisional.
 		this.ctx.blockConcurrencyWhile(async () => {
 			const room = this.load();
-			if (!room || !this.hasRoomMilestoneOutbox()) return;
+			if (!room) return;
+			const hasOutbox = this.hasRoomMilestoneOutbox();
+			if (!hasOutbox && nextJudgeReviewDeadline(room) === null) return;
 			await this.ctx.storage.transaction(async (transaction) => {
 				const current = this.load();
 				if (!current) return;
-				initializeRoomMilestoneOutbox(this.ctx.storage.sql);
+				if (hasOutbox) initializeRoomMilestoneOutbox(this.ctx.storage.sql);
 				await this.reconcileRoomAlarm(current, transaction);
 			});
 		});
@@ -211,6 +227,48 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 					: withRoomMilestones(response, milestones);
 			}
 
+			if (url.pathname === "/claim-judge" || url.pathname === "/resolve-judge") {
+				if (request.method !== "POST") {
+					const response = json({ error: "Method not allowed." }, 405);
+					response.headers.set("Allow", "POST");
+					return response;
+				}
+				if (!validToken(token)) throw new GameError("Judge authorization is required.", 403);
+				if (request.headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase() !== "application/json") {
+					throw new GameError("Invalid internal judge request.", 400);
+				}
+				const body = await readJson(request);
+				const turnId = internalTurnId(body.turnId);
+				const room = this.load();
+				if (!room) return json({ error: "Room not found." }, 404);
+				const now = Date.now();
+
+				if (url.pathname === "/claim-judge") {
+					assertExactInternalKeys(body, ["turnId"]);
+					const claim = claimJudgeReview(room, token, turnId, randomJudgeClaimId(), now);
+					this.save(room);
+					this.broadcast(room);
+					return json({
+						claim: {
+							claimId: claim.claimId,
+							topic: claim.topic,
+							tier: claim.tier,
+							deadlineAt: claim.deadlineAt,
+						},
+					});
+				}
+
+				assertExactInternalKeys(body, ["turnId", "claimId", "resolution"]);
+				const claimId = internalClaimId(body.claimId);
+				const resolution = internalJudgeResolution(body.resolution);
+				if (!resolveJudgeReview(room, turnId, claimId, resolution, now)) {
+					throw new GameError("That judge claim is no longer pending.", 409);
+				}
+				this.save(room);
+				this.broadcast(room);
+				return json({ resolved: true });
+			}
+
 			const room = this.load();
 			if (!room) return json({ error: "Room not found." }, 404);
 
@@ -296,16 +354,20 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 			await this.deleteRoomStorage();
 			return;
 		}
-		const expiresAt = room.updatedAt + ROOM_IDLE_TTL_MS;
 		const now = Date.now();
+		const expiresAt = room.updatedAt + ROOM_IDLE_TTL_MS;
 		// The room's privacy expiry outranks telemetry. Normally every queued
 		// event reaches its seven-day terminal deadline well before this point.
 		if (now >= expiresAt) {
 			await this.expireRoom();
 			return;
 		}
+		if (expireJudgeReviews(room, now) > 0) {
+			this.writeRoomState(room);
+			this.broadcast(room);
+		}
 		if (!this.hasRoomMilestoneOutbox()) {
-			await this.ctx.storage.setAlarm(expiresAt);
+			await this.reconcileRoomAlarm(room, this.ctx.storage, now);
 			return;
 		}
 		initializeRoomMilestoneOutbox(this.ctx.storage.sql);
@@ -345,7 +407,8 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 		await this.ctx.storage.setAlarm(Math.min(
 			now + ROOM_MILESTONE_WATCHDOG_MS,
 			head.deadlineAtMs,
-			expiresAt,
+			room.updatedAt + ROOM_IDLE_TTL_MS,
+			nextJudgeReviewDeadline(room) ?? Number.POSITIVE_INFINITY,
 		));
 
 		let result: RoomMilestoneReceiveResult;
@@ -613,8 +676,13 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 		const outboxAt = this.hasRoomMilestoneOutbox()
 			? readNextRoomMilestoneAlarmAt(this.ctx.storage.sql)
 			: null;
+		const judgeAt = nextJudgeReviewDeadline(room);
 		const expiresAt = room.updatedAt + ROOM_IDLE_TTL_MS;
-		const requestedAt = outboxAt === null ? expiresAt : Math.min(expiresAt, outboxAt);
+		const requestedAt = Math.min(
+			expiresAt,
+			outboxAt ?? Number.POSITIVE_INFINITY,
+			judgeAt ?? Number.POSITIVE_INFINITY,
+		);
 		// A FIFO follower can already be due when its predecessor is ACKed. Give
 		// the platform an explicit future timestamp so replacing the currently
 		// running alarm cannot be mistaken for leaving it unscheduled.
@@ -767,6 +835,8 @@ export default {
 			);
 			if (limited) return withIdentityCookie(limited, identity, request, true);
 		}
+		const judge = await handleJudgeRoute(request, env, identity.token, requestId);
+		if (judge) return withIdentityCookie(judge, identity, request, true);
 		const model = await handleModelRoute(request, env, identity.token, requestId, {
 			authorizeHost: async (code, token) => {
 				let response: Response;
@@ -909,6 +979,10 @@ export default {
 		);
 	},
 } satisfies ExportedHandler<WorkerEnv>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 async function serveAdminAnalyticsDocument(
 	request: Request,
@@ -1137,6 +1211,45 @@ function sameOrigin(request: Request): boolean {
 function randomCode(): string {
 	const values = crypto.getRandomValues(new Uint8Array(6));
 	return Array.from(values, (value) => CODE_ALPHABET[value % CODE_ALPHABET.length]).join("");
+}
+
+function randomJudgeClaimId(): string {
+	const bytes = crypto.getRandomValues(new Uint8Array(32));
+	return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function assertExactInternalKeys(body: Record<string, unknown>, expected: readonly string[]): void {
+	const keys = Object.keys(body);
+	if (keys.length !== expected.length || expected.some((key) => !Object.hasOwn(body, key))) {
+		throw new GameError("Invalid internal judge request.", 400);
+	}
+}
+
+function internalTurnId(value: unknown): string {
+	if (!isJudgeTurnId(value)) throw new GameError("Invalid internal judge request.", 400);
+	return value;
+}
+
+function internalClaimId(value: unknown): string {
+	if (!isJudgeClaimId(value)) throw new GameError("Invalid internal judge request.", 400);
+	return value;
+}
+
+function internalJudgeResolution(value: unknown): JudgeReviewResolution {
+	if (!isRecord(value)) throw new GameError("Invalid internal judge request.", 400);
+	if (value.status === "failed") {
+		assertExactInternalKeys(value, ["status"]);
+		return { status: "failed" };
+	}
+	if (value.status === "done") {
+		assertExactInternalKeys(value, ["status", "verdict"]);
+		try {
+			return { status: "done", verdict: normalizeJudgeVerdict(value.verdict) };
+		} catch {
+			throw new GameError("Invalid internal judge request.", 400);
+		}
+	}
+	throw new GameError("Invalid internal judge request.", 400);
 }
 
 async function readJson(request: Request): Promise<Record<string, unknown>> {

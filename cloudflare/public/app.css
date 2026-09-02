@@ -90,6 +90,9 @@ textarea { resize: vertical; line-height: 1.5; }
 .settings { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: .7rem; }
 .settings .pack { grid-column: span 2; }
 .settings .button { align-self: end; }
+.judge-settings { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .7rem; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+.judge-settings .button { align-self: end; }
+.judge-settings .choice-row { grid-column: 1 / -1; }
 .topic-model-fields { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(14rem, .8fr); gap: .7rem; }
 .topic-model-actions { justify-content: flex-start; }
 .topic-model-actions .hint { max-width: 48rem; margin: 0; }
@@ -115,6 +118,9 @@ textarea { resize: vertical; line-height: 1.5; }
 .microphone-choice-copy small { color: var(--muted); overflow-wrap: anywhere; }
 .microphone-choice .button, .microphone-dialog button, .microphone-dialog select { min-height: 2.75rem; }
 .turn-card .microphone-choice { margin: .25rem auto 1rem; }
+.turn-card .turn-judge-choice { width: min(100%, 42rem); margin: 1rem auto; text-align: left; }
+.turn-card .turn-judge-choice .choice-row + .choice-row { margin-top: .8rem; }
+.turn-card .turn-judge-choice .hint { margin: .8rem 0 0; }
 .microphone-dialog { width: min(32rem, calc(100% - 1rem)); max-height: calc(100dvh - 1rem); margin: auto; padding: 0; overflow: auto; color: var(--ink); border: 1px solid #565a48; border-radius: 1.1rem; background: var(--surface); box-shadow: 0 28px 100px rgba(0,0,0,.72); }
 .microphone-dialog::backdrop { background: rgba(4,5,3,.78); backdrop-filter: blur(4px); }
 .microphone-dialog-panel { display: grid; gap: 1rem; padding: clamp(1.15rem, 5vw, 2rem); }
@@ -367,6 +373,7 @@ textarea { resize: vertical; line-height: 1.5; }
   .hero-copy { min-height: 20rem; }
   .settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .settings .pack { grid-column: 1 / -1; }
+  .judge-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .topic-model-fields { grid-template-columns: 1fr; }
   .topic-editor-actions, .setup-kit-actions { width: 100%; align-items: stretch; flex-direction: column; }
   .topic-editor-actions .button, .topic-editor-actions .topic-file-input, .setup-kit-actions .button { width: 100%; }

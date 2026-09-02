@@ -18,6 +18,7 @@ import {
   SOUND_CUE_LEGACY_STORAGE_KEY,
   SOUND_CUE_NAMES,
   SOUND_CUE_STORAGE_KEY,
+  createDeferredFinalCueTracker,
   createSoundCues,
 } from "./sound-cues.js";
 import {
@@ -29,6 +30,10 @@ import {
   readTopicTextFile,
   serializeTopicText,
 } from "./setup-kits.js";
+import {
+  createTurnTranscriptDeliveryManager,
+  createTurnTranscription,
+} from "./turn-transcription.js";
 
 const {
   clearCoachingSummaries,
@@ -55,6 +60,12 @@ const soundCues = createSoundCues({
   getStorage: () => window.localStorage,
   getAudioContextConstructor: () => window.AudioContext || window.webkitAudioContext,
 });
+const turnTranscription = createTurnTranscription({
+  getRecognitionConstructor: () => window.SpeechRecognition || window.webkitSpeechRecognition,
+});
+const turnTranscriptDeliveries = createTurnTranscriptDeliveryManager();
+const deferredFinalCues = createDeferredFinalCueTracker();
+const turnTranscriptionCapability = turnTranscription.capability();
 
 let room = null;
 let roomCode = "";
@@ -68,6 +79,7 @@ let clockTimer = 0;
 let controller = null;
 let busy = false;
 let routeGeneration = 0;
+let pageLifecycleSuspended = false;
 let coachingRun = null;
 let pendingCoachingToken = null;
 let coachEnginePromise = null;
@@ -77,6 +89,8 @@ let progressSessions = [];
 let progressArtifactSessions = new Map();
 let pendingPracticeResume = null;
 let roomSetupView = freshRoomSetupView();
+let turnJudgeChoice = null;
+let turnFinalization = null;
 let microphoneDialogToken = null;
 let microphoneDialogOpener = null;
 let microphoneDialogScope = null;
@@ -100,6 +114,7 @@ document.addEventListener("click", handleClick);
 document.addEventListener("submit", handleSubmit);
 document.addEventListener("input", handleSetupDraftInput);
 document.addEventListener("change", handleSetupChange);
+document.addEventListener("change", handleTurnJudgeChoiceChange);
 window.addEventListener("popstate", () => {
   routeFocusRequested = true;
   loadRoute();
@@ -108,6 +123,7 @@ window.addEventListener("storage", handleSetupStorage);
 window.addEventListener("storage", handleMicrophoneStorage);
 window.addEventListener("storage", handleSoundCueStorage);
 window.addEventListener("pagehide", shutdown);
+window.addEventListener("pageshow", resumePageLifecycle);
 microphoneDialog.addEventListener("cancel", () => { microphoneDialogToken = null; });
 microphoneDialog.addEventListener("close", handleMicrophoneDialogClose);
 navigator.mediaDevices?.addEventListener?.("devicechange", handleMicrophoneDeviceChange);
@@ -2222,7 +2238,21 @@ function renderHostSettings() {
     <label>Rounds<input name="rounds" type="number" min="1" max="10" value="${room.settings.rounds}"></label>
     <label class="pack">Topic pack<select name="topicPack">${room.settings.topicPack === "custom" ? `<option value="custom" selected>Custom · your list</option>` : ""}${room.topicPacks.map((pack) => `<option value="${pack.id}" ${pack.id === room.settings.topicPack ? "selected" : ""}>${escapeHTML(pack.name)} · ${escapeHTML(pack.difficulty)}</option>`).join("")}</select></label>
     <button class="button" type="submit">Apply settings</button>
-    <p class="hint wide">The free online edition uses classic scoring. The optional AI judge remains available in the local Go edition.</p>
+  </form>${renderHostJudgeSettings()}`;
+}
+
+function renderHostJudgeSettings() {
+  if (!room.judge) {
+    return `<p class="hint wide">Classic scoring is active. Optional judge controls will appear after this room updates to the current protocol.</p>`;
+  }
+  return `<form class="judge-settings" data-judge-settings>
+    <input type="hidden" name="tier" value="routine">
+    <label class="choice-row pack">
+      <input type="checkbox" name="enabled" ${room.judge.enabled ? "checked" : ""}>
+      <span><strong>Offer the offline relevance judge</strong><small>Each speaker decides again for every turn. If they opt in, their browser creates text on-device and sends only that turn's transcript to this NonStopTalk Worker for an offline relevance review. Audio is never uploaded; transcript text is not stored, logged, sent to analytics, or sent to an external model.</small></span>
+    </label>
+    <button class="button" type="submit" data-setup-focus="judge-apply">Apply judge setting</button>
+    <p class="hint wide">Classic scoring always lands first and its baseline is safe. The optional one-time bonus is 0–20 points; refreshed room state confirms whether a review was applied. This offline mode uses no paid model or API.</p>
   </form>`;
 }
 
@@ -2268,12 +2298,81 @@ function renderSetupKits() {
 }
 
 function renderSettingsSummary() {
+  const scoring = room.judge?.enabled ? "Classic + optional offline bonus" : "Classic";
   return `<div class="grid">
     <div><p class="hint">Talk time</p><strong>${room.settings.duration}s</strong></div>
     <div><p class="hint">Silence limit</p><strong>${room.settings.silence}s</strong></div>
     <div><p class="hint">Rounds</p><strong>${room.settings.rounds}</strong></div>
-    <div><p class="hint">Scoring</p><strong>Classic</strong></div>
+    <div><p class="hint">Scoring</p><strong>${scoring}</strong></div>
   </div>`;
+}
+
+function currentTurnJudgeChoice(turn = room?.activeTurn) {
+  if (!turn || !room?.judge?.enabled) return "classic";
+  if (room.viewer?.playerId !== turn.playerId) return "classic";
+  return turnJudgeChoice?.code === roomCode
+    && turnJudgeChoice.turnId === turn.id
+    && turnJudgeChoice.playerId === turn.playerId
+    ? turnJudgeChoice.choice
+    : "";
+}
+
+function setCurrentTurnJudgeChoice(turn, choice) {
+  if (!turn || room?.viewer?.playerId !== turn.playerId || !["classic", "transcript"].includes(choice)) {
+    turnJudgeChoice = null;
+    return;
+  }
+  turnJudgeChoice = { code: roomCode, turnId: turn.id, playerId: turn.playerId, choice };
+}
+
+function renderTurnJudgeChoice(turn) {
+  if (!room.judge?.enabled || room.viewer.playerId !== turn.playerId) return "";
+  const choice = currentTurnJudgeChoice(turn);
+  const running = controller?.turnId === turn.id;
+  const localAvailable = turnTranscriptionCapability.supported;
+  const status = choice === "transcript"
+    ? "Approved for this turn only. Text is wiped after the one offline review request."
+    : choice === "classic"
+      ? "Classic scoring selected. No transcript will be created or sent."
+      : localAvailable
+        ? "Choose once for this exact turn before starting the microphone. Manual timing always uses classic scoring."
+        : "On-device transcription is unavailable here. Choose classic scoring or use the manual timer.";
+  return `<fieldset class="consent-card turn-judge-choice" data-turn-judge-choice>
+    <legend>Optional relevance bonus · this turn only</legend>
+    <label class="choice-row">
+      <input type="radio" name="turnJudgeChoice" value="classic" data-turn-id="${escapeHTML(turn.id)}" ${choice === "classic" ? "checked" : ""} ${running ? "disabled" : ""}>
+      <span><strong>Classic scoring</strong><small>No transcript and no judge bonus.</small></span>
+    </label>
+    <label class="choice-row">
+      <input type="radio" name="turnJudgeChoice" value="transcript" data-turn-id="${escapeHTML(turn.id)}" ${choice === "transcript" ? "checked" : ""} ${running || !localAvailable ? "disabled" : ""}>
+      <span><strong>Use on-device transcription</strong><small>The exact live microphone track is transcribed on-device. At the end, only the assigned topic and up to 8 KiB of transcript text go once to this NonStopTalk Worker’s offline judge. Audio is never uploaded. The text is never stored, logged, sent to analytics, or shared with an external model.</small></span>
+    </label>
+    <p class="hint" data-turn-judge-status role="status" aria-live="polite" aria-atomic="true">${escapeHTML(status)}</p>
+  </fieldset>`;
+}
+
+function renderTurnScoreDetail(turn) {
+  const judge = turn?.judge;
+  const bonus = Number.isSafeInteger(judge?.bonus) ? judge.bonus : 0;
+  const classic = Math.max(0, Number(turn?.score || 0) - bonus);
+  const base = `${turn.spokenSeconds} of ${turn.duration} seconds${turn.completed ? ` · ${room.completionBonus}-point completion bonus` : ""}`;
+  if (!judge) return `<p class="hint">${base}</p>`;
+  if (judge.status === "pending") {
+    return `<p class="hint">${base} · ${classic} classic points locked · offline relevance review pending</p>`;
+  }
+  if (judge.status === "done") {
+    return `<p class="hint">${base} · ${classic} classic + ${bonus} relevance bonus${judge.confidenceLabel ? ` · ${escapeHTML(judge.confidenceLabel)}` : ""}</p>${judge.feedback ? `<p class="notice info">${escapeHTML(judge.feedback)}</p>` : ""}`;
+  }
+  if (judge.status === "failed") {
+    return `<p class="hint">${base} · offline review unavailable; classic score kept</p>`;
+  }
+  return `<p class="hint">${base} · classic scoring chosen for this turn</p>`;
+}
+
+function pendingJudgeCount(state = room) {
+  return Array.isArray(state?.completedTurns)
+    ? state.completedTurns.filter((turn) => turn?.judge?.status === "pending").length
+    : 0;
 }
 
 function renderGame(current) {
@@ -2284,7 +2383,7 @@ function renderGame(current) {
     const last = room.lastTurn;
     return `<section class="room-grid">
       <div class="panel wide" style="text-align:center;padding:clamp(2rem,7vw,6rem)">
-        ${last ? `<p class="eyebrow">Turn scored</p><div class="score-callout">${escapeHTML(last.playerName)} earned ${last.score} points</div><p class="hint">${last.spokenSeconds} of ${last.duration} seconds${last.completed ? ` · ${room.completionBonus}-point completion bonus` : ""}</p>` : `<p class="eyebrow">Round ${room.currentRound}</p><h2 class="room-state-title room-next-title">${escapeHTML(current?.name || "Next player")} is up.</h2>`}
+        ${last ? `<p class="eyebrow">${last.judge?.status === "pending" ? "Classic score saved" : "Turn scored"}</p><div class="score-callout">${escapeHTML(last.playerName)} earned ${last.score} points${last.judge?.status === "pending" ? " so far" : ""}</div>${renderTurnScoreDetail(last)}` : `<p class="eyebrow">Round ${room.currentRound}</p><h2 class="room-state-title room-next-title">${escapeHTML(current?.name || "Next player")} is up.</h2>`}
         ${canStart ? `<button class="button primary" type="button" data-command="start-turn">${last ? "Next turn" : "Draw topic"}</button>` : `<p class="hint">Waiting for ${escapeHTML(current?.name || "the next player")} or the host.</p>`}
       </div>
       <aside class="panel wide"><div class="section-head"><h2>Scoreboard</h2><span>${room.completedTurns.length} turns</span></div>${renderScores(true)}</aside>
@@ -2313,8 +2412,9 @@ function renderTurnControls(turn) {
     scope: "room",
   });
   const soundCueToggle = renderSoundCueToggle();
+  const judgeChoice = renderTurnJudgeChoice(turn);
   if (turn.begunAt === null) {
-    return `${microphoneChoice}<div class="action-row">
+    return `${judgeChoice}${microphoneChoice}<div class="action-row">
       <button class="button primary" type="button" data-command="start-mic">Start with microphone</button>
       <button class="button" type="button" data-command="start-manual">Manual timer</button>
       <button class="button ghost" type="button" data-command="redraw">Redraw topic</button>
@@ -2323,7 +2423,7 @@ function renderTurnControls(turn) {
     </div>`;
   }
   const runningLocally = controller?.turnId === turn.id;
-  return `${microphoneChoice}<div class="action-row">
+  return `${judgeChoice}${microphoneChoice}<div class="action-row">
     ${runningLocally ? "" : `<button class="button" type="button" data-command="resume-mic">Resume microphone</button><button class="button" type="button" data-command="resume-manual">Resume manual</button>`}
     <button class="button ghost" type="button" data-command="end-turn">End turn</button>
     ${room.viewer.isHost ? `<button class="button ghost" type="button" data-command="mark-complete">Mark complete</button>` : ""}
@@ -2337,6 +2437,17 @@ function renderSoundCueToggle() {
 }
 
 function renderWinner() {
+  const pending = pendingJudgeCount();
+  if (pending > 0) {
+    return `<section class="winner">
+      <p class="eyebrow">Final review pending</p>
+      <h2 class="room-state-title">Standings are provisional</h2>
+      <p class="score-callout">${pending} ${pending === 1 ? "turn" : "turns"} awaiting an offline relevance score</p>
+      <p class="hint">Classic scores are already saved. A relevance bonus can still change the winner; any interrupted review expires safely to the classic score.</p>
+      <div style="max-width:34rem;margin:2rem auto">${renderScores(true)}</div>
+      ${room.viewer.isHost ? `<button class="button" type="button" data-command="reset">End pending reviews and play again</button>` : `<p class="hint">Waiting for the final review or the host.</p>`}
+    </section>`;
+  }
   return `<section class="winner">
     <p class="eyebrow">Winner</p>
     <h2 class="room-state-title">${escapeHTML(room.winner?.name || "Game over")}</h2>
@@ -2511,6 +2622,41 @@ async function handleSetupChange(event) {
   }
 }
 
+function handleTurnJudgeChoiceChange(event) {
+  const control = event.target instanceof Element ? event.target : null;
+  if (!control?.matches('[data-turn-judge-choice] input[name="turnJudgeChoice"]')) return;
+  const turn = room?.activeTurn;
+  if (busy) {
+    const retainedChoice = currentTurnJudgeChoice(turn);
+    for (const candidate of app.querySelectorAll('[data-turn-judge-choice] input[name="turnJudgeChoice"]')) {
+      candidate.checked = candidate.value === retainedChoice;
+    }
+    return;
+  }
+  if (!turn
+    || control.dataset.turnId !== turn.id
+    || room.viewer?.playerId !== turn.playerId
+    || !room.judge?.enabled
+    || controller?.turnId === turn.id) return;
+  const choice = control.value === "transcript" ? "transcript" : "classic";
+  if (choice === "transcript" && !turnTranscriptionCapability.supported) {
+    control.checked = false;
+    setCurrentTurnJudgeChoice(turn, "classic");
+    const classic = app.querySelector('[data-turn-judge-choice] input[value="classic"]');
+    if (classic) classic.checked = true;
+    showToast("On-device transcription is unavailable here. Classic scoring is selected.");
+  } else {
+    setCurrentTurnJudgeChoice(turn, choice);
+  }
+  if (choice === "classic") turnTranscription.discard(turn.id);
+  const status = app.querySelector("[data-turn-judge-status]");
+  if (status) {
+    status.textContent = currentTurnJudgeChoice(turn) === "transcript"
+      ? "Approved for this turn only. Text is wiped after the one offline review request."
+      : "Classic scoring selected. No transcript will be created or sent.";
+  }
+}
+
 function handleSetupStorage(event) {
   if (event.key !== null && event.key !== SETUP_KIT_STORAGE_KEY) return;
   if (!isCurrentHostSetup()) return;
@@ -2539,6 +2685,9 @@ async function handleSubmit(event) {
   event.preventDefault();
   if (busy) return;
   const values = Object.fromEntries(new FormData(form));
+  const judgeSettingsFocus = form.matches("[data-judge-settings]")
+    ? captureSetupControlFocus()
+    : null;
   try {
     setBusy(true);
     if (form.matches("[data-coach-setup]")) {
@@ -2590,6 +2739,12 @@ async function handleSubmit(event) {
           : payload.fallbackCode ? "the offline fallback" : "the offline generator";
         showToast(`${payload.topics.length} editable topics created with ${source}.`);
       }
+    } else if (form.matches("[data-judge-settings]")) {
+      await doAction({
+        type: "judge-settings",
+        enabled: values.enabled === "on",
+        tier: values.tier === "escalated" ? "escalated" : "routine",
+      });
     } else if (form.matches("[data-room-action]")) {
       await doAction(values);
     }
@@ -2598,6 +2753,7 @@ async function handleSubmit(event) {
     else showToast(error.message);
   } finally {
     setBusy(false);
+    restoreSetupControlFocus(judgeSettingsFocus);
   }
 }
 
@@ -2787,6 +2943,10 @@ async function handleClick(event) {
 async function startManual(notifyBegin) {
   const turn = room?.activeTurn;
   if (!turn) return;
+  if (room.judge?.enabled && room.viewer?.playerId === turn.playerId) {
+    setCurrentTurnJudgeChoice(turn, "classic");
+  }
+  turnTranscription.discard(turn.id);
   unlockSoundCues();
   const code = roomCode;
   const generation = routeGeneration;
@@ -2799,6 +2959,7 @@ async function startManual(notifyBegin) {
     turnId: turn.id,
     driver,
     mode: "manual",
+    judgeChoice: "classic",
     submitting: false,
     lastTickCueSecond: -1,
     silenceWarningPlayed: false,
@@ -2810,6 +2971,15 @@ async function startManual(notifyBegin) {
 async function startMicrophone(notifyBegin) {
   const turn = room?.activeTurn;
   if (!turn) return;
+  let judgeChoice = currentTurnJudgeChoice(turn);
+  if (room.judge?.enabled && room.viewer?.playerId === turn.playerId && !judgeChoice) {
+    app.querySelector('[data-turn-judge-choice] input:not([disabled])')?.focus({ preventScroll: true });
+    throw new Error("Choose on-device transcription or classic scoring for this turn before starting.");
+  }
+  if (judgeChoice === "transcript" && !turnTranscriptionCapability.supported) {
+    setCurrentTurnJudgeChoice(turn, "classic");
+    judgeChoice = "classic";
+  }
   unlockSoundCues();
   const code = roomCode;
   const generation = routeGeneration;
@@ -2819,6 +2989,7 @@ async function startMicrophone(notifyBegin) {
   let context;
   const remainsCurrent = () => isCurrentTurnDriver(code, generation, turn.id, driver);
   const releasePendingMicrophone = async () => {
+    turnTranscription.discard(turn.id);
     stream?.getTracks().forEach((track) => track.stop());
     if (context && context.state !== "closed") await context.close().catch(() => {});
   };
@@ -2847,11 +3018,47 @@ async function startMicrophone(notifyBegin) {
       await releasePendingMicrophone();
       return;
     }
+    // Retire any prior local controller before creating the new transcription
+    // session. Controller cleanup also discards its session, so doing this
+    // afterward could accidentally wipe the freshly authorized transcript.
     stopController();
+    if (judgeChoice === "transcript") {
+      const track = stream.getAudioTracks?.()[0]
+        || stream.getTracks().find((candidate) => candidate.kind === "audio");
+      try {
+        turnTranscription.start({
+          turnId: turn.id,
+          track,
+          isCurrent: () => remainsCurrent() && currentTurnJudgeChoice(turn) === "transcript",
+          onFailure: () => {
+            if (!remainsCurrent()) return;
+            judgeChoice = "classic";
+            setCurrentTurnJudgeChoice(turn, "classic");
+            if (controller?.turnId === turn.id) controller.judgeChoice = "classic";
+            const classic = app.querySelector('[data-turn-judge-choice] input[value="classic"]');
+            const transcript = app.querySelector('[data-turn-judge-choice] input[value="transcript"]');
+            if (classic) classic.checked = true;
+            if (transcript) transcript.checked = false;
+            const status = app.querySelector("[data-turn-judge-status]");
+            if (status) status.textContent = "On-device transcription stopped. Classic scoring will be kept and no transcript will be sent.";
+            showToast("On-device transcription stopped; this turn continues with classic scoring.");
+          },
+        });
+      } catch {
+        setCurrentTurnJudgeChoice(turn, "classic");
+        judgeChoice = "classic";
+        showToast("On-device transcription could not start with this microphone; classic scoring is selected.");
+      }
+    }
+    if (!remainsCurrent()) {
+      await releasePendingMicrophone();
+      return;
+    }
     controller = {
       turnId: turn.id,
       driver,
       mode: "mic",
+      judgeChoice,
       submitting: false,
       stream,
       context,
@@ -2925,18 +3132,140 @@ async function finishTurn(completed, eliminated, forcedSpoken) {
   const turn = room?.activeTurn;
   if (!turn) return;
   if (controller?.submitting) return;
-  if (completed || eliminated) unlockSoundCues();
   const code = roomCode;
   const generation = routeGeneration;
   const turnId = turn.id;
+  const finalization = beginTurnFinalization(code, generation, turnId);
+  if (!finalization) return;
+  try {
+    return await finishTurnOnce(turn, code, generation, completed, eliminated, forcedSpoken);
+  } finally {
+    releaseTurnFinalization(finalization);
+  }
+}
+
+async function finishTurnOnce(turn, code, generation, completed, eliminated, forcedSpoken) {
+  const turnId = turn.id;
+  if (completed || eliminated) unlockSoundCues();
+  const activeController = controller?.turnId === turnId ? controller : null;
+  const driver = activeController?.driver || microphoneDriverIdentity();
   if (controller) controller.submitting = true;
   const spokenSeconds = forcedSpoken ?? elapsedSeconds(turn);
+  let judgeChoice = activeController?.mode === "mic" ? activeController.judgeChoice : "classic";
+  let transcriptDelivery = null;
+  if (judgeChoice === "transcript") {
+    let capturedTranscript = await turnTranscription.finish(turnId);
+    if (!capturedTranscript) {
+      judgeChoice = "classic";
+      setCurrentTurnJudgeChoice(turn, "classic");
+    } else {
+      try {
+        transcriptDelivery = turnTranscriptDeliveries.begin(capturedTranscript);
+      } catch {
+        judgeChoice = "classic";
+        setCurrentTurnJudgeChoice(turn, "classic");
+        showToast("The transcript could not be kept within the private request boundary; classic scoring is selected.");
+      } finally {
+        capturedTranscript = "";
+      }
+    }
+  } else {
+    turnTranscription.discard(turnId);
+  }
+  if (driver && !isCurrentTurnDriver(code, generation, turnId, driver)) {
+    transcriptDelivery?.discard();
+    stopController();
+    return;
+  }
   stopController();
-  const accepted = await doAction({ type: "submit-turn", turnId, spokenSeconds, completed, eliminated });
-  if (!accepted || code !== roomCode || generation !== routeGeneration) return;
+  const submitAction = {
+    type: "submit-turn",
+    turnId,
+    spokenSeconds,
+    completed,
+    eliminated,
+  };
+  if (room.judge?.enabled) {
+    submitAction.manual = activeController?.mode !== "mic";
+    submitAction.judgeChoice = judgeChoice;
+  }
+  if (completed || eliminated) {
+    // Arm before the mutation request. If the Durable Object commits but the
+    // HTTP response is lost, an accepted WebSocket snapshot can still confirm
+    // this exact local finalization and produce its cue once.
+    deferredFinalCues.arm({ roomCode: code, routeGeneration: generation, turnId });
+  }
+  let accepted;
+  try {
+    accepted = await doAction(submitAction, { signal: transcriptDelivery?.signal });
+  } catch (error) {
+    const transcriptTimedOut = transcriptDelivery?.timedOut === true;
+    transcriptDelivery?.discard(error);
+    if (isDefinitiveRoomActionRejection(error)) deferredFinalCues.clear();
+    if (code !== roomCode || generation !== routeGeneration) return;
+    if (transcriptTimedOut) {
+      throw new Error("Turn submission timed out; the transcript was discarded. Refresh the room to confirm the classic score.");
+    }
+    throw error;
+  }
+  if (!accepted || code !== roomCode || generation !== routeGeneration) {
+    transcriptDelivery?.discard();
+    return;
+  }
   const scoredTurn = room?.completedTurns?.find((candidate) => candidate.id === turnId);
-  if (scoredTurn?.eliminated) playSoundCue(SOUND_CUE_NAMES.ELIMINATED);
-  else if (scoredTurn?.completed) playSoundCue(SOUND_CUE_NAMES.COMPLETED);
+  // `doAction` accepts room state before returning, so the cue tracker has
+  // already resolved an immediate result or retained a provisional final one.
+  // A malformed success without the scored turn is not allowed to leak intent
+  // into an unrelated later room state.
+  if (!scoredTurn && deferredFinalCues.pendingTurnId === turnId) deferredFinalCues.clear();
+  if (scoredTurn?.judge?.status !== "pending" || !transcriptDelivery) {
+    transcriptDelivery?.discard();
+    return;
+  }
+
+  try {
+    const result = await transcriptDelivery.deliver((privateTranscript, signal) => api(
+      "/api/v1/models/judge",
+      {
+        roomCode: code,
+        turnId,
+        transcript: privateTranscript,
+        externalConsent: false,
+      },
+      "POST",
+      { signal },
+    ));
+    if (!result.attempted && code === roomCode && generation === routeGeneration) {
+      showToast("Your classic score is safe. The refreshed room will show whether the one-time review was applied.");
+    }
+  } catch {
+    if (code === roomCode && generation === routeGeneration) {
+      showToast("Your classic score is safe. The refreshed room will show whether the one-time review was applied.");
+    }
+  }
+  if (code !== roomCode || generation !== routeGeneration) return;
+  await refreshRoomState();
+}
+
+function beginTurnFinalization(code, generation, turnId) {
+  if (turnFinalization?.roomCode === code
+    && turnFinalization.routeGeneration === generation
+    && turnFinalization.turnId === turnId) return null;
+  const finalization = Object.freeze({ roomCode: code, routeGeneration: generation, turnId });
+  turnFinalization = finalization;
+  return finalization;
+}
+
+function releaseTurnFinalization(finalization) {
+  if (turnFinalization !== finalization) return false;
+  turnFinalization = null;
+  return true;
+}
+
+function clearTurnFinalization() {
+  const hadFinalization = turnFinalization !== null;
+  turnFinalization = null;
+  return hadFinalization;
 }
 
 function updateClock() {
@@ -2971,10 +3300,10 @@ function remainingSeconds(turn) {
   return Math.max(0, turn.duration - elapsedSeconds(turn));
 }
 
-async function doAction(action) {
+async function doAction(action, { signal } = {}) {
   const code = roomCode;
   const generation = routeGeneration;
-  const payload = await api(`/api/rooms/${code}/action`, action, "POST");
+  const payload = await api(`/api/rooms/${code}/action`, action, "POST", { signal });
   if (code !== roomCode || generation !== routeGeneration) return false;
   if (action.type === "custom-topics" || action.type === "apply-setup-kit") {
     ensureRoomSetupView().topicDraft = null;
@@ -2995,9 +3324,22 @@ function acceptRoom(next) {
   const focusedDraft = captureFocusedDraft();
   const setupControlFocus = captureSetupControlFocus();
   const announcement = roomAnnouncement(previous, next);
+  if (previous?.activeTurn?.id !== next.activeTurn?.id
+    || previous?.activeTurn?.playerId !== next.activeTurn?.playerId) {
+    clearTurnFinalization();
+    turnTranscription.discard();
+    turnJudgeChoice = null;
+  }
   room = next;
   clockOffset = room.serverNow - Date.now();
+  const deferredFinalCue = deferredFinalCues.consume({
+    roomCode,
+    routeGeneration,
+    phase: room.phase,
+    completedTurns: room.completedTurns,
+  });
   renderRoom();
+  if (deferredFinalCue) playSoundCue(deferredFinalCue);
   reconcileMicrophoneDialog();
   if (routeHeadingHadFocus) {
     const heading = app.querySelector("h1");
@@ -3027,8 +3369,15 @@ async function refreshRoomState() {
     if (code !== roomCode || generation !== routeGeneration) return;
     acceptRoom(payload.room);
   } catch (error) {
-    showToast(error.message);
+    if (code === roomCode && generation === routeGeneration) showToast(error.message);
   }
+}
+
+function isDefinitiveRoomActionRejection(error) {
+  return Number.isSafeInteger(error?.status)
+    && error.status >= 400
+    && error.status < 500
+    && error.status !== 408;
 }
 
 function reconcileController() {
@@ -3041,6 +3390,7 @@ function reconcileController() {
 
 function stopController() {
   if (!controller) return;
+  turnTranscription.discard(controller.turnId);
   if (controller.raf) cancelAnimationFrame(controller.raf);
   controller.stream?.getTracks().forEach((track) => track.stop());
   if (controller.context && controller.context.state !== "closed") controller.context.close().catch(() => {});
@@ -3048,7 +3398,12 @@ function stopController() {
 }
 
 function stopRoomLifecycle() {
+  turnTranscriptDeliveries.abortAll();
+  deferredFinalCues.clear();
+  clearTurnFinalization();
   stopController();
+  turnTranscription.discard();
+  turnJudgeChoice = null;
   soundCues.release();
   disconnectSocket();
   clearInterval(clockTimer);
@@ -3100,8 +3455,9 @@ function disconnectSocket() {
   if (active && active.readyState < WebSocket.CLOSING) active.close(1000, "Navigating away");
 }
 
-async function api(path, body, method = "GET") {
+async function api(path, body, method = "GET", { signal } = {}) {
   const options = { method, credentials: "same-origin", headers: { Accept: "application/json" } };
+  if (signal) options.signal = signal;
   if (body !== undefined) {
     options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(body);
@@ -3255,6 +3611,7 @@ function editableControlKey(control) {
   if (!form || !app.contains(form)) return "";
   if (form.matches("[data-join-current-room]")) return `join-current:${control.name}`;
   if (form.matches("[data-model-topics]")) return `model-topics:${control.name}`;
+  if (form.matches("[data-judge-settings]")) return `judge-settings:${control.name}`;
   if (form.matches("[data-setup-kit-save]")) return `setup-kit-save:${control.name}`;
   if (form.matches("[data-setup-kit-library]")) return `setup-kit-library:${control.name}`;
   if (!form.matches("[data-room-action]")) return "";
@@ -3274,12 +3631,35 @@ function roomAnnouncement(previous, next) {
     return next.phase === "setup" ? `Room ${next.code} lobby loaded.` : `Room ${next.code} loaded.`;
   }
   if (previous.phase !== next.phase) {
-    if (next.phase === "finished") return `${next.winner?.name || "The winner"} wins with ${next.winner?.score ?? 0} points.`;
+    if (next.phase === "finished") {
+      return pendingJudgeCount(next) > 0
+        ? "The final classic score is saved. Standings are provisional while the offline review finishes."
+        : `${next.winner?.name || "The winner"} wins with ${next.winner?.score ?? 0} points.`;
+    }
     if (next.phase === "playing") return `Game started. ${next.players[next.currentPlayer]?.name || "The first player"} is up next.`;
     return "The room returned to game setup.";
   }
+  if (previous.judge?.enabled !== next.judge?.enabled) {
+    return next.judge?.enabled
+      ? "The offline relevance judge is now available. Each speaker still chooses separately for every turn."
+      : "The offline relevance judge is now disabled. Classic scoring remains active.";
+  }
+  if (next.phase === "finished" && pendingJudgeCount(previous) > 0 && pendingJudgeCount(next) === 0) {
+    return `${next.winner?.name || "The winner"} wins with ${next.winner?.score ?? 0} points after the final review.`;
+  }
+  const resolvedJudgeTurn = next.completedTurns?.find((turn) => {
+    const prior = previous.completedTurns?.find((candidate) => candidate.id === turn.id);
+    return prior?.judge?.status === "pending" && turn.judge?.status !== "pending";
+  });
+  if (resolvedJudgeTurn) {
+    return resolvedJudgeTurn.judge?.status === "done"
+      ? `${resolvedJudgeTurn.playerName}'s offline review added ${resolvedJudgeTurn.judge.bonus || 0} points.`
+      : `${resolvedJudgeTurn.playerName}'s offline review ended with the classic score unchanged.`;
+  }
   if (previous.lastTurn?.id !== next.lastTurn?.id && next.lastTurn) {
-    return `${next.lastTurn.playerName} earned ${next.lastTurn.score} points.`;
+    return next.lastTurn.judge?.status === "pending"
+      ? `${next.lastTurn.playerName}'s classic score is saved; an offline review is pending.`
+      : `${next.lastTurn.playerName} earned ${next.lastTurn.score} points.`;
   }
   if (previous.activeTurn?.id !== next.activeTurn?.id && next.activeTurn) {
     return `${next.activeTurn.playerName}'s turn. Topic: ${next.activeTurn.topic}`;
@@ -3307,7 +3687,15 @@ function escapeHTML(value) {
 }
 
 function shutdown() {
+  if (!pageLifecycleSuspended) routeGeneration += 1;
+  pageLifecycleSuspended = true;
   closeMicrophoneDialog({ restoreFocus: false });
   stopRoomLifecycle();
   stopCoachingLifecycle();
+}
+
+function resumePageLifecycle() {
+  if (!pageLifecycleSuspended) return;
+  pageLifecycleSuspended = false;
+  loadRoute();
 }

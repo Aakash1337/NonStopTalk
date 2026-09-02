@@ -31,6 +31,13 @@ const LEGACY_SOUND_STORAGE_KEY = "dont-stop-talking.sound";
 const SOUND_PREVIEW_RECIPE = [880];
 const SOUND_START_RECIPE = [660, 880];
 const SOUND_COMPLETED_RECIPE = [523, 659, 784];
+const HOST_JUDGE_TRANSCRIPT = "deterministic smoke-test topic orange";
+const GUEST_JUDGE_TRANSCRIPT = [
+  "deterministic",
+  "smoke-test",
+  "topic",
+  ...Array.from({ length: 27 }, (_, index) => `detail${index + 1}`),
+].join(" ");
 
 function boundedMessage(value) {
   return String(value instanceof Error ? value.message : value).slice(0, 500);
@@ -174,16 +181,39 @@ async function installSyntheticMicrophone(context, profile) {
     let streamNumber = 0;
     let audioContextNumber = 0;
     let releasePending = null;
+    let releasePendingJudge = null;
+    const recognitions = [];
 
     const harness = {
       profile: microphoneProfile,
       events,
       blockNextUserMedia: false,
+      blockNextJudgeRequest: false,
       releasePendingUserMedia() {
         if (!releasePending) throw new Error("No synthetic microphone request is waiting.");
         const release = releasePending;
         releasePending = null;
         release();
+      },
+      releasePendingJudgeRequest() {
+        if (!releasePendingJudge) throw new Error("No offline judge request is waiting.");
+        const release = releasePendingJudge;
+        releasePendingJudge = null;
+        release();
+      },
+      emitFinalTranscript(transcript) {
+        const recognition = [...recognitions].reverse().find((candidate) => candidate.starts > 0 && !candidate.aborted);
+        if (!recognition) throw new Error("No synthetic on-device recognizer is active.");
+        const result = [{ transcript: String(transcript), confidence: 0.9 }];
+        result.isFinal = true;
+        recognition.onresult?.({ resultIndex: 0, results: [result] });
+        events.push({ type: "recognition-result", transcriptBytes: new TextEncoder().encode(String(transcript)).byteLength });
+      },
+      emitRecognitionError() {
+        const recognition = [...recognitions].reverse().find((candidate) => candidate.starts > 0 && !candidate.aborted);
+        if (!recognition) throw new Error("No synthetic on-device recognizer is active.");
+        recognition.onerror?.({ error: "network" });
+        events.push({ type: "recognition-error" });
       },
     };
     Object.defineProperty(window, "__microphoneHarness", {
@@ -201,13 +231,18 @@ async function installSyntheticMicrophone(context, profile) {
       events.push({ type: "get-user-media", constraints: request });
       const streamId = `${microphoneProfile}-stream-${++streamNumber}`;
       const track = {
+        id: `${streamId}-audio-track`,
+        kind: "audio",
+        readyState: "live",
         stop() {
+          this.readyState = "ended";
           events.push({ type: "track-stopped", streamId });
         },
       };
       const stream = {
         id: streamId,
         getTracks() { return [track]; },
+        getAudioTracks() { return [track]; },
       };
       const makeReady = () => {
         events.push({ type: "stream-ready", streamId });
@@ -356,25 +391,67 @@ async function installSyntheticMicrophone(context, profile) {
     window.AudioContext = SyntheticAudioContext;
     window.webkitAudioContext = SyntheticAudioContext;
 
+    class SyntheticSpeechRecognition {
+      constructor() {
+        this.processLocally = false;
+        this.starts = 0;
+        this.aborted = false;
+        recognitions.push(this);
+        events.push({ type: "recognition-created" });
+      }
+
+      start(track) {
+        if (this.processLocally !== true || track?.kind !== "audio" || track?.readyState !== "live") {
+          throw new DOMException("Synthetic recognition requires the exact live local track.", "NotSupportedError");
+        }
+        this.starts += 1;
+        this.track = track;
+        this.aborted = false;
+        events.push({ type: "recognition-started", trackId: track.id, processLocally: this.processLocally });
+      }
+
+      stop() {
+        events.push({ type: "recognition-stopped", trackId: this.track?.id || "" });
+        this.onend?.();
+      }
+
+      abort() {
+        this.aborted = true;
+        events.push({ type: "recognition-aborted", trackId: this.track?.id || "" });
+      }
+    }
+    window.SpeechRecognition = SyntheticSpeechRecognition;
+    window.webkitSpeechRecognition = SyntheticSpeechRecognition;
+
     const originalFetch = window.fetch.bind(window);
     window.fetch = async (input, init) => {
       const url = new URL(typeof input === "string" ? input : input.url, location.href);
       let body = null;
       try { body = JSON.parse(init?.body || "null"); } catch { /* Only JSON room actions matter here. */ }
       const roomAction = /^\/api\/rooms\/[A-HJ-NP-Z2-9]{6}\/action$/u.test(url.pathname);
+      const judgeRequest = url.pathname === "/api/v1/models/judge";
       if (roomAction) {
         events.push({ type: "room-action", body });
+      }
+      if (judgeRequest) {
+        events.push({ type: "judge-request", body });
+        if (harness.blockNextJudgeRequest) {
+          harness.blockNextJudgeRequest = false;
+          await new Promise((resolve) => { releasePendingJudge = resolve; });
+        }
       }
       try {
         const response = await originalFetch(input, init);
         if (roomAction) {
           events.push({ type: "room-action-response", body, status: response.status });
         }
+        if (judgeRequest) events.push({ type: "judge-response", status: response.status });
         return response;
       } catch (error) {
         if (roomAction) {
           events.push({ type: "room-action-error", body, name: error?.name || "Error" });
         }
+        if (judgeRequest) events.push({ type: "judge-error", name: error?.name || "Error" });
         throw error;
       }
     };
@@ -482,6 +559,16 @@ async function postRoomAction(context, origin, code, action) {
     headers: { Accept: "application/json" },
   });
   assert.equal(response.status(), 200, `Remote room action ${action.type} failed: ${await response.text()}`);
+}
+
+async function postJudgeReview(context, origin, review) {
+  const response = await context.request.post(`${origin}/api/v1/models/judge`, {
+    data: review,
+    headers: { Accept: "application/json", Origin: origin },
+  });
+  if (response.status() !== 200) {
+    throw new Error(`Remote offline review failed (${response.status()}): ${await response.text()}`);
+  }
 }
 
 async function unauthorizedSettingsProbe(page, code) {
@@ -1153,6 +1240,56 @@ async function runBrowserFlow(origin, signal) {
     assert.deepEqual(toneFrequencies(await readHarnessEvents(host, soundEventOffset)), [],
       "Returning to the unbegun room must not replay the invalidated start cue.");
 
+    // A BFCache-style page suspension invalidates every route-bound async
+    // continuation, then pageshow restores the room lifecycle from fresh
+    // authoritative state. A response released after pagehide must stay inert.
+    let releaseSuspendedBeginResponse;
+    let observeSuspendedBeginRequest;
+    const suspendedBeginResponseGate = new Promise((resolve) => { releaseSuspendedBeginResponse = resolve; });
+    const suspendedBeginRequestObserved = new Promise((resolve) => { observeSuspendedBeginRequest = resolve; });
+    const suspendedBeginHandler = async (route) => {
+      const action = route.request().postDataJSON();
+      if (action?.type !== "begin-turn") {
+        await route.continue();
+        return;
+      }
+      observeSuspendedBeginRequest();
+      await suspendedBeginResponseGate;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ room: null }),
+      });
+    };
+    await host.route(roomActionRoute, suspendedBeginHandler);
+    const socketCountBeforePageResume = hostTracker.sockets
+      .filter((candidate) => new URL(candidate.url).pathname === `/api/rooms/${code}/socket`).length;
+    soundEventOffset = await harnessEventCount(host);
+    const suspendedStartClick = host.getByRole("button", { name: "Manual timer" }).click();
+    await suspendedBeginRequestObserved;
+    await host.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
+    releaseSuspendedBeginResponse();
+    await suspendedStartClick;
+    await eventually(async () => {
+      const events = await readHarnessEvents(host, soundEventOffset);
+      return events.some((event) => event.type === "room-action-response"
+        && event.body?.type === "begin-turn"
+        && event.status === 200) ? events : null;
+    }, "The page-suspended begin-turn response was not observed", signal);
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host, soundEventOffset)), [],
+      "A begin-turn response released after pagehide must not play a stale cue.");
+
+    await host.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    await host.getByRole("heading", { level: 1, name: `Room ${code}` }).waitFor();
+    await host.locator(".turn-card .room-state-title").filter({ hasText: TOPIC }).waitFor();
+    await waitForSocket(hostTracker, code, signal, socketCountBeforePageResume);
+    const roomAfterPageResume = await readRoom(host, code);
+    assert.equal(roomAfterPageResume.payload.room?.activeTurn?.begunAt, null,
+      "pageshow must reload the unmutated authoritative room after lifecycle suspension.");
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host, soundEventOffset)), [],
+      "BFCache-style lifecycle reactivation must not replay an invalidated cue.");
+    await host.unroute(roomActionRoute, suspendedBeginHandler);
+
     // The microphone preference is local to the current driver. It survives a
     // harmless room rerender, restores focus to the replacement opener, and
     // never creates a room action or exposes its device metadata to the guest.
@@ -1426,8 +1563,80 @@ async function runBrowserFlow(origin, signal) {
     });
     await host.getByRole("button", { name: "Mark complete" }).waitFor();
 
+    // Drive the duration boundary through the microphone path, but hold its
+    // first submit before it reaches the Worker. Controller cleanup happens
+    // before that request settles, so the still-rendered Mark complete button
+    // exercises the independent route/turn finalization guard.
+    const completionTurnId = (await readRoom(host, code)).payload.room?.activeTurn?.id;
+    assert.match(completionTurnId, /^t[1-9][0-9]*$/u);
+    const automaticResumeOffset = await harnessEventCount(host);
+    await host.getByRole("button", { name: "Resume microphone" }).click();
+    await host.getByRole("button", { name: "End turn" }).waitFor();
+    await waitForToneRecipe(
+      host,
+      automaticResumeOffset,
+      SOUND_START_RECIPE,
+      "The automatic-completion microphone resume cue",
+      signal,
+    );
+
+    let releaseAutomaticSubmit;
+    let observeAutomaticSubmit;
+    let resolveAutomaticResponse;
+    const automaticSubmitGate = new Promise((resolve) => { releaseAutomaticSubmit = resolve; });
+    const automaticSubmitObserved = new Promise((resolve) => { observeAutomaticSubmit = resolve; });
+    const automaticResponseSettled = new Promise((resolve) => { resolveAutomaticResponse = resolve; });
+    let automaticSubmitInterceptions = 0;
+    const automaticSubmitHandler = async (route) => {
+      const action = route.request().postDataJSON();
+      if (action?.type !== "submit-turn" || action.turnId !== completionTurnId) {
+        await route.continue();
+        return;
+      }
+      automaticSubmitInterceptions += 1;
+      if (automaticSubmitInterceptions > 1) {
+        await route.abort("failed");
+        return;
+      }
+      observeAutomaticSubmit();
+      await automaticSubmitGate;
+      const upstream = await route.fetch();
+      await route.fulfill({ response: upstream });
+      resolveAutomaticResponse();
+    };
+    await host.route(roomActionRoute, automaticSubmitHandler);
     const completionEventOffset = await harnessEventCount(host);
+    const completionRequestOffset = hostApiRequests.length;
+    await host.evaluate(() => {
+      const actualNow = Date.now;
+      window.__restoreAutomaticCompletionClock = () => {
+        Date.now = actualNow;
+        delete window.__restoreAutomaticCompletionClock;
+      };
+      Date.now = () => actualNow() + 60_000;
+    });
+    await automaticSubmitObserved;
+    await host.evaluate(() => window.__restoreAutomaticCompletionClock());
     await host.getByRole("button", { name: "Mark complete" }).click();
+    await delay(100, undefined, signal ? { signal } : undefined);
+    const guardedCompletionRequests = hostApiRequests.slice(completionRequestOffset)
+      .filter((request) => request.path === `/api/rooms/${code}/action`
+        && request.body?.type === "submit-turn"
+        && request.body.turnId === completionTurnId);
+    releaseAutomaticSubmit();
+    assert.deepEqual(guardedCompletionRequests, [{
+      method: "POST",
+      path: `/api/rooms/${code}/action`,
+      body: {
+        type: "submit-turn",
+        turnId: completionTurnId,
+        spokenSeconds: 10,
+        completed: true,
+        eliminated: false,
+      },
+    }], "A stale completion click must not duplicate an automatic in-flight turn submission.");
+    await automaticResponseSettled;
+    await host.unroute(roomActionRoute, automaticSubmitHandler);
     await Promise.all([
       eventually(() => host.locator(".score-callout").textContent().then((text) => text?.trim() === "Cloud Host earned 35 points"),
         "Host score did not render", signal),
@@ -1458,13 +1667,21 @@ async function runBrowserFlow(origin, signal) {
         && event.status === 200,
       "accepted completed submit-turn response",
     );
+    assert(submitRequestIndex < submitResponseIndex,
+      "The completed submit request must precede its successful HTTP response.");
     assertStrictEventOrder([
       [submitRequestIndex, "completed submit-turn request"],
-      [submitResponseIndex, "accepted completed submit-turn response"],
       [completionEvents.indexOf(completionTones[0]), "first completed tone"],
       [completionEvents.indexOf(completionTones[1]), "second completed tone"],
       [completionEvents.indexOf(completionTones[2]), "third completed tone"],
     ]);
+    await delay(100, undefined, signal ? { signal } : undefined);
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(host, completionEventOffset)),
+      SOUND_COMPLETED_RECIPE,
+    "Repeated automatic callbacks and the stale click must not replay the completed cue.");
+    // WebSocket state can authoritatively confirm the committed action before
+    // the initiating fetch receives its response. The response-loss scenario
+    // later in this smoke locks that ordering in deliberately.
     assert.deepEqual(toneFrequencies(await readHarnessEvents(guest)), [],
       "A spectator must not play another browser's start or completed cues.");
     assert.match(await host.locator(".panel.wide").first().textContent(), /10 of 10 seconds.*25-point completion bonus/su);
@@ -1635,6 +1852,581 @@ async function runBrowserFlow(origin, signal) {
     assert.equal(finished.payload.room?.activeTurn, null);
     assert.equal(finished.payload.room?.completedTurns?.length, 2);
     assert.equal(finished.payload.room?.winner?.name, "Cloud Host");
+    assert.deepEqual(finished.payload.room?.judge, { enabled: false, tier: "routine" },
+      "The optional offline judge must be disabled by default.");
+    assert(finished.payload.room.completedTurns.every((turn) => !Object.hasOwn(turn, "judge")),
+      "A default-off classic game must not invent per-turn judge state.");
+
+    // Start a second game and opt in to the free, deterministic judge. The
+    // room setting is host-only, while transcript consent remains a fresh
+    // speaker choice on every exact turn.
+    const judgeSettingRequestOffset = hostApiRequests.length;
+    await host.getByRole("button", { name: "Play again" }).click();
+    await Promise.all([
+      host.getByRole("button", { name: "Start game" }).waitFor(),
+      guest.getByText("Waiting for the host to start the game.", { exact: true }).waitFor(),
+    ]);
+    const judgeSettings = host.locator("[data-judge-settings]");
+    const judgeEnabled = judgeSettings.locator('input[name="enabled"]');
+    assert.equal(await judgeEnabled.isChecked(), false,
+      "Reset must preserve the explicit default-off judge setting.");
+    assert.equal(await guest.locator("[data-judge-settings]").count(), 0,
+      "A non-host must not receive room judge controls.");
+    await judgeEnabled.check();
+    await judgeSettings.getByRole("button", { name: "Apply judge setting" }).click();
+    await eventually(async () => {
+      const [hostState, guestState] = await Promise.all([readRoom(host, code), readRoom(guest, code)]);
+      return hostState.payload.room?.judge?.enabled === true
+        && hostState.payload.room?.judge?.tier === "routine"
+        && guestState.payload.room?.judge?.enabled === true
+        && guestState.payload.room?.judge?.tier === "routine";
+    }, "The routine offline-judge setting did not converge", signal);
+    const judgeSettingRequests = hostApiRequests.slice(judgeSettingRequestOffset)
+      .filter((request) => request.path === `/api/rooms/${code}/action`
+        && request.body?.type === "judge-settings");
+    assert.deepEqual(judgeSettingRequests, [{
+      method: "POST",
+      path: `/api/rooms/${code}/action`,
+      body: { type: "judge-settings", enabled: true, tier: "routine" },
+    }], "Enabling the judge must be one exact, transcript-free room action.");
+
+    await host.getByRole("button", { name: "Start game" }).click();
+    await Promise.all([
+      host.getByRole("heading", { name: "Cloud Host is up." }).waitFor(),
+      guest.getByRole("heading", { name: "Cloud Host is up." }).waitFor(),
+    ]);
+    await host.getByRole("button", { name: "Draw topic" }).click();
+    await Promise.all([
+      host.locator(".turn-card .room-state-title").filter({ hasText: TOPIC }).waitFor(),
+      guest.locator(".turn-card .room-state-title").filter({ hasText: TOPIC }).waitFor(),
+    ]);
+
+    const hostTranscriptChoice = host.locator('[data-turn-judge-choice] input[value="transcript"]');
+    const hostClassicChoice = host.locator('[data-turn-judge-choice] input[value="classic"]');
+    assert.equal(await hostTranscriptChoice.count(), 1,
+      "The exact speaker must receive one per-turn transcript choice.");
+    assert.deepEqual(await host.locator('[data-turn-judge-choice] input[name="turnJudgeChoice"]')
+      .evaluateAll((controls) => controls.map((control) => control.checked)), [false, false],
+    "A new turn must not inherit or imply transcript consent.");
+    assert.equal(await guest.locator("[data-turn-judge-choice]").count(), 0,
+      "A spectator must not be able to consent for the speaker.");
+
+    const unselectedRequestOffset = hostApiRequests.length;
+    const unselectedEventOffset = await harnessEventCount(host);
+    await host.getByRole("button", { name: "Start with microphone" }).click();
+    await host.locator("#toast")
+      .filter({ hasText: "Choose on-device transcription or classic scoring for this turn before starting." })
+      .waitFor();
+    assertNoNewApiRequests(hostApiRequests, unselectedRequestOffset,
+      "Rejecting an unselected per-turn judge choice");
+    const unselectedEvents = await readHarnessEvents(host, unselectedEventOffset);
+    assert.equal(unselectedEvents.some((event) => event.type === "get-user-media"), false,
+      "An unselected judge choice must block microphone acquisition.");
+    assert.equal(unselectedEvents.some((event) => event.type === "recognition-started"), false,
+      "An unselected judge choice must not start transcription.");
+
+    await hostTranscriptChoice.check();
+    assert.equal(await hostTranscriptChoice.isChecked(), true);
+    assert.equal(await hostClassicChoice.isChecked(), false);
+    assert.match(await host.locator("[data-turn-judge-status]").textContent(),
+      /Approved for this turn only/u);
+    const hostJudgeTurnId = await hostTranscriptChoice.getAttribute("data-turn-id");
+    assert.match(hostJudgeTurnId, /^t[1-9][0-9]*$/u);
+
+    const hostJudgeCaptureOffset = await harnessEventCount(host);
+    await host.getByRole("button", { name: "Start with microphone" }).click();
+    await host.getByRole("button", { name: "End turn" }).waitFor();
+    const hostJudgeCaptureEvents = await eventually(async () => {
+      const events = await readHarnessEvents(host, hostJudgeCaptureOffset);
+      return events.some((event) => event.type === "recognition-started") ? events : null;
+    }, "The host's exact-track on-device recognizer did not start", signal);
+    const hostJudgeMediaRequest = hostJudgeCaptureEvents.find((event) => event.type === "get-user-media");
+    const hostJudgeStream = hostJudgeCaptureEvents.find((event) => event.type === "stream-ready");
+    const hostJudgeMediaSource = hostJudgeCaptureEvents.find((event) => event.type === "media-source-created");
+    const hostJudgeRecognition = hostJudgeCaptureEvents.find((event) => event.type === "recognition-started");
+    assert.deepEqual(hostJudgeMediaRequest?.constraints, {
+      audio: { deviceId: { exact: "host-mic" } },
+      video: false,
+    }, "Judge transcription must reuse the chosen exact microphone constraint.");
+    assert.equal(hostJudgeMediaSource?.streamId, hostJudgeStream?.streamId,
+      "The analysis graph must use the captured synthetic stream.");
+    assert.equal(hostJudgeRecognition?.trackId, `${hostJudgeStream?.streamId}-audio-track`,
+      "On-device recognition must receive the exact live track from that stream.");
+    assert.equal(hostJudgeRecognition?.processLocally, true,
+      "The synthetic recognizer must prove mandatory local processing.");
+    assertStrictEventOrder([
+      [eventIndex(hostJudgeCaptureEvents, (event) => event.type === "stream-ready", "host judge stream"),
+        "host judge stream"],
+      [eventIndex(hostJudgeCaptureEvents,
+        (event) => event.type === "media-source-created" && event.streamId === hostJudgeStream?.streamId,
+        "host judge media source"), "host judge media source"],
+      [eventIndex(hostJudgeCaptureEvents,
+        (event) => event.type === "room-action-response"
+          && event.body?.type === "begin-turn"
+          && event.status === 200,
+        "host judge begin response"), "host judge begin response"],
+      [eventIndex(hostJudgeCaptureEvents,
+        (event) => event.type === "recognition-started"
+          && event.trackId === `${hostJudgeStream?.streamId}-audio-track`,
+        "host judge recognition"), "host judge recognition"],
+    ]);
+    await host.evaluate((transcript) => window.__microphoneHarness.emitFinalTranscript(transcript),
+      HOST_JUDGE_TRANSCRIPT);
+    assert.equal((await readHarnessEvents(host, hostJudgeCaptureOffset))
+      .some((event) => event.type === "recognition-result"
+        && event.transcriptBytes === Buffer.byteLength(HOST_JUDGE_TRANSCRIPT)), true,
+    "The recognizer must emit the exact bounded host transcript.");
+
+    // Briefly hold the first judge call so the smoke can observe the classic
+    // score already committed before the optional bonus resolves.
+    await host.evaluate(() => { window.__microphoneHarness.blockNextJudgeRequest = true; });
+    const hostJudgeFinishRequestOffset = hostApiRequests.length;
+    const hostJudgeFinishEventOffset = await harnessEventCount(host);
+    await host.getByRole("button", { name: "Mark complete" }).click();
+    const hostJudgePendingEvents = await eventually(async () => {
+      const events = await readHarnessEvents(host, hostJudgeFinishEventOffset);
+      return events.some((event) => event.type === "judge-request") ? events : null;
+    }, "The host's offline judge request was not observed", signal);
+    const hostSubmitEvent = hostJudgePendingEvents.find((event) =>
+      event.type === "room-action" && event.body?.type === "submit-turn");
+    const hostJudgeRequestEvent = hostJudgePendingEvents.find((event) => event.type === "judge-request");
+    assert.deepEqual(hostSubmitEvent?.body, {
+      type: "submit-turn",
+      turnId: hostJudgeTurnId,
+      spokenSeconds: 10,
+      completed: true,
+      eliminated: false,
+      manual: false,
+      judgeChoice: "transcript",
+    }, "The room submit must contain consent metadata but never the transcript.");
+    assert.deepEqual(hostJudgeRequestEvent?.body, {
+      roomCode: code,
+      turnId: hostJudgeTurnId,
+      transcript: HOST_JUDGE_TRANSCRIPT,
+      externalConsent: false,
+    }, "Only the dedicated same-origin judge request may carry the transcript.");
+    assertStrictEventOrder([
+      [eventIndex(hostJudgePendingEvents,
+        (event) => event.type === "recognition-stopped"
+          && event.trackId === `${hostJudgeStream?.streamId}-audio-track`,
+        "host recognizer stop"), "host recognizer stop"],
+      [eventIndex(hostJudgePendingEvents,
+        (event) => event.type === "track-stopped" && event.streamId === hostJudgeStream?.streamId,
+        "host microphone stop"), "host microphone stop"],
+      [hostJudgePendingEvents.indexOf(hostSubmitEvent), "host classic submit request"],
+      [eventIndex(hostJudgePendingEvents,
+        (event) => event.type === "room-action-response"
+          && event.body?.type === "submit-turn"
+          && event.status === 200,
+        "host classic submit response"), "host classic submit response"],
+      [hostJudgePendingEvents.indexOf(hostJudgeRequestEvent), "host judge request"],
+    ]);
+    assert.equal(hostJudgePendingEvents.some((event) => event.type === "judge-response"), false,
+      "The blocked judge must not appear resolved.");
+
+    const hostPendingJudgeState = await eventually(async () => {
+      const state = await readRoom(host, code);
+      return state.payload.room?.completedTurns?.find((turn) => turn.id === hostJudgeTurnId)
+        ?.judge?.status === "pending" ? state : null;
+    }, "The host classic score did not become publicly pending", signal);
+    const hostPendingTurn = hostPendingJudgeState.payload.room.completedTurns
+      .find((turn) => turn.id === hostJudgeTurnId);
+    assert.equal(hostPendingTurn.score, 35,
+      "Classic duration and completion points must land before judging.");
+    assert.deepEqual(hostPendingTurn.judge, { status: "pending", bonus: 0 });
+    assert.equal(hostPendingJudgeState.payload.room.standingsProvisional, true);
+    assert.equal(Object.hasOwn(hostPendingJudgeState.payload.room, "pendingJudgeReviews"), false,
+      "Private claim coordination must not cross the room API boundary.");
+    const hostPendingPublicJSON = JSON.stringify(hostPendingJudgeState.payload.room);
+    assert.equal(hostPendingPublicJSON.includes(HOST_JUDGE_TRANSCRIPT), false,
+      "The host transcript must never enter public or durable room state.");
+    assert.equal(hostPendingPublicJSON.includes('"claimId"'), false);
+    assert.equal(hostPendingPublicJSON.includes('"claimedAt"'), false);
+    assert.equal(hostPendingPublicJSON.includes('"deadlineAt"'), false);
+    await Promise.all([
+      eventually(() => host.locator(".score-callout").textContent()
+        .then((text) => text?.trim() === "Cloud Host earned 35 points so far"),
+      "The host did not render its pending classic score", signal),
+      eventually(() => guest.locator(".score-callout").textContent()
+        .then((text) => text?.trim() === "Cloud Host earned 35 points so far"),
+      "The guest did not receive the pending classic score", signal),
+    ]);
+
+    await host.evaluate(() => window.__microphoneHarness.releasePendingJudgeRequest());
+    await eventually(async () => {
+      const events = await readHarnessEvents(host, hostJudgeFinishEventOffset);
+      return events.some((event) => event.type === "judge-response" && event.status === 200);
+    }, "The host's offline judge did not resolve", signal);
+    const hostResolvedJudgeState = await eventually(async () => {
+      const state = await readRoom(host, code);
+      const turn = state.payload.room?.completedTurns?.find((candidate) => candidate.id === hostJudgeTurnId);
+      return turn?.judge?.status === "done" ? state : null;
+    }, "The host relevance bonus did not persist", signal);
+    const hostResolvedTurn = hostResolvedJudgeState.payload.room.completedTurns
+      .find((turn) => turn.id === hostJudgeTurnId);
+    assert.deepEqual(hostResolvedTurn.judge, {
+      status: "done",
+      bonus: 15,
+      relevance: 0.74,
+      confidence: 0.3,
+      confidenceLabel: "low confidence",
+      feedback: "Offline judge: you touched on the topic's key words.",
+    });
+    assert.equal(hostResolvedTurn.score, 50);
+    assert.equal(hostResolvedJudgeState.payload.room.standingsProvisional, false);
+    await Promise.all([
+      eventually(() => host.locator(".score-callout").textContent()
+        .then((text) => text?.trim() === "Cloud Host earned 50 points"),
+      "The host did not render its judged score", signal),
+      eventually(() => guest.locator(".score-callout").textContent()
+        .then((text) => text?.trim() === "Cloud Host earned 50 points"),
+      "The guest did not converge on the host's judged score", signal),
+    ]);
+    const hostJudgeNetworkRequests = hostApiRequests.slice(hostJudgeFinishRequestOffset)
+      .filter((request) => request.path === "/api/v1/models/judge");
+    assert.deepEqual(hostJudgeNetworkRequests, [{
+      method: "POST",
+      path: "/api/v1/models/judge",
+      body: {
+        roomCode: code,
+        turnId: hostJudgeTurnId,
+        transcript: HOST_JUDGE_TRANSCRIPT,
+        externalConsent: false,
+      },
+    }], "The host transcript must make exactly one offline-judge request.");
+
+    await guest.getByRole("button", { name: "Next turn" }).click();
+    await Promise.all([
+      eventually(() => guest.locator(".turn-meta").textContent()
+        .then((text) => text?.includes("Cloud Guest (you)")),
+      "The judged game did not advance to the guest", signal),
+      eventually(() => host.locator(".turn-meta").textContent()
+        .then((text) => text?.includes("Cloud Guest")),
+      "The host did not receive the judged guest turn", signal),
+    ]);
+    const guestTranscriptChoice = guest.locator('[data-turn-judge-choice] input[value="transcript"]');
+    assert.deepEqual(await guest.locator('[data-turn-judge-choice] input[name="turnJudgeChoice"]')
+      .evaluateAll((controls) => controls.map((control) => control.checked)), [false, false],
+    "Transcript permission must reset for the next exact turn and browser.");
+    const guestJudgeTurnId = await guestTranscriptChoice.getAttribute("data-turn-id");
+    assert.match(guestJudgeTurnId, /^t[1-9][0-9]*$/u);
+
+    // Give the active guest host controls only so the deterministic smoke can
+    // complete the ten-second turn immediately; transcript authority remains
+    // bound to that same speaker identity.
+    await postRoomAction(hostContext, origin, code, {
+      type: "transfer-host",
+      playerId: guestPlayerId,
+    });
+    await guest.getByRole("button", { name: "Mark complete" }).waitFor();
+    assert.equal(await host.getByRole("button", { name: "Mark complete" }).count(), 0);
+    await guestTranscriptChoice.check();
+    assert.match(await guest.locator("[data-turn-judge-status]").textContent(),
+      /Approved for this turn only/u);
+
+    const guestJudgeCaptureOffset = await harnessEventCount(guest);
+    await guest.getByRole("button", { name: "Start with microphone" }).click();
+    await guest.getByRole("button", { name: "End turn" }).waitFor();
+    const guestJudgeCaptureEvents = await eventually(async () => {
+      const events = await readHarnessEvents(guest, guestJudgeCaptureOffset);
+      return events.some((event) => event.type === "recognition-started") ? events : null;
+    }, "The guest's exact-track on-device recognizer did not start", signal);
+    const guestJudgeStream = guestJudgeCaptureEvents.find((event) => event.type === "stream-ready");
+    const guestJudgeMediaSource = guestJudgeCaptureEvents.find((event) => event.type === "media-source-created");
+    const guestJudgeRecognition = guestJudgeCaptureEvents.find((event) => event.type === "recognition-started");
+    assert.deepEqual(guestJudgeCaptureEvents.find((event) => event.type === "get-user-media")?.constraints, {
+      audio: true,
+      video: false,
+    }, "The guest's Auto-detect choice must request audio without leaking a device ID.");
+    assert.equal(guestJudgeMediaSource?.streamId, guestJudgeStream?.streamId);
+    assert.equal(guestJudgeRecognition?.trackId, `${guestJudgeStream?.streamId}-audio-track`);
+    assert.equal(guestJudgeRecognition?.processLocally, true);
+    await guest.evaluate((transcript) => window.__microphoneHarness.emitFinalTranscript(transcript),
+      GUEST_JUDGE_TRANSCRIPT);
+
+    // Hold the final review before it reaches the Worker. Both browsers must
+    // show only provisional classic standings and no definitive winner.
+    await guest.evaluate(() => { window.__microphoneHarness.blockNextJudgeRequest = true; });
+    const guestJudgeFinishRequestOffset = guestApiRequests.length;
+    const guestJudgeFinishEventOffset = await harnessEventCount(guest);
+    await guest.getByRole("button", { name: "Mark complete" }).click();
+    const guestJudgePendingEvents = await eventually(async () => {
+      const events = await readHarnessEvents(guest, guestJudgeFinishEventOffset);
+      return events.some((event) => event.type === "judge-request") ? events : null;
+    }, "The blocked final offline judge request was not observed", signal);
+    const guestSubmitEvent = guestJudgePendingEvents.find((event) =>
+      event.type === "room-action" && event.body?.type === "submit-turn");
+    const guestJudgeRequestEvent = guestJudgePendingEvents.find((event) => event.type === "judge-request");
+    assert.deepEqual(guestSubmitEvent?.body, {
+      type: "submit-turn",
+      turnId: guestJudgeTurnId,
+      spokenSeconds: 10,
+      completed: true,
+      eliminated: false,
+      manual: false,
+      judgeChoice: "transcript",
+    });
+    assert.deepEqual(guestJudgeRequestEvent?.body, {
+      roomCode: code,
+      turnId: guestJudgeTurnId,
+      transcript: GUEST_JUDGE_TRANSCRIPT,
+      externalConsent: false,
+    });
+    assertStrictEventOrder([
+      [eventIndex(guestJudgePendingEvents,
+        (event) => event.type === "recognition-stopped"
+          && event.trackId === `${guestJudgeStream?.streamId}-audio-track`,
+        "guest recognizer stop"), "guest recognizer stop"],
+      [eventIndex(guestJudgePendingEvents,
+        (event) => event.type === "track-stopped" && event.streamId === guestJudgeStream?.streamId,
+        "guest microphone stop"), "guest microphone stop"],
+      [guestJudgePendingEvents.indexOf(guestSubmitEvent), "guest classic submit request"],
+      [eventIndex(guestJudgePendingEvents,
+        (event) => event.type === "room-action-response"
+          && event.body?.type === "submit-turn"
+          && event.status === 200,
+        "guest classic submit response"), "guest classic submit response"],
+      [guestJudgePendingEvents.indexOf(guestJudgeRequestEvent), "guest judge request"],
+    ]);
+    assert.equal(guestJudgePendingEvents.some((event) => event.type === "judge-response"), false);
+    assert.deepEqual(toneFrequencies(guestJudgePendingEvents), [],
+      "A final completion cue must wait until the pending judge makes standings final.");
+
+    const provisionalStates = await eventually(async () => {
+      const states = await Promise.all([readRoom(host, code), readRoom(guest, code)]);
+      return states.every((state) => state.payload.room?.phase === "finished"
+        && state.payload.room?.standingsProvisional === true
+        && state.payload.room?.completedTurns?.find((turn) => turn.id === guestJudgeTurnId)
+          ?.judge?.status === "pending") ? states : null;
+    }, "Final provisional standings did not converge", signal);
+    for (const state of provisionalStates) {
+      const publicRoom = state.payload.room;
+      const pendingTurn = publicRoom.completedTurns.find((turn) => turn.id === guestJudgeTurnId);
+      assert.equal(publicRoom.winner, null,
+        "The public contract must not name a winner while standings are provisional.");
+      assert.equal(pendingTurn.score, 35);
+      assert.deepEqual(pendingTurn.judge, { status: "pending", bonus: 0 });
+      assert.equal(Object.hasOwn(publicRoom, "pendingJudgeReviews"), false);
+      const serialized = JSON.stringify(publicRoom);
+      assert.equal(serialized.includes(HOST_JUDGE_TRANSCRIPT), false);
+      assert.equal(serialized.includes(GUEST_JUDGE_TRANSCRIPT), false);
+      assert.equal(serialized.includes('"claimId"'), false);
+      assert.equal(serialized.includes('"claimedAt"'), false);
+      assert.equal(serialized.includes('"deadlineAt"'), false);
+    }
+    for (const page of [host, guest]) {
+      await page.locator(".winner .room-state-title")
+        .filter({ hasText: "Standings are provisional" }).waitFor();
+      assert.equal((await page.locator(".winner .eyebrow").textContent())?.trim(), "Final review pending");
+      assert.equal(await page.getByRole("button", { name: "Play again", exact: true }).count(), 0,
+        "No browser may render a definitive winner action while review is pending.");
+    }
+    assert.equal(await guest.getByRole("button", { name: "End pending reviews and play again" }).count(), 1,
+      "Only the current host may explicitly terminalize a pending final review.");
+    assert.equal(await host.getByRole("button", { name: "End pending reviews and play again" }).count(), 0);
+
+    await guest.evaluate(() => window.__microphoneHarness.releasePendingJudgeRequest());
+    const finalCompletionEvents = await waitForToneRecipe(
+      guest,
+      guestJudgeFinishEventOffset,
+      SOUND_COMPLETED_RECIPE,
+      "The final post-judge completion cue",
+      signal,
+    );
+    assert.deepEqual(toneFrequencies(finalCompletionEvents), SOUND_COMPLETED_RECIPE,
+      "The final completed cue must play exactly once after standings become final.");
+    await Promise.all([
+      eventually(() => host.locator(".winner .room-state-title").textContent()
+        .then((text) => text?.trim() === "Cloud Guest"),
+      "The host did not receive the final judged winner", signal),
+      eventually(() => guest.locator(".winner .room-state-title").textContent()
+        .then((text) => text?.trim() === "Cloud Guest"),
+      "The guest did not render the final judged winner", signal),
+      eventually(() => host.locator(".winner .score-callout").textContent()
+        .then((text) => text?.trim() === "55 points"),
+      "The host did not receive the final judged score", signal),
+      eventually(() => guest.locator(".winner .score-callout").textContent()
+        .then((text) => text?.trim() === "55 points"),
+      "The guest did not render the final judged score", signal),
+    ]);
+    const finalJudgeStates = await Promise.all([readRoom(host, code), readRoom(guest, code)]);
+    for (const state of finalJudgeStates) {
+      const publicRoom = state.payload.room;
+      assert.equal(publicRoom.phase, "finished");
+      assert.equal(publicRoom.standingsProvisional, false);
+      assert.equal(publicRoom.winner?.name, "Cloud Guest");
+      assert.equal(publicRoom.winner?.score, 55);
+      assert.deepEqual(publicRoom.standings.map(({ name, score }) => ({ name, score })), [
+        { name: "Cloud Guest", score: 55 },
+        { name: "Cloud Host", score: 50 },
+      ]);
+      const guestResolvedTurn = publicRoom.completedTurns.find((turn) => turn.id === guestJudgeTurnId);
+      assert.deepEqual(guestResolvedTurn.judge, {
+        status: "done",
+        bonus: 20,
+        relevance: 1,
+        confidence: 0.3,
+        confidenceLabel: "low confidence",
+        feedback: "Offline judge: you touched on the topic's key words.",
+      });
+      assert.equal(guestResolvedTurn.score, 55);
+      assert.equal(Object.hasOwn(publicRoom, "pendingJudgeReviews"), false);
+      const serialized = JSON.stringify(publicRoom);
+      assert.equal(serialized.includes(HOST_JUDGE_TRANSCRIPT), false);
+      assert.equal(serialized.includes(GUEST_JUDGE_TRANSCRIPT), false);
+      assert.equal(serialized.includes('"claimId"'), false);
+    }
+    const guestJudgeNetworkRequests = guestApiRequests.slice(guestJudgeFinishRequestOffset)
+      .filter((request) => request.path === "/api/v1/models/judge");
+    assert.deepEqual(guestJudgeNetworkRequests, [{
+      method: "POST",
+      path: "/api/v1/models/judge",
+      body: {
+        roomCode: code,
+        turnId: guestJudgeTurnId,
+        transcript: GUEST_JUDGE_TRANSCRIPT,
+        externalConsent: false,
+      },
+    }], "The final transcript must make exactly one offline-judge request.");
+
+    // A third game composes three lifecycle edges. The first turn is left
+    // pending, the final speaker's recognizer fails after capture begins, and
+    // the final submit commits while its HTTP response is deliberately lost.
+    // The final cue must wait for the earlier review, then play exactly once.
+    await guest.getByRole("button", { name: "Play again", exact: true }).click();
+    await guest.getByRole("button", { name: "Start game" }).waitFor();
+    assert.equal(await guest.locator('[data-judge-settings] input[name="enabled"]').isChecked(), true,
+      "Reset must preserve the explicitly enabled offline judge.");
+    await guest.getByRole("button", { name: "Make Cloud Host the host" }).click();
+    await host.getByRole("button", { name: "Start game" }).waitFor();
+    await host.getByRole("button", { name: "Start game" }).click();
+    await host.getByRole("heading", { name: "Cloud Host is up." }).waitFor();
+    await host.getByRole("button", { name: "Draw topic" }).click();
+    const lifecycleFirstTurn = await eventually(async () => {
+      const state = await readRoom(host, code);
+      return state.payload.room?.activeTurn?.playerId === hostPlayerId ? state.payload.room.activeTurn : null;
+    }, "The lifecycle game did not draw the host turn", signal);
+    await postRoomAction(hostContext, origin, code, {
+      type: "submit-turn",
+      turnId: lifecycleFirstTurn.id,
+      spokenSeconds: lifecycleFirstTurn.duration,
+      completed: true,
+      eliminated: false,
+      manual: false,
+      judgeChoice: "transcript",
+    });
+    await eventually(async () => {
+      const state = await readRoom(guest, code);
+      const turn = state.payload.room?.completedTurns?.find((candidate) => candidate.id === lifecycleFirstTurn.id);
+      return turn?.judge?.status === "pending" ? state : null;
+    }, "The independent earlier review did not become pending", signal);
+
+    await postRoomAction(hostContext, origin, code, {
+      type: "transfer-host",
+      playerId: guestPlayerId,
+    });
+    await guest.getByRole("button", { name: "Next turn" }).waitFor();
+    await guest.getByRole("button", { name: "Next turn" }).click();
+    await guest.locator(".turn-meta").filter({ hasText: "Cloud Guest (you)" }).waitFor();
+    const lifecycleTranscriptChoice = guest.locator('[data-turn-judge-choice] input[value="transcript"]');
+    const lifecycleClassicChoice = guest.locator('[data-turn-judge-choice] input[value="classic"]');
+    const lifecycleFinalTurnId = await lifecycleTranscriptChoice.getAttribute("data-turn-id");
+    await lifecycleTranscriptChoice.check();
+    await guest.getByRole("button", { name: "Start with microphone" }).click();
+    await guest.getByRole("button", { name: "End turn" }).waitFor();
+    await guest.evaluate(() => window.__microphoneHarness.emitRecognitionError());
+    assert.deepEqual(await guest.locator('[data-turn-judge-choice] input[name="turnJudgeChoice"]')
+      .evaluateAll((controls) => controls.map((control) => ({
+        value: control.value,
+        checked: control.checked,
+        disabled: control.disabled,
+      }))), [
+      { value: "classic", checked: true, disabled: true },
+      { value: "transcript", checked: false, disabled: true },
+    ], "A mid-turn recognition failure must visibly and semantically restore classic scoring.");
+    assert.match(await guest.locator("[data-turn-judge-status]").textContent(),
+      /On-device transcription stopped.*Classic scoring will be kept/u);
+    assert.equal(await lifecycleClassicChoice.isChecked(), true);
+
+    let resolveLostSubmitCommit;
+    const lostSubmitCommitted = new Promise((resolve) => { resolveLostSubmitCommit = resolve; });
+    let lostSubmitUpstreamStatus = 0;
+    const lostSubmitHandler = async (route) => {
+      const action = route.request().postDataJSON();
+      if (action?.type !== "submit-turn" || action.turnId !== lifecycleFinalTurnId) {
+        await route.continue();
+        return;
+      }
+      const upstream = await route.fetch();
+      lostSubmitUpstreamStatus = upstream.status();
+      resolveLostSubmitCommit();
+      await route.abort("failed");
+    };
+    await guest.route(`**/api/rooms/${code}/action`, lostSubmitHandler);
+    const lifecycleSubmitRequestOffset = guestApiRequests.length;
+    const lifecycleFinalCueOffset = await harnessEventCount(guest);
+    await guest.getByRole("button", { name: "Mark complete" }).click();
+    await lostSubmitCommitted;
+    assert.equal(lostSubmitUpstreamStatus, 200,
+      "The synthetic lost response must occur only after the Durable Object accepts the turn.");
+    const lifecycleProvisionalState = await eventually(async () => {
+      const state = await readRoom(guest, code);
+      const first = state.payload.room?.completedTurns?.find((turn) => turn.id === lifecycleFirstTurn.id);
+      const last = state.payload.room?.completedTurns?.find((turn) => turn.id === lifecycleFinalTurnId);
+      return state.payload.room?.phase === "finished"
+        && state.payload.room?.standingsProvisional === true
+        && first?.judge?.status === "pending"
+        && last?.judge?.status === "skipped" ? state : null;
+    }, "The lost final response did not leave authoritative provisional standings", signal);
+    assert.equal(lifecycleProvisionalState.payload.room.winner, null);
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(guest, lifecycleFinalCueOffset)), [],
+      "A committed final turn must not cue while an independent earlier review is pending.");
+    const lifecycleSubmitRequests = guestApiRequests.slice(lifecycleSubmitRequestOffset)
+      .filter((request) => request.path === `/api/rooms/${code}/action`
+        && request.body?.type === "submit-turn");
+    assert.deepEqual(lifecycleSubmitRequests, [{
+      method: "POST",
+      path: `/api/rooms/${code}/action`,
+      body: {
+        type: "submit-turn",
+        turnId: lifecycleFinalTurnId,
+        spokenSeconds: 10,
+        completed: true,
+        eliminated: false,
+        manual: false,
+        judgeChoice: "classic",
+      },
+    }], "Recognition failure must submit only transcript-free classic consent metadata.");
+    assert.equal(guestApiRequests.slice(lifecycleSubmitRequestOffset)
+      .some((request) => request.path === "/api/v1/models/judge"), false,
+    "Recognition failure must not send a judge request.");
+    await guest.unroute(`**/api/rooms/${code}/action`, lostSubmitHandler);
+
+    await postJudgeReview(hostContext, origin, {
+      roomCode: code,
+      turnId: lifecycleFirstTurn.id,
+      transcript: HOST_JUDGE_TRANSCRIPT,
+      externalConsent: false,
+    });
+    const lifecycleFinalCueEvents = await waitForToneRecipe(
+      guest,
+      lifecycleFinalCueOffset,
+      SOUND_COMPLETED_RECIPE,
+      "The response-loss-safe final completion cue",
+      signal,
+    );
+    assert.deepEqual(toneFrequencies(lifecycleFinalCueEvents), SOUND_COMPLETED_RECIPE,
+      "Final standings must release exactly one cue for the local final turn.");
+    const lifecycleFinalState = await eventually(async () => {
+      const state = await readRoom(guest, code);
+      return state.payload.room?.phase === "finished"
+        && state.payload.room?.standingsProvisional === false ? state : null;
+    }, "The independent earlier review did not finalize standings", signal);
+    assert.equal(lifecycleFinalState.payload.room.winner?.name, "Cloud Host");
+    assert.equal(lifecycleFinalState.payload.room.winner?.score, 50);
+    assert.deepEqual(toneFrequencies(await readHarnessEvents(guest, lifecycleFinalCueOffset)),
+      SOUND_COMPLETED_RECIPE,
+    "Repeated final snapshots must not replay the response-loss-safe cue.");
 
     assert.deepEqual(hostTracker.pageErrors, []);
     assert.deepEqual(guestTracker.pageErrors, []);

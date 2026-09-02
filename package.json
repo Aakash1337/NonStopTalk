@@ -19,6 +19,7 @@
     "test:cloud-progress": "node --test cloudflare/public/cloud-progress.test.js",
     "test:microphone-selection": "node --test cloudflare/public/microphone-selection.test.js",
     "test:sound-cues": "node --test cloudflare/public/sound-cues.test.js",
+    "test:turn-transcription": "node --test cloudflare/public/turn-transcription.test.js",
     "test:setup-kits": "node --test cloudflare/public/setup-kits.TEST.mjs",
     "test:admin": "node --test cloudflare/public/admin-analytics.test.js",
     "test:production-monitor": "node --test scripts/public-javascript-assets.test.mjs scripts/production-health-workflow.test.mjs",

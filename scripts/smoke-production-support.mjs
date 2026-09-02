@@ -27,6 +27,7 @@ const REQUIRED_PUBLIC_MODULE_PATHS = [
   "/setup-kits.js",
   "/microphone-selection.js",
   "/sound-cues.js",
+  "/turn-transcription.js",
 ];
 
 const JAVASCRIPT_SYNTAX_TIMEOUT_MS = 5_000;
@@ -281,12 +282,14 @@ export async function waitForPublicModuleGraph({
       const setupKitsSource = observedJavaScriptAssets.get("/setup-kits.js");
       const microphoneSelectionSource = observedJavaScriptAssets.get("/microphone-selection.js");
       const soundCuesSource = observedJavaScriptAssets.get("/sound-cues.js");
+      const turnTranscriptionSource = observedJavaScriptAssets.get("/turn-transcription.js");
       const appTokens = tokenizeJavaScript(appSource);
       const coachStorageTokens = tokenizeJavaScript(coachStorageSource);
       const coachEngineTokens = tokenizeJavaScript(coachEngineSource);
       const setupKitsTokens = tokenizeJavaScript(setupKitsSource);
       const microphoneSelectionTokens = tokenizeJavaScript(microphoneSelectionSource);
       const soundCuesTokens = tokenizeJavaScript(soundCuesSource);
+      const turnTranscriptionTokens = tokenizeJavaScript(turnTranscriptionSource);
       if (!hasNamespaceModuleImport(
         appTokens,
         "./coach-storage.js",
@@ -340,6 +343,16 @@ export async function waitForPublicModuleGraph({
       if (!hasAssignedFactoryCall(appTokens, "soundCues", "createSoundCues")) {
         throw new Error("/app.js does not consume the sound-cue boundary");
       }
+      if (!hasNamedModuleImport(
+        appTokens,
+        "./turn-transcription.js",
+        "createTurnTranscription",
+      )) {
+        throw new Error("/app.js does not reference the required turn-transcription module");
+      }
+      if (!hasAssignedFactoryCall(appTokens, "turnTranscription", "createTurnTranscription")) {
+        throw new Error("/app.js does not consume the turn-transcription boundary");
+      }
       if (!hasExportedFunction(coachStorageTokens, "openCoachDatabase", { async: true })) {
         throw new Error("/coach-storage.js does not expose the expected storage boundary");
       }
@@ -355,6 +368,9 @@ export async function waitForPublicModuleGraph({
       if (!hasExportedFunction(soundCuesTokens, "createSoundCues")) {
         throw new Error("/sound-cues.js does not expose createSoundCues");
       }
+      if (!hasExportedFunction(turnTranscriptionTokens, "createTurnTranscription")) {
+        throw new Error("/turn-transcription.js does not expose createTurnTranscription");
+      }
       remainingDeadlineMs(deadlineMs, now);
       return {
         observedJavaScriptAssets,
@@ -364,6 +380,7 @@ export async function waitForPublicModuleGraph({
         setupKitsSource,
         microphoneSelectionSource,
         soundCuesSource,
+        turnTranscriptionSource,
       };
     } catch (error) {
       lastError = asError(error);

@@ -18,6 +18,15 @@ declared in `wrangler.jsonc`.
 The default provider policy is `offline` / `off` with a daily external-call
 ceiling of 100. A normal deploy must not contact a model.
 
+The optional game judge is a separate default-off feature. It uses per-turn
+speaker consent, strict on-device transcription, and the same-origin Worker's
+deterministic offline heuristic. Audio never uploads. Transcript text exists
+only in browser/Worker request memory and never enters Durable Object/D1
+storage, logs, analytics, history, or a provider; only bounded transcript-free
+pending metadata and normalized verdicts enter room state. Classic scoring lands
+first and remains the fallback. This release adds no judge-specific API key,
+secret, binding, migration, provider budget, paid service, or runbook step.
+
 Named game setup kits are not an inventory resource. The current source stores
 the saved library—names, applied settings, and custom topics—in unencrypted,
 best-effort `localStorage` for one origin/browser profile. Save/delete and
@@ -52,6 +61,7 @@ npm run test:coach
 npm run test:cloud-progress
 npm run test:microphone-selection
 npm run test:sound-cues
+npm run test:turn-transcription
 npm run test:admin
 npm run test:production-monitor
 npm run test:deployment-contract
@@ -152,11 +162,11 @@ repository watchers receive them. The probe retries ordinary page and API GETs
 up to five times before failing, which absorbs a short network interruption
 without concealing a sustained outage. It recursively discovers every deployable
 `.js` or `.mjs` file under `cloudflare/public` and validates that complete Static Assets
-set as one generation for up to eight bounded attempts. There are currently
-eleven: the public SPA modules (including the sound-cue boundary), the coaching
-audio worklet, and the two isolated admin
-modules. `cloudflare/public/.assetsignore` excludes exact `*.test.js` and
-`*.test.mjs` paths from both deployments with Wrangler's case-insensitive
+set as one generation for up to eight bounded attempts. There are currently 12:
+the public SPA modules (including the sound-cue and turn-transcription
+boundaries), the coaching audio worklet, and the two isolated admin modules.
+`cloudflare/public/.assetsignore` excludes the nine current exact `*.test.js`
+and `*.test.mjs` paths from both deployments with Wrangler's case-insensitive
 gitignore semantics. The deployment contract locks that packaging boundary, and
 each live probe also requires every discovered excluded script path to resolve
 to protected HTML rather than executable JavaScript. Source
@@ -821,8 +831,10 @@ repeat the mutating canary.
 The Worker cron runs daily at 03:17 UTC. Anonymous cloud-summary ownership uses
 one roughly 30-day device lease; pseudonymous room facts expire after 90 days.
 Cleanup is bounded and can continue a backlog on the next run. Raw audio,
-recordings, and captured transcript text are not present in D1 and remain in the
-user's browser only when separately retained.
+recordings, and captured coaching transcript text are not present in D1 and
+remain in the user's browser only when separately retained. A consented game
+judge transcript is also absent from D1: it is never retained and exists only in
+browser/Worker request memory for the immediate offline grade.
 
 Schema v5 stores one non-sensitive cleanup heartbeat row. A successful cron
 updates it only after all attempted batches succeed and records whether expired
