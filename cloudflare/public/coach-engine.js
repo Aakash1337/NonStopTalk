@@ -167,6 +167,42 @@ export function deriveCalibration({ quietSamples = [], voiceSamples = [] } = {})
   };
 }
 
+/**
+ * Decide whether calibration evidence is strong enough to start an attempt
+ * without interrupting the speaker. Low-confidence calibration remains usable,
+ * but requires an explicit choice so limited evidence is never hidden.
+ */
+export function assessCalibrationReadiness(calibration = {}) {
+  const suppliedConfidence = calibration?.confidence ?? {};
+  const suppliedScore = suppliedConfidence.score;
+  const hasValidScore = typeof suppliedScore === "number"
+    && Number.isFinite(suppliedScore)
+    && suppliedScore >= 0
+    && suppliedScore <= 1;
+  const score = round(hasValidScore ? suppliedScore : 0, 3);
+  const level = confidenceLabel(score);
+  const reasons = Array.isArray(suppliedConfidence.reasons)
+    ? suppliedConfidence.reasons
+      .filter((reason) => typeof reason === "string" && reason.trim())
+      .map((reason) => reason.trim())
+    : [];
+  if (level === "low" && reasons.length === 0) {
+    reasons.push("Calibration did not collect enough distinct quiet and speaking evidence.");
+  }
+
+  return {
+    status: level === "low" ? "needs-confirmation" : "ready",
+    canStartAutomatically: level !== "low",
+    requiresConfirmation: level === "low",
+    confidence: {
+      score,
+      level,
+      reasons,
+      meaning: "Confidence describes measurement evidence, not the speaker.",
+    },
+  };
+}
+
 export class CoachingAnalyzer {
   constructor({ calibration, goal = "balanced-delivery", targetDurationMs = 60_000 } = {}) {
     this.calibration = normalizeCalibration(calibration);
@@ -284,6 +320,7 @@ export class CoachingAnalyzer {
     const projectedGapMs = this._lastAtMs === null ? 0 : endAt - this._lastAtMs;
     const maxSampleGapMs = Math.max(this._maxSampleGapMs, projectedGapMs);
     const continuity = durationMs > 0 ? clamp(observedDurationMs / durationMs, 0, 1) : 0;
+    const calibrationConfidence = assessCalibrationReadiness(this.calibration).confidence;
     const confidence = measurementConfidence({
       calibration: this.calibration,
       durationMs,
@@ -339,6 +376,7 @@ export class CoachingAnalyzer {
         unknownMs: round(unknownMs, 1),
         note: "A level frame is held for at most 250 ms; longer callback gaps are unknown and reduce measurement confidence.",
       },
+      calibrationConfidence,
       confidence,
       measurementConfidence: confidence,
       audioConfidence: confidence.level,
@@ -901,7 +939,8 @@ function inputLevelMetrics(samples, calibration, speakingMs) {
 }
 
 function measurementConfidence({ calibration, durationMs, observedDurationMs, speakingMs, sampleCount, continuity }) {
-  const calibrationScore = clamp(finiteNumber(calibration.confidence?.score, 0.35), 0, 1);
+  const calibrationReadiness = assessCalibrationReadiness(calibration);
+  const calibrationScore = calibrationReadiness.confidence.score;
   const expectedMinimumSamples = Math.max(8, observedDurationMs / COACHING_THRESHOLDS.frameHoldMs);
   const sampleDensity = clamp(sampleCount / expectedMinimumSamples, 0, 1);
   const durationEvidence = clamp(observedDurationMs / COACHING_THRESHOLDS.minimumReliableDurationMs, 0, 1);
@@ -912,15 +951,16 @@ function measurementConfidence({ calibration, durationMs, observedDurationMs, sp
       + durationEvidence * 0.25
       + voiceEvidence * 0.25
       + continuity * 0.05;
-  // Missing frames are not evidence. Coverage therefore acts as a hard ceiling,
-  // preventing projected duration from producing a high-confidence label.
-  const score = round(Math.min(weightedScore, continuity), 3);
+  // Missing frames and weak calibration are not evidence. Coverage and a low
+  // calibration result therefore cap the final confidence label.
+  const calibrationCeiling = calibrationReadiness.requiresConfirmation ? 0.499 : 1;
+  const score = round(Math.min(weightedScore, continuity, calibrationCeiling), 3);
   const reasons = [
     ...(durationMs < COACHING_THRESHOLDS.minimumReliableDurationMs ? ["The attempt is shorter than 15 seconds."] : []),
     ...(speakingMs < 5_000 ? ["Fewer than five seconds of voice were observed."] : []),
     ...(sampleDensity < 0.75 ? ["Level samples were sparse for the observed duration."] : []),
     ...(continuity < 0.9 ? ["One or more long audio-callback gaps were observed."] : []),
-    ...(calibration.confidence?.level === "low" ? ["The quiet and speaking calibration had limited evidence."] : []),
+    ...(calibrationReadiness.requiresConfirmation ? ["The quiet and speaking calibration had limited evidence."] : []),
   ];
   return {
     score,

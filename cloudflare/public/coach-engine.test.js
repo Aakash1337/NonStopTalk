@@ -7,6 +7,7 @@ import {
   CoachingAnalyzer,
   CoachingTipPolicy,
   analyzeTranscript,
+  assessCalibrationReadiness,
   buildAdvice,
   deriveCalibration,
   retrieveCoachingGuidance,
@@ -72,6 +73,71 @@ test("deriveCalibration accepts numbers and marks weak evidence as low confidenc
   assert.ok(calibration.speechOffThreshold < calibration.speechOnThreshold);
 });
 
+test("calibration readiness auto-starts medium and high evidence but pauses low evidence", () => {
+  for (const [level, score] of [["medium", 0.6], ["high", 0.9]]) {
+    const readiness = assessCalibrationReadiness({ confidence: { score, level, reasons: [] } });
+    assert.equal(readiness.status, "ready");
+    assert.equal(readiness.canStartAutomatically, true);
+    assert.equal(readiness.requiresConfirmation, false);
+    assert.equal(readiness.confidence.level, level);
+  }
+
+  const limited = assessCalibrationReadiness({
+    confidence: {
+      score: 0.2,
+      level: "low",
+      reasons: [" Quiet and speaking levels were not clearly separated. "],
+    },
+  });
+  assert.equal(limited.status, "needs-confirmation");
+  assert.equal(limited.canStartAutomatically, false);
+  assert.equal(limited.requiresConfirmation, true);
+  assert.deepEqual(limited.confidence.reasons, ["Quiet and speaking levels were not clearly separated."]);
+  assert.match(limited.confidence.meaning, /not the speaker/i);
+});
+
+test("calibration readiness fails closed when confidence metadata is absent", () => {
+  const readiness = assessCalibrationReadiness();
+  assert.equal(readiness.status, "needs-confirmation");
+  assert.equal(readiness.confidence.level, "low");
+  assert.equal(readiness.confidence.score, 0);
+  assert.ok(readiness.confidence.reasons.length > 0);
+
+  const partial = assessCalibrationReadiness({ confidence: { level: "high" } });
+  assert.equal(partial.status, "needs-confirmation");
+  assert.equal(partial.confidence.level, "low");
+
+  const inconsistent = assessCalibrationReadiness({ confidence: { score: 0.2, level: "high" } });
+  assert.equal(inconsistent.status, "needs-confirmation");
+  assert.equal(inconsistent.confidence.level, "low");
+
+  for (const invalidScore of [Number.NaN, -0.01, 1.01, true, "0.9", [0.9], { valueOf: () => 0.9 }]) {
+    const invalid = assessCalibrationReadiness({ confidence: { score: invalidScore, level: "high" } });
+    assert.equal(invalid.status, "needs-confirmation");
+    assert.equal(invalid.confidence.score, 0);
+  }
+
+  const roundedBoundary = assessCalibrationReadiness({ confidence: { score: 0.4996 } });
+  assert.equal(roundedBoundary.confidence.score, 0.5);
+  assert.equal(roundedBoundary.confidence.level, "medium");
+});
+
+test("medium calibration keeps its known limitation in the ephemeral report", () => {
+  const calibration = deriveCalibration({
+    quietSamples: calibrationSamples(0.01),
+    voiceSamples: calibrationSamples(0.013),
+  });
+  const readiness = assessCalibrationReadiness(calibration);
+  const analyzer = new CoachingAnalyzer({ calibration, targetDurationMs: 30_000 });
+  ingestRange(analyzer, 0, 30_000, 0.12);
+  const report = analyzer.finish(30_000);
+
+  assert.equal(readiness.status, "ready");
+  assert.equal(calibration.confidence.level, "medium");
+  assert.match(calibration.confidence.reasons.join(" "), /not clearly separated/i);
+  assert.deepEqual(report.calibrationConfidence.reasons, calibration.confidence.reasons);
+});
+
 test("analyzer measures speaking ratio, completed pauses, and bridged speaking runs", () => {
   const analyzer = calibratedAnalyzer();
   ingestRange(analyzer, 0, 1_000, 0.004);
@@ -124,6 +190,8 @@ test("analyzer reports calibrated level consistency and clipping without a quali
   assert.equal(report.clipping.durationMs, 300);
   assertClose(report.clippingPct, report.clippingRatio * 100, 0.011);
   assert.equal(report.audioConfidence, report.confidence.level);
+  assert.equal(report.calibrationConfidence.level, "high");
+  assert.match(report.calibrationConfidence.meaning, /not the speaker/i);
   assert.equal("score" in report, false, "there is deliberately no universal speaker score");
   assert.match(report.confidence.meaning, /not a rating of the speaker/i);
 });
@@ -217,6 +285,24 @@ test("an attempt with no level callbacks is entirely unknown and receives input-
   }]);
   assert.equal(report.confidence.score, 0);
   assert.equal(advice.priorities[0].id, "restore-stable-input");
+});
+
+test("continuing after limited calibration keeps the finished attempt confidence low", () => {
+  const analyzer = new CoachingAnalyzer({
+    calibration: deriveCalibration({
+      quietSamples: calibrationSamples(0.01),
+      voiceSamples: calibrationSamples(0.011),
+    }),
+    targetDurationMs: 30_000,
+  });
+  ingestRange(analyzer, 0, 30_000, 0.12);
+
+  const report = analyzer.finish(30_000);
+
+  assert.equal(report.calibrationConfidence.level, "low");
+  assert.equal(report.confidence.level, "low");
+  assert.ok(report.confidence.score < 0.5);
+  assert.match(report.confidence.reasons.join(" "), /calibration had limited evidence/i);
 });
 
 test("analyzer rejects out-of-order input and ingest after finish", () => {

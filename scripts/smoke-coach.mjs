@@ -102,7 +102,9 @@ async function launchBrowser() {
 
 const syntheticCoachAudio = () => {
   window.__coachTrackStopped = false;
+  window.__coachTrackStopCount = 0;
   window.__coachGetUserMediaCalls = 0;
+  window.__coachRecognitionStartCount = 0;
   const NativeAudioContext = window.AudioContext || window.webkitAudioContext;
   Object.defineProperty(navigator, "mediaDevices", {
     configurable: true,
@@ -126,9 +128,11 @@ const syntheticCoachAudio = () => {
         oscillator.start();
         const stream = destination.stream;
         for (const track of stream.getTracks()) {
+          window.__coachInputTrack = track;
           const nativeStop = track.stop.bind(track);
           track.stop = () => {
             window.__coachTrackStopped = true;
+            window.__coachTrackStopCount += 1;
             nativeStop();
             oscillator.stop();
             context.close().catch(() => {});
@@ -148,6 +152,7 @@ const syntheticCoachAudio = () => {
     }
     start(track) {
       if (!this.processLocally || track?.kind !== "audio") throw new DOMException("Local track required", "NotSupportedError");
+      window.__coachRecognitionStartCount += 1;
       this.timer = window.setTimeout(() => {
         const alternative = { transcript: "Um basically my idea solves the problem and my idea gives people a clearer next step" };
         const result = { 0: alternative, length: 1, isFinal: true };
@@ -245,6 +250,63 @@ const stalledCalibrationMeter = () => {
   };
 };
 
+const controlledCalibrationMeter = () => {
+  window.__coachMediaRecorderStartCount = 0;
+  const nativeMediaRecorderStart = window.MediaRecorder?.prototype?.start;
+  if (typeof nativeMediaRecorderStart === "function") {
+    window.MediaRecorder.prototype.start = function (...args) {
+      window.__coachMediaRecorderStartCount += 1;
+      return nativeMediaRecorderStart.apply(this, args);
+    };
+  }
+  window.__coachControlledSignal = {
+    quietRms: 0.01,
+    voiceRms: 0.01,
+    attemptRms: 0.12,
+  };
+  window.__coachControlledPort = null;
+  window.__coachControlledTimer = 0;
+  window.__setCoachControlledSignal = (signal = {}) => {
+    window.__coachControlledSignal = {
+      ...window.__coachControlledSignal,
+      ...signal,
+    };
+  };
+  window.__startCoachControlledFrames = () => {
+    clearInterval(window.__coachControlledTimer);
+    window.__coachControlledTimer = window.setInterval(() => {
+      const port = window.__coachControlledPort;
+      if (typeof port?.onmessage !== "function") return;
+      const heading = document.querySelector("#calibration-title")?.textContent || "";
+      const rms = heading.includes("Stay quiet")
+        ? window.__coachControlledSignal.quietRms
+        : heading.includes("Now speak")
+          ? window.__coachControlledSignal.voiceRms
+          : window.__coachControlledSignal.attemptRms;
+      port.onmessage({ data: { rms, peak: Math.min(0.99, rms * 1.7) } });
+    }, 50);
+  };
+  if (window.AudioWorklet?.prototype) {
+    window.AudioWorklet.prototype.addModule = () => Promise.resolve();
+  }
+  window.AudioWorkletNode = class {
+    constructor(context) {
+      const node = context.createGain();
+      const port = {
+        onmessage: null,
+        close() {
+          this.onmessage = null;
+          clearInterval(window.__coachControlledTimer);
+          window.__coachControlledTimer = 0;
+        },
+      };
+      Object.defineProperty(node, "port", { configurable: true, value: port });
+      window.__coachControlledPort = port;
+      return node;
+    }
+  };
+};
+
 async function storedSummaries(page) {
   return page.evaluate(async () => {
     const database = await new Promise((resolve, reject) => {
@@ -319,6 +381,10 @@ async function runPracticeFlow(browser, origin) {
   assert(await page.locator("[data-coach-calibration] h1").evaluate((heading) => document.activeElement === heading),
     "Starting calibration must move focus to its status heading");
   await page.waitForSelector("[data-coach-live]", { timeout: 12_000 });
+  assert(await page.locator("[data-coach-calibration-readiness]").count() === 0,
+    "Strong calibration evidence must start the attempt without a readiness gate");
+  assert(await page.evaluate(() => window.__coachGetUserMediaCalls) === 1,
+    "The strong calibration path must acquire the microphone exactly once");
   assert(await page.locator("[data-coach-live] h1").evaluate((heading) => document.activeElement === heading),
     "Starting an attempt must move focus to its prompt heading");
   assert(await page.locator("[data-coach-timer]").getAttribute("role") === "timer",
@@ -1819,6 +1885,256 @@ async function runCancelledWorkletFlow(browser, origin) {
   await context.close();
 }
 
+async function openLimitedCalibrationGate(browser, origin) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  await context.addInitScript(syntheticCoachAudio);
+  await context.addInitScript(controlledCalibrationMeter);
+  const page = await context.newPage();
+  const pageErrors = [];
+  const apiRequests = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.startsWith("/api/")) apiRequests.push(request.url());
+  });
+  try {
+    await page.goto(`${origin}/practice`);
+    await page.getByLabel("Optional transcript analysis").getByRole("checkbox").check();
+    await page.getByLabel("Optional full session retention").getByRole("checkbox").check();
+    await page.getByRole("button", { name: /Calibrate microphone/ }).click();
+    await page.waitForSelector("[data-coach-calibration]");
+    await page.evaluate(() => window.__startCoachControlledFrames());
+    await page.waitForSelector("[data-coach-calibration-readiness]", { timeout: 12_000 });
+    const preChoiceStarts = await page.evaluate(() => ({
+      recognition: window.__coachRecognitionStartCount,
+      recorder: window.__coachMediaRecorderStartCount,
+    }));
+    assert(preChoiceStarts.recognition === 0,
+      "On-device recognition must not start before a limited-calibration choice");
+    assert(preChoiceStarts.recorder === 0,
+      "Artifact recording must not start before a limited-calibration choice");
+    return { context, page, pageErrors, apiRequests };
+  } catch (error) {
+    await context.close();
+    throw error;
+  }
+}
+
+async function runCalibrationReadinessRetryFlow(browser, origin) {
+  const harness = await openLimitedCalibrationGate(browser, origin);
+  const { context, page, pageErrors, apiRequests } = harness;
+  try {
+    const gate = page.locator("[data-coach-calibration-readiness]");
+    const heading = page.getByRole("heading", { level: 1, name: "The coach needs a clearer signal." });
+    assert(await heading.evaluate((element) => document.activeElement === element),
+      "Low-confidence calibration must focus the readiness heading");
+    assert(await page.locator("[data-coach-live]").count() === 0,
+      "Low-confidence calibration must not start an attempt before the user's choice");
+    assert(await page.evaluate(() => window.__coachGetUserMediaCalls) === 1,
+      "Opening the calibration readiness gate must acquire the microphone exactly once");
+    assert(await page.evaluate(() => window.__coachTrackStopped) === false,
+      "The microphone must remain connected while the readiness choice is visible");
+
+    const normalizedGate = normalizeHyphenatedText(await gate.innerText());
+    for (const expected of [
+      "the quiet and speaking samples were too similar or incomplete",
+      "this is about the measurement setup",
+      "not a rating of your voice, speaking ability, or performance",
+      "quiet and speaking levels were not clearly separated",
+      "recording and transcription have not started",
+      "cancel to turn the microphone off",
+    ]) {
+      assert(normalizedGate.includes(expected),
+        `Calibration readiness must disclose ${JSON.stringify(expected)}; got ${JSON.stringify(normalizedGate)}`);
+    }
+    assert(await gate.locator("[data-coach-calibration-reasons] li").count() >= 1,
+      "Calibration readiness must expose its limitations as a semantic list");
+
+    await page.setViewportSize({ width: 320, height: 800 });
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+      "Calibration readiness must reflow at 320 CSS pixels without page-level horizontal scrolling");
+    await assertNoAxeViolations(page, "Calibration readiness at 320 CSS pixels");
+
+    await page.keyboard.press("Tab");
+    const retry = page.getByRole("button", { name: "Retry calibration" });
+    assert(await retry.evaluate((button) => document.activeElement === button),
+      "Retry calibration must be the first tab stop after the focused readiness heading");
+    await page.evaluate(() => window.__setCoachControlledSignal({ quietRms: 0.005, voiceRms: 0.14 }));
+    await page.keyboard.press("Enter");
+    const retryHeading = page.getByRole("heading", { level: 1, name: "Stay quiet for a moment." });
+    await retryHeading.waitFor();
+    assert(await retryHeading.evaluate((element) => document.activeElement === element),
+      "Retrying calibration must move focus to the restarted quiet-stage heading");
+    assert(await page.evaluate(() => window.__coachGetUserMediaCalls) === 1,
+      "Retrying calibration must reuse the current microphone stream");
+    assert(await page.evaluate(() => window.__coachTrackStopCount) === 0,
+      "Retrying calibration must not stop the current microphone stream");
+
+    await page.waitForSelector("[data-coach-live]", { timeout: 12_000 });
+    assert(await page.locator("[data-coach-calibration-readiness]").count() === 0,
+      "Corrected calibration evidence must leave the readiness gate and start the attempt");
+    assert(await page.evaluate(() => window.__coachGetUserMediaCalls) === 1,
+      "A corrected calibration retry must reach the attempt with one microphone acquisition");
+    const correctedStarts = await page.evaluate(() => ({
+      recognition: window.__coachRecognitionStartCount,
+      recorder: window.__coachMediaRecorderStartCount,
+    }));
+    assert(correctedStarts.recognition === 1 && correctedStarts.recorder === 1,
+      `Recognition and recording must each start once after corrected calibration, got ${JSON.stringify(correctedStarts)}`);
+    assert(await page.locator("[data-coach-live] h1").evaluate((element) => document.activeElement === element),
+      "A corrected calibration retry must focus the practice prompt");
+    assert(apiRequests.length === 0,
+      `The local calibration retry flow unexpectedly called the backend: ${apiRequests.join(", ")}`);
+    assert(pageErrors.length === 0,
+      `Calibration readiness retry flow emitted errors: ${JSON.stringify(pageErrors)}`);
+  } finally {
+    await context.close();
+  }
+}
+
+async function runCalibrationReadinessContinueFlow(browser, origin) {
+  const harness = await openLimitedCalibrationGate(browser, origin);
+  const { context, page, pageErrors, apiRequests } = harness;
+  try {
+    await page.getByRole("button", { name: "Continue with limited evidence" }).click();
+    await page.waitForSelector("[data-coach-live]");
+    assert(await page.evaluate(() => window.__coachGetUserMediaCalls) === 1,
+      "Continuing with limited calibration must not reacquire the microphone");
+    const continuedStarts = await page.evaluate(() => ({
+      recognition: window.__coachRecognitionStartCount,
+      recorder: window.__coachMediaRecorderStartCount,
+    }));
+    assert(continuedStarts.recognition === 1 && continuedStarts.recorder === 1,
+      `Recognition and recording must each start once only after explicit continuation, got ${JSON.stringify(continuedStarts)}`);
+    assert(await page.locator("[data-coach-live] h1").evaluate((element) => document.activeElement === element),
+      "Continuing with limited calibration must focus the practice prompt");
+    await page.waitForTimeout(1_200);
+    await page.getByRole("button", { name: "Finish attempt" }).click();
+    await page.waitForSelector("[data-coach-review]");
+
+    const explainer = page.locator("[data-coach-confidence-explainer]");
+    await explainer.waitFor();
+    const normalizedExplainer = normalizeHyphenatedText(await explainer.innerText());
+    for (const expected of [
+      "low measurement confidence",
+      "not a rating of you or your speaking",
+      "calibration separation",
+      "signal coverage",
+      "audio callback continuity",
+      "low calibration confidence",
+      "quiet and speaking levels were not clearly separated",
+      "quiet and speaking calibration had limited evidence",
+      "long callback gaps count as unknown not silence",
+    ]) {
+      assert(normalizedExplainer.includes(expected),
+        `Limited-calibration Review must explain ${JSON.stringify(expected)}; got ${JSON.stringify(normalizedExplainer)}`);
+    }
+    const summaries = await storedSummaries(page);
+    assert(summaries.length === 1,
+      `Continuing with limited calibration must persist exactly one summary, got ${summaries.length}`);
+    assert(summaries[0]?.metrics?.audioConfidence === "low",
+      `Limited calibration must remain low confidence in persisted comparison inputs, got ${JSON.stringify(summaries[0]?.metrics?.audioConfidence)}`);
+    assert(await page.evaluate(() => window.__coachTrackStopped),
+      "Finishing a limited-calibration attempt must stop the microphone");
+    await assertNoAxeViolations(page, "Limited-calibration coaching review");
+    assert(apiRequests.length === 0,
+      `The local limited-calibration continuation unexpectedly called the backend: ${apiRequests.join(", ")}`);
+    assert(pageErrors.length === 0,
+      `Calibration readiness continue flow emitted errors: ${JSON.stringify(pageErrors)}`);
+  } finally {
+    await context.close();
+  }
+}
+
+async function runCalibrationReadinessCancelFlow(browser, origin) {
+  const harness = await openLimitedCalibrationGate(browser, origin);
+  const { context, page, pageErrors, apiRequests } = harness;
+  try {
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await page.waitForSelector("[data-coach-setup]");
+    await page.waitForFunction(() => window.__coachTrackStopped === true);
+    assert(await page.getByRole("heading", { level: 1, name: "Practice with a signal, not a score." }).evaluate((element) => document.activeElement === element),
+      "Cancelling calibration readiness must return focus to the setup heading");
+    assert(await page.evaluate(() => window.__coachGetUserMediaCalls) === 1,
+      "Cancelling calibration readiness must not reacquire the microphone");
+    assert(await page.evaluate(() => window.__coachTrackStopCount) === 1,
+      "Cancelling calibration readiness must stop its microphone track exactly once");
+    const cancelledStarts = await page.evaluate(() => ({
+      recognition: window.__coachRecognitionStartCount,
+      recorder: window.__coachMediaRecorderStartCount,
+    }));
+    assert(cancelledStarts.recognition === 0 && cancelledStarts.recorder === 0,
+      `Cancelling at readiness must not start recognition or recording, got ${JSON.stringify(cancelledStarts)}`);
+    await page.waitForTimeout(250);
+    assert(await page.locator("[data-coach-live], [data-coach-calibration-readiness]").count() === 0,
+      "A cancelled readiness decision must not start later from delayed frames");
+    assert(apiRequests.length === 0,
+      `Cancelling calibration readiness unexpectedly called the backend: ${apiRequests.join(", ")}`);
+    assert(pageErrors.length === 0,
+      `Calibration readiness cancel flow emitted errors: ${JSON.stringify(pageErrors)}`);
+  } finally {
+    await context.close();
+  }
+}
+
+async function runCalibrationReadinessInputEndedFlow(browser, origin) {
+  const harness = await openLimitedCalibrationGate(browser, origin);
+  const { context, page, pageErrors, apiRequests } = harness;
+  try {
+    await page.evaluate(() => window.__coachInputTrack.dispatchEvent(new Event("ended")));
+    await page.waitForSelector("[data-coach-setup]");
+    const setupText = normalizeHyphenatedText(await page.locator("#app").innerText());
+    assert(setupText.includes("microphone input ended before the practice attempt started"),
+      "An input ending at the readiness gate must return an actionable calibration error");
+    assert(await page.evaluate(() => window.__coachTrackStopped),
+      "An input ending at the readiness gate must clean up the microphone stream");
+    assert(await page.locator("[data-coach-live], [data-coach-calibration-readiness]").count() === 0,
+      "An ended input must not leave the readiness gate or start a dead attempt");
+    assert(await page.getByRole("heading", { level: 1, name: "Practice with a signal, not a score." }).evaluate((element) => document.activeElement === element),
+      "An ended input at readiness must return focus to the setup heading");
+    const endedStarts = await page.evaluate(() => ({
+      recognition: window.__coachRecognitionStartCount,
+      recorder: window.__coachMediaRecorderStartCount,
+    }));
+    assert(endedStarts.recognition === 0 && endedStarts.recorder === 0,
+      `An ended input at readiness must not start recognition or recording, got ${JSON.stringify(endedStarts)}`);
+    assert(apiRequests.length === 0,
+      `The readiness input-ended flow unexpectedly called the backend: ${apiRequests.join(", ")}`);
+    assert(pageErrors.length === 0,
+      `Calibration readiness input-ended flow emitted errors: ${JSON.stringify(pageErrors)}`);
+  } finally {
+    await context.close();
+  }
+}
+
+async function runCalibrationReadinessRouteAwayFlow(browser, origin) {
+  const harness = await openLimitedCalibrationGate(browser, origin);
+  const { context, page, pageErrors, apiRequests } = harness;
+  try {
+    await page.getByRole("link", { name: "NonStopTalk" }).click();
+    await page.getByRole("heading", { level: 1, name: "Find your voice." }).waitFor();
+    await page.waitForFunction(() => window.__coachTrackStopped === true);
+    await page.waitForTimeout(250);
+    assert(new URL(page.url()).pathname === "/",
+      "Routing away from calibration readiness must keep the requested destination active");
+    assert(await page.locator("[data-coach-calibration], [data-coach-calibration-readiness], [data-coach-live]").count() === 0,
+      "Delayed calibration frames must not restore coaching UI after routing away");
+    assert(await page.getByRole("heading", { level: 1, name: "Find your voice." }).evaluate((element) => document.activeElement === element),
+      "Routing away from calibration readiness must focus the destination heading");
+    const routeAwayStarts = await page.evaluate(() => ({
+      recognition: window.__coachRecognitionStartCount,
+      recorder: window.__coachMediaRecorderStartCount,
+    }));
+    assert(routeAwayStarts.recognition === 0 && routeAwayStarts.recorder === 0,
+      `Routing away at readiness must not start recognition or recording, got ${JSON.stringify(routeAwayStarts)}`);
+    assert(apiRequests.length === 0,
+      `Routing away from calibration readiness unexpectedly called the backend: ${apiRequests.join(", ")}`);
+    assert(pageErrors.length === 0,
+      `Calibration readiness route-away flow emitted errors: ${JSON.stringify(pageErrors)}`);
+  } finally {
+    await context.close();
+  }
+}
+
 async function runStalledActiveFlow(browser, origin) {
   const context = await browser.newContext();
   await context.addInitScript(syntheticCoachAudio);
@@ -1896,6 +2212,11 @@ try {
   await runRouteLinkClickFlow(browser, origin);
   await runCancelledAudioResumeFlow(browser, origin);
   await runCalibrationAccessibilityFlow(browser, origin);
+  await runCalibrationReadinessRetryFlow(browser, origin);
+  await runCalibrationReadinessContinueFlow(browser, origin);
+  await runCalibrationReadinessCancelFlow(browser, origin);
+  await runCalibrationReadinessInputEndedFlow(browser, origin);
+  await runCalibrationReadinessRouteAwayFlow(browser, origin);
   await runCancelledPermissionFlow(browser, origin);
   await runCancelledWorkletFlow(browser, origin);
   await runStalledActiveFlow(browser, origin);
