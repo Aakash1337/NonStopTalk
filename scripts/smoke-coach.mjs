@@ -104,13 +104,49 @@ const syntheticCoachAudio = () => {
   window.__coachTrackStopped = false;
   window.__coachTrackStopCount = 0;
   window.__coachGetUserMediaCalls = 0;
+  window.__coachGetUserMediaConstraints = [];
+  window.__coachEnumerateDevicesCalls = 0;
+  window.__coachDelayEnumeration = false;
+  window.__coachEnumerationPending = false;
+  window.__releaseCoachEnumeration = null;
+  window.__coachMicrophoneDevices = [
+    { kind: "audioinput", deviceId: "default", label: "Laptop microphone", groupId: "private-default-group" },
+    {
+      kind: "audioinput",
+      deviceId: "studio-device-id",
+      label: "Studio <img data-hostile-microphone-label src=x onerror=alert(1)>",
+      groupId: "private-studio-group",
+    },
+    { kind: "videoinput", deviceId: "camera-device-id", label: "Camera", groupId: "private-camera-group" },
+  ];
   window.__coachRecognitionStartCount = 0;
   const NativeAudioContext = window.AudioContext || window.webkitAudioContext;
   Object.defineProperty(navigator, "mediaDevices", {
     configurable: true,
     value: {
-      async getUserMedia() {
+      addEventListener() {},
+      async enumerateDevices() {
+        window.__coachEnumerateDevicesCalls += 1;
+        if (window.__coachDelayEnumeration) {
+          window.__coachEnumerationPending = true;
+          await new Promise((resolve) => {
+            window.__releaseCoachEnumeration = () => {
+              window.__coachDelayEnumeration = false;
+              window.__coachEnumerationPending = false;
+              window.__releaseCoachEnumeration = null;
+              resolve();
+            };
+          });
+        }
+        return window.__coachMicrophoneDevices.map((device) => ({ ...device }));
+      },
+      async getUserMedia(constraints) {
         window.__coachGetUserMediaCalls += 1;
+        window.__coachGetUserMediaConstraints.push(JSON.parse(JSON.stringify(constraints)));
+        if (window.__coachRejectSelectedOnce && constraints?.audio?.deviceId?.exact) {
+          window.__coachRejectSelectedOnce = false;
+          throw new DOMException("The selected microphone was removed.", "NotFoundError");
+        }
         const context = new NativeAudioContext();
         await context.resume();
         const oscillator = context.createOscillator();
@@ -179,6 +215,284 @@ const syntheticCoachAudio = () => {
   }
   Object.defineProperty(window, "SpeechRecognition", { configurable: true, value: LocalRecognition });
 };
+
+const syntheticUnlabeledMicrophonePreview = () => {
+  window.__previewEnumerateCalls = 0;
+  window.__previewGetUserMediaCalls = 0;
+  window.__previewGetUserMediaConstraints = [];
+  window.__previewTrackStopCount = 0;
+  window.__previewSecondEnumerationPending = false;
+  window.__releasePreviewEnumeration = null;
+  Object.defineProperty(navigator, "mediaDevices", {
+    configurable: true,
+    value: {
+      addEventListener() {},
+      async enumerateDevices() {
+        window.__previewEnumerateCalls += 1;
+        if (window.__previewEnumerateCalls === 1) {
+          return [{ kind: "audioinput", deviceId: "preview-device-id", label: "" }];
+        }
+        window.__previewSecondEnumerationPending = true;
+        return new Promise((resolve) => {
+          window.__releasePreviewEnumeration = () => {
+            window.__previewSecondEnumerationPending = false;
+            window.__releasePreviewEnumeration = null;
+            resolve([{ kind: "audioinput", deviceId: "preview-device-id", label: "Named after permission" }]);
+          };
+        });
+      },
+      async getUserMedia(constraints) {
+        window.__previewGetUserMediaCalls += 1;
+        window.__previewGetUserMediaConstraints.push(JSON.parse(JSON.stringify(constraints)));
+        const track = {
+          kind: "audio",
+          stop() { window.__previewTrackStopCount += 1; },
+        };
+        return { getTracks: () => [track], getAudioTracks: () => [track] };
+      },
+    },
+  });
+};
+
+async function runUnlabeledMicrophonePreviewFlow(browser, origin) {
+  const context = await browser.newContext();
+  await context.addInitScript(syntheticUnlabeledMicrophonePreview);
+  const page = await context.newPage();
+  const pageErrors = [];
+  const apiRequests = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.startsWith("/api/")) apiRequests.push(request.url());
+  });
+
+  try {
+    await page.goto(`${origin}/practice`);
+    await page.waitForSelector("[data-coach-setup]");
+    await page.getByRole("button", { name: "Choose microphone" }).click();
+    const dialog = page.getByRole("dialog", { name: "Choose a microphone" });
+    await dialog.waitFor();
+    await page.waitForFunction(() => window.__previewSecondEnumerationPending === true);
+    const previewState = await page.evaluate(() => ({
+      enumerateCalls: window.__previewEnumerateCalls,
+      getUserMediaCalls: window.__previewGetUserMediaCalls,
+      constraints: window.__previewGetUserMediaConstraints,
+      stops: window.__previewTrackStopCount,
+    }));
+    assert(JSON.stringify(previewState) === JSON.stringify({
+      enumerateCalls: 2,
+      getUserMediaCalls: 1,
+      constraints: [{ audio: true, video: false }],
+      stops: 1,
+    }), `Permission-assisted discovery did not stop its preview before the pending refresh: ${JSON.stringify(previewState)}`);
+
+    await page.evaluate(() => window.__releasePreviewEnumeration());
+    await page.locator("[data-microphone-status]").filter({ hasText: "1 microphone input available" }).waitFor();
+    assert(await page.getByLabel("Audio input").locator('option[value="preview-device-id"]').textContent()
+      === "Named after permission", "The picker must reveal the label returned after permission");
+    assert(await page.evaluate(() => window.__previewGetUserMediaCalls) === 1,
+      "Permission-assisted discovery must open exactly one preview stream");
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await dialog.waitFor({ state: "hidden" });
+    assert(apiRequests.length === 0,
+      `Unlabeled microphone discovery unexpectedly called the backend: ${apiRequests.join(", ")}`);
+    assert(pageErrors.length === 0,
+      `Unlabeled microphone discovery emitted page errors: ${JSON.stringify(pageErrors)}`);
+  } finally {
+    await context.close();
+  }
+}
+
+async function runMissingSelectedMicrophoneFallbackFlow(browser, origin) {
+  const context = await browser.newContext();
+  await context.addInitScript(syntheticCoachAudio);
+  const page = await context.newPage();
+  const pageErrors = [];
+  const apiRequests = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.startsWith("/api/")) apiRequests.push(request.url());
+  });
+
+  try {
+    await page.goto(`${origin}/practice`);
+    await page.waitForSelector("[data-coach-setup]");
+    await page.evaluate(() => {
+      localStorage.setItem("nonstoptalk.microphone.v1", "missing-device-id");
+      localStorage.setItem("unrelated-local-preference", "keep-me");
+    });
+    await page.reload();
+    await page.waitForSelector("[data-coach-setup]");
+    await page.evaluate(() => { window.__coachRejectSelectedOnce = true; });
+
+    await page.getByRole("button", { name: /Calibrate microphone/ }).click();
+    await page.waitForFunction(() => window.__coachGetUserMediaCalls === 2);
+    const fallbackState = await page.evaluate(() => ({
+      constraints: window.__coachGetUserMediaConstraints,
+      microphonePreference: localStorage.getItem("nonstoptalk.microphone.v1"),
+      unrelatedPreference: localStorage.getItem("unrelated-local-preference"),
+    }));
+    assert(JSON.stringify(fallbackState.constraints) === JSON.stringify([
+      {
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: false,
+          deviceId: { exact: "missing-device-id" },
+        },
+        video: false,
+      },
+      {
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: false,
+        },
+        video: false,
+      },
+    ]), `Selected-device fallback made unexpected capture requests: ${JSON.stringify(fallbackState.constraints)}`);
+    assert(fallbackState.microphonePreference === null,
+      "A successful Auto-detect fallback must clear the stale selected-device preference");
+    assert(fallbackState.unrelatedPreference === "keep-me",
+      "Selected-device fallback must not clear unrelated browser preferences");
+    const toast = page.locator("#toast");
+    assert(await toast.isVisible(), "Selected-device fallback must show its bounded status message");
+    assert(await toast.textContent() === "The requested microphone is unavailable; this start is using Auto-detect.",
+      `Selected-device fallback showed unexpected copy: ${JSON.stringify(await toast.textContent())}`);
+    await page.getByRole("heading", { name: "Now speak normally." }).waitFor({ timeout: 6_000 });
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await page.waitForSelector("[data-coach-setup]");
+    assert(await page.locator("[data-microphone-selected-label]").textContent() === "Auto-detect",
+      "Selected-device fallback must update the next visible choice label to Auto-detect");
+    assert(await page.evaluate(() => window.__coachTrackStopCount) === 1,
+      "Cancelling after Auto-detect fallback must stop the usable fallback stream exactly once");
+    assert(apiRequests.length === 0,
+      `Selected-device fallback unexpectedly called the backend: ${apiRequests.join(", ")}`);
+    assert(pageErrors.length === 0,
+      `Selected-device fallback emitted page errors: ${JSON.stringify(pageErrors)}`);
+  } finally {
+    await context.close();
+  }
+}
+
+async function runMicrophoneSelectionFlow(browser, origin) {
+  const context = await browser.newContext();
+  await context.addInitScript(syntheticCoachAudio);
+  const page = await context.newPage();
+  const pageErrors = [];
+  const apiRequests = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.startsWith("/api/")) apiRequests.push(request.url());
+  });
+
+  try {
+    await page.goto(`${origin}/practice`);
+    await page.waitForSelector("[data-coach-setup]");
+    const opener = page.getByRole("button", { name: "Choose microphone" });
+    assert(await page.locator("[data-microphone-selected-label]").textContent() === "Auto-detect",
+      "Practice must default to browser-selected microphone input");
+    await opener.focus();
+    await opener.press("Enter");
+
+    const dialog = page.getByRole("dialog", { name: "Choose a microphone" });
+    await dialog.waitFor();
+    const list = page.getByLabel("Audio input");
+    await page.locator("[data-microphone-status]").filter({ hasText: "2 microphone inputs available" }).waitFor();
+    assert(await list.evaluate((control) => document.activeElement === control),
+      "Opening the microphone dialog must focus its native input selector");
+    assert(await page.evaluate(() => window.__coachEnumerateDevicesCalls) === 1,
+      "Opening the microphone dialog must enumerate inputs exactly once when labels are already available");
+    assert(await page.evaluate(() => window.__coachGetUserMediaCalls) === 0,
+      "Named input discovery must not open a permission preview stream");
+    assert(await list.locator("option").count() === 3,
+      "The picker must include Auto-detect and only the two audio inputs");
+    const hostileLabel = "Studio <img data-hostile-microphone-label src=x onerror=alert(1)>";
+    assert(await list.locator('option[value="studio-device-id"]').textContent() === hostileLabel,
+      "The picker must preserve the bounded browser label as visible text");
+    assert(await dialog.locator("img, [data-hostile-microphone-label]").count() === 0,
+      "A hostile microphone label must not become executable markup");
+    await assertNoAxeViolations(page, "Microphone selection dialog");
+
+    await list.selectOption("studio-device-id");
+    await page.getByRole("button", { name: "Use microphone" }).press("Enter");
+    await dialog.waitFor({ state: "hidden" });
+    assert(await opener.evaluate((button) => document.activeElement === button),
+      "Choosing a microphone must restore focus to the dialog opener");
+    assert(await page.locator("[data-microphone-selected-label]").textContent() === hostileLabel,
+      "The practice setup must display the selected input label as text");
+    assert(await page.locator("[data-microphone-choice] img, [data-microphone-choice] [data-hostile-microphone-label]").count() === 0,
+      "A hostile selected label must remain text outside the dialog");
+    assert(await page.evaluate(() => localStorage.getItem("nonstoptalk.microphone.v1")) === "studio-device-id",
+      "Microphone selection must persist only the opaque selected device ID");
+    assert(!JSON.stringify(await page.evaluate(() => ({ ...localStorage }))).includes("Studio <img"),
+      "Microphone labels must never enter browser persistence");
+    assert(apiRequests.length === 0,
+      `Selecting a microphone unexpectedly called the backend: ${apiRequests.join(", ")}`);
+
+    await page.reload();
+    await page.waitForSelector("[data-coach-setup]");
+    assert(await page.evaluate(() => localStorage.getItem("nonstoptalk.microphone.v1")) === "studio-device-id",
+      "The selected opaque microphone ID must survive reload");
+    assert(await page.locator("[data-microphone-selected-label]").textContent() === "Saved microphone",
+      "Reload must not imply that a device label was persisted before discovery");
+
+    // The saved choice is rendered before asynchronous discovery completes.
+    // Changing that provisional selection must win over the older refresh.
+    await page.evaluate(() => { window.__coachDelayEnumeration = true; });
+    await opener.press("Enter");
+    await dialog.waitFor();
+    await page.waitForFunction(() => window.__coachEnumerationPending === true);
+    assert(await list.inputValue() === "studio-device-id",
+      "The picker must initially expose the saved microphone while refresh is pending");
+    await list.selectOption("");
+    assert(await list.inputValue() === "",
+      "The test must establish Auto-detect as the in-progress user choice");
+    await page.evaluate(() => window.__releaseCoachEnumeration());
+    await page.locator("[data-microphone-status]").filter({ hasText: "2 microphone inputs available" }).waitFor();
+    assert(await list.inputValue() === "",
+      "A delayed device refresh must not overwrite the user's in-progress Auto-detect choice");
+    await page.getByRole("button", { name: "Use microphone" }).press("Enter");
+    await dialog.waitFor({ state: "hidden" });
+    assert(await page.evaluate(() => localStorage.getItem("nonstoptalk.microphone.v1")) === null,
+      "Applying the preserved Auto-detect choice must clear the saved device ID");
+
+    // Restore the named choice for the selected-device calibration assertion.
+    await opener.press("Enter");
+    await dialog.waitFor();
+    await page.locator("[data-microphone-status]").filter({ hasText: "2 microphone inputs available" }).waitFor();
+    await list.selectOption("studio-device-id");
+    await page.getByRole("button", { name: "Use microphone" }).press("Enter");
+    await dialog.waitFor({ state: "hidden" });
+    assert(await page.evaluate(() => localStorage.getItem("nonstoptalk.microphone.v1")) === "studio-device-id",
+      "The named microphone must remain selectable after the delayed refresh race");
+
+    await page.getByRole("button", { name: /Calibrate microphone/ }).click();
+    await page.waitForSelector("[data-coach-calibration]");
+    await page.waitForFunction(() => window.__coachGetUserMediaCalls === 1);
+    assert(await page.evaluate(() => window.__coachGetUserMediaCalls) === 1,
+      "Calibration must acquire the persisted selected microphone exactly once");
+    const constraints = await page.evaluate(() => window.__coachGetUserMediaConstraints);
+    assert(JSON.stringify(constraints) === JSON.stringify([{
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: false,
+        deviceId: { exact: "studio-device-id" },
+      },
+      video: false,
+    }]), `Calibration used unexpected selected-device constraints: ${JSON.stringify(constraints)}`);
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await page.waitForSelector("[data-coach-setup]");
+    assert(await page.evaluate(() => window.__coachTrackStopCount) === 1,
+      "Cancelling selected-device calibration must stop its microphone stream exactly once");
+    assert(apiRequests.length === 0,
+      `The local microphone-selection flow unexpectedly called the backend: ${apiRequests.join(", ")}`);
+    assert(pageErrors.length === 0,
+      `The microphone-selection flow emitted page errors: ${JSON.stringify(pageErrors)}`);
+  } finally {
+    await context.close();
+  }
+}
 
 const delayedCoachPermission = () => {
   window.__lateCoachTrackStopped = false;
@@ -2240,6 +2554,9 @@ let browser;
 try {
   await waitForServer(`${origin}/practice`, child, () => logs);
   browser = await launchBrowser();
+  await runUnlabeledMicrophonePreviewFlow(browser, origin);
+  await runMissingSelectedMicrophoneFallbackFlow(browser, origin);
+  await runMicrophoneSelectionFlow(browser, origin);
   await runPracticeFlow(browser, origin);
   await runMixedGenerationRetentionDisclosureFlow(browser, origin);
   await runArtifactUsageDashboardFlow(browser, origin);

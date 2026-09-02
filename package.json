@@ -17,6 +17,7 @@
     "db:migrate:staging": "wrangler d1 migrations apply PLATFORM_DB --remote --env staging",
     "test:coach": "node --test cloudflare/public/coach-engine.test.js cloudflare/public/coach-loop.test.js cloudflare/public/coach-storage.test.js",
     "test:cloud-progress": "node --test cloudflare/public/cloud-progress.test.js",
+    "test:microphone-selection": "node --test cloudflare/public/microphone-selection.test.js",
     "test:setup-kits": "node --test cloudflare/public/setup-kits.test.js",
     "test:admin": "node --test cloudflare/public/admin-analytics.test.js",
     "test:production-monitor": "node --test scripts/production-health-workflow.test.mjs",

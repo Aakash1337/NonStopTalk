@@ -27,6 +27,7 @@ const PUBLIC_JAVASCRIPT_ASSET_PATHS = [
   "/coach-storage.js",
   "/coach-engine.js",
   "/setup-kits.js",
+  "/microphone-selection.js",
 ];
 const expectedJavaScriptAssets = new Map(await Promise.all(
   PUBLIC_JAVASCRIPT_ASSET_PATHS.map(async (pathname) => [
@@ -210,6 +211,6 @@ console.log(JSON.stringify({
   analyticsDelivery: observedAnalyticsDelivery,
   checkedRoutes: [
     "/", "/practice", "/progress", "/app.js", "/coach-storage.js", "/coach-engine.js",
-    "/setup-kits.js", "/admin/analytics", "/api/v1/platform/status",
+    "/setup-kits.js", "/microphone-selection.js", "/admin/analytics", "/api/v1/platform/status",
   ],
 }));

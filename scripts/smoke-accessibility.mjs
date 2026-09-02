@@ -15,6 +15,25 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+const syntheticAccessibilityMicrophones = () => {
+  const microphones = [
+    { kind: "audioinput", deviceId: "accessibility-table-mic", label: "Table microphone" },
+    { kind: "audioinput", deviceId: "accessibility-room-mic", label: "Room microphone" },
+  ];
+  Object.defineProperty(navigator, "mediaDevices", {
+    configurable: true,
+    value: {
+      addEventListener() {},
+      removeEventListener() {},
+      enumerateDevices: () => Promise.resolve(microphones.map((device) => ({ ...device }))),
+      getUserMedia: () => Promise.resolve({
+        getAudioTracks: () => [],
+        getTracks: () => [],
+      }),
+    },
+  });
+};
+
 async function getFreePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -106,6 +125,7 @@ async function assertSinglePageStructure(page, label) {
 
 async function runAccessibilityFlow(browser, origin) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  await context.addInitScript(syntheticAccessibilityMicrophones);
   const page = await context.newPage();
   const pageErrors = [];
   const coachingDataRequests = [];
@@ -145,6 +165,65 @@ async function runAccessibilityFlow(browser, origin) {
     "SPA navigation must announce the destination heading");
   await assertSinglePageStructure(page, "Practice page");
   await assertNoAxeViolations(page, "Practice page");
+
+  const microphoneOpener = page.getByRole("button", { name: "Choose microphone" });
+  await microphoneOpener.click();
+  const microphoneDialog = page.getByRole("dialog", { name: "Choose a microphone" });
+  await microphoneDialog.waitFor();
+  assert(await microphoneDialog.getAttribute("aria-describedby") === "microphone-dialog-description",
+    "The microphone dialog must expose its privacy explanation as an accessible description");
+  assert((await page.locator("#microphone-dialog-description").innerText()).includes("stores only the chosen device ID"),
+    "The microphone dialog description must explain what is stored");
+  const microphoneList = page.getByLabel("Audio input");
+  assert(await microphoneList.evaluate((select) => document.activeElement === select && select.closest("dialog")?.open),
+    "Opening the microphone dialog must move focus to its native audio-input selector");
+  const microphoneStatus = microphoneDialog.getByRole("status");
+  await microphoneStatus.filter({ hasText: "2 microphone inputs available." }).waitFor();
+  assert(await microphoneStatus.getAttribute("aria-live") === "polite"
+    && await microphoneStatus.getAttribute("aria-atomic") === "true",
+  "Microphone availability feedback must use polite, atomic live-status semantics");
+  await assertNoAxeViolations(page, "Open microphone dialog");
+
+  assert(await microphoneList.inputValue() === "", "The microphone selector must begin on Auto-detect");
+  await microphoneList.press("ArrowDown");
+  assert(await microphoneList.inputValue() === "accessibility-table-mic",
+    "The native microphone selector must support keyboard option selection");
+  await page.keyboard.press("Escape");
+  await microphoneDialog.waitFor({ state: "hidden" });
+  await page.waitForFunction(() => document.activeElement?.matches('[data-command="microphone-open"]'));
+  assert(await microphoneOpener.evaluate((button) => document.activeElement === button),
+    "Escape must close the microphone dialog and restore focus to its opener");
+
+  await page.setViewportSize({ width: 320, height: 800 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await microphoneOpener.click();
+  await microphoneDialog.waitFor();
+  assert(await microphoneList.evaluate((select) => document.activeElement === select),
+    "The microphone selector must still receive initial focus with reduced motion enabled");
+  const microphoneDialogBounds = await microphoneDialog.boundingBox();
+  assert(microphoneDialogBounds
+    && microphoneDialogBounds.x >= 0
+    && microphoneDialogBounds.x + microphoneDialogBounds.width <= 320,
+  `The microphone dialog must fit within 320 CSS pixels, got ${JSON.stringify(microphoneDialogBounds)}`);
+  assert(await microphoneDialog.evaluate((dialog) => dialog.scrollWidth <= dialog.clientWidth),
+    "The microphone dialog contents must not overflow horizontally at 320 CSS pixels");
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    "The open microphone dialog must not create page-level horizontal scrolling at 320 CSS pixels");
+  const microphoneTransitionDurations = await microphoneDialog.evaluate((dialog) => [
+    getComputedStyle(dialog).transitionDuration,
+    ...Array.from(dialog.querySelectorAll("*"), (element) => getComputedStyle(element).transitionDuration),
+  ]);
+  assert(microphoneTransitionDurations.every((durations) =>
+    durations.split(",").every((duration) => Number.parseFloat(duration) === 0)),
+  `Reduced-motion mode must remove microphone-dialog transitions, got ${JSON.stringify(microphoneTransitionDurations)}`);
+  await assertNoAxeViolations(page, "Open microphone dialog at 320 CSS pixels with reduced motion");
+  await microphoneDialog.getByRole("button", { name: "Cancel" }).click();
+  await microphoneDialog.waitFor({ state: "hidden" });
+  await page.waitForFunction(() => document.activeElement?.matches('[data-command="microphone-open"]'));
+  assert(await microphoneOpener.evaluate((button) => document.activeElement === button),
+    "Cancel must close the microphone dialog and restore focus to its opener");
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.emulateMedia({ reducedMotion: "no-preference" });
 
   trackProgressRequests = true;
   await page.getByRole("link", { name: "Progress", exact: true }).click();

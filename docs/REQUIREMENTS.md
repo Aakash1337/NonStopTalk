@@ -112,7 +112,7 @@ The slice is modular and designed around Workers, Durable Objects, D1, Static As
 ### Turn play — implemented
 
 - The active player, topic, round, timer, voice state, and standings are shown.
-- Both editions support local Web Audio voice-activity detection; the Go edition also supports explicit microphone selection.
+- Both editions support explicit microphone selection and local Web Audio voice-activity detection. The Cloudflare SPA shares one origin-local choice between Practice and the current Play driver, persists only the browser's opaque device ID, and keeps labels in memory.
 - A microphone-driven turn ends at full duration or after the configured silence period.
 - Timer completion takes precedence if completion and silence cross in the same update.
 - A manual timer handles denied, missing, or unsupported microphone access.
@@ -158,7 +158,7 @@ The slice is modular and designed around Workers, Durable Objects, D1, Static As
 | --- | --- |
 | Usability | Fast game defaults, a focused coaching flow, large live surfaces, mobile layouts, and visible fallbacks are implemented. Formal time-to-start, distraction, or learning-loop usability testing has not been run. |
 | Accessibility | Semantic labels, keyboard-operable native controls, visible focus styling, non-color text states, and reduced-motion CSS exist. WCAG 2.1 AA conformance has not been audited. |
-| Reliability | Go unit/handler tests, Cloudflare rules/platform tests, a shared versioned six-family game-rule contract, setup-kit module/action tests, 38 deterministic coaching/loop tests plus eight IndexedDB storage-contract tests (46 total), cloud-progress tests, and Playwright smoke flows cover core paths—including rejected-action atomicity, a two-browser Cloudflare WebSocket game with isolated identities and host-authorization rejection, setup-kit persistence/isolation and one-action convergence, calibration fast/gated paths and confidence caps, gate-action races, keyboard/320-pixel behavior, recording/transcription deferral, baseline/retry persistence gating/resume, comparison, legacy grouping, v1→v3 lifecycle migration, exact expiry/usage reporting, cap/quota summary-only outcomes, artifact-only deletion, storage rollback/fail-closed behavior, and cleanup-heartbeat failure/backlog/staleness behavior. Microphone calibration and optional local transcription still depend on browser, language pack, device, and room conditions. |
+| Reliability | Go unit/handler tests, Cloudflare rules/platform tests, a shared versioned six-family game-rule contract, setup-kit module/action tests, 38 deterministic coaching/loop tests plus eight IndexedDB storage-contract tests (46 coaching total), 23 shared microphone-selection contract/race tests, cloud-progress tests, and Playwright smoke flows cover core paths—including rejected-action atomicity, a two-browser Cloudflare WebSocket game with isolated identities and host-authorization rejection, setup-kit persistence/isolation and one-action convergence, exact selected-input Practice/Play capture with no metadata egress, picker focus/rerender/authority races, calibration fast/gated paths and confidence caps, gate-action races, keyboard/320-pixel behavior, recording/transcription deferral, baseline/retry persistence gating/resume, comparison, legacy grouping, v1→v3 lifecycle migration, exact expiry/usage reporting, cap/quota summary-only outcomes, artifact-only deletion, storage rollback/fail-closed behavior, and cleanup-heartbeat failure/backlog/staleness behavior. Microphone calibration and optional local transcription still depend on browser, language pack, device, and room conditions. |
 | Local persistence | `cmd/web` autosaves JSON every 10 seconds by default. `cmd/desktop` is memory-only. |
 | Online durability | Each Cloudflare room has one SQLite-backed Durable Object, so state survives hibernation, Worker restarts, and deployments until its 30-day idle expiry. |
 | Coaching persistence | IndexedDB v3 is the best-effort local summary/artifact source. Its required content-free lifecycle ledger gives new artifacts exactly 30 days from save and migrated artifacts exactly 30 days from upgrade, enforces a 128 MiB logical cap for new retention without evicting valid content, and preserves compact summaries for app-limit or browser-quota outcomes. A one-pass local snapshot gives Progress exact aggregate/per-attempt usage and deadlines without estimating browser quota or loading all Blobs together. Individual artifacts can be deleted without deleting their compact summaries or loop relationships. Incompatible storage fails closed, and the deployed Release-A floor remains compatible with an already-upgraded database. An independent opt-in can back up only compact summaries—including explicit relationship metadata—to D1 under an anonymous browser identity. Schema v4 internally maps that browser one-to-one to an opaque sync profile while all session operations remain device-owned. One device-level UTC-day-bucketed lease lasts at least 30 and less than 31 days after cloud use; new cloud saves stop once 250 summaries exist without forcibly deleting valid legacy rows. No account recovery or cross-device sync exists. |
@@ -177,7 +177,8 @@ The repository's playable baseline is:
 6. A bad microphone or judge outcome can fall back to classic/manual play and host score correction.
 7. The Cloudflare host can turn a bounded theme into an editable deterministic topic draft without a model key; when an external tier is configured, missing budget/credentials or provider failure preserves that fallback, while missing consent prevents the external attempt entirely.
 8. The Cloudflare host can save the applied setup as a bounded device-local named kit, reload and reapply it with exactly one atomic room action, and import/export custom-topic text without a network or analytics request. An import remains only an editor draft until explicit use, while guests never receive undrawn topics.
-9. The local Go app and native Cloudflare edition both provide the documented core game flow.
+9. The current Cloudflare turn driver can choose a browser input without a room/API/analytics request; the same saved choice drives Practice and Play, survives reload, falls back safely when an input disappears, and leaves manual timing available.
+10. The local Go app and native Cloudflare edition both provide the documented core game flow.
 
 The coaching-prototype baseline is:
 
@@ -212,7 +213,7 @@ The coaching-prototype baseline is:
 - Visible user profiles and profile management
 - Family/content filters
 - Post-turn AI summaries
-- Full multiplayer-game feature parity between the Go and Cloudflare editions beyond the implemented online topic-draft and setup-kit slices; AI judge, microphone picker, and sound cues remain
+- Full multiplayer-game feature parity between the Go and Cloudflare editions beyond the implemented online topic-draft, setup-kit, and microphone-selection slices; AI judge and sound cues remain
 - A formal accessibility audit
 - Validated audio thresholds and confidence across representative microphones, browsers, room noise, and assistive setups
 - Validated learning outcomes, repeatability, and interpretation for the implemented baseline → review → unassisted-retry comparisons

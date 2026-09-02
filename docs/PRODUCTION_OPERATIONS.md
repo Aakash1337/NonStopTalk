@@ -50,6 +50,7 @@ go test -race ./...
 go vet ./...
 npm run test:coach
 npm run test:cloud-progress
+npm run test:microphone-selection
 npm run test:admin
 npm run test:production-monitor
 npm run test:deployment-contract
@@ -145,7 +146,8 @@ creator, a later cron editor, or the user who re-enables it); do not assume
 repository watchers receive them. The probe retries ordinary page and API GETs
 up to five times before failing, which absorbs a short network interruption
 without concealing a sustained outage. It separately fetches and validates the
-public `app.js` + `coach-storage.js` + `coach-engine.js` + `setup-kits.js`
+public `app.js` + `coach-storage.js` + `coach-engine.js` + `setup-kits.js` +
+`microphone-selection.js`
 module graph as one generation for up to eight bounded attempts. It requires
 every served module to match the corresponding checked-out release source
 byte-for-byte, then checks the reviewed unbundled import/consumption/export

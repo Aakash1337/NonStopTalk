@@ -70,6 +70,7 @@ npm run audit:dependencies
 npm run typecheck:cloudflare
 npm run test:cloudflare
 npm run test:setup-kits
+npm run test:microphone-selection
 npm run test:cloudflare-runtime
 npm run test:cloudflare-runtime-outbox
 npm run test:worker-runtime-runner
@@ -175,7 +176,7 @@ Each online room owns one Durable Object selected by its room code. The object s
 
 A room is deleted after 30 days without a state change. The alarm closes any remaining sockets and clears the object's storage. In production's current `best-effort` mode, ordinary rooms never initialize local milestone-outbox tables. Staging uses exact lowercase `outbox`, so each real milestone mutation atomically writes the room state, complete ordered event group, stable lifecycle metadata, and shared alarm. The consumer recognizes and drains a valid version-1 outbox during exact operation or rollback, one FIFO head per use of the object's shared alarm, with bounded persisted retry/dead-letter handling. Browser identity is an unguessable, HTTP-only cookie; clearing that cookie loses the corresponding seat/host identity.
 
-The repository's free online multiplayer source mirrors the core room, setup, topic, microphone/manual timer, classic scoring, score override, standings, history, host transfer, and host-claim flows. It also produces editable topic drafts through deterministic templates or the optional provider boundary described below, supports host-only named device-local setup kits, and imports/exports custom-topic editor text. The remaining known Go-game parity gaps are the AI judge, microphone picker, and sound cues.
+The repository's free online multiplayer source mirrors the core room, setup, topic, explicit browser-local microphone choice/manual timer, classic scoring, score override, standings, history, host transfer, and host-claim flows. The current driver shares the same opaque-ID-only microphone preference as Practice; selection is local and does not touch the room API, D1, Analytics Engine, or a model. It also produces editable topic drafts through deterministic templates or the optional provider boundary described below, supports host-only named device-local setup kits, and imports/exports custom-topic editor text. The remaining known Go-game parity gaps are the AI judge and sound cues.
 
 Setup kits store their name, currently applied duration/silence/rounds, topic-pack choice, and custom topics unencrypted in best-effort `localStorage` for that origin/browser profile. They are unsynced and have no server recovery. The bounds are 25 kits, 40 Unicode code points per name, 500 custom topics of 200 code points each, 20,000 editor characters, 64 KiB per imported topic file before reading, and 512 KiB for the serialized store. Import fills only the editor draft until explicit use; an exported `nonstoptalk-topics.txt` file is outside app deletion/control. Deleting coaching history does not delete this separate game store.
 
