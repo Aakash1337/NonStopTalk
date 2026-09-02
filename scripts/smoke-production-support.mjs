@@ -4,6 +4,7 @@ export const PUBLIC_MODULE_GRAPH_RETRY_MS = 1_000;
 const COACH_STORAGE_IMPORT = /\bfrom\s+["']\.\/coach-storage\.js["']/u;
 const COACH_STORAGE_EXPORT = "export async function openCoachDatabase";
 const COACH_ENGINE_IMPORT = /\bimport\(\s*["']\.\/coach-engine\.js["']\s*\)/u;
+const COACH_ENGINE_READINESS_USE = /\.assessCalibrationReadiness\s*\(/u;
 const COACH_ENGINE_EXPORT = /\bexport\s+function\s+assessCalibrationReadiness\s*\(/u;
 
 function asError(error) {
@@ -42,6 +43,9 @@ export async function waitForPublicModuleGraph({
       }
       if (!COACH_ENGINE_IMPORT.test(appSource)) {
         throw new Error("/app.js does not reference the required coaching engine module");
+      }
+      if (!COACH_ENGINE_READINESS_USE.test(appSource)) {
+        throw new Error("/app.js does not consume the calibration-readiness boundary");
       }
       if (!coachStorageSource.includes(COACH_STORAGE_EXPORT)) {
         throw new Error("/coach-storage.js does not expose the expected storage boundary");

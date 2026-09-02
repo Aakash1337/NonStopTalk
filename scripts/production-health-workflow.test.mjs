@@ -251,6 +251,7 @@ test("production probe verifies the required public JavaScript module graph", ()
   assert.match(productionProbe, /!\/\^\\s\*\(\?:<!doctype\\s\+html\|<html\\b\)\/iu\.test\(source\)/u);
   assert.match(productionProbeSupport, /from\\s\+\["'\]\\\.\\\/coach-storage\\\.js\["'\]/u);
   assert.match(productionProbeSupport, /import\\\(\\s\*\["'\]\\\.\\\/coach-engine\\\.js\["'\]\\s\*\\\)/u);
+  assert.match(productionProbeSupport, /\\\.assessCalibrationReadiness\\s\*\\\(/u);
   assert.match(productionProbeSupport, /export async function openCoachDatabase/u);
   assert.match(productionProbeSupport, /export\\s\+function\\s\+assessCalibrationReadiness/u);
 });
@@ -265,7 +266,7 @@ test("production probe retries a mixed public asset generation as one module gra
         calls.app += 1;
         return calls.app < 3
           ? "console.log('previous deployment');"
-          : "import { openCoachDatabase } from './coach-storage.js'; import('./coach-engine.js');";
+          : "import { openCoachDatabase } from './coach-storage.js'; import('./coach-engine.js'); engine.assessCalibrationReadiness({});";
       }
       if (pathname === "/coach-storage.js") {
         calls.storage += 1;
@@ -297,7 +298,7 @@ test("production probe retries a temporary storage-asset SPA fallback", async ()
     loadJavaScriptAsset: async (pathname) => {
       if (pathname === "/app.js") {
         calls.app += 1;
-        return "import { openCoachDatabase } from './coach-storage.js'; import('./coach-engine.js');";
+        return "import { openCoachDatabase } from './coach-storage.js'; import('./coach-engine.js'); engine.assessCalibrationReadiness({});";
       }
       if (pathname === "/coach-storage.js") {
         calls.storage += 1;
@@ -328,7 +329,7 @@ test("production probe retries a temporary coaching-engine SPA fallback", async 
     loadJavaScriptAsset: async (pathname) => {
       if (pathname === "/app.js") {
         calls.app += 1;
-        return "import { openCoachDatabase } from './coach-storage.js'; import('./coach-engine.js');";
+        return "import { openCoachDatabase } from './coach-storage.js'; import('./coach-engine.js'); engine.assessCalibrationReadiness({});";
       }
       if (pathname === "/coach-storage.js") {
         calls.storage += 1;
@@ -374,7 +375,7 @@ test("production probe keeps a persistent module-graph defect bounded and visibl
   assert.deepEqual(delays, [7, 14]);
 });
 
-test("production probe rejects a coaching engine without the exact readiness export", async () => {
+test("production probe rejects a legacy app that imports but does not consume calibration readiness", async () => {
   let calls = 0;
 
   await assert.rejects(
@@ -383,6 +384,29 @@ test("production probe rejects a coaching engine without the exact readiness exp
         calls += 1;
         if (pathname === "/app.js") {
           return "import { openCoachDatabase } from './coach-storage.js'; import('./coach-engine.js');";
+        }
+        if (pathname === "/coach-storage.js") return "export async function openCoachDatabase() {}";
+        return "export function assessCalibrationReadiness() {}";
+      },
+      sleep: async () => {},
+      attempts: 1,
+      retryMs: 0,
+    }),
+    /app\.js does not consume the calibration-readiness boundary/u,
+  );
+
+  assert.equal(calls, 3);
+});
+
+test("production probe rejects a coaching engine without the exact readiness export", async () => {
+  let calls = 0;
+
+  await assert.rejects(
+    waitForPublicModuleGraph({
+      loadJavaScriptAsset: async (pathname) => {
+        calls += 1;
+        if (pathname === "/app.js") {
+          return "import { openCoachDatabase } from './coach-storage.js'; import('./coach-engine.js'); engine.assessCalibrationReadiness({});";
         }
         if (pathname === "/coach-storage.js") return "export async function openCoachDatabase() {}";
         return "export function assessCalibrationReadinessLegacy() {}";
