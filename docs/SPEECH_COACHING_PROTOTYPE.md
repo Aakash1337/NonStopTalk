@@ -13,10 +13,10 @@ It currently supports:
 - Interview-answer, presentation-opening, and impromptu prompts
 - One focus per attempt: intentional pace, purposeful pauses, or steady delivery
 - 30, 45, 60, or 90 second attempts
-- A four-second, session-specific microphone calibration
+- A four-second, session-specific microphone calibration with a pre-attempt readiness gate only when its evidence is low: retry on the connected microphone, continue with limited evidence, or cancel
 - Browser-side acoustic analysis through `AudioWorklet`, with an `AnalyserNode` compatibility path
 - A recommended review-only baseline → review → unassisted-retry format, plus an alternative standalone format with sparse deterministic live cues
-- A post-attempt strength, highest-value focus, evidence, and retry drill
+- A post-attempt strength, highest-value focus, evidence, retry drill, and plain-language measurement-confidence explanation with visible factors and limiting reasons
 - Explicit safe grouping and selected-goal baseline/retry measurements with limited-evidence guardrails and no improvement verdict
 - Optional transcript-derived pace/filler/repetition evidence through strict on-device browser recognition; consented derived word patterns remain in the compact summary
 - Aggregate session summaries in IndexedDB, plus JSON export
@@ -83,6 +83,13 @@ Calibration lasts four seconds:
 
 The analyzer derives a threshold between those observations. This is more resilient than one global amplitude cutoff, but it is still sensitive to sudden noise, distance changes, automatic device processing, and a user who speaks during the quiet phase.
 
+The calibration score controls only what happens before the attempt; it does not rate the person speaking:
+
+- **Medium or high evidence:** the attempt starts immediately, preserving the prior fast path.
+- **Low evidence:** the page pauses before the attempt and explains why pause and input-level measurements may be less reliable. **Retry calibration** clears the old samples and collects another four seconds from the same connected stream, so the browser does not ask for microphone permission again. **Continue with limited evidence** starts the attempt with conservative confidence. **Cancel** stops the microphone and returns to setup.
+
+While that choice is visible, the microphone remains connected so retry can be immediate, but no attempt timer, `MediaRecorder`, or optional local `SpeechRecognition` has started. The actions are native buttons, the heading receives focus when the screen opens, and the controls stack at a 320-pixel viewport. Current-run and phase checks ensure a stale audio callback, ended track, navigation, cancellation, or competing action cannot start a late or second attempt.
+
 ### 3. Speak in review-only or single-coached mode
 
 The recommended baseline/retry format deliberately withholds live coaching. Both attempts show the prompt, selected focus, remaining time, and a microphone-connected state, but they do not mount the live level meter, live statistics, or coaching-tip surface. Measurements appear only after speaking, so the retry does not depend on live help.
@@ -114,6 +121,7 @@ The review contains:
 - Unobserved duration when audio-level callbacks were missing
 - Optional word count, words per minute, filler/repetition counts, and derived pattern labels when local transcript analysis captured text
 - A warning when recognition finalization did not finish cleanly and captured text may be partial
+- A dedicated measurement-confidence explanation. It says confidence is about the browser's captured evidence rather than the speaker; explains the role of calibration separation, analyzed time, observed voice, signal coverage, and callback continuity; shows calibration confidence, coverage/unobserved time, and longest callback gap; and lists the engine's specific limiting reasons
 
 The timeline exists only in the in-memory review. It is intentionally excluded from the stored summary.
 
@@ -131,7 +139,7 @@ For a valid pair, Progress and retry Review display raw baseline → retry value
 - **Purposeful pauses:** measured pauses per observed minute, median measured pause, and longest speaking run.
 - **Steady delivery:** level consistency and clipping-frame percentage.
 
-The comparison is labeled **Limited evidence** when either attempt contains less than 15 analyzed seconds, less than 75% signal coverage, low/unknown signal confidence, or no shared measurement for the selected goal. It still exposes the raw available values and explains the limitation. The UI explicitly says that slower/faster, more/fewer pauses, or another numerical direction is not automatically better, that input-level measures also reflect microphone/setup conditions, and that the pair is not a universal speaking score.
+The comparison is labeled **Limited evidence** when either attempt contains less than 15 analyzed seconds, less than 75% signal coverage, low/unknown measurement confidence, or no shared measurement for the selected goal. Continuing after a low calibration caps that attempt below the medium-confidence boundary even if the later signal is complete, so any pair containing it remains limited. The comparison still exposes the raw available values and explains the limitation. The UI explicitly says that slower/faster, more/fewer pauses, or another numerical direction is not automatically better, that input-level measures also reflect microphone/setup conditions, and that the pair is not a universal speaking score.
 
 `/progress` always reads summaries for the current site origin and browser profile. After this browser has opted into compact backup, it also reads reachable D1 summaries and merges them by session ID; local records win so local-only artifact controls survive. This anonymous cookie is not an account or cross-device credential. One device-level UTC-day-bucketed lease controls all of its cloud summaries and lasts at least 30 and less than 31 days after cloud use. New saves stop when 250 summaries already exist; valid unexpired legacy rows remain available rather than being forcibly deleted.
 
@@ -155,8 +163,12 @@ Workers Static Assets
             │         └─ AnalyserNode compatibility path
             │              time-domain frames → RMS + peak
             │
+            ├─ Calibration readiness gate
+            │    medium/high → start; low → retry / continue limited / cancel
+            │    recorder and recognizer remain stopped until start
+            │
             ├─ CoachingAnalyzer
-            │    calibration → speech/pause segments → aggregate metrics
+            │    calibration → speech/pause segments → metrics + confidence reasons
             │
             ├─ CoachingTipPolicy
             │    standalone snapshots → deterministic sparse cue
@@ -302,7 +314,7 @@ calibration score    = 0.45 × sample evidence
                      + 0.55 × clamp(relative separation / 0.45, 0, 1)
 ```
 
-Scores at least `0.75` are labeled high; scores at least `0.50` are medium; the rest are low. The label describes available signal evidence, never the speaker.
+Scores at least `0.75` are labeled high; scores at least `0.50` are medium; the rest are low. `assessCalibrationReadiness()` derives the label from the bounded numeric score rather than trusting a supplied label; missing or invalid confidence therefore fails closed to the low-evidence choice. Medium/high results can start automatically. A low result preserves normalized engine reasons and requires the explicit retry/continue/cancel decision. The label describes available signal evidence, never the speaker.
 
 ## Metrics and what they mean
 
@@ -320,7 +332,7 @@ Scores at least `0.75` are labeled high; scores at least `0.50` are medium; the 
 | Longest speaking run | Longest voiced run after bridging interior quiet gaps of at most `250 ms` | Detecting a long run without a reset | Noise can merge runs; a long run is not automatically bad |
 | Level consistency | `0.7 × in-calibrated-band ratio + 0.3 × stability`, where `stability = clamp(1 − coefficient of variation / 0.75)` | Input/delivery stability for this setup | It mixes voice behavior with distance, gain, compression, and mic handling |
 | Clipping percentage | Frames with `peak ≥ 0.98` divided by analyzed frames | Warning about possible digital overload | This is a sample-frame ratio, not a physical loudness value; analog distortion and browser processing can occur below that point |
-| Audio confidence | Heuristic label based on calibration separation and usable evidence | Communicating uncertainty | It is not a statistical confidence interval |
+| Measurement confidence (`audioConfidence` in the compact summary) | Heuristic label based on calibration separation and usable evidence | Communicating uncertainty and gating pair interpretation | It is not a statistical confidence interval or a rating of the speaker |
 
 Metrics are evidence for a chosen practice goal, not components of one hidden score. A user should primarily compare like-for-like attempts on the same goal, device, and environment.
 
@@ -335,14 +347,15 @@ score = 0.25 × calibration confidence
       + 0.25 × voice evidence (full at 5 seconds)
       + 0.05 × callback continuity
 
-final score = min(weighted score, signal coverage)
+low-calibration ceiling = 0.499 when calibration needs confirmation; otherwise 1
+final score             = min(weighted score, signal coverage, low-calibration ceiling)
 ```
 
-Sample density compares observed frames with a conservative minimum of `max(8, observed duration / 250 ms)`. Signal coverage is the observed/attempt-duration ratio and acts as a hard confidence ceiling: missing frames are not evidence. The same high/medium/low label boundaries apply. This is a transparent heuristic, not a probability that the advice is correct.
+Sample density compares observed frames with a conservative minimum of `max(8, observed duration / 250 ms)`. Signal coverage is the observed/attempt-duration ratio and acts as a hard confidence ceiling: missing frames are not evidence. Continuing after a low calibration applies the separate `0.499` ceiling, so abundant later samples cannot silently upgrade weak starting evidence to medium/high. The same high/medium/low label boundaries apply. Reasons identify a short attempt, too little observed voice, sparse frames, callback gaps, or limited calibration evidence. Review presents those reasons alongside calibration confidence, coverage/unobserved time, and the longest callback gap. This is a transparent heuristic, not a probability that the advice is correct.
 
 ## Optional transcript measurements
 
-The prototype does not send audio to a transcription service. When the user checks the option and the browser exposes mandatory local processing, it creates `SpeechRecognition`, sets `processLocally = true`, supplies the active microphone track, and keeps interim text in memory up to 20,000 characters. Failed initialization or an attempt with no captured text yields no transcript metrics.
+The prototype does not send audio to a transcription service. When the user checks the option and the browser exposes mandatory local processing, it creates `SpeechRecognition` only as the attempt starts—after calibration has either passed the fast path or the user has chosen to continue. It sets `processLocally = true`, supplies the active microphone track, and keeps interim text in memory up to 20,000 characters. Failed initialization or an attempt with no captured text yields no transcript metrics.
 
 At finish, the page calls `recognition.stop()` and allows up to two seconds for final `onresult` delivery and clean termination. A recognition error or timeout after text arrived does not erase that text: the analyzer may use it, but Review warns that it may be partial. With separate full-session retention, both the artifact and summary artifact metadata set `transcriptMayBePartial`, so Progress repeats the warning. Error events and their payloads are never retained, and the application never describes captured text as complete.
 
@@ -365,7 +378,7 @@ Attempt-recording/captured-transcript retention is independent from transcript a
 
 When selected:
 
-1. `MediaRecorder` attaches to the same microphone stream after calibration, so the four-second calibration is not part of the recording.
+1. `MediaRecorder` attaches to the same microphone stream only when the attempt starts after calibration readiness is resolved, so neither the four-second calibration nor time spent on the low-evidence choice is part of the recording.
 2. It prefers Opus WebM, then WebM, then Opus Ogg when the browser reports support; otherwise it lets the browser choose a default.
 3. Approximately one-second encoded chunks remain in page memory while the attempt runs.
 4. Finishing stops the recorder and combines non-empty chunks into an audio `Blob`.
@@ -604,6 +617,7 @@ JSON export reads only `session-summaries` and adds product/export schema metada
 | --- | --- |
 | Opening Practice | Does not open the microphone |
 | Microphone | Browser permission requested after an explanation |
+| Low calibration readiness | Pauses before the attempt; retry reuses the connected stream, continue accepts limited evidence, and cancel releases the stream. Recording and transcription have not started while the choice waits |
 | Default audio path | Reduced in the audio graph; not recorded, persisted, or uploaded |
 | Live measurement frames | Kept in page memory for the active attempt |
 | Transcript analysis | Separate opt-in; mandatory local processing; derived counts/patterns enter the summary; captured text cleared by default |
@@ -616,7 +630,7 @@ JSON export reads only `session-summaries` and adds product/export schema metada
 | Individual download | Reads the opted-in artifact and creates a recording file or UTF-8 transcript file |
 | Delete one artifact | Removes one `session-artifacts` record and its required lifecycle row, and resets that summary's artifact metadata in one transaction; the compact summary/pair remains |
 | Delete all history | Clears every local coaching store after confirmation; previously downloaded files are outside its scope |
-| Navigation/cancel | Stops recognition/recorder, discards unsaved chunks, stops microphone tracks/worklet/intervals/context, and rejects delayed permission/worklet activation |
+| Navigation/cancel | Stops recognition/recorder, discards unsaved chunks, stops microphone tracks/worklet/intervals/context, and rejects delayed permission/worklet/calibration activation or a competing readiness action |
 | Cloudflare Durable Object | Multiplayer room state only; receives no coaching data |
 | Central D1 | Explicitly backed-up compact summaries, consent, anonymous expiry, and aggregate platform facts; never media/captured transcripts |
 | External model | None in the coaching prototype |
@@ -633,7 +647,7 @@ Read the implementation in this order:
 4. **`cloudflare/public/coach-loop.js`** — pure relationship validation, safe grouping, and descriptive selected-goal comparison guardrails.
 5. **`cloudflare/public/cloud-progress.js`** — the narrow cloud-summary allowlist and versioned API client.
 6. **`cloudflare/public/coach-audio-worklet.js`** — the small sample-to-RMS/peak processor.
-7. **`cloudflare/public/coach-engine.js`** — calibration, metrics, retrieval, tips, grounding, and advice.
+7. **`cloudflare/public/coach-engine.js`** — calibration readiness, confidence caps, metrics, retrieval, tips, grounding, and advice.
 8. **`cloudflare/platform.ts`** — Worker-side validation, anonymous ownership, relationship columns, D1 retention, and aggregate analytics.
 9. **`scripts/smoke-coach.mjs`** — browser-level proof using synthetic media, the complete pair/resume flow, local stores, lifecycle races, and default/off network assertions.
 10. **`scripts/smoke-coach-storage.mjs`** — hash-pinned, same-origin browser proof for v3 migration, retention/cap/corruption behavior, and Release-A rollback/restoration.
@@ -646,11 +660,12 @@ Use this sequence instead of starting with file names:
 1. **Capture:** `getUserMedia` provides a live track after permission.
 2. **Reduce:** AudioWorklet turns thousands of samples into about ten RMS/peak frames per second.
 3. **Calibrate:** Quiet and speaking examples adapt the threshold to this attempt.
-4. **Classify:** The analyzer turns frames into voiced/unvoiced segments with timing stability.
-5. **Measure:** Segment durations and voiced levels produce inspectable aggregate metrics.
-6. **Retrieve:** The selected goal and measured evidence rank curated local coaching cards.
-7. **Assemble advice:** The top retrieved card normally supplies the intact base drill; an evidence-safety rule can keep the measured priority's drill instead. Deterministic rules append one metric-specific comparison sentence, select strength/focus, and record whether the card was used.
-8. **Store and relate by consent:** The default path clears live media/captured text and writes a local summary with explicit standalone or baseline/retry metadata. Separate choices may write a linked local artifact or send the narrower compact-summary allowlist to D1. Progress validates relationships before grouping or comparing them.
+4. **Gate limited evidence:** Medium/high calibration starts directly; low calibration waits for retry, explicit limited continuation, or cancel before recording/transcription can begin.
+5. **Classify:** The analyzer turns frames into voiced/unvoiced segments with timing stability.
+6. **Measure and explain confidence:** Segment durations and voiced levels produce inspectable aggregate metrics. Calibration, duration, voice, coverage, and callback continuity produce a measurement-confidence label and explicit limiting reasons; low calibration caps that label below medium.
+7. **Retrieve:** The selected goal and measured evidence rank curated local coaching cards.
+8. **Assemble advice:** The top retrieved card normally supplies the intact base drill; an evidence-safety rule can keep the measured priority's drill instead. Deterministic rules append one metric-specific comparison sentence, select strength/focus, and record whether the card was used.
+9. **Store and relate by consent:** The default path clears live media/captured text and writes a local summary with explicit standalone or baseline/retry metadata. Separate choices may write a linked local artifact or send the narrower compact-summary allowlist to D1. Progress validates relationships before grouping or comparing them.
 
 This makes the privacy boundary and the coaching mechanism understandable without calling every calculation “AI.”
 
@@ -686,8 +701,8 @@ npm run smoke
 
 What each coaching check demonstrates:
 
-- `test:coach` runs 42 tests: 34 across controlled frames/transcripts, the pure engine, legacy/explicit relationships, persistence gating, safe grouping, immutable comparisons, exact goal measures, and limited-evidence guardrails, plus eight storage-contract tests for the required v3 schema, atomic progress snapshot, exact retention, Blob/UTF-8 byte accounting, conservative lifecycle validation, metadata scrubbing, and quota classification.
-- `smoke:coach` drives `/practice` with synthetic media through both the standalone live-cue path and the default baseline → Progress/reload/resume → review-only retry path. It covers UI integration, comparison, artifact-only deletion, v1→v3 opening, active-v3 operation against a compatible future schema, expiry, app-limit/browser-quota summary-only messages, composed warnings, and asserts that default/off local-first paths make no coaching-data API request.
+- `test:coach` runs 46 tests: 38 across controlled frames/transcripts, calibration readiness and low-confidence attempt caps, the pure engine, legacy/explicit relationships, persistence gating, safe grouping, immutable comparisons, exact goal measures, and limited-evidence guardrails, plus eight storage-contract tests for the required v3 schema, atomic progress snapshot, exact retention, Blob/UTF-8 byte accounting, conservative lifecycle validation, metadata scrubbing, and quota classification.
+- `smoke:coach` drives `/practice` with synthetic media through the medium/high fast path, low-evidence readiness screen, retry on the same microphone, explicit limited continuation, cancel, and competing/stale action guards. It proves that recording/transcription stay stopped before the choice; the screen is keyboard-operable, focused, accessible, and usable at 320 pixels; Review exposes confidence factors/reasons; and the calibration path makes no coaching-data API request. The same smoke continues through both the standalone live-cue path and default baseline → Progress/reload/resume → review-only retry path and covers UI integration, comparison, artifact-only deletion, v1→v3 opening, active-v3 operation against a compatible future schema, expiry, app-limit/browser-quota summary-only messages, composed warnings, and default/off network assertions.
 - `smoke:coach-storage` serves immutable Release-A and current modules on one origin. It covers fresh schema/atomic triads, shared-timestamp v2→v3 Unicode backfill, exact expiry, fail-closed corruption, summary-only cleanup, exact cap edges, grace migration/no eviction, a real two-tab cap race, upgrade abort/retry, malformed/blocked/incompatible schemas, and hash-pinned v3 → Release A → v3 rollback/restoration.
 - `test:cloud-progress` checks the separate opt-in allowlist, relationship metadata/legacy compatibility, merged-history behavior, API calls, and preference state; platform tests cover Worker relationship validation, identity, expiry, analytics, and local-artifact stripping.
 - `smoke:platform` starts an isolated local Wrangler/D1 environment and exercises status, backup, relationship-field round trip and reserved D1 columns, export, aggregate analytics, privacy rejection, and cloud deletion.

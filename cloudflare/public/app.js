@@ -164,6 +164,7 @@ function freshPracticeState(setup = {}, loop = null) {
     saved: false,
     transcriptUsed: false,
     live: null,
+    calibrationReadiness: null,
     loop: loop ? { ...loop } : null,
     completedSummary: null,
     comparison: null,
@@ -173,6 +174,10 @@ function freshPracticeState(setup = {}, loop = null) {
 function renderPractice() {
   if (practice.phase === "calibrating" || practice.phase === "permission") {
     renderPracticeCalibration();
+    return;
+  }
+  if (practice.phase === "calibration-readiness") {
+    renderCalibrationReadiness();
     return;
   }
   if (practice.phase === "active" || practice.phase === "finishing") {
@@ -273,6 +278,34 @@ function renderPracticeCalibration() {
       <div class="calibration-track" aria-hidden="true"><span data-coach-calibration-bar style="width:${waiting ? 0 : quiet ? 30 : 70}%"></span></div>
       <p class="calibration-status" role="status" data-coach-calibration-status>${waiting ? "Waiting for permission…" : quiet ? "Measuring room level…" : "Measuring your speaking level…"}</p>
       <button class="button ghost" type="button" data-command="coach-cancel">Cancel</button>
+    </section>`;
+}
+
+function renderCalibrationReadiness() {
+  const readiness = practice.calibrationReadiness ?? {};
+  const confidence = readiness.confidence ?? {};
+  const reasons = Array.isArray(confidence.reasons) && confidence.reasons.length
+    ? confidence.reasons
+    : ["Calibration did not collect enough distinct quiet and speaking evidence."];
+  app.innerHTML = `
+    <section class="coach-stage calibration-readiness" data-coach-calibration-readiness aria-labelledby="calibration-readiness-title">
+      <div class="stage-top"><span class="device-badge"><span aria-hidden="true">●</span> On device</span><span class="step-mark">02 / 03</span></div>
+      <p class="eyebrow">Calibration check</p>
+      <h1 id="calibration-readiness-title">The coach needs a clearer signal.</h1>
+      <p class="lede">The quiet and speaking samples were too similar or incomplete, so pause and level measurements may be less reliable.</p>
+      <div class="calibration-readiness-card">
+        <span class="device-badge">${escapeHTML(confidenceLabel(confidence.level))}</span>
+        <h2>This is about the measurement setup.</h2>
+        <p>It is not a rating of your voice, speaking ability, or performance.</p>
+        <strong>What limited the check</strong>
+        <ul data-coach-calibration-reasons>${reasons.map((reason) => `<li>${escapeHTML(reason)}</li>`).join("")}</ul>
+      </div>
+      <p class="calibration-status">Your microphone remains connected while you choose. Recording and transcription have not started. Cancel to turn the microphone off.</p>
+      <div class="calibration-actions">
+        <button class="button primary" type="button" data-command="coach-calibration-retry">Retry calibration</button>
+        <button class="button ghost" type="button" data-command="coach-calibration-continue">Continue with limited evidence</button>
+        <button class="button ghost" type="button" data-command="coach-cancel">Cancel</button>
+      </div>
     </section>`;
 }
 
@@ -393,6 +426,7 @@ function renderPracticeReview() {
           ${reviewMetric(formatOptionalPercentage(report.clippingPct), "clipping frames")}
           ${report.unknownMs > 0 ? reviewMetric(formatDuration(report.unknownMs), "unobserved audio") : ""}
         </div>
+        ${renderSignalConfidence(report)}
         ${renderCoachTimeline(report)}
         ${transcript ? `<div class="transcript-evidence"><div><span class="device-badge">On-device transcript</span><strong>${transcript.wordCount ?? 0} words · ${formatNumber(transcript.wordsPerMinute)} wpm</strong></div><p>${escapeHTML(formatTranscriptPatternSummary(transcript))} ${practice.savedArtifacts?.transcriptStored ? practice.savedArtifacts.transcriptMayBePartial ? "You opted to retain the captured transcript locally; finalization did not complete, so it may be partial." : "You opted to retain the captured transcript locally." : "The captured transcript has been discarded; these derived patterns are retained locally for analysis."}</p></div>` : `<p class="hint privacy-note">No transcript metrics were used or stored.${practice.savedArtifacts?.transcriptStored ? " A captured transcript artifact was retained locally at your request." : ""}</p>`}
         ${renderCoachGrounding(grounding)}
@@ -463,6 +497,41 @@ function renderCoachGrounding(grounding = {}) {
   return `<aside class="grounding-evidence" data-coach-grounding aria-label="Local RAG advice grounding">
     <div><span class="device-badge">Local RAG · retrieved</span><h3>${escapeHTML(card.title || "Curated coaching guidance")}</h3><small>${escapeHTML(card.source || "NonStopTalk Coaching Library")}</small></div>
     <div><p>${escapeHTML(card.excerpt || "")}</p><p class="hint">${escapeHTML(provenance)}${terms ? ` Matched locally: ${escapeHTML(terms)}.` : ""} No model or network call was used.</p></div>
+  </aside>`;
+}
+
+function renderSignalConfidence(report = {}) {
+  const confidence = report.confidence ?? report.measurementConfidence ?? {};
+  const calibration = report.calibrationConfidence ?? {};
+  const reasons = [...new Set([
+    ...(Array.isArray(calibration.reasons) ? calibration.reasons : []),
+    ...(Array.isArray(confidence.reasons) ? confidence.reasons : []),
+  ].filter((reason) => typeof reason === "string" && reason.trim()).map((reason) => reason.trim()))];
+  const calibrationLevel = String(calibration.level || "unknown");
+  const calibrationLabel = `${calibrationLevel.charAt(0).toUpperCase()}${calibrationLevel.slice(1)} calibration confidence`;
+  const coverage = Number.isFinite(Number(report.coverageRatio)) ? formatPercent(report.coverageRatio) : "Unavailable";
+  const unknown = Number.isFinite(Number(report.unknownMs)) ? formatDuration(report.unknownMs) : "Unavailable";
+  const maxGap = Number.isFinite(Number(report.continuity?.maxSampleGapMs))
+    ? formatDuration(report.continuity.maxSampleGapMs)
+    : "Unavailable";
+  return `<aside class="signal-confidence" data-coach-confidence-explainer aria-labelledby="coach-confidence-title">
+    <div>
+      <p class="eyebrow">Measurement confidence</p>
+      <h3 id="coach-confidence-title">How measurement confidence works</h3>
+      <span class="device-badge">${escapeHTML(confidenceLabel(confidence.level || report.audioConfidence))}</span>
+    </div>
+    <div>
+      <p>Measurement confidence describes how much usable audio evidence this browser captured. It is not a rating of you or your speaking.</p>
+      <p>It considers calibration separation, analyzed time, observed voice, signal coverage, and audio-callback continuity. Long callback gaps count as unknown—not silence.</p>
+      <dl class="confidence-factors">
+        <div><dt>Calibration</dt><dd>${escapeHTML(calibrationLabel)}</dd></div>
+        <div><dt>Usable signal</dt><dd>${escapeHTML(coverage)} coverage · ${escapeHTML(unknown)} unobserved</dd></div>
+        <div><dt>Longest callback gap</dt><dd>${escapeHTML(maxGap)}</dd></div>
+      </dl>
+      ${reasons.length
+        ? `<div class="confidence-reasons"><strong>What limited this measurement</strong><ul>${reasons.map((reason) => `<li>${escapeHTML(reason)}</li>`).join("")}</ul></div>`
+        : `<p class="hint">No additional signal-evidence limitations were detected.</p>`}
+    </div>
   </aside>`;
 }
 
@@ -585,6 +654,8 @@ async function beginCoachingSession(values) {
       quietSamples: [],
       voiceSamples: [],
       calibrationStartedAt: performance.now(),
+      calibrationReadiness: null,
+      activating: false,
       analyzer: null,
       tipPolicy: null,
       startedAt: 0,
@@ -621,16 +692,8 @@ async function beginCoachingSession(values) {
     }
     pendingCoachingToken = null;
     practice.analysisMode = run.analysisMode;
-    run.calibrationStartedAt = performance.now();
-    practice.phase = "calibrating";
-    practice.calibrationStage = "quiet";
-    practice.live = { elapsedMs: 0, level: 0, pauseCount: 0, speakingRatio: 0 };
-    showQuietCalibrationStage();
+    if (!startCalibrationSampling(run)) return;
     run.updateTimer = window.setInterval(updateCoachingUI, 100);
-    run.calibrationTimer = window.setTimeout(() => {
-      if (run !== coachingRun || practice.phase !== "calibrating") return;
-      failCoachingRun(run, "Microphone analysis stopped during calibration. Check the input and try again.");
-    }, 7_000);
   } catch (error) {
     stream?.getTracks().forEach((track) => track.stop());
     if (context?.state !== "closed") await context?.close().catch(() => {});
@@ -654,7 +717,7 @@ async function attachCoachingMeter(run) {
       const node = new AudioWorkletNode(run.context, "coaching-meter");
       const silent = run.context.createGain();
       silent.gain.value = 0;
-      node.port.onmessage = (event) => ingestCoachingFrame(event.data);
+      node.port.onmessage = (event) => ingestCoachingFrame(run, event.data);
       run.source.connect(node).connect(silent).connect(run.context.destination);
       run.meterNode = node;
       run.silentNode = silent;
@@ -679,22 +742,26 @@ async function attachCoachingMeter(run) {
       energy += sample * sample;
       peak = Math.max(peak, Math.abs(sample));
     }
-    ingestCoachingFrame({ rms: Math.sqrt(energy / samples.length), peak });
+    ingestCoachingFrame(run, { rms: Math.sqrt(energy / samples.length), peak });
   }, 100);
   return true;
 }
 
-function isPendingCoachingRun(run) {
-  return coachingRun === run
-    && pendingCoachingToken === run.token
+function isCurrentCoachingRun(run) {
+  return Boolean(run)
+    && coachingRun === run
     && routeGeneration === run.generation
     && isPracticeRoute()
-    && run.context?.state !== "closed";
+    && run.context?.state !== "closed"
+    && (!run.inputTrack || run.inputTrack.readyState !== "ended");
 }
 
-function ingestCoachingFrame(frame) {
-  const run = coachingRun;
-  if (!run || !Number.isFinite(frame?.rms) || !Number.isFinite(frame?.peak)) return;
+function isPendingCoachingRun(run) {
+  return isCurrentCoachingRun(run) && pendingCoachingToken === run.token;
+}
+
+function ingestCoachingFrame(run, frame) {
+  if (!isCurrentCoachingRun(run) || !Number.isFinite(frame?.rms) || !Number.isFinite(frame?.peak)) return;
   const now = performance.now();
   if (practice.phase === "calibrating") {
     const elapsed = now - run.calibrationStartedAt;
@@ -706,7 +773,7 @@ function ingestCoachingFrame(frame) {
       practice.calibrationStage = "voice";
       showSpeakingCalibrationStage();
     }
-    if (elapsed >= 4_000 && !run.activating) activateCoachingAttempt(run);
+    if (elapsed >= 4_000 && !run.activating) completeCoachingCalibration(run);
     return;
   }
   if (practice.phase !== "active" || !run.analyzer) return;
@@ -729,40 +796,105 @@ function ingestCoachingFrame(frame) {
   if (elapsedMs >= practice.setup.duration * 1000) finishCoachingSession("timer").catch((error) => showToast(error.message));
 }
 
-async function activateCoachingAttempt(run) {
-  if (run !== coachingRun || run.activating) return;
+function startCalibrationSampling(run, { retry = false } = {}) {
+  if (!run) return false;
+  const expectedPhase = retry ? "calibration-readiness" : "permission";
+  if (practice.phase !== expectedPhase) return false;
+  if (!isCurrentCoachingRun(run)) {
+    failCoachingRun(run, "Microphone input is no longer available. Check the input and try again.");
+    return false;
+  }
+  clearTimeout(run.calibrationTimer);
+  run.quietSamples = [];
+  run.voiceSamples = [];
+  run.calibration = null;
+  run.calibrationReadiness = null;
+  run.activating = false;
+  run.calibrationStartedAt = performance.now();
+  practice.phase = "calibrating";
+  practice.calibrationStage = "quiet";
+  practice.calibrationReadiness = null;
+  practice.live = { elapsedMs: 0, level: 0, pauseCount: 0, speakingRatio: 0 };
+  if (retry) {
+    renderPractice();
+    focusMainHeading();
+    announce("Calibration restarted. Stay quiet for a moment.");
+  } else {
+    showQuietCalibrationStage();
+  }
+  armCalibrationWatchdog(run);
+  return true;
+}
+
+function armCalibrationWatchdog(run) {
+  clearTimeout(run.calibrationTimer);
+  run.calibrationTimer = window.setTimeout(() => {
+    if (run !== coachingRun || practice.phase !== "calibrating") return;
+    failCoachingRun(run, "Microphone analysis stopped during calibration. Check the input and try again.");
+  }, 7_000);
+}
+
+function completeCoachingCalibration(run) {
+  if (!isCurrentCoachingRun(run) || run.activating || practice.phase !== "calibrating") return;
   run.activating = true;
   clearTimeout(run.calibrationTimer);
   try {
     run.calibration = run.engine.deriveCalibration({ quietSamples: run.quietSamples, voiceSamples: run.voiceSamples });
-    run.analyzer = new run.engine.CoachingAnalyzer({
-      calibration: run.calibration,
-      goal: practice.setup.goal,
-      targetDurationMs: practice.setup.duration * 1000,
-    });
-    run.tipPolicy = practice.loop?.feedbackMode === "review-only"
-      ? null
-      : new run.engine.CoachingTipPolicy({ cooldownMs: 10_000 });
-    run.startedAt = performance.now();
-    run.attemptTimer = window.setTimeout(() => {
-      if (run !== coachingRun || practice.phase !== "active") return;
-      finishCoachingSession("timer").catch((error) => showToast(error.message));
-    }, practice.setup.duration * 1_000);
-    practice.phase = "active";
-    practice.live = snapshotToLive(run.analyzer.snapshot(0), 0, 0, null);
-    if (practice.setup.retainArtifacts) startArtifactRecorder(run);
-    if (practice.setup.transcriptConsent) startLocalRecognition(run);
-    renderPractice();
-    focusMainHeading();
-    announce("Calibration complete. Your practice attempt has started.");
+    run.calibrationReadiness = run.engine.assessCalibrationReadiness(run.calibration);
+    practice.calibrationReadiness = run.calibrationReadiness;
+    if (!run.calibrationReadiness.canStartAutomatically) {
+      practice.phase = "calibration-readiness";
+      renderPractice();
+      focusMainHeading();
+      announce("Calibration needs your choice. Retry calibration or continue with limited evidence.");
+      return;
+    }
+    startCoachingAttempt(run);
   } catch (error) {
-    stopCoachingLifecycle();
-    practice.phase = "setup";
-    practice.error = error?.message || "Calibration could not find a clear speaking level. Try again closer to the microphone.";
-    renderPractice();
-    focusMainHeading();
-    announce(practice.error);
+    failCoachingRun(run, error?.message || "Calibration could not find a clear speaking level. Try again closer to the microphone.");
+  } finally {
+    if (practice.phase !== "active") run.activating = false;
   }
+}
+
+function continueWithLimitedCalibration(run) {
+  if (!run || practice.phase !== "calibration-readiness") return;
+  if (!isCurrentCoachingRun(run) || !run.calibration) {
+    failCoachingRun(run, "Microphone input is no longer available. Check the input and try again.");
+    return;
+  }
+  run.activating = true;
+  try {
+    startCoachingAttempt(run);
+  } catch (error) {
+    failCoachingRun(run, error?.message || "The practice attempt could not start. Check the input and try again.");
+  }
+}
+
+function startCoachingAttempt(run) {
+  if (!isCurrentCoachingRun(run) || !run.calibration) throw new Error("Microphone input is no longer available.");
+  clearTimeout(run.calibrationTimer);
+  run.analyzer = new run.engine.CoachingAnalyzer({
+    calibration: run.calibration,
+    goal: practice.setup.goal,
+    targetDurationMs: practice.setup.duration * 1000,
+  });
+  run.tipPolicy = practice.loop?.feedbackMode === "review-only"
+    ? null
+    : new run.engine.CoachingTipPolicy({ cooldownMs: 10_000 });
+  run.startedAt = performance.now();
+  run.attemptTimer = window.setTimeout(() => {
+    if (run !== coachingRun || practice.phase !== "active") return;
+    finishCoachingSession("timer").catch((error) => showToast(error.message));
+  }, practice.setup.duration * 1_000);
+  practice.phase = "active";
+  practice.live = snapshotToLive(run.analyzer.snapshot(0), 0, 0, null);
+  if (practice.setup.retainArtifacts) startArtifactRecorder(run);
+  if (practice.setup.transcriptConsent) startLocalRecognition(run);
+  renderPractice();
+  focusMainHeading();
+  announce("Calibration complete. Your practice attempt has started.");
+  run.activating = false;
 }
 
 function startLocalRecognition(run) {
@@ -989,7 +1121,7 @@ function stopCoachingLifecycle() {
   const run = coachingRun;
   if (run) stopCoachingHardware(run);
   coachingRun = null;
-  if (practice.phase === "permission" || practice.phase === "calibrating" || practice.phase === "active" || practice.phase === "finishing") {
+  if (practice.phase === "permission" || practice.phase === "calibrating" || practice.phase === "calibration-readiness" || practice.phase === "active" || practice.phase === "finishing") {
     practice = freshPracticeState(practice.setup);
   }
 }
@@ -999,6 +1131,10 @@ function handleCoachingInputEnded(run) {
   if (practice.phase === "active") {
     appendArtifactWarning("Microphone input ended before the selected duration.");
     finishCoachingSession("input-ended").catch((error) => showToast(error.message));
+    return;
+  }
+  if (practice.phase === "calibration-readiness") {
+    failCoachingRun(run, "Microphone input ended before the practice attempt started. Check the input and try again.");
     return;
   }
   if (practice.phase === "permission" || practice.phase === "calibrating") {
@@ -1235,7 +1371,7 @@ function formatTranscriptPatternSummary(metrics = {}) {
 }
 function formatDuration(milliseconds) { return `${(Math.max(0, Number(milliseconds) || 0) / 1000).toFixed(milliseconds >= 10_000 ? 0 : 1)}s`; }
 function levelLabel(value) { return value > .92 ? "High" : value > .35 ? "Clear" : "Low"; }
-function confidenceLabel(value) { const text = String(value || "unknown"); return `${text.charAt(0).toUpperCase()}${text.slice(1)} signal confidence`; }
+function confidenceLabel(value) { const text = String(value || "unknown"); return `${text.charAt(0).toUpperCase()}${text.slice(1)} measurement confidence`; }
 function microphoneErrorMessage(error) {
   if (error?.name === "NotAllowedError") return "Microphone permission was denied. Allow access in your browser settings, then try again.";
   if (error?.name === "NotFoundError") return "No microphone was found. Connect one and try again.";
@@ -1849,7 +1985,7 @@ async function handleClick(event) {
     return;
   }
   const button = event.target.closest("[data-command]");
-  if (!button || busy) return;
+  if (!button || !button.isConnected || busy) return;
   const command = button.dataset.command;
   try {
     setBusy(true);
@@ -1885,6 +2021,10 @@ async function handleClick(event) {
       practice = freshPracticeState(practice.setup);
       renderPractice();
       focusMainHeading();
+    } else if (command === "coach-calibration-retry") {
+      startCalibrationSampling(coachingRun, { retry: true });
+    } else if (command === "coach-calibration-continue") {
+      continueWithLimitedCalibration(coachingRun);
     } else if (command === "coach-stop") {
       await finishCoachingSession("manual");
     } else if (command === "coach-retry") {

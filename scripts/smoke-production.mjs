@@ -89,7 +89,7 @@ async function getPlatformStatus() {
 }
 
 async function getJavaScriptAsset(pathname) {
-  // The outer module-graph loop owns retries so each attempt observes both
+  // The outer module-graph loop owns retries so each attempt observes all
   // assets from the same deployment-propagation window.
   const response = await get(pathname, "text/javascript", 1);
   const mediaType = String(response.headers.get("content-type") || "")
@@ -190,7 +190,7 @@ console.log(JSON.stringify({
   schemaVersion: status.schemaVersion,
   analyticsDelivery: observedAnalyticsDelivery,
   checkedRoutes: [
-    "/", "/practice", "/progress", "/app.js", "/coach-storage.js",
+    "/", "/practice", "/progress", "/app.js", "/coach-storage.js", "/coach-engine.js",
     "/admin/analytics", "/api/v1/platform/status",
   ],
 }));
