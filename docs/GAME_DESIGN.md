@@ -50,7 +50,7 @@ AI bonus = round(relevance × 20)
 final turn score = classic score + AI bonus
 ```
 
-The judge returns short feedback and a confidence label. No transcript, a judge error, or an interrupted result leaves classic scoring unchanged. Host score controls adjust a player's total by ±5 points.
+The judge returns short feedback and a confidence label. Classic scoring lands first and its baseline remains intact; a review that does not commit adds no bonus. In the Cloudflare edition, authoritative room state resolves an ambiguous completion response, and standings and the winner are provisional until all pending offline reviews resolve or fail closed. Host score controls adjust a player's total by ±5 points.
 
 Party-vote, topic-difficulty, no-filler, and standalone repetition modifiers are not implemented.
 
@@ -67,7 +67,7 @@ Party-vote, topic-difficulty, no-filler, and standalone repetition modifiers are
 | Scored | Breakdown, judge status when relevant, standings, and host corrections are shown. |
 | Winner | Final standings and one displayed winner are shown. |
 
-The AI choice and judge status are specific to the local/self-hosted Go edition; the free Cloudflare edition uses classic scoring.
+Both editions expose the AI choice and judge status. In the Cloudflare edition the feature is disabled by default, the speaker decides again for each turn, and the manual timer always chooses classic. A consented microphone turn uses strict on-device transcription, then sends only the capped text to the same-origin Worker for its deterministic offline heuristic. Audio never uploads, and transcript text never enters Durable Object/D1 storage, logs, analytics, history, or a provider. This path needs no model key, paid API, new secret, or migration. Remote Cloudflare judging with GLM or Gemma remains later, schema-gated work; the current external adapters generate topics only.
 
 There is no pre-turn countdown, pause state, or restart-current-turn action yet.
 

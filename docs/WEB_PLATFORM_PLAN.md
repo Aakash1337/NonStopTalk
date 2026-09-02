@@ -23,22 +23,27 @@ The current application already supplies the first item. Workers Static Assets s
 3. **Local-first coaching.** Audio frames, recordings, and captured transcript text stay in the browser. Only an allowlisted compact summary can be uploaded, and only after the user selects cloud backup.
 4. **Graceful degradation.** The game and local coaching history remain usable when D1, Analytics Engine, or a provider is unavailable. Topic generation returns deterministic drafts when external work cannot safely run.
 5. **Measure outcomes, not people.** Initial analytics contain aggregate event counts and coarse product dimensions. They do not store IP addresses, names, room-member tokens, audio, or transcript text.
+6. **Private game judging.** The online judge is off by default and needs new consent from the exact speaker each turn. Audio stays in the browser; only the capped on-device transcript reaches the same-origin Worker for memory-only offline grading, and it never enters Durable Object/D1 storage, logs, analytics, history, or a provider.
 
 ## Target architecture
 
 ```text
 Browser SPA
   |-- local audio analysis + IndexedDB artifacts
+  |-- per-turn speaker consent + strict on-device transcript
+  |       `-- same-origin offline-judge request (memory only)
   |-- host theme (<= 200 characters) + one-request provider consent
   |-- versioned HTTPS API
           |
           +-- Room Durable Object (authoritative live room state + WebSockets;
+          |                         transcript-free judge claim/verdict;
           |                         gated atomic v1-outbox producer/consumer)
           +-- D1 platform store (summaries, consent, internal profile mappings,
           |                      room facts, daily rollups, model-usage budget,
           |                      internal milestone receiver + receipt cleanup)
           +-- Analytics Engine (best-effort time-series events)
           +-- Workers Logs/Traces (runtime health)
+          +-- pure offline relevance judge (default-off; no provider/D1)
           +-- topic-provider adapter
           |     +-- deterministic templates (default/fallback)
           |     +-- direct Z.AI GLM-4.7-Flash (optional routine tier)
@@ -55,6 +60,9 @@ The first slice uses these modules:
 
 - `cloudflare/platform.ts`: validation, hashed anonymous identity, internal sync-profile membership, D1 repositories, consent records, retention, room facts, and aggregate analytics.
 - `cloudflare/public/cloud-progress.js`: a browser-side allowlist and the optional summary-backup API client.
+- `cloudflare/public/turn-transcription.js`: strict selected-track, exact-turn, on-device transcript capture and memory cleanup.
+- `cloudflare/judge.ts`: shared-formula offline grading, strict verdict normalization, fixed feedback, bonus, and confidence labels.
+- `cloudflare/judge-routes.ts`: same-origin/exact-turn validation, request-memory grading, and transcript-free claim resolution.
 - `cloudflare/model-provider.ts`: bounded deterministic, direct GLM-4.7-Flash, Workers AI GLM-5.3-Flash, and Gemma 4 31B topic adapters.
 - `cloudflare/model-routes.ts`: host/setup authorization, per-request consent, D1 budget reservation/reconciliation, response metadata, and deterministic remote-failure fallback.
 - `cloudflare/migrations/`: append-only D1 migrations.
@@ -73,11 +81,14 @@ GET     /api/v1/progress/export
 GET     /api/v1/admin/analytics?days=30
 GET     /api/v1/admin/model-usage?days=30
 POST    /api/v1/models/topics
+POST    /api/v1/models/judge
 ```
 
 Every new API response includes a request ID and a no-store policy. Mutations require same-origin requests. Both admin endpoints require the same `ANALYTICS_ADMIN_TOKEN` bearer secret. Progress ownership remains the SHA-256 digest of the existing high-entropy browser token; the raw token is not stored in D1. Schema v4 also assigns an opaque internal sync profile, but its ID is never returned or accepted for access. The public status route verifies D1 readiness and returns top-level `status` (`ok` or `degraded`), `apiVersion`, `schemaVersion`, and `degradedCapabilities`. Its non-secret `capabilities` object reports cloud-progress status, retention, and `newSaveLimit`; retention-cleanup health; keyed-room-fact status; aggregate-analytics delivery/admin-read/Analytics-Engine configuration; and only non-secret topic-provider availability/degradation. Every non-exact mode reports `best-effort`. The Release-B producer reports `durable-outbox` only with exact `outbox`, schema 6, and a secure room-fact HMAC key; an unready exact configuration reports `degraded-outbox` and degrades `aggregateAnalyticsDelivery` rather than overstating delivery.
 
 `POST /api/v1/models/topics` is host-only and setup-only. It accepts a room code for authorization, a routine/escalated tier, an explicit consent boolean, and a trimmed theme capped at 200 characters. The normalized theme is the only host or room content forwarded to a model. Fixed instructions and model settings accompany it, but room authorization fields and NonStopTalk request IDs never leave the Worker. The response is a bounded editable topic draft plus provider/fallback metadata; applying that draft remains an ordinary room action. There is at most one external call, no retry, and no automatic escalation. A configured external request without consent is rejected before budget reservation or provider contact. Missing credentials/bindings, invalid provider selectors, unavailable/exhausted D1 budget, provider errors, timeouts, or invalid output return the deterministic draft. Public status reports invalid or incomplete provider configuration as degraded; authorization and input failures remain explicit errors. Status checks binding shape, not Workers Paid entitlement, so a denied first GLM-5.3 request can still fail closed. Provider output is materialized before the 64 KiB validation bound; a timeout stops local waiting, but an upstream that ignores abort may still complete and bill.
+
+`POST /api/v1/models/judge` is a separate same-origin, exact-turn-speaker-only boundary. It requires the room code, exact pending turn ID, an 8 KiB maximum nonempty transcript, and the exact marker `externalConsent: false`; missing or different consent markers fail closed so this offline endpoint cannot imply external consent. It claims the assigned topic and bounded transcript-free review metadata from the room Durable Object, grades synchronously in Worker request memory with the deterministic offline heuristic, then resolves only a normalized verdict. It never reserves model budget or invokes `model-provider.ts`. The browser clears its text after starting the request; the Worker does not persist/log it, and the Durable Object never receives it. Classic score is already committed and its baseline remains safe. A review that does not commit adds no bonus; if its completion response is lost after commit, authoritative room state confirms the one-time outcome.
 
 Anonymous cloud progress is deliberately transitional. Its access cookie is not an account or recovery credential. Cloud use refreshes one device-level lease, bucketed to a UTC day and lasting at least 30 days (and less than 31 days), for all of that browser's summaries. Ordinary reads do not rewrite each summary merely to renew retention. The daily cleanup deletes bounded batches of expired detail, continues within a capped run budget, and leaves any remaining backlog for the next cron. Clearing the browser cookie can make a backup unreachable before cleanup. A real account will eventually adopt these records into a durable user identity.
 
@@ -171,7 +182,8 @@ Exit: deployments are repeatable, game outcomes are queryable across rooms, and 
 - **Implemented first sub-slice:** direct GLM-4.7-Flash as the strict-free routine option, Workers AI GLM-5.3-Flash as the preferred cheap Workers Paid routine option, and Gemma 4 31B as an independently configured, explicitly host-selected escalation tier.
 - **Implemented first sub-slice:** plain-language consent for each external attempt; the normalized theme (maximum 200 characters) is the only host or room content sent to a provider, never audio, transcript text, names, room codes/member/authentication tokens, game history, or coaching summaries.
 - **Implemented first sub-slice:** aggregate D1 daily call budgeting with a default ceiling of 100, provider/output validation, and one external attempt at most. There is no retry or Queue yet.
-- **Still future:** transcription, semantic coaching, external coaching RAG, or any audio/transcript provider path. Each requires its own consent, retention, evaluation, and cost design.
+- **Implemented private judge sub-slice:** default-off, per-turn speaker-consented strict on-device transcription plus a same-origin Worker offline heuristic. Audio never uploads; transcript text is request-memory-only and never reaches Durable Objects, D1, logs, analytics, history, or a provider. Classic scoring lands first and remains the fallback. This adds no paid API, secret, binding, migration, or provider budget.
+- **Still future:** remote/provider transcription, a GLM/Gemma Cloudflare judge, semantic coaching, external coaching RAG, or any audio/provider-transcript path. Each requires its own schema/version gate, consent, retention, evaluation, and cost design.
 - Add a Queue only when a later provider job genuinely requires durable asynchronous retry; topic drafts use immediate deterministic fallback instead.
 
 Partial exit reached: topic providers can be enabled, disabled, or replaced without changing game rules, storage repositories, or the deterministic generator. Phase 4 remains open until any broader external-analysis feature is separately designed and validated.
@@ -184,7 +196,8 @@ Partial exit reached: topic providers can be enabled, disabled, or replaced with
 - Use Analytics Engine for high-volume exploratory telemetry because writes are non-blocking and sampled at scale; never depend on it for billing or user-visible state.
 - Keep raw coaching artifacts in IndexedDB. Add R2 only if users explicitly request cloud media storage and a storage/egress budget is approved.
 - Add Queue only for work that genuinely needs retry/delivery semantics. The current topic route makes no retry and falls back deterministically.
-- Keep both topic tiers off by default, require per-attempt host consent, make escalation explicit, pass the general 60-requests-per-minute scoped API limiter plus the dedicated five-requests-per-minute `MODEL_RATE_LIMITER`, and enforce `MODEL_DAILY_CALL_LIMIT` (100 by default) in D1 before an external call.
+- Keep the Cloudflare judge offline-only and default-off for J1. It adds one bounded public Worker request after consent; a successful review internally claims and resolves the turn through two Durable Object fetches and two room-state saves/alarm reconciliations. It stores no transcript or D1 record; do not couple it to topic-provider credentials, model budgets, or paid plans.
+- Keep both topic tiers off by default, require per-attempt host consent, make escalation explicit, pass the general 60-requests-per-minute `API_RATE_LIMITER` `platform` bucket and then the five-requests-per-minute `MODEL_RATE_LIMITER` under the `model-topics` scope, and enforce `MODEL_DAILY_CALL_LIMIT` (100 by default) in D1 before an external call. The offline judge traverses only the general `platform` bucket and makes no provider-limiter call, D1 budget reservation, or external call.
 - Cost snapshot checked August 31, 2026: [Z.AI lists direct GLM-4.7-Flash input, cached input, storage, and output as free](https://docs.z.ai/guides/overview/pricing), avoiding a fixed Workers Paid charge. [Cloudflare lists GLM-5.3-Flash](https://developers.cloudflare.com/workers-ai/platform/pricing/) at $0.15/M input, $0.03/M cached-input, and $0.50/M output, while [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/) lists a $5 USD/account/month Paid minimum; this adapter's plain binding path requires that plan. [Google lists Gemma 4](https://ai.google.dev/gemini-api/docs/pricing#gemma-4) as free-only and says free-tier content is used to improve its products, so Gemma remains explicit escalation and receives only the theme. Terms and quotas can change.
 - At the same check date, [D1 Free](https://developers.cloudflare.com/d1/platform/pricing/) included 5M rows read/day, 100K rows written/day, and 5 GB, while [Analytics Engine Free](https://developers.cloudflare.com/analytics/analytics-engine/pricing/) published 100K writes/day and 10K reads/day and said billing was not yet active. Recheck before launch.
 - Add per-user/account provider budgets only after durable accounts exist; the current slice has an aggregate UTC-day ceiling.
@@ -197,7 +210,7 @@ The following require product or operational input and are not safe to guess:
 - production custom domain and Cloudflare account;
 - auth method, email sender/domain, and account recovery policy;
 - data residency and retention beyond the anonymous 30-day bootstrap;
-- whether any audio or transcript may ever be uploaded;
+- whether audio may ever be uploaded, or a game/coaching transcript may ever be retained remotely or sent beyond the current one-turn same-origin memory-only Worker boundary;
 - external coaching model/provider and any monthly spend ceiling beyond the current aggregate topic-call guard;
 - who may access the analytics admin endpoint.
 

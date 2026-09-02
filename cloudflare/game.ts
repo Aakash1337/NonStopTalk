@@ -1,5 +1,20 @@
+import {
+	confidenceLabel,
+	judgeBonus,
+	normalizeJudgeVerdict,
+	type JudgeTier,
+	type JudgeVerdict,
+} from "./judge";
+
 export const MAX_PLAYERS = 12;
 export const COMPLETION_BONUS = 25;
+export const JUDGE_REVIEW_TIMEOUT_MS = 30_000;
+export const MAX_PENDING_JUDGE_REVIEWS = MAX_PLAYERS * 10;
+export const JUDGE_SKIPPED_FEEDBACK = "Classic scoring was used for this turn.";
+export const JUDGE_BUSY_FEEDBACK = "The judge was busy, so scoring stays classic.";
+export const JUDGE_FAILED_FEEDBACK = "The judge could not review this turn, so scoring stays classic.";
+export const JUDGE_TIMEOUT_FEEDBACK = "The judge did not finish in time, so scoring stays classic.";
+export const JUDGE_RESET_FEEDBACK = "The judge review ended with the game, so scoring stays classic.";
 export const HOST_CLAIM_GRACE_MS = 30_000;
 export const MAX_PLAYER_NAME_CODE_POINTS = 40;
 export const MAX_TOPIC_CODE_POINTS = 200;
@@ -38,7 +53,50 @@ export interface Turn {
 	completed?: boolean;
 	eliminated?: boolean;
 	score?: number;
+	judge?: TurnJudge;
 }
+
+export type JudgeStatus = "pending" | "done" | "skipped" | "failed";
+
+export interface TurnJudge {
+	status: JudgeStatus;
+	bonus: number;
+	relevance?: number;
+	confidence?: number;
+	feedback?: string;
+	/** Derived for public display; new room state does not persist this label. */
+	confidenceLabel?: string;
+}
+
+export interface JudgeConfig {
+	enabled: boolean;
+	tier: JudgeTier;
+}
+
+/**
+ * Private room-local coordination metadata. It is deliberately kept outside
+ * Turn so public turn serialization can never reveal claim capability data.
+ */
+export interface PendingJudgeReview {
+	turnId: string;
+	playerId: string;
+	tier: JudgeTier;
+	deadlineAt: number;
+	claimId: string | null;
+	claimedAt: number | null;
+}
+
+export interface JudgeReviewClaim {
+	claimId: string;
+	turnId: string;
+	topic: string;
+	tier: JudgeTier;
+	deadlineAt: number;
+}
+
+export type JudgeReviewResolution =
+	| { status: "done"; verdict: JudgeVerdict }
+	| { status: "failed" };
 
 export interface GameHistory {
 	finishedAt: number;
@@ -59,6 +117,10 @@ export interface RoomState {
 	players: Player[];
 	members: Record<string, string>;
 	settings: Settings;
+	/** Missing on pre-judge persisted rooms and normalized to disabled/routine. */
+	judge?: JudgeConfig;
+	/** Private, bounded, transcript-free review coordination state. */
+	pendingJudgeReviews?: PendingJudgeReview[];
 	topics: string[];
 	deck: number[];
 	deckCursor: number;
@@ -187,6 +249,8 @@ export function createRoomState(
 		players: [],
 		members: {},
 		settings: { duration: 60, silence: 2, rounds: 1, topicPack: "everyday" },
+		judge: { enabled: false, tier: "routine" },
+		pendingJudgeReviews: [],
 		topics: [...TOPIC_PACKS[0].topics],
 		deck: [],
 		deckCursor: 0,
@@ -298,6 +362,18 @@ export function applyAction(
 			}
 			break;
 		}
+		case "judge-settings": {
+			requireHost(isHost);
+			requireSetup(room);
+			if (typeof action.enabled !== "boolean") {
+				throw new GameError("Choose whether the optional judge is enabled.");
+			}
+			if (action.tier !== "routine" && action.tier !== "escalated") {
+				throw new GameError("Choose a valid judge tier.");
+			}
+			room.judge = { enabled: action.enabled, tier: action.tier };
+			break;
+		}
 		case "apply-setup-kit": {
 			requireHost(isHost);
 			requireSetup(room);
@@ -366,6 +442,7 @@ export function applyAction(
 			// Repair a legacy counter before completed turn IDs are cleared. This
 			// preserves monotonic IDs without rewriting stored turn history.
 			repairNextTurn(room);
+			terminalizeJudgeReviews(room, JUDGE_RESET_FEEDBACK);
 			archiveFinishedGame(room, now);
 			room.phase = "playing";
 			room.currentPlayer = 0;
@@ -423,6 +500,7 @@ export function applyAction(
 		case "submit-turn": {
 			const turn = requireTurn(room, text(action.turnId));
 			requireTurnDriver(isHost, playerId, turn);
+			const judgePlan = judgeSubmissionPlan(room, playerId, turn, action);
 			let spoken = clamp(integer(action.spokenSeconds, 0), 0, turn.duration);
 			const eliminated = Boolean(action.eliminated);
 			const requestedCompletion = Boolean(action.completed) && !eliminated;
@@ -455,6 +533,25 @@ export function applyAction(
 				eliminated,
 				score: spoken + (completed ? COMPLETION_BONUS : 0),
 			};
+			if (judgePlan === "pending") {
+				scored.judge = { status: "pending", bonus: 0 };
+				const reviews = canonicalPendingJudgeReviews(room);
+				if (reviews.length < MAX_PENDING_JUDGE_REVIEWS) {
+					reviews.push({
+						turnId: scored.id,
+						playerId: scored.playerId,
+						tier: readJudgeConfig(room).tier,
+						deadlineAt: now + JUDGE_REVIEW_TIMEOUT_MS,
+						claimId: null,
+						claimedAt: null,
+					});
+					room.pendingJudgeReviews = reviews;
+				} else {
+					scored.judge = { status: "failed", bonus: 0, feedback: JUDGE_BUSY_FEEDBACK };
+				}
+			} else if (judgePlan === "skipped") {
+				scored.judge = { status: "skipped", bonus: 0, feedback: JUDGE_SKIPPED_FEEDBACK };
+			}
 			findPlayer(room, turn.playerId).score += scored.score ?? 0;
 			room.completedTurns.push(scored);
 			room.activeTurn = null;
@@ -476,6 +573,7 @@ export function applyAction(
 			requireHost(isHost);
 			if (room.phase === "playing") throw new GameError("A running game cannot be reset.", 409);
 			repairNextTurn(room);
+			terminalizeJudgeReviews(room, JUDGE_RESET_FEEDBACK);
 			archiveFinishedGame(room, now);
 			room.phase = "setup";
 			room.currentPlayer = 0;
@@ -520,6 +618,154 @@ export function applyAction(
 	touch(room, now);
 }
 
+/**
+ * Atomically reserve one pending transcript review for the exact speaker that
+ * consented on the completed turn. The claim ID is generated by the Worker;
+ * no transcript, browser token, or provider payload is accepted into state.
+ */
+export function claimJudgeReview(
+	room: RoomState,
+	token: string,
+	turnId: string,
+	claimId: string,
+	now = Date.now(),
+): JudgeReviewClaim {
+	if (!validJudgeClaimId(claimId)) throw new GameError("The judge claim ID is invalid.");
+	const turn = room.completedTurns.find((candidate) => candidate.id === turnId);
+	if (!turn || turn.judge?.status !== "pending") {
+		throw new GameError("That judge review is no longer available.", 409);
+	}
+	if (room.members[token] !== turn.playerId) {
+		throw new GameError("Only that turn's speaker can request its judge review.", 403);
+	}
+
+	const reviews = canonicalPendingJudgeReviews(room);
+	const index = reviews.findIndex((review) =>
+		review.turnId === turn.id && review.playerId === turn.playerId
+	);
+	const review = reviews[index];
+	if (!review || review.claimId !== null || review.deadlineAt <= now) {
+		throw new GameError("That judge review is no longer available.", 409);
+	}
+
+	reviews[index] = { ...review, claimId, claimedAt: now };
+	room.pendingJudgeReviews = reviews;
+	touch(room, now);
+	return {
+		claimId,
+		turnId: turn.id,
+		topic: turn.topic,
+		tier: review.tier,
+		deadlineAt: review.deadlineAt,
+	};
+}
+
+/**
+ * Resolve a previously claimed exact turn. Wrong, stale, late, or replayed
+ * capabilities are inert. A committed resolution removes the capability
+ * before another invocation can award a second bonus.
+ */
+export function resolveJudgeReview(
+	room: RoomState,
+	turnId: string,
+	claimId: string,
+	resolution: JudgeReviewResolution,
+	now = Date.now(),
+): boolean {
+	if (!validJudgeClaimId(claimId)) return false;
+	const reviews = canonicalPendingJudgeReviews(room);
+	const reviewIndex = reviews.findIndex((review) =>
+		review.turnId === turnId && review.claimId === claimId
+	);
+	const review = reviews[reviewIndex];
+	if (!review || review.deadlineAt <= now) return false;
+	const turn = room.completedTurns.find((candidate) => candidate.id === turnId);
+	if (
+		!turn ||
+		turn.playerId !== review.playerId ||
+		turn.judge?.status !== "pending"
+	) return false;
+
+	let verdict: JudgeVerdict | null = null;
+	if (resolution?.status === "done") {
+		try {
+			verdict = normalizeJudgeVerdict(resolution.verdict);
+		} catch {
+			return false;
+		}
+	} else if (resolution?.status !== "failed") return false;
+
+	if (verdict) {
+		const bonus = judgeBonus(verdict.relevance);
+		setResolvedTurnScore(room, turn, bonus);
+		turn.judge = {
+			status: "done",
+			bonus,
+			relevance: verdict.relevance,
+			confidence: verdict.confidence,
+			feedback: verdict.feedback,
+		};
+	} else {
+		setResolvedTurnScore(room, turn, 0);
+		turn.judge = { status: "failed", bonus: 0, feedback: JUDGE_FAILED_FEEDBACK };
+	}
+
+	reviews.splice(reviewIndex, 1);
+	room.pendingJudgeReviews = reviews;
+	touch(room, now);
+	return true;
+}
+
+/** Fail overdue (and impossible legacy-orphaned) work back to classic scoring. */
+export function expireJudgeReviews(room: RoomState, now = Date.now()): number {
+	const reviews = canonicalPendingJudgeReviews(room);
+	const usable = new Map<string, PendingJudgeReview>();
+	for (const review of reviews) {
+		const turn = room.completedTurns.find((candidate) => candidate.id === review.turnId);
+		if (
+			turn?.judge?.status === "pending" &&
+			turn.playerId === review.playerId &&
+			!usable.has(review.turnId)
+		) usable.set(review.turnId, review);
+	}
+
+	let expired = 0;
+	for (const turn of room.completedTurns) {
+		if (turn.judge?.status !== "pending") continue;
+		const review = usable.get(turn.id);
+		if (review && review.deadlineAt > now) continue;
+		setResolvedTurnScore(room, turn, 0);
+		turn.judge = {
+			status: "failed",
+			bonus: 0,
+			feedback: review ? JUDGE_TIMEOUT_FEEDBACK : JUDGE_FAILED_FEEDBACK,
+		};
+		usable.delete(turn.id);
+		expired += 1;
+	}
+	if (!expired) return 0;
+
+	room.pendingJudgeReviews = reviews.filter((review) => usable.get(review.turnId) === review);
+	touch(room, now);
+	return expired;
+}
+
+/** Earliest room-local judge deadline for multiplexing the Durable Object alarm. */
+export function nextJudgeReviewDeadline(room: RoomState): number | null {
+	const reviews = canonicalPendingJudgeReviews(room);
+	const byTurn = new Map(reviews.map((review) => [review.turnId, review]));
+	let earliest: number | null = null;
+	for (const turn of room.completedTurns) {
+		if (turn.judge?.status !== "pending") continue;
+		const review = byTurn.get(turn.id);
+		// A malformed or missing private row must wake promptly so the alarm can
+		// repair the public pending state back to classic scoring.
+		if (!review || review.playerId !== turn.playerId) return 0;
+		if (earliest === null || review.deadlineAt < earliest) earliest = review.deadlineAt;
+	}
+	return earliest;
+}
+
 export function standings(room: RoomState): Player[] {
 	return [...room.players].sort((left, right) => right.score - left.score);
 }
@@ -531,6 +777,9 @@ export function publicRoomState(room: RoomState, token: string, onlineTokens: Se
 			.filter(([memberToken]) => onlineTokens.has(memberToken))
 			.map(([, id]) => id),
 	);
+	const completedTurns = room.completedTurns.map(publicTurn);
+	const publicStandings = standings(room).map(publicPlayer);
+	const standingsProvisional = room.completedTurns.some((turn) => turn.judge?.status === "pending");
 	return {
 		code: room.code,
 		version: room.version,
@@ -538,20 +787,34 @@ export function publicRoomState(room: RoomState, token: string, onlineTokens: Se
 		maxPlayers: MAX_PLAYERS,
 		completionBonus: COMPLETION_BONUS,
 		phase: room.phase,
-		players: room.players.map((player) => ({ ...player, online: onlinePlayerIds.has(player.id) })),
-		settings: room.settings,
+		players: room.players.map((player) => ({
+			...publicPlayer(player),
+			online: onlinePlayerIds.has(player.id),
+		})),
+		settings: {
+			duration: room.settings.duration,
+			silence: room.settings.silence,
+			rounds: room.settings.rounds,
+			topicPack: room.settings.topicPack,
+		},
+		judge: readJudgeConfig(room),
 		topicCount: room.topics.length,
 		// The undrawn deck is host-only so guests cannot inspect surprise topics.
-		topics: room.hostToken === token ? room.topics : [],
+		topics: room.hostToken === token ? [...room.topics] : [],
 		topicPacks: TOPIC_PACKS.map(({ topics, ...pack }) => ({ ...pack, count: topics.length })),
 		currentPlayer: room.currentPlayer,
 		currentRound: room.currentRound,
-		activeTurn: room.activeTurn,
-		completedTurns: room.completedTurns,
-		lastTurn: room.completedTurns.at(-1) ?? null,
-		standings: standings(room),
-		winner: room.phase === "finished" ? standings(room)[0] ?? null : null,
-		history: room.history,
+		activeTurn: room.activeTurn ? publicTurn(room.activeTurn) : null,
+		completedTurns,
+		lastTurn: completedTurns.at(-1) ?? null,
+		standings: publicStandings,
+		standingsProvisional,
+		winner: room.phase === "finished" && !standingsProvisional ? publicStandings[0] ?? null : null,
+		history: room.history.map((record) => ({
+			finishedAt: record.finishedAt,
+			standings: record.standings.map(publicPlayer),
+			turns: record.turns,
+		})),
 		viewer: {
 			playerId,
 			isHost: room.hostToken === token,
@@ -575,6 +838,178 @@ export function setHostOnline(room: RoomState, online: boolean, now = Date.now()
 	room.hostDisconnectedAt = next;
 	touch(room, now);
 	return true;
+}
+
+function readJudgeConfig(room: RoomState): JudgeConfig {
+	return {
+		enabled: room.judge?.enabled === true,
+		tier: room.judge?.tier === "escalated" ? "escalated" : "routine",
+	};
+}
+
+function judgeSubmissionPlan(
+	room: RoomState,
+	playerId: string,
+	turn: Turn,
+	action: Action,
+): "none" | "skipped" | "pending" {
+	if (
+		action.judgeChoice !== undefined &&
+		action.judgeChoice !== "classic" &&
+		action.judgeChoice !== "transcript"
+	) throw new GameError("Choose classic play or transcript judging.");
+	if (action.manual !== undefined && typeof action.manual !== "boolean") {
+		throw new GameError("The turn mode is invalid.");
+	}
+	if (action.judgeChoice === "transcript" && playerId !== turn.playerId) {
+		throw new GameError("Only the current speaker can choose transcript judging.", 403);
+	}
+
+	const config = readJudgeConfig(room);
+	if (!config.enabled) return "none";
+	if (action.manual === true || action.judgeChoice !== "transcript") return "skipped";
+	return "pending";
+}
+
+function terminalizeJudgeReviews(room: RoomState, feedback: string): void {
+	for (const turn of room.completedTurns) {
+		if (turn.judge?.status !== "pending") continue;
+		setResolvedTurnScore(room, turn, 0);
+		turn.judge = { status: "failed", bonus: 0, feedback };
+	}
+	room.pendingJudgeReviews = [];
+}
+
+function setResolvedTurnScore(room: RoomState, turn: Turn, bonus: number): void {
+	const classic = classicTurnScore(turn);
+	const prior = Number.isSafeInteger(turn.score) ? Number(turn.score) : classic;
+	const next = classic + bonus;
+	turn.score = next;
+	const player = room.players.find((candidate) => candidate.id === turn.playerId);
+	if (!player) return;
+	player.score = Math.max(MINIMUM_SCORE, player.score + next - prior);
+}
+
+function classicTurnScore(turn: Turn): number {
+	const duration = clamp(integer(turn.duration, 0), 0, 300);
+	const spoken = clamp(integer(turn.spokenSeconds, 0), 0, duration);
+	return spoken + (turn.completed === true && turn.eliminated !== true ? COMPLETION_BONUS : 0);
+}
+
+function canonicalPendingJudgeReviews(room: RoomState): PendingJudgeReview[] {
+	if (!Array.isArray(room.pendingJudgeReviews)) return [];
+	const reviews: PendingJudgeReview[] = [];
+	const seen = new Set<string>();
+	for (const value of room.pendingJudgeReviews) {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+		const review = value as Partial<PendingJudgeReview>;
+		if (
+			typeof review.turnId !== "string" || !/^t[1-9][0-9]*$/.test(review.turnId) ||
+			typeof review.playerId !== "string" || !/^p[1-9][0-9]*$/.test(review.playerId) ||
+			(review.tier !== "routine" && review.tier !== "escalated") ||
+			!Number.isSafeInteger(review.deadlineAt) || Number(review.deadlineAt) < 0 ||
+			seen.has(review.turnId)
+		) continue;
+		const turn = room.completedTurns.find((candidate) => candidate.id === review.turnId);
+		if (turn?.judge?.status !== "pending" || turn.playerId !== review.playerId) continue;
+
+		let claimId: string | null = null;
+		let claimedAt: number | null = null;
+		if (review.claimId !== null) {
+			if (
+				typeof review.claimId !== "string" || !validJudgeClaimId(review.claimId) ||
+				!Number.isSafeInteger(review.claimedAt) || Number(review.claimedAt) < 0 ||
+				Number(review.claimedAt) > Number(review.deadlineAt)
+			) continue;
+			claimId = review.claimId;
+			claimedAt = Number(review.claimedAt);
+		} else if (review.claimedAt !== null) continue;
+
+		seen.add(review.turnId);
+		reviews.push({
+			turnId: review.turnId,
+			playerId: review.playerId,
+			tier: review.tier,
+			deadlineAt: Number(review.deadlineAt),
+			claimId,
+			claimedAt,
+		});
+		if (reviews.length === MAX_PENDING_JUDGE_REVIEWS) break;
+	}
+	return reviews;
+}
+
+function validJudgeClaimId(value: string): boolean {
+	return /^[0-9a-f]{64}$/.test(value);
+}
+
+function publicPlayer(player: Player): Player {
+	return { id: player.id, name: player.name, score: player.score };
+}
+
+function publicTurn(turn: Turn): Turn {
+	const result: Turn = {
+		id: turn.id,
+		playerId: turn.playerId,
+		playerName: turn.playerName,
+		round: turn.round,
+		topic: turn.topic,
+		topicIndex: turn.topicIndex,
+		duration: turn.duration,
+		silence: turn.silence,
+		begunAt: turn.begunAt,
+	};
+	if (typeof turn.spokenSeconds === "number") result.spokenSeconds = turn.spokenSeconds;
+	if (typeof turn.completed === "boolean") result.completed = turn.completed;
+	if (typeof turn.eliminated === "boolean") result.eliminated = turn.eliminated;
+	if (typeof turn.score === "number") result.score = turn.score;
+	const judge = publicTurnJudge(turn.judge);
+	if (judge) result.judge = judge;
+	return result;
+}
+
+function publicTurnJudge(value: TurnJudge | undefined): TurnJudge | undefined {
+	if (!value) return undefined;
+	switch (value.status) {
+		case "pending":
+			return { status: "pending", bonus: 0 };
+		case "skipped":
+			return { status: "skipped", bonus: 0, feedback: JUDGE_SKIPPED_FEEDBACK };
+		case "failed": {
+			const allowed = new Set([
+				JUDGE_BUSY_FEEDBACK,
+				JUDGE_FAILED_FEEDBACK,
+				JUDGE_TIMEOUT_FEEDBACK,
+				JUDGE_RESET_FEEDBACK,
+			]);
+			return {
+				status: "failed",
+				bonus: 0,
+				feedback: allowed.has(value.feedback ?? "") ? value.feedback : JUDGE_FAILED_FEEDBACK,
+			};
+		}
+		case "done": {
+			try {
+				const verdict = normalizeJudgeVerdict({
+					relevance: value.relevance,
+					confidence: value.confidence,
+					feedback: value.feedback,
+				});
+				return {
+					status: "done",
+					bonus: judgeBonus(verdict.relevance),
+					relevance: verdict.relevance,
+					confidence: verdict.confidence,
+					confidenceLabel: confidenceLabel(verdict.confidence),
+					feedback: verdict.feedback,
+				};
+			} catch {
+				return { status: "failed", bonus: 0, feedback: JUDGE_FAILED_FEEDBACK };
+			}
+		}
+		default:
+			return undefined;
+	}
 }
 
 function addPlayer(room: RoomState, token: string, rawName: string): Player {

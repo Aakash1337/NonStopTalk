@@ -5,6 +5,7 @@ import {
 	SOUND_CUE_LEGACY_STORAGE_KEY,
 	SOUND_CUE_NAMES,
 	SOUND_CUE_STORAGE_KEY,
+	createDeferredFinalCueTracker,
 	createSoundCues,
 } from "./sound-cues.js";
 
@@ -484,4 +485,159 @@ test("close exceptions and rejected close promises are swallowed", async () => {
 	await rejecting.unlock();
 	assert.doesNotThrow(() => rejecting.release());
 	await Promise.resolve();
+});
+
+test("a finalization intent ignores unrelated state, waits through pending, and resolves exactly once", () => {
+	const tracker = createDeferredFinalCueTracker();
+	assert.deepEqual(tracker.arm({ roomCode: "ABC234", routeGeneration: 7, turnId: "t9" }), {
+		roomCode: "ABC234",
+		routeGeneration: 7,
+		turnId: "t9",
+	});
+	assert.equal(tracker.pendingTurnId, "t9");
+	assert.equal(tracker.consume({
+		roomCode: "ABC234",
+		routeGeneration: 7,
+		phase: "playing",
+		completedTurns: [{ id: "t8", completed: true }],
+	}), "", "an unrelated accepted snapshot must not erase an in-flight exact-turn intent");
+	assert.equal(tracker.pendingTurnId, "t9");
+	const pendingState = {
+		roomCode: "ABC234",
+		routeGeneration: 7,
+		phase: "finished",
+		completedTurns: [{ id: "t9", completed: true, eliminated: false, judge: { status: "pending" } }],
+	};
+	assert.equal(tracker.consume(pendingState), "");
+	assert.equal(tracker.consume(pendingState), "", "repeated WebSocket pending snapshots must stay inert");
+	assert.equal(tracker.pendingTurnId, "t9");
+
+	const resolvedState = structuredClone(pendingState);
+	resolvedState.completedTurns[0].judge.status = "done";
+	assert.equal(tracker.consume(resolvedState), SOUND_CUE_NAMES.COMPLETED);
+	assert.equal(tracker.pendingTurnId, "");
+	assert.equal(tracker.consume(resolvedState), "", "the same terminal snapshot must not replay the cue");
+});
+
+test("the final turn cue waits for an earlier independent pending review", () => {
+	const tracker = createDeferredFinalCueTracker();
+	tracker.arm({ roomCode: "ABC234", routeGeneration: 8, turnId: "t2" });
+	const provisional = {
+		roomCode: "ABC234",
+		routeGeneration: 8,
+		phase: "finished",
+		completedTurns: [
+			{ id: "t1", completed: true, eliminated: false, judge: { status: "pending" } },
+			{ id: "t2", completed: true, eliminated: false, judge: { status: "skipped" } },
+		],
+	};
+	assert.equal(tracker.consume(provisional), "");
+	assert.equal(tracker.pendingTurnId, "t2");
+
+	const final = structuredClone(provisional);
+	final.completedTurns[0].judge.status = "failed";
+	assert.equal(tracker.consume(final), SOUND_CUE_NAMES.COMPLETED);
+	assert.equal(tracker.pendingTurnId, "");
+	assert.equal(tracker.consume(final), "", "the finalized standings snapshot must stay exact-once");
+});
+
+test("a non-final local result cues immediately even when its review is pending", () => {
+	const tracker = createDeferredFinalCueTracker();
+	tracker.arm({ roomCode: "ABC234", routeGeneration: 9, turnId: "t1" });
+	const state = {
+		roomCode: "ABC234",
+		routeGeneration: 9,
+		phase: "playing",
+		completedTurns: [
+			{ id: "t1", completed: false, eliminated: true, judge: { status: "pending" } },
+		],
+	};
+	assert.equal(tracker.consume(state), SOUND_CUE_NAMES.ELIMINATED);
+	assert.equal(tracker.pendingTurnId, "");
+	assert.equal(tracker.consume(state), "", "an immediate state-driven cue must not replay");
+});
+
+test("a later alarm failure consumes the matching deferred elimination cue", () => {
+	const tracker = createDeferredFinalCueTracker();
+	tracker.arm({ roomCode: "XYZ789", routeGeneration: 12, turnId: "t42" });
+	assert.equal(tracker.consume({
+		roomCode: "XYZ789",
+		routeGeneration: 12,
+		phase: "finished",
+		completedTurns: [{ id: "t42", completed: false, eliminated: true, judge: { status: "pending" } }],
+	}), "");
+	assert.equal(tracker.consume({
+		roomCode: "XYZ789",
+		routeGeneration: 12,
+		phase: "finished",
+		completedTurns: [{ id: "t42", completed: false, eliminated: true, judge: { status: "failed" } }],
+	}), SOUND_CUE_NAMES.ELIMINATED);
+	assert.equal(tracker.pendingTurnId, "");
+});
+
+test("deferred final cues clear on route replacement, reset, malformed terminal state, and teardown", () => {
+	const tracker = createDeferredFinalCueTracker();
+	tracker.arm({ roomCode: "ABC234", routeGeneration: 2, turnId: "t1" });
+	assert.equal(tracker.consume({
+		roomCode: "DEF567",
+		routeGeneration: 3,
+		phase: "finished",
+		completedTurns: [{ id: "t1", completed: true, judge: { status: "done" } }],
+	}), "");
+	assert.equal(tracker.pendingTurnId, "");
+
+	tracker.arm({ roomCode: "DEF567", routeGeneration: 3, turnId: "t2" });
+	assert.equal(tracker.consume({
+		roomCode: "DEF567",
+		routeGeneration: 3,
+		phase: "setup",
+		completedTurns: [],
+	}), "");
+	assert.equal(tracker.pendingTurnId, "");
+
+	tracker.arm({ roomCode: "DEF567", routeGeneration: 3, turnId: "t3" });
+	assert.equal(tracker.consume({
+		roomCode: "DEF567",
+		routeGeneration: 3,
+		phase: "finished",
+		completedTurns: [{ id: "t3", completed: true, judge: { status: "unexpected" } }],
+	}), "");
+	assert.equal(tracker.pendingTurnId, "");
+
+	tracker.arm({ roomCode: "DEF567", routeGeneration: 3, turnId: "t4" });
+	assert.equal(tracker.consume({
+		roomCode: "DEF567",
+		routeGeneration: 3,
+		phase: "finished",
+		completedTurns: [{ id: "unrelated", completed: true, judge: { status: "done" } }],
+	}), "");
+	assert.equal(tracker.pendingTurnId, "",
+		"a definitive finished room cannot retain a missing speculative turn");
+
+	tracker.arm({ roomCode: "DEF567", routeGeneration: 3, turnId: "t5" });
+	assert.equal(tracker.consume({
+		roomCode: "DEF567",
+		routeGeneration: 3,
+		phase: "playing",
+		completedTurns: [{ id: "t5", completed: false, eliminated: false, judge: { status: "skipped" } }],
+	}), "");
+	assert.equal(tracker.pendingTurnId, "",
+		"an accepted exact turn without a terminal result must clear speculative intent");
+
+	tracker.arm({ roomCode: "DEF567", routeGeneration: 3, turnId: "t6" });
+	assert.equal(tracker.clear(), true);
+	assert.equal(tracker.clear(), false);
+});
+
+test("deferred final cue identity is strict and re-arming replaces stale work", () => {
+	const tracker = createDeferredFinalCueTracker();
+	assert.throws(() => tracker.arm(), /room code, route generation, and turn ID/u);
+	assert.throws(
+		() => tracker.arm({ roomCode: "ABC234", routeGeneration: 1.5, turnId: "t1" }),
+		TypeError,
+	);
+	tracker.arm({ roomCode: "ABC234", routeGeneration: 4, turnId: "t1" });
+	tracker.arm({ roomCode: "ABC234", routeGeneration: 4, turnId: "t2" });
+	assert.equal(tracker.pendingTurnId, "t2");
+	assert(Object.isFrozen(tracker));
 });

@@ -87,7 +87,7 @@ The first incremental platform slice is being built without replacing the playab
 - Modular separation among Durable Object room authority, D1 repositories, identity, coaching backup, analytics, and topic providers
 - Local coaching and gameplay that continue to work when D1 or analytics is unavailable
 
-This phase remains free-or-cheap by default: it uses existing Cloudflare primitives, keeps routine generation offline unless enabled, makes the larger model an explicit escalation, and caps aggregate external calls. The identity foundation adds only two small D1 metadata rows per browser; cleanup health adds one global row and one write per successful day. The receipt/outbox lane adds no Cloudflare service, binding, secret, migration, provider/model call, paid product, fixed monthly cost, or per-user row; it reuses each room's bounded SQLite Durable Object outbox, its existing alarm, central D1 schema 6, and the existing room-fact secret. Production and staging exact mode add one bounded local event and one exact-90-day D1 receipt per delivered room milestone. Device-local setup kits likewise add no Cloudflare resource, binding, migration, provider call, or cloud-storage cost: only explicit Apply uses the existing room Durable Object action. Accounts, cross-device authentication/progress, external coaching AI, Queue-backed work, and R2 media storage remain later phases. The next identity slice may add bilateral numeric-code linking only with a separate `IDENTITY_HASH_KEY` and explicit consent on both browsers; it must not silently grant cloud-summary consent. See the [Web platform plan](WEB_PLATFORM_PLAN.md).
+This phase remains free-or-cheap by default: it uses existing Cloudflare primitives, keeps routine generation offline unless enabled, makes the larger model an explicit escalation, and caps aggregate external calls. The identity foundation adds only two small D1 metadata rows per browser; cleanup health adds one global row and one write per successful day. The receipt/outbox lane adds no Cloudflare service, binding, secret, migration, provider/model call, paid product, fixed monthly cost, or per-user row; it reuses each room's bounded SQLite Durable Object outbox, its existing alarm, central D1 schema 6, and the existing room-fact secret. Production and staging exact mode add one bounded local event and one exact-90-day D1 receipt per delivered room milestone. The optional offline judge likewise uses only the existing browser, Worker, and Durable Object request path and adds no D1 record, provider/model call, secret, binding, migration, paid API, or fixed monthly cost. Device-local setup kits likewise add no Cloudflare resource, binding, migration, provider call, or cloud-storage cost: only explicit Apply uses the existing room Durable Object action. Accounts, cross-device authentication/progress, external coaching AI, Queue-backed work, and R2 media storage remain later phases. The next identity slice may add bilateral numeric-code linking only with a separate `IDENTITY_HASH_KEY` and explicit consent on both browsers; it must not silently grant cloud-summary consent. See the [Web platform plan](WEB_PLATFORM_PLAN.md).
 
 ## 5. Content, sharing, and retention — Implemented
 
@@ -102,18 +102,23 @@ This phase remains free-or-cheap by default: it uses existing Cloudflare primiti
 
 Profiles and server-side custom-pack libraries are not part of this phase's implemented scope.
 
-## 6. Optional AI judge — Implemented locally
+## 6. Optional AI judge — Implemented in Go and as an offline Cloudflare slice
 
 - Host opt-in plus per-speaker, per-turn consent
 - Fail-closed on-device `SpeechRecognition` requirement
 - No microphone-audio upload by NonStopTalk
-- Anthropic or Z.AI GLM relevance grading when explicitly selected; an unset selector preserves legacy Anthropic auto-selection only when its key exists
-- Transparent server-side offline heuristic without an API key
-- Asynchronous, capped relevance bonus with confidence and short feedback
+- Transparent server-side offline heuristic without an API key in both editions, locked by a shared versioned grading contract
+- Cloudflare J1 sends only the capped current-turn transcript to the same-origin Worker; it is memory-only and never stored in the room Durable Object, D1, logs, analytics, history, model-usage data, or a provider
+- Cloudflare classic scoring lands first and its baseline remains available; the exact-turn offline result can add a capped relevance bonus once, while an uncommitted review adds no bonus and authoritative room state resolves an ambiguous completion response
+- Cloudflare J1 needs no paid API, key, new secret, binding, database migration, Queue, or provider budget; the current GLM/Gemma adapters remain topic-only
+- The local Go edition separately supports Anthropic or Z.AI GLM relevance grading when explicitly selected; an unset selector preserves legacy Anthropic auto-selection only when its key exists
+- Asynchronous, capped relevance bonus with confidence and short feedback in both editions
 - Classic-score preservation on missing transcript, timeout, provider failure, or interrupted restore
 - Host score correction
 
 Because strict local-recognition support is not widely available, classic/manual play remains the primary compatibility path.
+
+Remote-provider judging in the Cloudflare edition remains future work. It must be introduced behind a new schema/version gate with separate external-processing consent, retention/provider disclosure, cost limits, and rollback coverage. GLM-5.3 Flash is the preferred cheap Workers Paid routine candidate, direct GLM-4.7 Flash is the strict-free candidate, and Gemma 4 31B remains an explicitly selected escalation only; none is currently an online judge fallback.
 
 ## 7. Deployment and hardening — In progress
 
@@ -150,12 +155,13 @@ Implemented work includes:
 - Bounded Cloudflare setup-kit storage, plain-text topic transfer, one-action atomic apply, host/phase authorization, browser-storage failure handling, and guest topic privacy coverage
 - Shared Cloudflare Practice/Play microphone selection with opaque-ID-only browser persistence, memory-only labels, bounded unavailable-device fallback, driver/route race guards, and no application or analytics request
 - Driver-only Cloudflare game sound cues with the same short Web Audio recipes and browser-local opt-out as the Go edition, plus cross-tab preference synchronization, stale-route suppression, and no media or network dependency
+- Default-off Cloudflare offline judging with per-turn speaker consent, strict selected-track on-device transcription, same-origin memory-only grading, transcript-free Durable Object claims, shared Go/TypeScript judge vectors, provisional-result handling, and classic-score fallback
 - A separate-document operator analytics dashboard with strict CSP/no-transform isolation, source-quality tests, and narrow/mobile browser smoke coverage
 - Separate production/staging databases, analytics datasets, rate limits, secrets, cron schedules, deployment probes, migration checks, and production incident/recovery guidance
 
 Remaining hardening:
 
-- Game-feature parity between the Go and Cloudflare editions; the remaining known gap is the AI judge
+- Remote-provider judge parity between the Go and Cloudflare editions; the offline Cloudflare relevance judge is implemented, while any GLM/Gemma judge path remains schema-gated
 - Expansion of the automated cross-edition contract beyond the implemented core rules
 - Broader browser/device testing
 - Formal security and accessibility reviews

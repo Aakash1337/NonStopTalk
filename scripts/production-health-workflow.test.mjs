@@ -53,9 +53,11 @@ const VALID_APP_MODULE_GRAPH = [
   "import { createSetupKitStore } from './setup-kits.js';",
   "import { createMicrophoneSelection } from './microphone-selection.js';",
   "import { createSoundCues } from './sound-cues.js';",
+  "import { createTurnTranscription } from './turn-transcription.js';",
   "const setupKitStore = createSetupKitStore();",
   "const microphoneSelection = createMicrophoneSelection({ getStorage: () => null });",
   "const soundCues = createSoundCues({ getStorage: () => null });",
+  "const turnTranscription = createTurnTranscription({ getRecognitionConstructor: () => null });",
   "let coachEnginePromise = null;",
   "let coachingRun = null;",
   "function loadCoachEngine() {",
@@ -74,6 +76,7 @@ const VALID_COACH_ENGINE_MODULE = "export function assessCalibrationReadiness() 
 const VALID_SETUP_KITS_MODULE = "export function createSetupKitStore() {}";
 const VALID_MICROPHONE_SELECTION_MODULE = "export function createMicrophoneSelection() {}";
 const VALID_SOUND_CUES_MODULE = "export function createSoundCues() {}";
+const VALID_TURN_TRANSCRIPTION_MODULE = "export function createTurnTranscription() {}";
 const checkedOutJavaScriptAssets = await readPublicJavaScriptAssets();
 
 function validPublicModuleSource(pathname) {
@@ -83,6 +86,7 @@ function validPublicModuleSource(pathname) {
   if (pathname === "/setup-kits.js") return VALID_SETUP_KITS_MODULE;
   if (pathname === "/microphone-selection.js") return VALID_MICROPHONE_SELECTION_MODULE;
   if (pathname === "/sound-cues.js") return VALID_SOUND_CUES_MODULE;
+  if (pathname === "/turn-transcription.js") return VALID_TURN_TRANSCRIPTION_MODULE;
   assert.fail(`unexpected public module path: ${pathname}`);
 }
 
@@ -322,6 +326,7 @@ test("production probe verifies every deployed JavaScript asset and the required
     "/setup-kits.js",
     "/microphone-selection.js",
     "/sound-cues.js",
+    "/turn-transcription.js",
   ]) {
     assert.match(productionProbeSupport, new RegExp(JSON.stringify(pathname).replace(".", "\\."), "u"));
   }
@@ -344,11 +349,14 @@ test("production probe verifies every deployed JavaScript asset and the required
   assert.match(productionProbeSupport, /hasAssignedFactoryCall\(\s*appTokens,\s*"microphoneSelection",\s*"createMicrophoneSelection",/u);
   assert.match(productionProbeSupport, /hasNamedModuleImport\(\s*appTokens,\s*"\.\/sound-cues\.js",\s*"createSoundCues",/u);
   assert.match(productionProbeSupport, /hasAssignedFactoryCall\(appTokens, "soundCues", "createSoundCues"\)/u);
+  assert.match(productionProbeSupport, /hasNamedModuleImport\(\s*appTokens,\s*"\.\/turn-transcription\.js",\s*"createTurnTranscription",/u);
+  assert.match(productionProbeSupport, /hasAssignedFactoryCall\(appTokens, "turnTranscription", "createTurnTranscription"\)/u);
   assert.match(productionProbeSupport, /hasExportedFunction\(coachStorageTokens, "openCoachDatabase", \{ async: true \}\)/u);
   assert.match(productionProbeSupport, /hasExportedFunction\(coachEngineTokens, "assessCalibrationReadiness"\)/u);
   assert.match(productionProbeSupport, /hasExportedFunction\(setupKitsTokens, "createSetupKitStore"\)/u);
   assert.match(productionProbeSupport, /hasExportedFunction\(microphoneSelectionTokens, "createMicrophoneSelection"\)/u);
   assert.match(productionProbeSupport, /hasExportedFunction\(soundCuesTokens, "createSoundCues"\)/u);
+  assert.match(productionProbeSupport, /hasExportedFunction\(turnTranscriptionTokens, "createTurnTranscription"\)/u);
   assert.match(productionProbeSupport, /spawnSync\(process\.execPath, \["--check", "--input-type=module"\]/u);
   assert.match(productionAssetDiscovery, /PUBLIC_JAVASCRIPT_ASSET_MAX_BYTES = 512 \* 1024/u);
   assert.match(productionProbe, /readVerifiedJavaScriptResponse\(response, pathname\)/u);
@@ -376,7 +384,7 @@ test("production probe verifies every deployed JavaScript asset and the required
 });
 
 test("production probe requires the complete exact checked-out JavaScript generation", async () => {
-  assert.equal(checkedOutJavaScriptAssets.size, 11);
+  assert.equal(checkedOutJavaScriptAssets.size, 12);
   const result = await waitForExactPublicModuleGraph({
     loadJavaScriptAsset: async (pathname) => checkedOutJavaScriptAssets.get(pathname),
     expectedJavaScriptAssets: checkedOutJavaScriptAssets,
@@ -391,6 +399,10 @@ test("production probe requires the complete exact checked-out JavaScript genera
     checkedOutJavaScriptAssets.get("/microphone-selection.js"),
   );
   assert.equal(result.soundCuesSource, checkedOutJavaScriptAssets.get("/sound-cues.js"));
+  assert.equal(
+    result.turnTranscriptionSource,
+    checkedOutJavaScriptAssets.get("/turn-transcription.js"),
+  );
   assert.deepEqual(result.observedJavaScriptAssets, checkedOutJavaScriptAssets);
 
   let calls = 0;
@@ -457,6 +469,7 @@ test("positive asset retries never overlap an unresolved previous sweep", async 
     "/setup-kits.js",
     "/microphone-selection.js",
     "/sound-cues.js",
+    "/turn-transcription.js",
   ].map((pathname) => [pathname, 0]));
   const delays = [];
   let releaseFirstApp;
@@ -476,14 +489,14 @@ test("positive asset retries never overlap an unresolved previous sweep", async 
   });
 
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual([...calls.values()], [1, 1, 1, 1, 1, 1],
+  assert.deepEqual([...calls.values()], [1, 1, 1, 1, 1, 1, 1],
     "attempt two must wait for every started attempt-one load and body read");
   assert.deepEqual(delays, []);
   releaseFirstApp(VALID_APP_MODULE_GRAPH);
 
   const result = await verification;
   assert.match(result.appSource, /coach-storage\.js/u);
-  assert.deepEqual([...calls.values()], [2, 2, 2, 2, 2, 2]);
+  assert.deepEqual([...calls.values()], [2, 2, 2, 2, 2, 2, 2]);
   assert.deepEqual(delays, [7]);
 });
 
@@ -906,7 +919,15 @@ test("positive and excluded phases consume the same shared deadline", async () =
 });
 
 test("production probe retries a mixed public asset generation as one module graph", async () => {
-  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0, microphoneSelection: 0, soundCues: 0 };
+  const calls = {
+    app: 0,
+    storage: 0,
+    engine: 0,
+    setupKits: 0,
+    microphoneSelection: 0,
+    soundCues: 0,
+    turnTranscription: 0,
+  };
   const delays = [];
 
   const result = await waitForPublicModuleGraph({
@@ -933,9 +954,13 @@ test("production probe retries a mixed public asset generation as one module gra
         calls.microphoneSelection += 1;
         return VALID_MICROPHONE_SELECTION_MODULE;
       }
-      assert.equal(pathname, "/sound-cues.js");
-      calls.soundCues += 1;
-      return VALID_SOUND_CUES_MODULE;
+      if (pathname === "/sound-cues.js") {
+        calls.soundCues += 1;
+        return VALID_SOUND_CUES_MODULE;
+      }
+      assert.equal(pathname, "/turn-transcription.js");
+      calls.turnTranscription += 1;
+      return VALID_TURN_TRANSCRIPTION_MODULE;
     },
     sleep: async (milliseconds) => delays.push(milliseconds),
   });
@@ -949,19 +974,30 @@ test("production probe retries a mixed public asset generation as one module gra
   assert.match(result.microphoneSelectionSource, /createMicrophoneSelection/u);
   assert.match(result.appSource, /sound-cues\.js/u);
   assert.match(result.soundCuesSource, /createSoundCues/u);
+  assert.match(result.appSource, /turn-transcription\.js/u);
+  assert.match(result.turnTranscriptionSource, /createTurnTranscription/u);
   assert.equal(calls.app, 3);
   assert.equal(calls.storage, 3);
   assert.equal(calls.engine, 3);
   assert.equal(calls.setupKits, 3);
   assert.equal(calls.microphoneSelection, 3);
   assert.equal(calls.soundCues, 3);
+  assert.equal(calls.turnTranscription, 3);
   assert.deepEqual(delays, [1_000, 2_000]);
   assert.equal(PUBLIC_MODULE_GRAPH_ATTEMPTS, 8);
   assert.equal(PUBLIC_MODULE_GRAPH_RETRY_MS, 1_000);
 });
 
 test("production probe retries a temporary storage-asset SPA fallback", async () => {
-  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0, microphoneSelection: 0, soundCues: 0 };
+  const calls = {
+    app: 0,
+    storage: 0,
+    engine: 0,
+    setupKits: 0,
+    microphoneSelection: 0,
+    soundCues: 0,
+    turnTranscription: 0,
+  };
   const delays = [];
 
   const result = await waitForPublicModuleGraph({
@@ -989,9 +1025,13 @@ test("production probe retries a temporary storage-asset SPA fallback", async ()
         calls.microphoneSelection += 1;
         return VALID_MICROPHONE_SELECTION_MODULE;
       }
-      assert.equal(pathname, "/sound-cues.js");
-      calls.soundCues += 1;
-      return VALID_SOUND_CUES_MODULE;
+      if (pathname === "/sound-cues.js") {
+        calls.soundCues += 1;
+        return VALID_SOUND_CUES_MODULE;
+      }
+      assert.equal(pathname, "/turn-transcription.js");
+      calls.turnTranscription += 1;
+      return VALID_TURN_TRANSCRIPTION_MODULE;
     },
     sleep: async (milliseconds) => delays.push(milliseconds),
   });
@@ -1003,11 +1043,20 @@ test("production probe retries a temporary storage-asset SPA fallback", async ()
   assert.equal(calls.setupKits, 2);
   assert.equal(calls.microphoneSelection, 2);
   assert.equal(calls.soundCues, 2);
+  assert.equal(calls.turnTranscription, 2);
   assert.deepEqual(delays, [1_000]);
 });
 
 test("production probe retries a temporary coaching-engine SPA fallback", async () => {
-  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0, microphoneSelection: 0, soundCues: 0 };
+  const calls = {
+    app: 0,
+    storage: 0,
+    engine: 0,
+    setupKits: 0,
+    microphoneSelection: 0,
+    soundCues: 0,
+    turnTranscription: 0,
+  };
   const delays = [];
 
   const result = await waitForPublicModuleGraph({
@@ -1035,9 +1084,13 @@ test("production probe retries a temporary coaching-engine SPA fallback", async 
         calls.microphoneSelection += 1;
         return VALID_MICROPHONE_SELECTION_MODULE;
       }
-      assert.equal(pathname, "/sound-cues.js");
-      calls.soundCues += 1;
-      return VALID_SOUND_CUES_MODULE;
+      if (pathname === "/sound-cues.js") {
+        calls.soundCues += 1;
+        return VALID_SOUND_CUES_MODULE;
+      }
+      assert.equal(pathname, "/turn-transcription.js");
+      calls.turnTranscription += 1;
+      return VALID_TURN_TRANSCRIPTION_MODULE;
     },
     sleep: async (milliseconds) => delays.push(milliseconds),
   });
@@ -1049,11 +1102,20 @@ test("production probe retries a temporary coaching-engine SPA fallback", async 
   assert.equal(calls.setupKits, 2);
   assert.equal(calls.microphoneSelection, 2);
   assert.equal(calls.soundCues, 2);
+  assert.equal(calls.turnTranscription, 2);
   assert.deepEqual(delays, [1_000]);
 });
 
 test("production probe retries a temporary setup-kit SPA fallback", async () => {
-  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0, microphoneSelection: 0, soundCues: 0 };
+  const calls = {
+    app: 0,
+    storage: 0,
+    engine: 0,
+    setupKits: 0,
+    microphoneSelection: 0,
+    soundCues: 0,
+    turnTranscription: 0,
+  };
   const delays = [];
 
   const result = await waitForPublicModuleGraph({
@@ -1081,9 +1143,13 @@ test("production probe retries a temporary setup-kit SPA fallback", async () => 
         calls.microphoneSelection += 1;
         return VALID_MICROPHONE_SELECTION_MODULE;
       }
-      assert.equal(pathname, "/sound-cues.js");
-      calls.soundCues += 1;
-      return VALID_SOUND_CUES_MODULE;
+      if (pathname === "/sound-cues.js") {
+        calls.soundCues += 1;
+        return VALID_SOUND_CUES_MODULE;
+      }
+      assert.equal(pathname, "/turn-transcription.js");
+      calls.turnTranscription += 1;
+      return VALID_TURN_TRANSCRIPTION_MODULE;
     },
     sleep: async (milliseconds) => delays.push(milliseconds),
   });
@@ -1095,11 +1161,20 @@ test("production probe retries a temporary setup-kit SPA fallback", async () => 
   assert.equal(calls.setupKits, 2);
   assert.equal(calls.microphoneSelection, 2);
   assert.equal(calls.soundCues, 2);
+  assert.equal(calls.turnTranscription, 2);
   assert.deepEqual(delays, [1_000]);
 });
 
 test("production probe retries a temporary microphone-selection SPA fallback", async () => {
-  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0, microphoneSelection: 0, soundCues: 0 };
+  const calls = {
+    app: 0,
+    storage: 0,
+    engine: 0,
+    setupKits: 0,
+    microphoneSelection: 0,
+    soundCues: 0,
+    turnTranscription: 0,
+  };
   const delays = [];
 
   const result = await waitForPublicModuleGraph({
@@ -1127,9 +1202,13 @@ test("production probe retries a temporary microphone-selection SPA fallback", a
         }
         return VALID_MICROPHONE_SELECTION_MODULE;
       }
-      assert.equal(pathname, "/sound-cues.js");
-      calls.soundCues += 1;
-      return VALID_SOUND_CUES_MODULE;
+      if (pathname === "/sound-cues.js") {
+        calls.soundCues += 1;
+        return VALID_SOUND_CUES_MODULE;
+      }
+      assert.equal(pathname, "/turn-transcription.js");
+      calls.turnTranscription += 1;
+      return VALID_TURN_TRANSCRIPTION_MODULE;
     },
     sleep: async (milliseconds) => delays.push(milliseconds),
   });
@@ -1141,11 +1220,20 @@ test("production probe retries a temporary microphone-selection SPA fallback", a
   assert.equal(calls.setupKits, 2);
   assert.equal(calls.microphoneSelection, 2);
   assert.equal(calls.soundCues, 2);
+  assert.equal(calls.turnTranscription, 2);
   assert.deepEqual(delays, [1_000]);
 });
 
 test("production probe retries a temporary sound-cue SPA fallback", async () => {
-  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0, microphoneSelection: 0, soundCues: 0 };
+  const calls = {
+    app: 0,
+    storage: 0,
+    engine: 0,
+    setupKits: 0,
+    microphoneSelection: 0,
+    soundCues: 0,
+    turnTranscription: 0,
+  };
   const delays = [];
 
   const result = await waitForPublicModuleGraph({
@@ -1170,12 +1258,16 @@ test("production probe retries a temporary sound-cue SPA fallback", async () => 
         calls.microphoneSelection += 1;
         return VALID_MICROPHONE_SELECTION_MODULE;
       }
-      assert.equal(pathname, "/sound-cues.js");
-      calls.soundCues += 1;
-      if (calls.soundCues === 1) {
-        throw new Error("/sound-cues.js did not return JavaScript");
+      if (pathname === "/sound-cues.js") {
+        calls.soundCues += 1;
+        if (calls.soundCues === 1) {
+          throw new Error("/sound-cues.js did not return JavaScript");
+        }
+        return VALID_SOUND_CUES_MODULE;
       }
-      return VALID_SOUND_CUES_MODULE;
+      assert.equal(pathname, "/turn-transcription.js");
+      calls.turnTranscription += 1;
+      return VALID_TURN_TRANSCRIPTION_MODULE;
     },
     sleep: async (milliseconds) => delays.push(milliseconds),
   });
@@ -1187,6 +1279,66 @@ test("production probe retries a temporary sound-cue SPA fallback", async () => 
   assert.equal(calls.setupKits, 2);
   assert.equal(calls.microphoneSelection, 2);
   assert.equal(calls.soundCues, 2);
+  assert.equal(calls.turnTranscription, 2);
+  assert.deepEqual(delays, [1_000]);
+});
+
+test("production probe retries a temporary turn-transcription SPA fallback", async () => {
+  const calls = {
+    app: 0,
+    storage: 0,
+    engine: 0,
+    setupKits: 0,
+    microphoneSelection: 0,
+    soundCues: 0,
+    turnTranscription: 0,
+  };
+  const delays = [];
+
+  const result = await waitForPublicModuleGraph({
+    loadJavaScriptAsset: async (pathname) => {
+      if (pathname === "/app.js") {
+        calls.app += 1;
+        return VALID_APP_MODULE_GRAPH;
+      }
+      if (pathname === "/coach-storage.js") {
+        calls.storage += 1;
+        return VALID_COACH_STORAGE_MODULE;
+      }
+      if (pathname === "/coach-engine.js") {
+        calls.engine += 1;
+        return VALID_COACH_ENGINE_MODULE;
+      }
+      if (pathname === "/setup-kits.js") {
+        calls.setupKits += 1;
+        return VALID_SETUP_KITS_MODULE;
+      }
+      if (pathname === "/microphone-selection.js") {
+        calls.microphoneSelection += 1;
+        return VALID_MICROPHONE_SELECTION_MODULE;
+      }
+      if (pathname === "/sound-cues.js") {
+        calls.soundCues += 1;
+        return VALID_SOUND_CUES_MODULE;
+      }
+      assert.equal(pathname, "/turn-transcription.js");
+      calls.turnTranscription += 1;
+      if (calls.turnTranscription === 1) {
+        throw new Error("/turn-transcription.js did not return JavaScript");
+      }
+      return VALID_TURN_TRANSCRIPTION_MODULE;
+    },
+    sleep: async (milliseconds) => delays.push(milliseconds),
+  });
+
+  assert.match(result.turnTranscriptionSource, /createTurnTranscription/u);
+  assert.equal(calls.app, 2);
+  assert.equal(calls.storage, 2);
+  assert.equal(calls.engine, 2);
+  assert.equal(calls.setupKits, 2);
+  assert.equal(calls.microphoneSelection, 2);
+  assert.equal(calls.soundCues, 2);
+  assert.equal(calls.turnTranscription, 2);
   assert.deepEqual(delays, [1_000]);
 });
 
@@ -1208,7 +1360,7 @@ test("production probe keeps a persistent module-graph defect bounded and visibl
     /does not reference the required coaching storage module/u,
   );
 
-  assert.equal(calls, 18);
+  assert.equal(calls, 21);
   assert.deepEqual(delays, [7, 14]);
 });
 
@@ -1237,7 +1389,7 @@ test("production probe ignores module-graph markers inside comments, strings, te
     /app\.js does not reference the required coaching storage module/u,
   );
 
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
 });
 
 test("production probe rejects import.meta ASI and side-effect import shadow decoys", async () => {
@@ -1295,7 +1447,7 @@ test("production probe rejects import.meta ASI and side-effect import shadow dec
       }),
       /app\.js does not reference the required coaching storage module/u,
     );
-    assert.equal(calls, 6);
+    assert.equal(calls, 7);
   }
 });
 
@@ -1372,7 +1524,7 @@ test("production probe rejects oversized assets before tokenization", async () =
     }),
     /app\.js exceeds the reviewed JavaScript asset boundary/u,
   );
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
 });
 
 test("production probe ignores export markers inside non-code text", async () => {
@@ -1382,6 +1534,7 @@ test("production probe ignores export markers inside non-code text", async () =>
     ["/setup-kits.js", "const marker = /export function createSetupKitStore()/u;", /setup-kits\.js does not expose/u],
     ["/microphone-selection.js", "const marker = 'export function createMicrophoneSelection() {}';", /microphone-selection\.js does not expose/u],
     ["/sound-cues.js", "const marker = `export function createSoundCues() {}`;", /sound-cues\.js does not expose/u],
+    ["/turn-transcription.js", "const marker = /export function createTurnTranscription()/u;", /turn-transcription\.js does not expose/u],
   ]) {
     let calls = 0;
     await assert.rejects(
@@ -1398,7 +1551,7 @@ test("production probe ignores export markers inside non-code text", async () =>
       }),
       expected,
     );
-    assert.equal(calls, 6);
+    assert.equal(calls, 7);
   }
 });
 
@@ -1417,7 +1570,7 @@ test("production probe rejects syntactically invalid assets even when every mark
     }),
     /app\.js is not valid JavaScript module syntax/u,
   );
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
 });
 
 test("production probe rejects an app without the required setup-kit import", async () => {
@@ -1442,7 +1595,7 @@ test("production probe rejects an app without the required setup-kit import", as
     /app\.js does not reference the required setup-kit module/u,
   );
 
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
 });
 
 test("production probe rejects an app that imports but does not consume setup-kit storage", async () => {
@@ -1467,7 +1620,7 @@ test("production probe rejects an app that imports but does not consume setup-ki
     /app\.js does not consume the setup-kit storage boundary/u,
   );
 
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
 });
 
 test("production probe rejects a setup-kit module without the exact store export", async () => {
@@ -1489,7 +1642,7 @@ test("production probe rejects a setup-kit module without the exact store export
     /setup-kits\.js does not expose createSetupKitStore/u,
   );
 
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
 });
 
 test("production probe rejects microphone import markers hidden in non-code text", async () => {
@@ -1516,7 +1669,7 @@ test("production probe rejects microphone import markers hidden in non-code text
     /app\.js does not reference the required microphone-selection module/u,
   );
 
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
 });
 
 test("production probe rejects a nested microphone factory-call decoy", async () => {
@@ -1545,7 +1698,7 @@ test("production probe rejects a nested microphone factory-call decoy", async ()
     /app\.js does not consume the microphone-selection boundary/u,
   );
 
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
 });
 
 test("production probe rejects a microphone module without the exact factory export", async () => {
@@ -1567,7 +1720,7 @@ test("production probe rejects a microphone module without the exact factory exp
     /microphone-selection\.js does not expose createMicrophoneSelection/u,
   );
 
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
 });
 
 test("production probe rejects sound-cue import markers hidden in non-code text", async () => {
@@ -1594,7 +1747,7 @@ test("production probe rejects sound-cue import markers hidden in non-code text"
     /app\.js does not reference the required sound-cue module/u,
   );
 
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
 });
 
 test("production probe rejects a nested sound-cue factory-call decoy", async () => {
@@ -1623,7 +1776,7 @@ test("production probe rejects a nested sound-cue factory-call decoy", async () 
     /app\.js does not consume the sound-cue boundary/u,
   );
 
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
 });
 
 test("production probe rejects a sound-cue module without the exact factory export", async () => {
@@ -1645,7 +1798,85 @@ test("production probe rejects a sound-cue module without the exact factory expo
     /sound-cues\.js does not expose createSoundCues/u,
   );
 
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
+});
+
+test("production probe rejects turn-transcription import markers hidden in non-code text", async () => {
+  let calls = 0;
+  const appSource = VALID_APP_MODULE_GRAPH.replace(
+    "import { createTurnTranscription } from './turn-transcription.js';\n",
+    [
+      "const transcriptionImportMarker = \"import { createTurnTranscription } from './turn-transcription.js';\";",
+      "// import { createTurnTranscription } from './turn-transcription.js';",
+    ].join("\n") + "\n",
+  );
+
+  await assert.rejects(
+    waitForPublicModuleGraph({
+      loadJavaScriptAsset: async (pathname) => {
+        calls += 1;
+        if (pathname === "/app.js") return appSource;
+        return validPublicModuleSource(pathname);
+      },
+      sleep: async () => {},
+      attempts: 1,
+      retryMs: 0,
+    }),
+    /app\.js does not reference the required turn-transcription module/u,
+  );
+
+  assert.equal(calls, 7);
+});
+
+test("production probe rejects a nested turn-transcription factory-call decoy", async () => {
+  let calls = 0;
+  const appSource = VALID_APP_MODULE_GRAPH.replace(
+    "const turnTranscription = createTurnTranscription({ getRecognitionConstructor: () => null });\n",
+    [
+      "function unusedTurnTranscriptionFactory() {",
+      "  const turnTranscription = createTurnTranscription({ getRecognitionConstructor: () => null });",
+      "  return turnTranscription;",
+      "}",
+    ].join("\n") + "\n",
+  );
+
+  await assert.rejects(
+    waitForPublicModuleGraph({
+      loadJavaScriptAsset: async (pathname) => {
+        calls += 1;
+        if (pathname === "/app.js") return appSource;
+        return validPublicModuleSource(pathname);
+      },
+      sleep: async () => {},
+      attempts: 1,
+      retryMs: 0,
+    }),
+    /app\.js does not consume the turn-transcription boundary/u,
+  );
+
+  assert.equal(calls, 7);
+});
+
+test("production probe rejects a turn-transcription module without the exact factory export", async () => {
+  let calls = 0;
+
+  await assert.rejects(
+    waitForPublicModuleGraph({
+      loadJavaScriptAsset: async (pathname) => {
+        calls += 1;
+        if (pathname === "/turn-transcription.js") {
+          return "export function createLegacyTurnTranscription() {}";
+        }
+        return validPublicModuleSource(pathname);
+      },
+      sleep: async () => {},
+      attempts: 1,
+      retryMs: 0,
+    }),
+    /turn-transcription\.js does not expose createTurnTranscription/u,
+  );
+
+  assert.equal(calls, 7);
 });
 
 test("production probe rejects a legacy app that imports but does not consume calibration readiness", async () => {
@@ -1670,7 +1901,7 @@ test("production probe rejects a legacy app that imports but does not consume ca
     /app\.js does not consume the calibration-readiness boundary/u,
   );
 
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
 });
 
 test("production probe rejects a coaching engine without the exact readiness export", async () => {
@@ -1693,5 +1924,5 @@ test("production probe rejects a coaching engine without the exact readiness exp
     /coach-engine\.js does not expose assessCalibrationReadiness/u,
   );
 
-  assert.equal(calls, 6);
+  assert.equal(calls, 7);
 });
