@@ -910,7 +910,7 @@ test("pinned Wrangler JSON readiness requires ordered same-stream ping and pong"
 		PINNED_WRANGLER_TAIL_VERSION,
 	);
 	assert.throws(
-		() => requirePinnedWranglerTailVersion("4.128.0"),
+		() => requirePinnedWranglerTailVersion("4.128.1"),
 		/pinned Wrangler tail contract/u,
 	);
 

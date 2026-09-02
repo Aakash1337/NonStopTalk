@@ -1,6 +1,6 @@
 "use strict";
 
-// Wrangler 4.127.1 exposes no JSON-tail readiness record. Its debug channel
+// Wrangler 4.128.0 exposes no JSON-tail readiness record. Its debug channel
 // does emit these two transport-only markers from the same WebSocket after it
 // opens. Keep every other debug record inside the child process so telemetry,
 // local paths, and authentication diagnostics can never enter the proof pipe.

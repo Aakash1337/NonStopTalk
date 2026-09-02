@@ -248,7 +248,7 @@ const stalledCalibrationMeter = () => {
 async function storedSummaries(page) {
   return page.evaluate(async () => {
     const database = await new Promise((resolve, reject) => {
-      const request = indexedDB.open("nonstoptalk-coaching", 2);
+      const request = indexedDB.open("nonstoptalk-coaching");
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
@@ -267,7 +267,7 @@ async function storedSummaries(page) {
 async function storedArtifacts(page) {
   return page.evaluate(async () => {
     const database = await new Promise((resolve, reject) => {
-      const request = indexedDB.open("nonstoptalk-coaching", 2);
+      const request = indexedDB.open("nonstoptalk-coaching");
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
@@ -306,6 +306,12 @@ async function runPracticeFlow(browser, origin) {
   await page.getByRole("radio", { name: /Single coached attempt/ }).check();
   const retentionCheckbox = page.getByLabel("Optional full session retention").getByRole("checkbox");
   assert(!(await retentionCheckbox.isChecked()), "Raw audio/full transcript retention must be opt-in");
+  const retentionDisclosure = (await page.getByLabel("Optional full session retention").innerText()).toLocaleLowerCase();
+  assert(retentionDisclosure.includes("either remain until you delete them or follow a 30-day local retention policy")
+    && retentionDisclosure.includes("newly saved artifacts get 30 days")
+    && retentionDisclosure.includes("existing artifacts get 30 days from the storage upgrade")
+    && retentionDisclosure.includes("never uploaded"),
+  "Retention consent must disclose both compatible local-lifecycle policies and the no-upload boundary");
   await page.getByLabel("Optional transcript analysis").getByRole("checkbox").check();
   await retentionCheckbox.check();
   await page.getByRole("button", { name: /Calibrate microphone/ }).click();
@@ -639,6 +645,574 @@ async function runVersionOneMigrationFlow(browser, origin) {
   await context.close();
 }
 
+async function runFutureVersionCompatibilityFlow(browser, origin) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.goto(origin);
+  await page.evaluate(async () => {
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching", 3);
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        const summaries = database.createObjectStore("session-summaries", { keyPath: "id" });
+        summaries.createIndex("createdAt", "createdAt");
+        const artifacts = database.createObjectStore("session-artifacts", { keyPath: "id" });
+        artifacts.createIndex("createdAt", "createdAt");
+        const lifecycle = database.createObjectStore("artifact-lifecycle", { keyPath: "id" });
+        lifecycle.createIndex("expiresAtMs", "expiresAtMs");
+        summaries.put({
+          id: "future-v3-summary",
+          createdAt: "2026-08-10T12:00:00.000Z",
+          scenario: "presentation",
+          goal: "energy",
+          metrics: { speakingRatio: 0.65, pauseCount: 2, durationMs: 30_000 },
+          advice: { focus: "Future-version summary preserved" },
+        });
+        summaries.put({
+          id: "expired-v3-artifact",
+          createdAt: "2026-07-01T12:00:00.000Z",
+          scenario: "interview",
+          goal: "pace",
+          metrics: { speakingRatio: 0.6, pauseCount: 1, durationMs: 30_000 },
+          advice: { focus: "Expired artifact summary preserved" },
+          artifacts: { audioStored: true, audioBytes: 7, audioMimeType: "audio/webm", transcriptStored: true, transcriptMayBePartial: false },
+        });
+        artifacts.put({
+          id: "expired-v3-artifact",
+          createdAt: "2026-07-01T12:00:00.000Z",
+          audioBlob: new Blob(["expired"], { type: "audio/webm" }),
+          audioMimeType: "audio/webm",
+          transcript: "expired sensitive text",
+          transcriptMayBePartial: false,
+        });
+        lifecycle.put({
+          id: "expired-v3-artifact",
+          retainedAtMs: Date.now() - 2_592_000_001,
+          expiresAtMs: Date.now() - 1,
+          logicalBytes: 29,
+          lifecycleSchemaVersion: 1,
+          legacyGrace: true,
+        });
+      };
+      request.onsuccess = () => {
+        request.result.close();
+        resolve();
+      };
+      request.onerror = () => reject(request.error);
+    });
+  });
+
+  await page.goto(`${origin}/progress`);
+  await page.waitForSelector("[data-coach-progress]");
+  assert((await page.locator("body").innerText()).includes("Future-version summary preserved"),
+    "The v2 compatibility release must read required stores after a future database upgrade");
+  const expiredState = await page.evaluate(async () => {
+    const database = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      return await new Promise((resolve, reject) => {
+        const transaction = database.transaction(["session-summaries", "session-artifacts", "artifact-lifecycle"], "readonly");
+        const summary = transaction.objectStore("session-summaries").get("expired-v3-artifact");
+        const artifact = transaction.objectStore("session-artifacts").get("expired-v3-artifact");
+        const lifecycle = transaction.objectStore("artifact-lifecycle").get("expired-v3-artifact");
+        transaction.oncomplete = () => resolve({
+          summary: summary.result,
+          artifact: artifact.result,
+          lifecycle: lifecycle.result,
+        });
+        transaction.onerror = () => reject(transaction.error);
+      });
+    } finally {
+      database.close();
+    }
+  });
+  assert(expiredState.summary?.artifacts?.audioStored === false
+    && expiredState.summary?.artifacts?.transcriptStored === false
+    && !expiredState.artifact
+    && !expiredState.lifecycle,
+  "The rollback-compatible summary read must atomically expire future-schema artifact state while preserving its compact summary");
+
+  const bookkeeping = await page.evaluate(async () => {
+    const { clearCoachingSummaries, deleteCoachingArtifacts, readCoachingArtifact, saveCoachingSession } = await import("/coach-storage.js");
+    const id = "rollback-created-artifact";
+    const saveResult = await saveCoachingSession({
+      id,
+      createdAt: "2026-08-20T12:00:00.000Z",
+      scenario: "interview",
+      goal: "pace",
+      artifacts: { audioStored: true, audioBytes: 4, audioMimeType: "audio/webm", transcriptStored: true, transcriptMayBePartial: false },
+    }, {
+      id,
+      createdAt: "2026-08-20T12:00:00.000Z",
+      audioBlob: new Blob(["test"], { type: "audio/webm" }),
+      audioMimeType: "audio/webm",
+      transcript: "hello",
+      transcriptMayBePartial: false,
+    });
+    const beforeDelete = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching");
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction("artifact-lifecycle", "readonly");
+        const read = transaction.objectStore("artifact-lifecycle").get(id);
+        read.onsuccess = () => resolve(read.result);
+        read.onerror = () => reject(read.error);
+        transaction.oncomplete = () => database.close();
+      };
+      request.onerror = () => reject(request.error);
+    });
+    await deleteCoachingArtifacts(id);
+    const afterDelete = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching");
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction(["session-summaries", "artifact-lifecycle"], "readonly");
+        const summaryRead = transaction.objectStore("session-summaries").get(id);
+        const lifecycleRead = transaction.objectStore("artifact-lifecycle").get(id);
+        transaction.oncomplete = () => {
+          database.close();
+          resolve({ summary: summaryRead.result, lifecycle: lifecycleRead.result });
+        };
+        transaction.onerror = () => reject(transaction.error);
+      };
+      request.onerror = () => reject(request.error);
+    });
+    const savePrunedId = "rollback-save-pruned-expiry";
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching");
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction(["session-summaries", "session-artifacts", "artifact-lifecycle"], "readwrite");
+        transaction.objectStore("session-summaries").put({
+          id: savePrunedId,
+          createdAt: new Date().toISOString(),
+          artifacts: { audioStored: true, audioBytes: 1, audioMimeType: "audio/webm", transcriptStored: false, transcriptMayBePartial: false },
+        });
+        transaction.objectStore("session-artifacts").put({
+          id: savePrunedId,
+          createdAt: new Date().toISOString(),
+          audioBlob: new Blob(["x"], { type: "audio/webm" }),
+          transcript: "",
+        });
+        transaction.objectStore("artifact-lifecycle").put({
+          id: savePrunedId,
+          retainedAtMs: Date.now() - 2_592_000_001,
+          expiresAtMs: Date.now() - 1,
+          logicalBytes: 134_217_728,
+          lifecycleSchemaVersion: 1,
+          legacyGrace: false,
+        });
+        transaction.oncomplete = () => {
+          database.close();
+          resolve();
+        };
+        transaction.onerror = () => reject(transaction.error);
+      };
+      request.onerror = () => reject(request.error);
+    });
+    const saveAfterPruneId = "rollback-save-after-expiry";
+    const saveAfterPrune = await saveCoachingSession({
+      id: saveAfterPruneId,
+      createdAt: new Date().toISOString(),
+      scenario: "interview",
+      goal: "pace",
+      artifacts: { audioStored: true, audioBytes: 1, audioMimeType: "audio/webm", transcriptStored: false, transcriptMayBePartial: false },
+    }, {
+      id: saveAfterPruneId,
+      createdAt: new Date().toISOString(),
+      audioBlob: new Blob(["x"], { type: "audio/webm" }),
+      audioMimeType: "audio/webm",
+      transcript: "",
+      transcriptMayBePartial: false,
+    });
+    const savePrunedState = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching");
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction(["session-summaries", "session-artifacts", "artifact-lifecycle"], "readonly");
+        const summaryRead = transaction.objectStore("session-summaries").get(savePrunedId);
+        const artifactRead = transaction.objectStore("session-artifacts").get(savePrunedId);
+        const lifecycleRead = transaction.objectStore("artifact-lifecycle").get(savePrunedId);
+        transaction.oncomplete = () => {
+          database.close();
+          resolve({ summary: summaryRead.result, artifact: artifactRead.result, lifecycle: lifecycleRead.result });
+        };
+        transaction.onerror = () => reject(transaction.error);
+      };
+      request.onerror = () => reject(request.error);
+    });
+    await deleteCoachingArtifacts(saveAfterPruneId);
+    const replacementId = "rollback-summary-only-replacement";
+    const replacementStored = await saveCoachingSession({
+      id: replacementId,
+      createdAt: new Date().toISOString(),
+      scenario: "interview",
+      goal: "pace",
+      artifacts: { audioStored: true, audioBytes: 1, audioMimeType: "audio/webm", transcriptStored: false, transcriptMayBePartial: false },
+    }, {
+      id: replacementId,
+      createdAt: new Date().toISOString(),
+      audioBlob: new Blob(["x"], { type: "audio/webm" }),
+      audioMimeType: "audio/webm",
+      transcript: "",
+      transcriptMayBePartial: false,
+    });
+    const replacementSummaryOnly = await saveCoachingSession({
+      id: replacementId,
+      createdAt: new Date().toISOString(),
+      scenario: "interview",
+      goal: "pace",
+      artifacts: { audioStored: true, audioBytes: 1, audioMimeType: "audio/webm", transcriptStored: false, transcriptMayBePartial: false },
+    }, null);
+    let mismatchedIdRejected = false;
+    let nonStringIdRejected = false;
+    try {
+      await saveCoachingSession({ id: "mismatch-summary" }, { id: "mismatch-artifact", audioBlob: new Blob(["x"]) });
+    } catch (error) {
+      mismatchedIdRejected = error instanceof TypeError;
+    }
+    try {
+      await saveCoachingSession({ id: 42 }, null);
+    } catch (error) {
+      nonStringIdRejected = error instanceof TypeError;
+    }
+    const replacementState = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching");
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction(["session-summaries", "session-artifacts", "artifact-lifecycle"], "readonly");
+        const summaryRead = transaction.objectStore("session-summaries").get(replacementId);
+        const artifactRead = transaction.objectStore("session-artifacts").get(replacementId);
+        const lifecycleRead = transaction.objectStore("artifact-lifecycle").get(replacementId);
+        transaction.oncomplete = () => {
+          database.close();
+          resolve({ summary: summaryRead.result, artifact: artifactRead.result, lifecycle: lifecycleRead.result });
+        };
+        transaction.onerror = () => reject(transaction.error);
+      };
+      request.onerror = () => reject(request.error);
+    });
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching");
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction("artifact-lifecycle", "readwrite");
+        transaction.objectStore("artifact-lifecycle").put({
+          id: "existing-capacity",
+          retainedAtMs: Date.now(),
+          expiresAtMs: Date.now() + 2_592_000_000,
+          logicalBytes: 134_217_728,
+          lifecycleSchemaVersion: 1,
+          legacyGrace: false,
+        });
+        transaction.oncomplete = () => {
+          database.close();
+          resolve();
+        };
+        transaction.onerror = () => reject(transaction.error);
+      };
+      request.onerror = () => reject(request.error);
+    });
+    const cappedId = "rollback-cap-fallback";
+    const cappedResult = await saveCoachingSession({
+      id: cappedId,
+      createdAt: new Date().toISOString(),
+      scenario: "interview",
+      goal: "pace",
+      artifacts: { audioStored: true, audioBytes: 1, audioMimeType: "audio/webm", transcriptStored: false, transcriptMayBePartial: false },
+    }, {
+      id: cappedId,
+      createdAt: new Date().toISOString(),
+      audioBlob: new Blob(["x"], { type: "audio/webm" }),
+      audioMimeType: "audio/webm",
+      transcript: "",
+      transcriptMayBePartial: false,
+    });
+    const cappedState = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching");
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction(["session-summaries", "session-artifacts", "artifact-lifecycle"], "readonly");
+        const summaryRead = transaction.objectStore("session-summaries").get(cappedId);
+        const artifactRead = transaction.objectStore("session-artifacts").get(cappedId);
+        const lifecycleRead = transaction.objectStore("artifact-lifecycle").get(cappedId);
+        transaction.oncomplete = () => {
+          database.close();
+          resolve({ summary: summaryRead.result, artifact: artifactRead.result, lifecycle: lifecycleRead.result });
+        };
+        transaction.onerror = () => reject(transaction.error);
+      };
+      request.onerror = () => reject(request.error);
+    });
+    const directExpiryId = "rollback-direct-expiry";
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching");
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction(["session-summaries", "session-artifacts", "artifact-lifecycle"], "readwrite");
+        transaction.objectStore("session-summaries").put({
+          id: directExpiryId,
+          createdAt: new Date().toISOString(),
+          artifacts: { audioStored: true, audioBytes: 1, audioMimeType: "audio/webm", transcriptStored: false, transcriptMayBePartial: false },
+        });
+        transaction.objectStore("session-artifacts").put({
+          id: directExpiryId,
+          createdAt: new Date().toISOString(),
+          audioBlob: new Blob(["x"], { type: "audio/webm" }),
+          transcript: "",
+        });
+        transaction.objectStore("artifact-lifecycle").put({
+          id: directExpiryId,
+          retainedAtMs: Date.now() - 2_592_000_001,
+          expiresAtMs: Date.now() - 1,
+          logicalBytes: 1,
+          lifecycleSchemaVersion: 1,
+          legacyGrace: false,
+        });
+        transaction.oncomplete = () => {
+          database.close();
+          resolve();
+        };
+        transaction.onerror = () => reject(transaction.error);
+      };
+      request.onerror = () => reject(request.error);
+    });
+    const expiredArtifactRead = await readCoachingArtifact(directExpiryId);
+    await clearCoachingSummaries();
+    const clearedCounts = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching");
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction(["session-summaries", "session-artifacts", "artifact-lifecycle"], "readonly");
+        const reads = ["session-summaries", "session-artifacts", "artifact-lifecycle"]
+          .map((store) => transaction.objectStore(store).count());
+        transaction.oncomplete = () => {
+          database.close();
+          resolve(reads.map((read) => read.result));
+        };
+        transaction.onerror = () => reject(transaction.error);
+      };
+      request.onerror = () => reject(request.error);
+    });
+    return {
+      saveResult,
+      beforeDelete,
+      afterDelete,
+      saveAfterPrune,
+      savePrunedState,
+      replacementStored,
+      replacementSummaryOnly,
+      replacementState,
+      mismatchedIdRejected,
+      nonStringIdRejected,
+      cappedResult,
+      cappedState,
+      expiredArtifactRead,
+      clearedCounts,
+    };
+  });
+  assert(bookkeeping.saveResult?.artifactStatus === "stored", "A rollback-compatible save should report retained artifacts");
+  assert(bookkeeping.beforeDelete?.lifecycleSchemaVersion === 1 && bookkeeping.beforeDelete?.logicalBytes === 9,
+    "A rollback-compatible save must maintain optional future artifact bookkeeping without storing content in it");
+  assert(!bookkeeping.afterDelete.lifecycle && bookkeeping.afterDelete.summary?.artifacts?.audioStored === false,
+    "A rollback-compatible delete must clear optional future bookkeeping and summary metadata atomically");
+  assert(bookkeeping.saveAfterPrune?.artifactStatus === "stored"
+    && bookkeeping.savePrunedState.summary?.artifacts?.audioStored === false
+    && !bookkeeping.savePrunedState.artifact
+    && !bookkeeping.savePrunedState.lifecycle,
+  "A rollback-compatible save must exclude expired bytes and atomically clear their artifact state before applying the cap");
+  assert(bookkeeping.replacementStored?.artifactStatus === "stored"
+    && bookkeeping.replacementSummaryOnly?.artifactStatus === "not-requested"
+    && bookkeeping.replacementState.summary?.artifacts?.audioStored === false
+    && !bookkeeping.replacementState.artifact
+    && !bookkeeping.replacementState.lifecycle,
+  "A summary-only replacement must remove any same-ID sensitive artifact state atomically");
+  assert(bookkeeping.mismatchedIdRejected && bookkeeping.nonStringIdRejected,
+    "Storage writes must reject mismatched or non-string IDs before creating orphan records");
+  assert(bookkeeping.cappedResult?.artifactStatus === "app-limit"
+    && bookkeeping.cappedState.summary?.artifacts?.audioStored === false
+    && !bookkeeping.cappedState.artifact
+    && !bookkeeping.cappedState.lifecycle,
+  "A rollback-compatible save must preserve its compact summary without new artifact data at the future app limit");
+  assert(!bookkeeping.expiredArtifactRead,
+    "A direct artifact read must never return an artifact whose future lifecycle row has expired");
+  assert(bookkeeping.clearedCounts.every((count) => count === 0),
+    "A rollback-compatible full deletion must clear summaries, artifacts, and optional lifecycle rows");
+
+  const upgrade = await page.evaluate(async () => {
+    const { openCoachDatabase } = await import("/coach-storage.js");
+    const heldDatabase = await openCoachDatabase();
+    const openedVersion = heldDatabase.version;
+    const upgradedVersion = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching", 4);
+      request.onsuccess = () => {
+        const version = request.result.version;
+        request.result.close();
+        resolve(version);
+      };
+      request.onerror = () => reject(request.error);
+      request.onblocked = () => reject(new Error("The compatibility connection blocked a future upgrade"));
+    });
+    return { openedVersion, upgradedVersion };
+  });
+  assert(upgrade.openedVersion === 3 && upgrade.upgradedVersion === 4,
+    "The compatibility release must open newer schemas and close its connection on versionchange");
+  assert(pageErrors.length === 0, `Future-version compatibility flow emitted errors: ${JSON.stringify(pageErrors)}`);
+  await context.close();
+}
+
+async function runComposedStorageWarningFlow(browser, origin) {
+  const context = await browser.newContext();
+  await context.addInitScript(syntheticCoachAudio);
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.goto(origin);
+  await page.evaluate(async () => {
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.open("nonstoptalk-coaching", 3);
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        const summaries = database.createObjectStore("session-summaries", { keyPath: "id" });
+        summaries.createIndex("createdAt", "createdAt");
+        const artifacts = database.createObjectStore("session-artifacts", { keyPath: "id" });
+        artifacts.createIndex("createdAt", "createdAt");
+        const lifecycle = database.createObjectStore("artifact-lifecycle", { keyPath: "id" });
+        lifecycle.createIndex("expiresAtMs", "expiresAtMs");
+        lifecycle.put({
+          id: "existing-capacity",
+          retainedAtMs: Date.now(),
+          expiresAtMs: Date.now() + 2_592_000_000,
+          logicalBytes: 134_217_728,
+          lifecycleSchemaVersion: 1,
+          legacyGrace: false,
+        });
+      };
+      request.onsuccess = () => {
+        request.result.close();
+        resolve();
+      };
+      request.onerror = () => reject(request.error);
+    });
+  });
+
+  await page.goto(`${origin}/practice`);
+  await page.getByRole("radio", { name: /Single coached attempt/ }).check();
+  await page.getByLabel("Optional transcript analysis").getByRole("checkbox").check();
+  await page.getByLabel("Optional full session retention").getByRole("checkbox").check();
+  await page.getByRole("button", { name: /Calibrate microphone/ }).click();
+  await page.waitForSelector("[data-coach-live]", { timeout: 12_000 });
+  await page.waitForTimeout(700);
+  await page.locator("[data-coach-stop]").click();
+  await page.waitForSelector("[data-coach-review]", { timeout: 5_000 });
+  const review = (await page.locator("[data-coach-review]").innerText()).toLocaleLowerCase();
+  assert(review.includes("on-device recognition ended with an error"),
+    "The review must retain a pre-existing partial-transcript warning");
+  assert(review.includes("128 mib artifact limit is full"),
+    "The review must also disclose why its opted-in artifact was not stored");
+  const summaries = await storedSummaries(page);
+  assert(summaries.length === 1 && summaries[0]?.artifacts?.audioStored === false
+    && summaries[0]?.artifacts?.transcriptStored === false,
+  "The app-limit fallback must preserve one compact summary with truthful artifact metadata");
+  assert((await storedArtifacts(page)).length === 0,
+    "The app-limit fallback must not retain the rejected recording or transcript");
+  assert(pageErrors.length === 0, `Composed storage-warning flow emitted errors: ${JSON.stringify(pageErrors)}`);
+  await context.close();
+}
+
+async function runBrowserQuotaFallbackFlow(browser, origin) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  let cdp;
+  try {
+    await page.goto(origin);
+    await page.evaluate(async () => {
+      await new Promise((resolve, reject) => {
+        const request = indexedDB.open("nonstoptalk-coaching", 3);
+        request.onupgradeneeded = () => {
+          const database = request.result;
+          const summaries = database.createObjectStore("session-summaries", { keyPath: "id" });
+          summaries.createIndex("createdAt", "createdAt");
+          const artifacts = database.createObjectStore("session-artifacts", { keyPath: "id" });
+          artifacts.createIndex("createdAt", "createdAt");
+          const lifecycle = database.createObjectStore("artifact-lifecycle", { keyPath: "id" });
+          lifecycle.createIndex("expiresAtMs", "expiresAtMs");
+        };
+        request.onsuccess = () => {
+          request.result.close();
+          resolve();
+        };
+        request.onerror = () => reject(request.error);
+      });
+    });
+    cdp = await context.newCDPSession(page);
+    const usage = await cdp.send("Storage.getUsageAndQuota", { origin });
+    await cdp.send("Storage.overrideQuotaForOrigin", {
+      origin,
+      quotaSize: Math.ceil(usage.usage) + 200_000,
+    });
+    const quotaFallback = await page.evaluate(async () => {
+      const { saveCoachingSession } = await import("/coach-storage.js");
+      const id = "browser-quota-fallback";
+      const result = await saveCoachingSession({
+        id,
+        createdAt: new Date().toISOString(),
+        scenario: "interview",
+        goal: "pace",
+        artifacts: { audioStored: true, audioBytes: 1_000_000, audioMimeType: "audio/webm", transcriptStored: false, transcriptMayBePartial: false },
+      }, {
+        id,
+        createdAt: new Date().toISOString(),
+        audioBlob: new Blob([new Uint8Array(1_000_000)], { type: "audio/webm" }),
+        audioMimeType: "audio/webm",
+        transcript: "",
+        transcriptMayBePartial: false,
+      });
+      const database = await new Promise((resolve, reject) => {
+        const request = indexedDB.open("nonstoptalk-coaching");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      try {
+        return await new Promise((resolve, reject) => {
+          const transaction = database.transaction(["session-summaries", "session-artifacts", "artifact-lifecycle"], "readonly");
+          const summary = transaction.objectStore("session-summaries").get(id);
+          const artifact = transaction.objectStore("session-artifacts").get(id);
+          const lifecycle = transaction.objectStore("artifact-lifecycle").get(id);
+          transaction.oncomplete = () => resolve({
+            result,
+            summary: summary.result,
+            artifact: artifact.result,
+            lifecycle: lifecycle.result,
+          });
+          transaction.onerror = () => reject(transaction.error);
+        });
+      } finally {
+        database.close();
+      }
+    });
+    assert(quotaFallback.result?.summarySaved === true
+      && quotaFallback.result?.artifactStatus === "browser-quota",
+    "A real browser quota failure must return the typed summary-only outcome");
+    assert(quotaFallback.summary?.artifacts?.audioStored === false
+      && quotaFallback.summary?.artifacts?.transcriptStored === false,
+    "A real browser quota failure must commit the compact summary with truthful artifact metadata");
+    assert(!quotaFallback.artifact && !quotaFallback.lifecycle,
+      "A failed quota transaction must leave no artifact or lifecycle row behind");
+    assert(pageErrors.length === 0, `Browser-quota fallback flow emitted errors: ${JSON.stringify(pageErrors)}`);
+  } finally {
+    if (cdp) await cdp.send("Storage.overrideQuotaForOrigin", { origin }).catch(() => {});
+    await context.close();
+  }
+}
+
 async function runLegacyProgressFlow(browser, origin) {
   const context = await browser.newContext();
   const page = await context.newPage();
@@ -875,6 +1449,9 @@ try {
   await runDefaultRetentionFlow(browser, origin);
   await runTranscriptFinalizationTimeoutFlow(browser, origin);
   await runVersionOneMigrationFlow(browser, origin);
+  await runFutureVersionCompatibilityFlow(browser, origin);
+  await runComposedStorageWarningFlow(browser, origin);
+  await runBrowserQuotaFallbackFlow(browser, origin);
   await runLegacyProgressFlow(browser, origin);
   await runRouteLinkClickFlow(browser, origin);
   await runCancelledAudioResumeFlow(browser, origin);

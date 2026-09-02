@@ -26,7 +26,7 @@ Implemented prototype scope:
 - Compact session summaries in origin-scoped IndexedDB in the current browser profile, including consented derived filler/repetition patterns
 - Separate, off-by-default retention of the attempt recording and available captured transcript in an origin-local artifact store, with individual downloads and per-attempt artifact-only deletion; finalization errors/timeouts mark retained text as possibly partial in Review and Progress, artifacts are excluded from summary JSON export, and deletion preserves the compact attempt/pair
 - No coaching audio or captured-transcript upload; the independent compact-summary backup boundary is described in the platform section below
-- Thirty-four deterministic coaching/loop tests and browser smoke flows covering the single coached format, the default baseline → Progress/reload/resume → unassisted-retry format, baseline persistence gating, safe grouping/comparison, per-attempt artifact deletion, and no coaching-data API request when backup is off
+- Thirty-six deterministic tests—34 coaching/loop tests plus two IndexedDB storage-contract tests—and browser smoke flows covering the single coached format, the default baseline → Progress/reload/resume → unassisted-retry format, baseline persistence gating, safe grouping/comparison, per-attempt artifact deletion, storage rollback compatibility and summary-only fallbacks, and no coaching-data API request when backup is off
 
 This prototype demonstrates the technical and interaction loop. It does not yet establish measurement accuracy across devices, learning outcomes, clinical value, accessibility conformance, or accent/language fairness.
 
@@ -34,7 +34,7 @@ Next coaching milestones:
 
 1. Run a consented pilot to validate audio events, false-tip rate, distraction, browser/device availability, privacy network behavior, and subgroup fairness.
 2. Measure the implemented baseline/retry loop's repeatability and usability without turning raw paired deltas into an improvement verdict.
-3. Add user-authored prompts/goals, stronger calibration guidance, automatic local artifact expiration/quota controls, and clearer signal-confidence explanations.
+3. Add user-authored prompts/goals, stronger calibration guidance, activate automatic local artifact expiration and user-facing quota controls on the implemented forward-compatible storage foundation, and add clearer signal-confidence explanations.
 4. Build guided interview and presentation programs after the core measurements are validated.
 5. Evaluate a production semantic/LLM RAG layer, local model, self-hosted service, or bring-your-own-key coaching as separate opt-in adapters; keep the private deterministic/local-retrieval core complete without them.
 6. Decide whether to share a coaching client with the Go edition; the prototype is available only in the Cloudflare SPA today.

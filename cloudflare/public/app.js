@@ -8,6 +8,14 @@ import {
   normalizeAttemptRelationship,
   relationshipForSummary,
 } from "./coach-loop.js";
+import {
+  clearCoachingSummaries,
+  deleteCoachingArtifacts,
+  readCoachingArtifact,
+  readCoachingSummaries,
+  readCoachingSummary,
+  saveCoachingSession,
+} from "./coach-storage.js";
 
 const app = document.querySelector("#app");
 const announcer = document.querySelector("#announcer");
@@ -229,7 +237,7 @@ function renderPracticeSetup() {
         <legend>Optional full session retention</legend>
         <label class="choice-row">
           <input type="checkbox" name="retainArtifacts" ${practice.setup.retainArtifacts && canRecord ? "checked" : ""}>
-          <span><strong>Keep the recording and captured transcript when available</strong><small>${canRecord ? "Stores the browser-encoded attempt recording and, when local transcription is enabled and succeeds, its captured transcript for this site in this browser profile. Those artifacts are never uploaded. There is no automatic local expiry; Progress downloads or deletes them per attempt and can also delete all local coaching data. Downloaded copies are yours to manage." : "This browser cannot create a local audio recording. Compact coaching summaries still work."}</small></span>
+          <span><strong>Keep the recording and captured transcript when available</strong><small>${canRecord ? "Stores the browser-encoded attempt recording and, when local transcription is enabled and succeeds, its captured transcript for this site in this browser profile. Those artifacts are never uploaded. Depending on the local storage version already used by this browser profile, artifacts either remain until you delete them or follow a 30-day local retention policy. Under that newer policy, newly saved artifacts get 30 days and existing artifacts get 30 days from the storage upgrade; browser storage pressure or site-data deletion can remove them sooner. Progress downloads or deletes them per attempt and can also delete all local coaching data. Downloaded copies are yours to manage." : "This browser cannot create a local audio recording. Compact coaching summaries still work."}</small></span>
         </label>
       </fieldset>
       <fieldset class="consent-card" aria-label="Optional cloud summary backup">
@@ -425,6 +433,17 @@ function retainedArtifactCopy(artifacts = {}) {
   if (artifacts.audioStored) return "The browser-encoded recording is stored only for this site in this browser profile; no captured transcript was saved.";
   if (artifacts.transcriptStored) return `The captured transcript is stored only for this site in this browser profile; no recording was saved.${transcriptCaveat}`;
   return "No full-session artifact was available to save.";
+}
+
+function appendArtifactWarning(message) {
+  const warning = String(message || "").trim();
+  if (!warning) return;
+  const current = String(practice.artifactWarning || "").trim();
+  if (!current) {
+    practice.artifactWarning = warning;
+  } else if (!current.includes(warning)) {
+    practice.artifactWarning = `${current} ${warning}`;
+  }
 }
 
 function renderCoachGrounding(grounding = {}) {
@@ -779,13 +798,13 @@ function startArtifactRecorder(run) {
       if (!run.discardRecording && event.data?.size) run.recordedChunks.push(event.data);
     };
     recorder.onerror = () => {
-      if (run === coachingRun) practice.artifactWarning = "The browser could not retain this recording.";
+      if (run === coachingRun) appendArtifactWarning("The browser could not retain this recording.");
     };
     recorder.start(1_000);
     run.recorder = recorder;
   } catch {
     run.recorder = null;
-    practice.artifactWarning = "The browser could not retain this recording.";
+    appendArtifactWarning("The browser could not retain this recording.");
   }
 }
 
@@ -866,7 +885,7 @@ async function finishCoachingSession(reason = "manual") {
   ]);
   const transcriptText = typeof capturedTranscript === "string" ? capturedTranscript.trim() : "";
   const transcriptMayBePartial = Boolean(transcriptText && run.transcriptFinalizationWarning);
-  if (transcriptMayBePartial) practice.artifactWarning ||= run.transcriptFinalizationWarning;
+  if (transcriptMayBePartial) appendArtifactWarning(run.transcriptFinalizationWarning);
   let report;
   let advice;
   try {
@@ -899,7 +918,7 @@ async function finishCoachingSession(reason = "manual") {
     ? buildCoachingArtifact(summary.id, summary.createdAt, audioBlob, transcriptText, transcriptMayBePartial)
     : null;
   if (practice.setup.retainArtifacts && !artifact) {
-    practice.artifactWarning ||= "No full recording or transcript artifact was available to save for this attempt.";
+    appendArtifactWarning("No full recording or transcript artifact was available to save for this attempt.");
   }
   summary.artifacts = artifactMetadata(artifact);
   practice.completedSummary = summary;
@@ -921,15 +940,23 @@ async function finishCoachingSession(reason = "manual") {
     };
   }
   try {
-    await saveCoachingSession(summary, artifact);
+    const storageResult = await saveCoachingSession(summary, artifact);
+    if (storageResult.artifactStatus !== "stored" && artifact) {
+      summary.artifacts = artifactMetadata(null);
+      if (storageResult.artifactStatus === "app-limit") {
+        appendArtifactWarning("The compact summary was saved, but this site's 128 MiB artifact limit is full. Existing recordings and transcripts were preserved.");
+      } else if (storageResult.artifactStatus === "browser-quota") {
+        appendArtifactWarning("The compact summary was saved, but the browser did not have enough storage for this recording or transcript.");
+      }
+    }
     practice.saved = true;
-    practice.artifactSaved = Boolean(artifact);
+    practice.artifactSaved = storageResult.artifactStatus === "stored";
     practice.savedArtifacts = summary.artifacts;
   } catch {
     practice.saved = false;
     practice.artifactSaved = false;
     practice.savedArtifacts = null;
-    practice.artifactWarning ||= "This browser could not save the local coaching record.";
+    appendArtifactWarning("This browser could not save the local coaching record.");
   }
   if (practice.setup.cloudSync) {
     try {
@@ -937,7 +964,7 @@ async function finishCoachingSession(reason = "manual") {
       practice.cloudSaved = true;
     } catch {
       practice.cloudSaved = false;
-      practice.artifactWarning ||= "The compact summary was saved locally, but its optional online backup did not complete.";
+      appendArtifactWarning("The compact summary was saved locally, but its optional online backup did not complete.");
     }
   }
   if (/^\/progress\/?$/i.test(location.pathname)) {
@@ -964,7 +991,7 @@ function stopCoachingLifecycle() {
 function handleCoachingInputEnded(run) {
   if (run !== coachingRun) return;
   if (practice.phase === "active") {
-    practice.artifactWarning ||= "Microphone input ended before the selected duration.";
+    appendArtifactWarning("Microphone input ended before the selected duration.");
     finishCoachingSession("input-ended").catch((error) => showToast(error.message));
     return;
   }
@@ -1311,102 +1338,6 @@ function formatAttemptDate(value) {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
 }
 
-const COACH_DB_NAME = "nonstoptalk-coaching";
-const COACH_STORE = "session-summaries";
-const COACH_ARTIFACT_STORE = "session-artifacts";
-const COACH_DB_VERSION = 2;
-
-function openCoachDatabase() {
-  return new Promise((resolve, reject) => {
-    if (!window.indexedDB) {
-      reject(new Error("IndexedDB unavailable"));
-      return;
-    }
-    let settled = false;
-    const fail = (error) => {
-      if (settled) return;
-      settled = true;
-      reject(error);
-    };
-    const request = indexedDB.open(COACH_DB_NAME, COACH_DB_VERSION);
-    request.onupgradeneeded = () => {
-      const database = request.result;
-      if (!database.objectStoreNames.contains(COACH_STORE)) {
-        const store = database.createObjectStore(COACH_STORE, { keyPath: "id" });
-        store.createIndex("createdAt", "createdAt");
-      }
-      if (!database.objectStoreNames.contains(COACH_ARTIFACT_STORE)) {
-        const store = database.createObjectStore(COACH_ARTIFACT_STORE, { keyPath: "id" });
-        store.createIndex("createdAt", "createdAt");
-      }
-    };
-    request.onsuccess = () => {
-      if (settled) {
-        request.result.close();
-        return;
-      }
-      settled = true;
-      resolve(request.result);
-    };
-    request.onerror = () => fail(request.error || new Error("Could not open coaching history"));
-    request.onblocked = () => fail(new Error("A previous NonStopTalk tab is blocking the coaching storage upgrade."));
-  });
-}
-
-async function withCoachTransaction(storeNames, mode, callback) {
-  const database = await openCoachDatabase();
-  try {
-    return await new Promise((resolve, reject) => {
-      const transaction = database.transaction(storeNames, mode);
-      let result;
-      try { result = callback(transaction); } catch (error) { reject(error); return; }
-      const isRequest = typeof IDBRequest === "function" && result instanceof IDBRequest;
-      transaction.oncomplete = () => resolve(isRequest ? result.result : result);
-      transaction.onerror = () => reject(transaction.error || new Error("Coaching history operation failed"));
-      transaction.onabort = () => reject(transaction.error || new Error("Coaching history operation was cancelled"));
-    });
-  } finally {
-    database.close();
-  }
-}
-
-function withCoachStore(storeName, mode, callback) {
-  return withCoachTransaction([storeName], mode, (transaction) => callback(transaction.objectStore(storeName)));
-}
-
-function saveCoachingSession(summary, artifact) {
-  const stores = artifact ? [COACH_STORE, COACH_ARTIFACT_STORE] : [COACH_STORE];
-  return withCoachTransaction(stores, "readwrite", (transaction) => {
-    transaction.objectStore(COACH_STORE).put(summary);
-    if (artifact) transaction.objectStore(COACH_ARTIFACT_STORE).put(artifact);
-  });
-}
-
-function readCoachingSummaries() {
-  return withCoachStore(COACH_STORE, "readonly", (store) => store.getAll());
-}
-
-function readCoachingSummary(id) {
-  return withCoachStore(COACH_STORE, "readonly", (store) => store.get(String(id || "")));
-}
-
-function readCoachingArtifact(id) {
-  return withCoachStore(COACH_ARTIFACT_STORE, "readonly", (store) => store.get(id));
-}
-
-function deleteCoachingArtifacts(id) {
-  const sessionId = String(id || "");
-  return withCoachTransaction([COACH_STORE, COACH_ARTIFACT_STORE], "readwrite", (transaction) => {
-    const summaries = transaction.objectStore(COACH_STORE);
-    const artifacts = transaction.objectStore(COACH_ARTIFACT_STORE);
-    const request = summaries.get(sessionId);
-    request.onsuccess = () => {
-      if (request.result) summaries.put({ ...request.result, artifacts: artifactMetadata(null) });
-      artifacts.delete(sessionId);
-    };
-  });
-}
-
 async function readCoachingSummariesWithRetry() {
   try {
     return await readCoachingSummaries();
@@ -1417,13 +1348,6 @@ async function readCoachingSummariesWithRetry() {
     await new Promise((resolve) => setTimeout(resolve, 50));
     return readCoachingSummaries();
   }
-}
-
-function clearCoachingSummaries() {
-  return withCoachTransaction([COACH_STORE, COACH_ARTIFACT_STORE], "readwrite", (transaction) => {
-    transaction.objectStore(COACH_STORE).clear();
-    transaction.objectStore(COACH_ARTIFACT_STORE).clear();
-  });
 }
 
 async function exportCoachingSummaries() {
@@ -1831,7 +1755,7 @@ async function handleClick(event) {
       await finishCoachingSession("manual");
     } else if (command === "coach-retry") {
       if (!hasPersistedAttempt(practice.saved, practice.cloudSaved)) {
-        practice.artifactWarning ||= "The baseline must be saved locally or online before starting its paired retry.";
+        appendArtifactWarning("The baseline must be saved locally or online before starting its paired retry.");
         renderPractice();
         focusMainHeading();
         announce("The baseline was not saved. Try the baseline again before starting a paired retry.");
