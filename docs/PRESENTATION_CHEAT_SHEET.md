@@ -25,6 +25,7 @@ Progress:                                                     ↑ reads IndexedD
 
 Play: browser → /api/rooms/... Worker → ROOMS binding → SQLite Durable Object
                                       ↕ hibernatable WebSockets
+                                      └→ bounded milestone outbox → receipt-gated D1
 
 Default/off coaching makes no coaching-data API call. The optional backup sends only an
 allowlisted summary to D1. Audio, recordings, and captured transcripts stay local, and
@@ -93,6 +94,8 @@ The optional choices start off and do different jobs. A standalone **Try again**
 
 > Durable Objects coordinate multiplayer Play rooms only. The player opens `/room/ABC234`; the browser uses `/api/rooms/ABC234/{state|join|action|socket}`. The Worker validates the request, selects one SQLite-backed object by room code through the internal `ROOMS` binding, and forwards the operation. The Durable Object has no separate public URL. Practice and Progress do not create or call one.
 
+The committed production and staging policy selects the same exact room-milestone lane: the room mutation and bounded local event group share one SQLite transaction and existing alarm, then each delivered milestone gets one 90-day D1 receipt so replay cannot repeat its eligible room fact or daily rollup. Staging is proved; production still needs its attended post-merge canary. Progress/consent D1 counters and all Analytics Engine writes remain best-effort.
+
 Deployment description: **Worker with Static Assets plus a SQLite Durable Object**, not Pages-only and not a Container.
 
 ## Deploy quick reference
@@ -118,6 +121,8 @@ npm run deploy
 ```
 
 For a repository-connected build, create a **Worker** project, use repository root `/`, select Node 22 or newer (24 matches CI), leave the output directory unset, and run the Cloudflare, coach, and cloud-progress tests in the build command. Provision D1, apply its migrations, and configure both secrets once per environment before using `npm run deploy`.
+
+For this production outbox-activation release only, the attended target-locked canary is `npm run smoke:production-outbox -- 58df8c9f-b4d7-4f3e-b15c-32dfec579355`. That UUID is the release-specific immediate code-rollback bookmark, not a permanent value or D1 bookmark; later releases must record a fresh reviewed rollback version.
 
 ## Safe claims
 
@@ -162,7 +167,7 @@ That adds cost, latency, provider and consent boundaries, nondeterminism, source
 
 **How do you know it helps?**
 
-We do not claim that yet. Pairing and descriptive comparison are implemented; their accuracy, repeatability, usefulness, fairness, and learning effect are not validated. The next pilot should measure completed loops, paired goal-specific distributions, false tips, distraction, availability, privacy, grounding, device effects, and fairness. The platform's best-effort room/summary-save/delete/consent counters do not measure learning outcomes; a pilot still needs a separate consented study design.
+We do not claim that yet. Pairing and descriptive comparison are implemented; their accuracy, repeatability, usefulness, fairness, and learning effect are not validated. The next pilot should measure completed loops, paired goal-specific distributions, false tips, distraction, availability, privacy, grounding, device effects, and fairness. Receipt-gated room-milestone D1 counters and best-effort summary-save/delete/consent counters do not measure learning outcomes; a pilot still needs a separate consented study design.
 
 **Why did the original Cloudflare deploy fail?**
 
@@ -170,7 +175,7 @@ Wrangler had no declared Worker entry point or static asset directory. `wrangler
 
 **Is it free?**
 
-The design uses free/low-cost Cloudflare primitives and requires no paid speech, AI, embedding, vector, Queue, R2, or Container service. Accounts, external coaching AI, Queues, and R2 are future choices. Do not promise unlimited or permanent pricing.
+The design uses free/low-cost Cloudflare primitives and requires no paid speech, AI, embedding, vector, Queue, R2, or Container service. Exact room-milestone delivery reuses bounded Durable Object SQLite plus its existing alarm and adds one 90-day D1 receipt per delivered milestone; it adds no service, binding, secret, migration, model, paid product, or fixed monthly cost. Accounts, external coaching AI, Queues, and R2 are future choices. Do not promise unlimited or permanent pricing.
 
 **Why keep Play?**
 

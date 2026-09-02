@@ -128,7 +128,7 @@ test("production health workflow probes exactly the reviewed delivery policies",
       + "        include:\n"
       + "          - environment: production\n"
       + "            origin: https://dontstoptalking.org\n"
-      + "            expected_delivery: best-effort\n"
+      + "            expected_delivery: durable-outbox\n"
       + "          - environment: staging\n"
       + "            origin: https://nonstoptalk-staging.aakashplays656.workers.dev\n"
       + "            expected_delivery: durable-outbox\n",
@@ -146,7 +146,7 @@ test("production health workflow probes exactly the reviewed delivery policies",
     {
       environment: "production",
       origin: "https://dontstoptalking.org",
-      expectedDelivery: "best-effort",
+      expectedDelivery: "durable-outbox",
     },
     {
       environment: "staging",
@@ -158,16 +158,16 @@ test("production health workflow probes exactly the reviewed delivery policies",
 });
 
 test("production probe defaults and accepts only reviewed analytics delivery policies", () => {
-  assert.equal(DEFAULT_EXPECTED_ANALYTICS_DELIVERY, "best-effort");
-  assert.equal(resolveExpectedAnalyticsDelivery(undefined, undefined), "best-effort");
+  assert.equal(DEFAULT_EXPECTED_ANALYTICS_DELIVERY, "durable-outbox");
+  assert.equal(resolveExpectedAnalyticsDelivery(undefined, undefined), "durable-outbox");
   for (const value of ["best-effort", "durable-outbox"]) {
     assert.equal(resolveExpectedAnalyticsDelivery(value, undefined), value);
     assert.equal(resolveExpectedAnalyticsDelivery(undefined, value), value);
   }
 
   assert.equal(
-    resolveExpectedAnalyticsDelivery("durable-outbox", "best-effort"),
-    "durable-outbox",
+    resolveExpectedAnalyticsDelivery("best-effort", "durable-outbox"),
+    "best-effort",
     "the explicit command-line policy must override the environment",
   );
   assert.equal(
@@ -176,7 +176,7 @@ test("production probe defaults and accepts only reviewed analytics delivery pol
     "a valid command-line policy must fully replace an ambient environment value",
   );
   assert.throws(
-    () => resolveExpectedAnalyticsDelivery("", "best-effort"),
+    () => resolveExpectedAnalyticsDelivery("", "durable-outbox"),
     /expected analytics delivery policy .*must be exactly/iu,
     "an explicitly empty CLI value must not fall through to a valid environment value",
   );

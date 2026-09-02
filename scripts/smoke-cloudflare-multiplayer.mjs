@@ -19,6 +19,7 @@ import {
   terminateProcessTree,
   waitForJsonReadiness,
 } from "./smoke-process-support.mjs";
+import { LOCAL_BEST_EFFORT_DELIVERY_WRANGLER_ARGS } from "./smoke-local-worker-policy.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const wrangler = path.join(root, "node_modules", "wrangler", "bin", "wrangler.js");
@@ -1096,6 +1097,7 @@ async function startWorker(stateDirectory, envFile, signal) {
           "--port", String(port),
           "--persist-to", stateDirectory,
           "--env-file", envFile,
+          ...LOCAL_BEST_EFFORT_DELIVERY_WRANGLER_ARGS,
           "--var", "TOPIC_ROUTINE_PROVIDER:offline",
           "--var", "TOPIC_ESCALATION_PROVIDER:off",
         ],

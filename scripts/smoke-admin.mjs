@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 
 import { chromium } from "playwright";
 
+import { LOCAL_BEST_EFFORT_DELIVERY_WRANGLER_ARGS } from "./smoke-local-worker-policy.mjs";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WEB_ANALYTICS_ORIGIN = "https://static.cloudflareinsights.com";
 
@@ -161,7 +163,16 @@ const port = await getFreePort();
 const origin = `http://127.0.0.1:${port}`;
 const wrangler = path.join(root, "node_modules", "wrangler", "bin", "wrangler.js");
 let logs = "";
-const child = spawn(process.execPath, [wrangler, "dev", "--local", "--ip", "127.0.0.1", "--port", String(port)], {
+const child = spawn(process.execPath, [
+  wrangler,
+  "dev",
+  "--local",
+  "--ip",
+  "127.0.0.1",
+  "--port",
+  String(port),
+  ...LOCAL_BEST_EFFORT_DELIVERY_WRANGLER_ARGS,
+], {
   cwd: root,
   detached: process.platform !== "win32",
   env: { ...process.env, NO_COLOR: "1" },

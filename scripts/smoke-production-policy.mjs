@@ -1,4 +1,4 @@
-export const DEFAULT_EXPECTED_ANALYTICS_DELIVERY = "best-effort";
+export const DEFAULT_EXPECTED_ANALYTICS_DELIVERY = "durable-outbox";
 export const REVIEWED_ANALYTICS_DELIVERY_POLICIES = Object.freeze([
   "best-effort",
   "durable-outbox",
