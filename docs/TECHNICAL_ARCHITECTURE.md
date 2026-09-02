@@ -16,6 +16,7 @@ local/self-hosted browser
 
 online browser SPA
   ├─ static HTML/CSS/JS ───────────────────────> Workers Static Assets
+  ├─ named setup kits + topic text ─────────────> origin-local localStorage/files
   ├─ JSON actions ─────────────────────────────> Worker /api/* router
   ├─ host theme + one-request consent ─────────> topic-provider adapter
   │                                                ├─ deterministic templates
@@ -62,10 +63,11 @@ There are two runtime editions. The richer local/self-hosted game edition is one
 - Tests: Go unit/handler/race/vet checks, a shared Go/TypeScript game-rule contract, and Playwright browser smoke flows
 - Free online runtime: Workers Static Assets, a TypeScript fetch router, SQLite-backed Durable Objects, and hibernatable WebSockets
 - In-progress web platform: versioned Worker APIs, central D1 repositories/migrations, an internal sync-profile foundation, scheduled anonymous-data expiry, coarse D1/Analytics Engine event aggregation, and a schema-v6 room-milestone lane with a configuration-gated atomic producer, receipt-gated receiver, active receipt expiry cleanup, Release-A-compatible retry consumer, and aggregate D1 model-usage budgeting
+- Cloudflare setup portability: a dependency-free, bounded `localStorage` setup-kit module plus plain-text topic parsing/serialization; only explicit kit application crosses the existing room-action boundary
 - Cloudflare verification: Node's test runner through `tsx`, isolated best-effort and exact-outbox Workers runtimes, a false-green-aware Vitest wrapper, browser smokes, and Wrangler deploy/startup checks
 - Coaching state: ephemeral browser objects plus IndexedDB v3 summary, opt-in artifact, and required content-free lifecycle stores
 - Coaching knowledge: curated in-app cards with local lexical retrieval and deterministic template assembly; no LLM, open-ended prose synthesis, embeddings, or vector database
-- Coaching verification: 42 Node tests for the deterministic engine, practice loop, and v3 storage contract; browser coverage asserting no coaching-data API request on the default/off path and exercising migration, lifecycle, the local artifact-usage dashboard, rollback, corruption, and summary-only fallbacks; and separate cloud-progress/platform tests for the allowlist, APIs, ownership, retention, and analytics
+- Coaching verification: 46 Node tests for the deterministic engine, practice loop, and v3 storage contract; browser coverage asserting no coaching-data API request on the default/off path and exercising migration, lifecycle, the local artifact-usage dashboard, rollback, corruption, and summary-only fallbacks; and separate cloud-progress/platform tests for the allowlist, APIs, ownership, retention, and analytics
 
 There is no SPA framework, frontend bundler, account system, server-side coaching analysis service, or server-side audio pipeline. The online edition uses browser-native modules, Durable Object SQLite/WebSockets for live rooms, and an in-progress D1/Analytics Engine platform layer; the Go edition does not.
 
@@ -91,6 +93,10 @@ cloudflare/worker.ts              Worker composition + SQLite-backed room object
 cloudflare/routes.ts              public API route parser
 cloudflare/public/app.js          online SPA routing, game UI, coaching lifecycle,
                                   downloads, and review
+cloudflare/public/setup-kits.js   bounded origin-local setup-kit store and
+                                  plain-text topic parser/serializer
+cloudflare/public/setup-kits.test.js
+                                  setup normalization, corruption, quota, and limits
 cloudflare/public/coach-storage.js
                                   IndexedDB v3 lifecycle policy, migration, and
                                   Release-A/newer-schema rollback compatibility
@@ -188,6 +194,10 @@ The server remains authoritative for room state and remote score caps. Browser t
 `cloudflare/worker.ts` routes public `/api/rooms/{code}` requests to one Durable Object selected by the normalized room code. The object serializes actions, stores the complete classic-game state in its private SQLite database, and broadcasts per-viewer public state through hibernatable WebSockets. `cloudflare/game.ts` owns the online rule implementation; identity tokens never appear in public state.
 
 Static navigation paths such as `/`, `/practice`, `/progress`, and `/room/ABC234` are served by Workers Static Assets with SPA fallback. The online multiplayer game performs microphone voice-activity analysis locally and remains classic-only for scoring. During setup, its host-only `/api/v1/models/topics` boundary can produce an editable topic draft from a theme capped at 200 characters. Routine generation is deterministic unless `TOPIC_ROUTINE_PROVIDER=glm` selects direct Z.AI GLM-4.7-Flash or `TOPIC_ROUTINE_PROVIDER=glm53` selects Workers AI GLM-5.3-Flash through the `AI` binding. Gemma 4 31B is available only when `TOPIC_ESCALATION_PROVIDER=gemma31` and the host explicitly selects escalation. Every external path also requires fresh consent for that generation attempt. The separate coaching route can create an explicitly consented transcript only through strict on-device browser recognition; it never uses the topic providers or sends captured transcript text or a recording to the Worker. Compact summary backup is an independent, off-by-default API boundary; captured-transcript/recording retention remains local-only.
+
+The source also imports `cloudflare/public/setup-kits.js` as a separate pure browser module. It stores at most 25 allowlisted, cloned records under a versioned `localStorage` key for the current origin/browser: name (40 Unicode code points), applied duration/silence/rounds, topic-pack ID, and at most 500 custom topics of 200 Unicode code points each. Editor input is capped at 20,000 characters and the full serialized store at 512 KiB. Corrupt/future-version data and storage read/quota failures fail closed; a failed write cannot deliberately replace the last valid bytes. This store is unencrypted, best effort, unsynced, and has no recovery.
+
+Save/delete and `.txt` import/export stay in the browser and make no application API, provider, analytics, D1, Analytics Engine, or Durable Object request. Import populates only the editor draft until the host explicitly uses the custom list. Exported files leave browser storage and therefore cannot be removed by app deletion. Apply is the only server transition: one flat `apply-setup-kit` action sends the selected settings/topics—but never the local kit name—to the existing same-origin room endpoint. The Durable Object authorizes host/setup state, substitutes its canonical built-in pack or validates a nonempty custom list, then resets deck state and commits one room version/topic generation. Validation failure, a guest request, or a started room leaves the entire room unchanged. Public guest state continues to omit the undrawn topics.
 
 ### Web platform foundation (in progress)
 
@@ -334,6 +344,8 @@ The Cloudflare edition stores each room in its own SQLite-backed Durable Object.
 
 Local coaching history remains independent of both room persistence systems. It uses best-effort IndexedDB v3 scoped to the current site origin and browser profile. Site-data deletion, private browsing, storage pressure, browser policy, or database failure may remove data or prevent a save before the app's deadline; expiry cleanup runs opportunistically on a later storage operation because no code runs while the site is closed. The required content-free lifecycle ledger gives new artifacts exactly 30 days from save and migrated artifacts exactly 30 days from upgrade, and Release A keeps honoring those rows during rollback. The optional D1 backup is a separate compact-summary store controlled by one device-level, UTC-day-bucketed anonymous inactivity lease and a new-save guard once 250 summaries exist. There is no account adoption, recovery, or cross-device sync yet.
 
+Cloudflare game setup kits use a third, deliberately independent store: unencrypted origin-local `localStorage`, not coaching IndexedDB, the room Durable Object, D1, or Analytics Engine. Clearing coaching history does not clear setup kits. Clearing site data, changing origin/port/browser profile, storage policy/pressure, or a corrupt/unavailable store can make kits disappear or prevent a save. A downloaded topic-text file is outside every in-app delete path.
+
 ## Embedded assets
 
 `assets.go` uses `go:embed` for templates and the complete static directory. Both entry points construct the server from that embedded filesystem. A compiled executable therefore works without a repository-relative working directory and does not need a separate static asset deployment.
@@ -362,6 +374,7 @@ Current controls include:
 - Three-hour local room lifetime and 30-day Durable Object room retention
 - Same-origin JSON mutations and WebSocket upgrades, 64 KiB bodies, per-source room-creation throttling, a general 60-requests-per-minute scoped API limiter, a dedicated five-topic-requests-per-minute `MODEL_RATE_LIMITER`, per-member socket caps, and private identity state online
 - Host/setup authorization, per-generation external consent, a 200-character theme cap, independent routine/escalation enablement, and an aggregate D1 daily provider limit of 100 by default
+- Setup-kit limits of 25 records, 40 Unicode code points per name, 500 custom topics of 200 code points each, 20,000 editor characters, and a 512 KiB serialized store; bounded numeric normalization, all-or-nothing topic validation, and one atomic room mutation on Apply
 - At most one external topic call per request, with no automatic escalation, provider retry, or Queue and a deterministic fallback on every unavailable/error path
 - Explicit microphone, transcript-analysis, artifact-retention, and compact-backup boundaries; route-scoped media/recorder cleanup; no coaching-data request on the default/off path; dual-sided summary allowlists; and separate local artifact storage
 
@@ -378,6 +391,7 @@ npx playwright install chromium
 npm run smoke
 npm run typecheck:cloudflare
 npm run test:cloudflare
+npm run test:setup-kits
 npm run test:worker-runtime-runner
 npm run test:staging-outbox-smoke
 npm run test:staging-outbox-rollback-drill
@@ -391,14 +405,14 @@ npm run smoke:coach
 npm run smoke:coach-storage
 ```
 
-The local Playwright suite covers manual fallback with reload/resume, mocked microphone completion, two-browser SSE play, offline AI judging, and fail-closed classic play. A separate hermetic Wrangler smoke uses two isolated browser contexts to cover the Cloudflare WebSocket room, host authorization, deterministic host scoring, Durable Object persistence across browser reconnect, and final-state convergence. Go and Cloudflare adapters both execute the versioned `testdata/game-contract.v1.json` cases for six core invariant families; endpoint-level Go tests additionally verify that rejected topic and score actions do not mutate room state or version. Cloudflare tests also cover persistence/public-state boundaries, platform routing, D1 validation/ownership/retention, relationship metadata, aggregate analytics, canonical milestone payload validation, receipt replay/conflict behavior, post-commit Analytics Engine isolation, schema-6 receipt cleanup, the absence of receipt SQL from schema-5 cleanup, best-effort rooms that do not initialize outbox storage, and rollback-bridge FIFO retry/dead-letter draining. A separate exact-outbox Workers runtime covers real Worker-to-Durable-Object delivery, atomic state/event/alarm rollback, stable IDs under transaction replay, FIFO lifecycle delivery, D1 ACK-crash replay, schema-marker recovery, eviction, concurrent joins, all-or-drop final pairs at capacity, canonicalization drops, exactly-one routing, and both Worker/Durable-Object version-skew directions. A hardened test runner treats known workerd teardown, pending-RPC, and uncaught-runtime errors as failures even if Vitest exits zero. The 42 coaching/storage tests comprise 34 deterministic signal/retrieval/relationship tests and eight IndexedDB contract tests for required v3 policy, the atomic progress snapshot, exact retention, byte accounting, conservative lifecycle validation, metadata scrubbing, and quota classification. Browser coverage verifies standalone live cues, the default review-only baseline → Progress/reload/resume → retry path, local storage, exact usage/deadline display, v1→v3 migration, artifact-only deletion, expiry, Release-A and future-schema compatibility, fail-closed corruption, 128 MiB app-limit and real browser-quota summary-only outcomes, and that local-first default/off paths make no coaching-data API request; cloud-progress tests separately exercise the opt-in client and allowlist. The platform smoke confirms the relationship round trip and reserved D1 columns. Wrangler validates the deploy bundle.
+The local Playwright suite covers manual fallback with reload/resume, mocked microphone completion, two-browser SSE play, offline AI judging, and fail-closed classic play. A separate hermetic Wrangler smoke uses two isolated browser contexts to cover the Cloudflare WebSocket room, host authorization, deterministic host scoring, Durable Object persistence across browser reconnect, setup-kit persistence/isolation, plain-text transfer, one-action application/convergence, and final-state convergence. Go and Cloudflare adapters both execute the versioned `testdata/game-contract.v1.json` cases for six core invariant families; endpoint-level Go tests additionally verify that rejected topic and score actions do not mutate room state or version. Cloudflare tests also cover setup-kit normalization/corruption/quota bounds, atomic host application and rejection, persistence/public-state boundaries, platform routing, D1 validation/ownership/retention, relationship metadata, aggregate analytics, canonical milestone payload validation, receipt replay/conflict behavior, post-commit Analytics Engine isolation, schema-6 receipt cleanup, the absence of receipt SQL from schema-5 cleanup, best-effort rooms that do not initialize outbox storage, and rollback-bridge FIFO retry/dead-letter draining. A separate exact-outbox Workers runtime covers real Worker-to-Durable-Object delivery, atomic state/event/alarm rollback, stable IDs under transaction replay, FIFO lifecycle delivery, D1 ACK-crash replay, schema-marker recovery, eviction, concurrent joins, all-or-drop final pairs at capacity, canonicalization drops, exactly-one routing, and both Worker/Durable-Object version-skew directions. A hardened test runner treats known workerd teardown, pending-RPC, and uncaught-runtime errors as failures even if Vitest exits zero. The 46 coaching/storage tests comprise 38 deterministic signal/retrieval/relationship tests and eight IndexedDB contract tests for required v3 policy, the atomic progress snapshot, exact retention, byte accounting, conservative lifecycle validation, metadata scrubbing, and quota classification. Browser coverage verifies standalone live cues, the default review-only baseline → Progress/reload/resume → retry path, local storage, exact usage/deadline display, v1→v3 migration, artifact-only deletion, expiry, Release-A and future-schema compatibility, fail-closed corruption, 128 MiB app-limit and real browser-quota summary-only outcomes, and that local-first default/off paths make no coaching-data API request; cloud-progress tests separately exercise the opt-in client and allowlist. The platform smoke confirms the relationship round trip and reserved D1 columns. Wrangler validates the deploy bundle.
 
 `smoke:coach-storage` supplies the storage-specific browser proof with a hash-pinned Release-A fixture and current code served on the same origin. It covers atomic migration/abort, exact retention and byte boundaries, corruption reconciliation, grace/no-eviction, a genuine two-tab cap race, blocked upgrades, compatible/incompatible future schemas, and Release-A rollback followed by v3 restoration. `smoke:coach` separately proves the Practice/Progress UI and default/off network boundary.
 
 ## Architectural backlog
 
 - Expand the shared cross-edition contract beyond its six current core invariant families, or generate more rules from a common source
-- Cloudflare parity for AI, presets, import/export, explicit microphone selection, and sound cues
+- Cloudflare parity for the AI judge, explicit microphone selection, and sound cues
 - Validation of coaching thresholds, repeatability, false-tip rate, distraction, browser/device availability, accessibility, and accent/language fairness
 - Learning-outcome, repeatability, usability, and fairness validation for the implemented baseline-to-unassisted-retry comparison
 - Coaching parity or a shared client strategy for the local Go edition

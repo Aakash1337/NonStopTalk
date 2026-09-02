@@ -298,13 +298,49 @@ export function applyAction(
 			}
 			break;
 		}
+		case "apply-setup-kit": {
+			requireHost(isHost);
+			requireSetup(room);
+
+			// A setup kit is one complete room mutation. Resolve and validate its
+			// topic source before changing settings so a malformed browser-local
+			// kit cannot leave a partially applied setup behind.
+			const nextSettings = {
+				duration: clamp(integer(action.duration, room.settings.duration), 10, 300),
+				silence: clamp(integer(action.silence, room.settings.silence), 1, 10),
+				rounds: clamp(integer(action.rounds, room.settings.rounds), 1, 10),
+				topicPack: "",
+			};
+			const requestedPack = text(action.topicPack);
+			const builtInPack = TOPIC_PACKS.find((candidate) => candidate.id === requestedPack);
+			let nextTopics: string[];
+			if (builtInPack) {
+				nextSettings.topicPack = builtInPack.id;
+				// Built-in packs are server-owned. Ignore any stale or modified copy
+				// stored in the browser with the rest of the kit.
+				nextTopics = [...builtInPack.topics];
+			} else if (requestedPack === "custom") {
+				nextSettings.topicPack = "custom";
+				nextTopics = cleanActionTopics(action.topics);
+				if (!nextTopics.length) throw new GameError("Choose at least one topic.");
+			} else {
+				throw new GameError("Choose a valid topic pack.");
+			}
+			const nextTopicGeneration = currentTopicGeneration(room) + 1;
+
+			room.settings = nextSettings;
+			room.topics = nextTopics;
+			room.topicGeneration = nextTopicGeneration;
+			resetDeck(room);
+			// This index belongs to the replaced topic collection, unlike a deck
+			// reset between games where cross-cycle repeat protection is useful.
+			room.lastTopicIndex = null;
+			break;
+		}
 		case "custom-topics": {
 			requireHost(isHost);
 			requireSetup(room);
-			const topics = Array.isArray(action.topics)
-				? action.topics.map(String)
-				: text(action.topics).replaceAll("\r\n", "\n").split("\n");
-			const cleaned = cleanTopics(topics);
+			const cleaned = cleanActionTopics(action.topics);
 			if (!cleaned.length) throw new GameError("Choose at least one topic.");
 			if (action.topicGeneration !== undefined) {
 				if (integer(action.topicGeneration, -1) !== currentTopicGeneration(room)) {
@@ -697,13 +733,21 @@ function cleanTopics(values: string[]): string[] {
 		const topic = trimGameSpace(
 			truncateCodePoints(trimGameSpace(String(value)), MAX_TOPIC_CODE_POINTS),
 		);
-		const key = topic.toLocaleLowerCase();
+		// Keep duplicate handling identical across browser and Worker locales.
+		const key = topic.toLowerCase();
 		if (!topic || seen.has(key)) continue;
 		seen.add(key);
 		topics.push(topic);
 		if (topics.length === 500) break;
 	}
 	return topics;
+}
+
+function cleanActionTopics(value: unknown): string[] {
+	const topics = Array.isArray(value)
+		? value.map(String)
+		: text(value).replaceAll("\r\n", "\n").split("\n");
+	return cleanTopics(topics);
 }
 
 function cleanName(value: string): string {

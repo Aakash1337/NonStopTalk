@@ -206,8 +206,60 @@ async function runAccessibilityFlow(browser, origin) {
   assert(await page.title() === `Room ${roomCode} · NonStopTalk`, "Room routes must have a descriptive document title");
   assert(await page.getByLabel("Custom topics, one per line").count() === 1,
     "The custom-topic editor must have an accessible name");
+  assert(await page.getByRole("heading", { level: 2, name: "Local setup kits" }).count() === 1,
+    "The host lobby must expose a named Local setup kits section");
+  assert(await page.getByLabel("Saved setup kit").count() === 1,
+    "The saved-kit selector must have an accessible name");
+  assert(await page.getByLabel("Kit name").count() === 1,
+    "The setup-kit name field must have an accessible name");
+  assert(await page.getByLabel("Import topic list (.txt)").count() === 1,
+    "The topic import control must have an accessible name");
+  assert(await page.getByRole("button", { name: "Apply selected kit" }).isDisabled(),
+    "Apply must be disabled while the local kit library is empty");
+  assert(await page.getByRole("button", { name: "Delete selected kit" }).isDisabled(),
+    "Delete must be disabled while the local kit library is empty");
+  assert(await page.locator("[data-setup-kit-status]").getAttribute("role") === "status",
+    "Setup-kit feedback must use live status semantics");
   await assertSinglePageStructure(page, "Room lobby");
   await assertNoAxeViolations(page, "Room lobby");
+
+  // Enter submits the local save form, then focus lands on the replacement
+  // button instead of disappearing when the panel rerenders.
+  const kitName = page.getByLabel("Kit name");
+  await kitName.fill("Keyboard kit");
+  await kitName.press("Enter");
+  await page.locator("[data-setup-kit-status]").filter({ hasText: "Saved “Keyboard kit” on this device." }).waitFor();
+  const saveKit = page.getByRole("button", { name: "Save applied setup" });
+  assert(await saveKit.evaluate((button) => document.activeElement === button),
+    "Keyboard save must retain a useful focus target after the local rerender");
+  assert(!await page.getByRole("button", { name: "Apply selected kit" }).isDisabled(),
+    "A saved kit must enable Apply");
+
+  const applyKit = page.getByRole("button", { name: "Apply selected kit" });
+  await applyKit.focus();
+  await page.keyboard.press("Enter");
+  await page.locator("[data-setup-kit-status]").filter({ hasText: `Applied “Keyboard kit” to room ${roomCode}.` }).waitFor();
+  assert(await applyKit.evaluate((button) => document.activeElement === button),
+    "Keyboard apply must preserve focus through the authoritative room rerender");
+  await assertNoAxeViolations(page, "Room lobby with a saved setup kit");
+
+  const topicImport = page.getByLabel("Import topic list (.txt)");
+  await topicImport.focus();
+  assert(await topicImport.evaluate((input) => document.activeElement === input),
+    "The native topic-file control must be keyboard focusable");
+
+  await page.setViewportSize({ width: 320, height: 800 });
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    "The room lobby and setup-kit controls must reflow at 320 CSS pixels without page-level horizontal scrolling");
+  assert(await page.locator("[data-setup-kits]").evaluate((panel) => panel.scrollWidth <= panel.clientWidth),
+    "The setup-kit panel must not overflow its 320-pixel layout");
+  await assertNoAxeViolations(page, "Room lobby with setup kits at 320 CSS pixels");
+
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  const setupTransitionDurations = await page.locator("[data-setup-kits]").evaluate((panel) => getComputedStyle(panel).transitionDuration);
+  assert(setupTransitionDurations.split(",").every((duration) => Number.parseFloat(duration) === 0),
+    `Reduced-motion mode must remove setup-kit transitions, got ${JSON.stringify(setupTransitionDurations)}`);
+  await page.setViewportSize({ width: 1280, height: 900 });
 
   const localPlayerForm = page.locator("form[data-room-action]:has(input[value='add-player'])");
   await localPlayerForm.locator("input[name='name']").fill("Accessibility Guest");
@@ -228,7 +280,7 @@ async function runAccessibilityFlow(browser, origin) {
 
   await page.setViewportSize({ width: 320, height: 800 });
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
-    "The room lobby must reflow at 320 CSS pixels without page-level horizontal scrolling");
+    "The active room must reflow at 320 CSS pixels without page-level horizontal scrolling");
 
   await page.emulateMedia({ reducedMotion: "reduce" });
   const transitionDurations = await page.evaluate(() => {

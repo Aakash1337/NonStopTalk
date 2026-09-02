@@ -18,6 +18,20 @@ declared in `wrangler.jsonc`.
 The default provider policy is `offline` / `off` with a daily external-call
 ceiling of 100. A normal deploy must not contact a model.
 
+Named game setup kits are not an inventory resource. The current source stores
+the saved library—names, applied settings, and custom topics—in unencrypted,
+best-effort `localStorage` for one origin/browser profile. Save/delete and
+plain-text import/export make no application network, model, analytics, D1, or
+Durable Object request. Explicit Apply sends the selected settings/topics—but
+not the local kit name—through one existing same-origin room action and uses
+normal Durable Object room persistence. The Apply action itself creates no D1
+or Analytics Engine work; later ordinary milestones may include coarse applied
+settings under the existing pseudonymous room-fact policy. There is no setup-kit
+server backup, recovery, synchronization, or new Cloudflare product, resource,
+or binding; Apply still consumes an existing Worker/Durable Object request and
+write allocation. Deleting coaching history does not delete setup kits, and an
+exported `.txt` file is outside app control.
+
 `dontstoptalking.org` is declared as the production custom domain in
 `wrangler.jsonc`. Version preview URLs are disabled because a preview would
 otherwise share its environment's Durable Objects and D1 bindings. Source maps
@@ -46,15 +60,18 @@ npm run test:staging-outbox-rollback-drill
 npm run check:cloudflare-types
 npm run typecheck:cloudflare
 npm run test:cloudflare
+npm run test:setup-kits
 npm run test:cloudflare-runtime
 npm run test:cloudflare-runtime-outbox
 npm run check:cloudflare
 npm run check:cloudflare-staging
 npm run check:cloudflare-startup
 npm run smoke:platform
+npx playwright install --with-deps chromium
 npm run smoke:multiplayer
 npm run smoke:accessibility
 npm run smoke:coach
+npm run smoke:coach-storage
 npm run smoke:admin
 npm run smoke
 ```
@@ -128,10 +145,16 @@ creator, a later cron editor, or the user who re-enables it); do not assume
 repository watchers receive them. The probe retries ordinary page and API GETs
 up to five times before failing, which absorbs a short network interruption
 without concealing a sustained outage. It separately fetches and validates the
-public `app.js`/`coach-storage.js` module graph together for up to eight bounded
-attempts. This accommodates the brief mixed asset generation an edge can expose
-immediately after a deployment while still failing a persistent missing module,
-wrong MIME type, HTML fallback, or missing security header.
+public `app.js` + `coach-storage.js` + `coach-engine.js` + `setup-kits.js`
+module graph as one generation for up to eight bounded attempts. It requires
+every served module to match the corresponding checked-out release source
+byte-for-byte, then checks the reviewed unbundled import/consumption/export
+shapes and syntax within a 512 KiB decompressed-body ceiling. The source-shape
+check is a deployment canary, not a general JavaScript reachability proof;
+CI and the browser smokes exercise the runtime integrations. This accommodates
+the brief mixed asset generation an edge can expose immediately after a deployment while still
+failing a persistent mixed generation, missing module, wrong export/MIME type,
+HTML fallback, or missing security header.
 
 ## Staging promotion
 

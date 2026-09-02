@@ -17,7 +17,7 @@ An incremental [web platform foundation](docs/WEB_PLATFORM_PLAN.md) is now in pr
 - Local pass-and-play and remote turns in the same room
 - Player add, rename, remove, and reorder controls
 - Configurable 10–300 second turns, 1–10 second silence limits, and 1–10 rounds
-- Five built-in topic packs plus custom lists; the local Go edition also has import/export, offline or provider-assisted theme generation, and device-local saved presets. The Cloudflare edition can turn a host theme into an editable draft through deterministic templates by default, direct Z.AI GLM-4.7-Flash as the strict-free routine option, Workers AI GLM-5.3-Flash as the preferred low-cost paid routine option, or Gemma 4 31B for an explicitly selected escalation.
+- Five built-in topic packs plus custom lists. Both editions support plain-text custom-topic import/export and browser-local saved setups; the Cloudflare source provides host-only named setup kits containing the currently applied duration, silence limit, rounds, topic pack, and custom topics. The Cloudflare edition can also turn a host theme into an editable draft through deterministic templates by default, direct Z.AI GLM-4.7-Flash as the strict-free routine option, Workers AI GLM-5.3-Flash as the preferred low-cost paid routine option, or Gemma 4 31B for an explicitly selected escalation.
 - A shuffled topic deck that uses every available topic before repeating; with more than one topic, a new cycle does not immediately repeat the previous draw
 - Local voice-activity and silence detection plus a manual timer fallback; the Go edition also has microphone selection and sound cues
 - Classic scoring, score explanations, host adjustments, standings, winner view, and the last 20 finished games in each room; optional AI relevance bonuses are available in the local Go edition
@@ -44,6 +44,8 @@ The platform also includes a narrow, disabled-by-default theme-to-topics provide
 Classic play does not require an account, an API key, transcription, or audio upload. The browser uses its microphone locally for voice-activity detection. Coaching similarly processes microphone frames in the browser and never uploads audio or captured transcript text. With cloud summary backup off—the default—a coaching attempt makes no coaching-data API call. If the user explicitly enables backup, the app sends only the compact allowlisted summary to the NonStopTalk Worker/D1 platform. Attempt-recording/captured-transcript retention is a separate, off-by-default local-storage option; without it, audio is reduced to measurements and captured transcript text is discarded.
 
 The free Cloudflare multiplayer game remains classic-only for scoring. Its optional topic generator can make a single external request only after the host consents for that generation attempt; the normalized theme, capped at 200 characters, is the only host or room content sent to the provider. Audio, transcript text, names, and room tokens are excluded. Deterministic topic generation remains the default and fallback. The separate coaching path may create a transcript only after explicit consent and only when the browser supports mandatory on-device recognition. Derived filler/repetition patterns are saved with its compact summary and may be part of an explicitly selected cloud backup; captured transcript text is never part of that backup. By default captured transcript text is discarded; if the user separately enables full-session retention, the recording and available captured transcript are stored only for that site origin and browser profile. A finalization warning is persisted and shown whenever retained text may be partial. Coaching-card retrieval and deterministic review assembly also stay in the browser. The following AI-judge behavior belongs to the local Go game edition.
+
+Cloudflare setup kits are a separate browser-local convenience, not an account or cloud library. Kit names, settings, and custom topics are stored unencrypted in `localStorage` for the current origin and browser profile, with a maximum of 25 kits, 40 Unicode code points per name, 500 topics of 200 code points each, 20,000 characters of editor text, and 512 KiB for the serialized kit store. Saving/deleting a kit and importing/exporting topic text make no application API, model, analytics, D1, or Durable Object request and add no Cloudflare resource or cost. Import fills only the editor draft until the host explicitly uses the custom list. Applying a kit sends exactly its selected room settings/topics through one existing same-origin room action; the room Durable Object validates custom topics, replaces built-in packs with server-canonical content, and commits one atomic room version/generation change. Kit names never enter room state, D1, Analytics Engine, or a model, and guests never receive the undrawn topic list. Browser storage is best effort, unsynced, and has no recovery; exported `.txt` files are outside the app's deletion or retention control. Deleting coaching history does not delete game setup kits.
 
 The AI judge is opt-in at two levels: the host enables it for the room, then the current speaker chooses whether to use transcription for that turn. Transcription starts only when the browser exposes `SpeechRecognition` with `processLocally` support and accepts the selected live microphone track. If any of those checks fail, the turn continues with classic scoring or the manual timer.
 
@@ -186,6 +188,7 @@ Validate the native Cloudflare game rules and deploy bundle:
 ```sh
 npm run typecheck:cloudflare
 npm run test:cloudflare
+npm run test:setup-kits
 npm run test:coach
 npm run test:cloud-progress
 npm run test:admin
@@ -223,6 +226,7 @@ npm run smoke:platform
 - An in-progress modular platform layer using D1 for queryable consented summaries and protected daily rollups, plus Analytics Engine for coarse best-effort telemetry; Durable Objects remain responsible for live rooms, and a configuration-gated atomic outbox producer is enabled in staging while remaining off in production, with a Release-A-compatible consumer and no additional service
 - A dependency-free, protected operator dashboard over the existing aggregate APIs, isolated from public-site RUM and backed by reconciled daily tables
 - A separate Cloudflare topic-provider adapter with deterministic default/fallback behavior, optional direct GLM-4.7 or Workers AI GLM-5.3-Flash routine generation, explicit Gemma 4 31B escalation, and aggregate D1 cost controls
+- A dependency-free Cloudflare setup-kit module using origin-scoped `localStorage`, with bounded named kits and plain-text custom-topic import/export; only explicit Apply crosses the existing room-action boundary
 - Playwright browser smoke coverage plus Go unit and handler tests
 
 There is no frontend build step for local play.
@@ -238,7 +242,7 @@ These ideas are not presented as current features:
 - Visible user profiles and profile management
 - Family/content filters
 - Post-turn AI summaries
-- Full multiplayer-game feature parity between the local Go and free Cloudflare editions (AI judge, saved presets, import/export, microphone picker, and sound cues)
+- Full multiplayer-game feature parity between the local Go and free Cloudflare editions (AI judge, microphone picker, and sound cues remain)
 - Validated learning outcomes from baseline-to-unassisted-retry coaching programs; the product now implements descriptive pairing but does not claim that a changed measurement is improvement
 - Coaching accuracy, usability, accessibility, and accent/language fairness validation across browsers and microphones
 - Guided programs, accounts and cross-device authentication/progress, educator tools, and optional external semantic/AI coaching

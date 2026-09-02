@@ -83,11 +83,16 @@ This is lightweight coordination for a social game, not adversarial anti-cheat.
 
 ## Topics and replay
 
-The current packs are Everyday Sparks, Story Time, Absurd Arguments, Fast Debate, and Instant Expert. Hosts can paste or edit a custom list in either edition. The Go edition additionally lets hosts:
+The current packs are Everyday Sparks, Story Time, Absurd Arguments, Fast Debate, and Instant Expert. Hosts can paste or edit a custom list in either edition. Both editions can import/export that editor as plain text. In the Cloudflare source, importing fills only the editor draft; it does not change the room until the host explicitly uses the custom list. The downloaded `.txt` file is an ordinary device file outside the app's deletion and retention controls.
 
-- Import/export custom topics as plain text.
+The Go edition additionally lets hosts:
+
 - Generate ten prompts from a theme through server templates, Anthropic, or Z.AI GLM according to `NONSTOPTALK_AI_PROVIDER`.
 - Save settings plus custom topics as a browser-local preset.
+
+The Cloudflare source additionally lets the current host save up to 25 named setup kits for that site origin and browser profile. Each kit captures the currently applied duration, silence limit, rounds, topic-pack choice, and custom topics. Names are limited to 40 Unicode code points; custom lists are limited to 500 topics of 200 code points each; editor text is limited to 20,000 characters; and the serialized kit store is limited to 512 KiB. The saved library lives only in unencrypted, best-effort `localStorage`; it is not synced, backed up, recoverable, or sent to other room participants. Once a kit is applied, its settings have ordinary room visibility, while public guest state still omits the undrawn topic text.
+
+Saving/deleting kits and importing/exporting text make no application API, model, analytics, D1, or Durable Object request. Applying a kit is explicit: the browser sends its selected settings/topics in one existing same-origin room action, without the local kit name. The room normalizes bounded settings and validates the topic source before committing, replaces built-in contents from server-canonical packs or accepts a nonempty normalized custom list, resets the shuffled deck, and commits one atomic room version/topic-generation change. An unknown pack, empty normalized custom list, authorization failure, or phase failure changes nothing, and guests never receive the undrawn topic list.
 
 Each room retains summaries of its last 20 finished games. Summaries contain standings and turn count, not transcripts.
 

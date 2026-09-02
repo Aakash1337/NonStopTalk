@@ -22,6 +22,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const wrangler = path.join(root, "node_modules", "wrangler", "bin", "wrangler.js");
 const WHOLE_SMOKE_TIMEOUT_MS = 180_000;
 const TOPIC = "A deterministic smoke-test topic";
+const IMPORTED_TOPICS = "Imported <strong>topic</strong>\nA second imported topic";
 
 function boundedMessage(value) {
   return String(value instanceof Error ? value.message : value).slice(0, 500);
@@ -126,6 +127,30 @@ function trackBrowser(page, label) {
   return { pageErrors, socketErrors, sockets };
 }
 
+function trackApiRequests(page) {
+  const requests = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.origin !== new URL(page.url() || url).origin || !url.pathname.startsWith("/api/")) return;
+    let body = null;
+    try { body = request.postDataJSON(); } catch { /* Non-JSON requests have no action body. */ }
+    requests.push({ method: request.method(), path: url.pathname, body });
+  });
+  return requests;
+}
+
+async function readDownloadText(download) {
+  const stream = await download.createReadStream();
+  assert.ok(stream, "The browser download must expose a readable stream.");
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function assertNoNewApiRequests(requests, before, label) {
+  assert.deepEqual(requests.slice(before), [], `${label} unexpectedly contacted a site API.`);
+}
+
 async function eventually(check, label, signal, timeoutMs = 12_000) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
@@ -173,6 +198,14 @@ async function readRoom(page, code) {
   }, code);
 }
 
+async function postRoomAction(context, origin, code, action) {
+  const response = await context.request.post(`${origin}/api/rooms/${code}/action`, {
+    data: action,
+    headers: { Accept: "application/json" },
+  });
+  assert.equal(response.status(), 200, `Remote room action ${action.type} failed: ${await response.text()}`);
+}
+
 async function unauthorizedSettingsProbe(page, code) {
   return page.evaluate(async (roomCode) => {
     const getState = async () => {
@@ -208,6 +241,44 @@ async function unauthorizedSettingsProbe(page, code) {
   }, code);
 }
 
+async function unauthorizedSetupKitProbe(page, code) {
+  return page.evaluate(async (roomCode) => {
+    const getState = async () => {
+      const response = await fetch(`/api/rooms/${roomCode}/state`, {
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+      });
+      return response.json();
+    };
+    const before = await getState();
+    const response = await fetch(`/api/rooms/${roomCode}/action`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "apply-setup-kit",
+        duration: 10,
+        silence: 1,
+        rounds: 1,
+        topicPack: "custom",
+        topics: ["Unauthorized setup-kit topic"],
+      }),
+    });
+    const error = await response.json();
+    const after = await getState();
+    return {
+      status: response.status,
+      error: error.error,
+      beforeVersion: before.room?.version,
+      afterVersion: after.room?.version,
+      beforeSettings: before.room?.settings,
+      afterSettings: after.room?.settings,
+      beforeTopics: before.room?.topics,
+      afterTopics: after.room?.topics,
+    };
+  }, code);
+}
+
 async function runBrowserFlow(origin, signal) {
   throwIfAborted(signal, "Browser flow");
   const browser = await launchBrowser(signal);
@@ -233,6 +304,7 @@ async function runBrowserFlow(origin, signal) {
     const guest = await guestContext.newPage();
     const hostTracker = trackBrowser(host, "host");
     const guestTracker = trackBrowser(guest, "guest");
+    const hostApiRequests = trackApiRequests(host);
     for (const page of [host, guest]) {
       page.setDefaultTimeout(12_000);
       page.setDefaultNavigationTimeout(20_000);
@@ -257,6 +329,9 @@ async function runBrowserFlow(origin, signal) {
     await waitForSocket(guestTracker, code, signal);
     await host.getByLabel("Rename Cloud Guest").waitFor();
     await host.getByRole("button", { name: "Make Cloud Guest the host" }).waitFor();
+    const joinedGuest = await readRoom(guest, code);
+    const guestPlayerId = joinedGuest.payload.room?.viewer?.playerId;
+    assert.ok(guestPlayerId, "The joined guest must have a player identity.");
 
     const hostCookie = (await hostContext.cookies(origin)).find((cookie) => cookie.name === "nonstoptalk_token");
     const guestCookie = (await guestContext.cookies(origin)).find((cookie) => cookie.name === "nonstoptalk_token");
@@ -267,8 +342,34 @@ async function runBrowserFlow(origin, signal) {
     assert.equal(await guest.locator("form.settings").count(), 0);
     assert.equal(await guest.locator("[data-model-topics]").count(), 0);
     assert.equal(await guest.getByLabel("Custom topics, one per line").count(), 0);
+    assert.equal(await guest.locator("[data-setup-kits]").count(), 0);
     assert.equal(await guest.getByLabel("Local player").count(), 0);
     assert.equal(await guest.getByRole("button", { name: "Start game" }).count(), 0);
+    await host.getByRole("heading", { level: 2, name: "Local setup kits" }).waitFor();
+
+    // A browser storage failure disables only the local library; the host lobby
+    // stays rendered and recovers when storage access returns.
+    let requestCount = hostApiRequests.length;
+    await host.evaluate(() => {
+      window.__setupKitOriginalGetItem = Storage.prototype.getItem;
+      Storage.prototype.getItem = () => { throw new DOMException("blocked", "SecurityError"); };
+      window.dispatchEvent(new StorageEvent("storage", { key: "nonstoptalk.setup-kits.v1" }));
+    });
+    await host.locator("[data-setup-kit-status]")
+      .filter({ hasText: "Saved setup kits could not be read." }).waitFor();
+    assert(await host.getByRole("button", { name: "Save applied setup" }).isDisabled(),
+      "A local-storage failure must disable setup-kit writes without crashing the room.");
+    assert.equal(await host.getByRole("heading", { level: 1, name: `Room ${code}` }).count(), 1,
+      "A local-storage failure must not replace the rest of the room UI.");
+    assertNoNewApiRequests(hostApiRequests, requestCount, "Rendering a local-storage setup-kit error");
+    await host.evaluate(() => {
+      Storage.prototype.getItem = window.__setupKitOriginalGetItem;
+      delete window.__setupKitOriginalGetItem;
+      window.dispatchEvent(new StorageEvent("storage", { key: "nonstoptalk.setup-kits.v1" }));
+    });
+    await host.getByRole("button", { name: "Save applied setup" }).waitFor({ state: "visible" });
+    assert(!await host.getByRole("button", { name: "Save applied setup" }).isDisabled(),
+      "Setup-kit controls must recover after local storage becomes available.");
 
     const unauthorized = await unauthorizedSettingsProbe(guest, code);
     assert.equal(unauthorized.status, 403);
@@ -277,6 +378,125 @@ async function runBrowserFlow(origin, signal) {
       "A rejected guest action must not advance the room version.");
     assert.deepEqual(unauthorized.afterSettings, unauthorized.beforeSettings,
       "A rejected guest action must not change room settings.");
+    const unauthorizedKit = await unauthorizedSetupKitProbe(guest, code);
+    assert.equal(unauthorizedKit.status, 403);
+    assert.equal(unauthorizedKit.error, "Only the host can do that.");
+    assert.equal(unauthorizedKit.afterVersion, unauthorizedKit.beforeVersion,
+      "A rejected guest setup kit must not advance the room version.");
+    assert.deepEqual(unauthorizedKit.afterSettings, unauthorizedKit.beforeSettings,
+      "A rejected guest setup kit must not change room settings.");
+    assert.deepEqual(unauthorizedKit.afterTopics, unauthorizedKit.beforeTopics,
+      "A rejected guest setup kit must not change room topics.");
+
+    // Saving a kit is browser-local, escapes its name, and survives a reload in
+    // this browser context without appearing in another browser identity.
+    requestCount = hostApiRequests.length;
+    const kitName = "Default <kit>";
+    const kitNameInput = host.getByLabel("Kit name");
+    await kitNameInput.fill(kitName);
+    await kitNameInput.press("Enter");
+    await host.locator("[data-setup-kit-status]").filter({ hasText: `Saved “${kitName}” on this device.` }).waitFor();
+    assertNoNewApiRequests(hostApiRequests, requestCount, "Saving a local setup kit");
+    assert.equal(await host.locator("[data-setup-kits] kit").count(), 0,
+      "A hostile setup-kit name must remain text instead of becoming markup.");
+    const storedDefault = await host.evaluate(() => JSON.parse(localStorage.getItem("nonstoptalk.setup-kits.v1")));
+    assert.deepEqual(storedDefault, {
+      schemaVersion: 1,
+      kits: [{ name: kitName, duration: 60, silence: 2, rounds: 1, topicPack: "everyday", topics: [] }],
+    });
+    assert.equal(await guest.evaluate(() => localStorage.getItem("nonstoptalk.setup-kits.v1")), null,
+      "A setup kit must not cross isolated browser contexts.");
+
+    const socketCountBeforeKitReload = hostTracker.sockets
+      .filter((socket) => new URL(socket.url).pathname === `/api/rooms/${code}/socket`).length;
+    await host.reload({ waitUntil: "domcontentloaded" });
+    await host.getByLabel("Saved setup kit").waitFor();
+    assert.equal(await host.getByLabel("Saved setup kit").inputValue(), kitName);
+    await waitForSocket(hostTracker, code, signal, socketCountBeforeKitReload);
+
+    // Host transfer hides the old host's local controls. The new host sees only
+    // the library from its own browser profile, then can transfer control back.
+    await host.getByRole("button", { name: "Make Cloud Guest the host" }).click();
+    await guest.getByRole("heading", { level: 2, name: "Local setup kits" }).waitFor();
+    await eventually(() => host.locator("[data-setup-kits]").count().then((count) => count === 0),
+      "The former host retained setup-kit controls", signal);
+    assert.equal(await guest.getByLabel("Saved setup kit").inputValue(), "",
+      "The new host must see its own empty browser-local kit library.");
+    await guest.getByRole("button", { name: "Make Cloud Host the host" }).click();
+    await host.getByLabel("Saved setup kit").waitFor();
+    assert.equal(await host.getByLabel("Saved setup kit").inputValue(), kitName);
+    await eventually(() => guest.locator("[data-setup-kits]").count().then((count) => count === 0),
+      "Setup-kit controls remained visible after transferring host back", signal);
+
+    // Plain-text import edits only the local draft. A guest mutation forces a
+    // WebSocket rerender and proves the imported draft and focus survive it.
+    requestCount = hostApiRequests.length;
+    const topicImport = host.locator("[data-topic-import]");
+    await topicImport.setInputFiles({
+      name: "portable-topics.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from(IMPORTED_TOPICS),
+    });
+    const topicEditor = host.getByLabel("Custom topics, one per line");
+    await host.locator("[data-topic-status]").filter({ hasText: "Imported 2 topics" }).waitFor();
+    assert.equal(await topicEditor.inputValue(), IMPORTED_TOPICS);
+    assert(await topicEditor.evaluate((control) => document.activeElement === control),
+      "Topic import must return focus to the editable draft.");
+    assertNoNewApiRequests(hostApiRequests, requestCount, "Importing a local topic file");
+
+    await postRoomAction(guestContext, origin, code, {
+      type: "rename-player",
+      playerId: guestPlayerId,
+      name: "Cloud Guest Two",
+    });
+    await host.getByLabel("Rename Cloud Guest Two").waitFor();
+    assert.equal(await topicEditor.inputValue(), IMPORTED_TOPICS,
+      "A WebSocket rerender discarded the imported topic draft.");
+    assert(await topicEditor.evaluate((control) => document.activeElement === control),
+      "A WebSocket rerender discarded topic-editor focus.");
+    assert.match(await host.locator("[data-topic-status]").textContent(), /Imported 2 topics/u,
+      "A WebSocket rerender discarded topic-import status.");
+
+    requestCount = hostApiRequests.length;
+    const [topicDownload] = await Promise.all([
+      host.waitForEvent("download"),
+      host.getByRole("button", { name: "Export topic list" }).click(),
+    ]);
+    assert.equal(topicDownload.suggestedFilename(), "nonstoptalk-topics.txt");
+    assert.equal(await readDownloadText(topicDownload), IMPORTED_TOPICS);
+    assertNoNewApiRequests(hostApiRequests, requestCount, "Exporting the topic editor");
+    assert(await host.getByRole("button", { name: "Export topic list" }).evaluate((button) => document.activeElement === button),
+      "Topic export must preserve the initiating keyboard focus target.");
+
+    // An async file read that finishes after SPA navigation must not restore
+    // stale room UI or dispatch a room action.
+    await host.evaluate(() => {
+      const original = File.prototype.text;
+      File.prototype.text = function delayedTopicFileText() {
+        return new Promise((resolve) => {
+          window.__releaseDelayedTopicFile = () => {
+            File.prototype.text = original;
+            window.__releaseDelayedTopicFile = null;
+            resolve("A stale imported topic");
+          };
+        });
+      };
+    });
+    requestCount = hostApiRequests.length;
+    await topicImport.setInputFiles({
+      name: "delayed-topics.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("ignored"),
+    });
+    await host.getByRole("link", { name: "Home", exact: true }).click();
+    await host.getByRole("heading", { level: 1, name: "Find your voice." }).waitFor();
+    await host.evaluate(() => window.__releaseDelayedTopicFile());
+    await host.waitForFunction(() => window.__releaseDelayedTopicFile === null);
+    assertNoNewApiRequests(hostApiRequests, requestCount, "A stale topic-file completion");
+    await host.goBack();
+    await host.getByRole("heading", { level: 1, name: `Room ${code}` }).waitFor();
+    await host.getByLabel("Saved setup kit").waitFor();
+    assert.equal(await host.getByLabel("Saved setup kit").inputValue(), kitName);
 
     const settings = host.locator("form.settings");
     await settings.getByLabel("Talk time (seconds)").fill("10");
@@ -308,6 +528,111 @@ async function runBrowserFlow(origin, signal) {
         && guestState.payload.room?.topicCount === 1
         && guestState.payload.room?.topics?.length === 0;
     }, "Custom-topic privacy state did not converge", signal);
+
+    // A saved custom kit captures only the currently applied room setup. An
+    // exact-name overwrite is explicit and remains local.
+    const customKitName = "Fast custom";
+    requestCount = hostApiRequests.length;
+    await host.getByLabel("Kit name").fill(customKitName);
+    await host.getByLabel("Kit name").press("Enter");
+    await host.locator("[data-setup-kit-status]").filter({ hasText: `Saved “${customKitName}” on this device.` }).waitFor();
+    assertNoNewApiRequests(hostApiRequests, requestCount, "Saving an applied custom setup kit");
+
+    let overwritePrompt = "";
+    host.once("dialog", async (dialog) => {
+      overwritePrompt = dialog.message();
+      await dialog.accept();
+    });
+    requestCount = hostApiRequests.length;
+    await host.getByLabel("Kit name").press("Enter");
+    assert.equal(overwritePrompt, `Replace the saved “${customKitName}” kit in this browser?`);
+    assertNoNewApiRequests(hostApiRequests, requestCount, "Overwriting a local setup kit");
+
+    await host.getByLabel("Saved setup kit").selectOption(kitName);
+    const unsavedKitName = "Unsaved <draft>";
+    await host.getByLabel("Kit name").fill(unsavedKitName);
+    await host.getByLabel("Kit name").evaluate((input) => input.setSelectionRange(4, 9));
+    await postRoomAction(guestContext, origin, code, {
+      type: "rename-player",
+      playerId: guestPlayerId,
+      name: "Cloud Guest",
+    });
+    await host.getByLabel("Rename Cloud Guest").waitFor();
+    assert.equal(await host.getByLabel("Saved setup kit").inputValue(), kitName,
+      "A WebSocket rerender discarded the selected local setup kit.");
+    assert.equal(await host.getByLabel("Kit name").inputValue(), unsavedKitName,
+      "A WebSocket rerender discarded the setup-kit name draft.");
+    assert.deepEqual(await host.getByLabel("Kit name").evaluate((input) => ({
+      focused: document.activeElement === input,
+      start: input.selectionStart,
+      end: input.selectionEnd,
+    })), { focused: true, start: 4, end: 9 },
+    "A WebSocket rerender discarded setup-kit focus or selection.");
+    assert.match(await host.locator("[data-setup-kit-status]").textContent(), /Saved “Fast custom” on this device\./u,
+      "A WebSocket rerender discarded setup-kit status.");
+
+    // Change every applied setting, then restore the custom kit through exactly
+    // one room action. The local kit name must not cross that boundary.
+    await settings.getByLabel("Talk time (seconds)").fill("25");
+    await settings.getByLabel("Silence limit").fill("3");
+    await settings.getByLabel("Rounds").fill("2");
+    await settings.getByLabel("Topic pack").selectOption("debate");
+    await settings.getByRole("button", { name: "Apply settings" }).click();
+    await eventually(async () => {
+      const state = await readRoom(guest, code);
+      return state.payload.room?.settings?.duration === 25
+        && state.payload.room?.settings?.silence === 3
+        && state.payload.room?.settings?.rounds === 2
+        && state.payload.room?.settings?.topicPack === "debate";
+    }, "The temporary room setup did not converge", signal);
+
+    await host.getByLabel("Saved setup kit").selectOption(customKitName);
+    requestCount = hostApiRequests.length;
+    await host.getByRole("button", { name: "Apply selected kit" }).click();
+    await host.locator("[data-setup-kit-status]").filter({ hasText: `Applied “${customKitName}” to room ${code}.` }).waitFor();
+    const applyRequests = hostApiRequests.slice(requestCount);
+    assert.equal(applyRequests.length, 1, "Applying a setup kit must make exactly one API request.");
+    assert.deepEqual(applyRequests[0], {
+      method: "POST",
+      path: `/api/rooms/${code}/action`,
+      body: {
+        type: "apply-setup-kit",
+        duration: 10,
+        silence: 1,
+        rounds: 1,
+        topicPack: "custom",
+        topics: [TOPIC],
+      },
+    });
+    assert.equal(Object.hasOwn(applyRequests[0].body, "name"), false,
+      "The browser-local kit name must not be sent to the room.");
+    assert(await host.getByRole("button", { name: "Apply selected kit" }).evaluate((button) => document.activeElement === button),
+      "Applying a setup kit must preserve keyboard focus through the room rerender.");
+    await eventually(async () => {
+      const [hostState, guestState] = await Promise.all([readRoom(host, code), readRoom(guest, code)]);
+      return hostState.payload.room?.settings?.duration === 10
+        && hostState.payload.room?.settings?.silence === 1
+        && hostState.payload.room?.settings?.rounds === 1
+        && hostState.payload.room?.settings?.topicPack === "custom"
+        && hostState.payload.room?.topics?.length === 1
+        && hostState.payload.room.topics[0] === TOPIC
+        && guestState.payload.room?.topicCount === 1
+        && guestState.payload.room?.topics?.length === 0;
+    }, "Applied setup-kit state did not converge privately", signal);
+
+    let deletePrompt = "";
+    host.once("dialog", async (dialog) => {
+      deletePrompt = dialog.message();
+      await dialog.accept();
+    });
+    requestCount = hostApiRequests.length;
+    await host.getByRole("button", { name: "Delete selected kit" }).click();
+    await host.locator("[data-setup-kit-status]").filter({ hasText: `Deleted “${customKitName}” from this device.` }).waitFor();
+    assert.equal(deletePrompt, `Delete “${customKitName}” from this browser? This does not change the room.`);
+    assertNoNewApiRequests(hostApiRequests, requestCount, "Deleting a local setup kit");
+    assert.equal(await host.getByLabel("Saved setup kit").inputValue(), kitName);
+    const storedAfterDelete = await host.evaluate(() => JSON.parse(localStorage.getItem("nonstoptalk.setup-kits.v1")));
+    assert.deepEqual(storedAfterDelete.kits.map((kit) => kit.name), [kitName]);
 
     await host.getByRole("button", { name: "Start game" }).click();
     await Promise.all([
