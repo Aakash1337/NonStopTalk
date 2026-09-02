@@ -130,7 +130,9 @@
 				"binding": "CF_VERSION_METADATA"
 			},
 			"vars": {
-				"ROOM_MILESTONE_DELIVERY_MODE": "best-effort",
+				// Staging is the isolated operational proof lane for the reviewed
+				// Release-B producer. Production remains best-effort above.
+				"ROOM_MILESTONE_DELIVERY_MODE": "outbox",
 				"TOPIC_ROUTINE_PROVIDER": "offline",
 				"TOPIC_ESCALATION_PROVIDER": "off",
 				"MODEL_DAILY_CALL_LIMIT": "25"
