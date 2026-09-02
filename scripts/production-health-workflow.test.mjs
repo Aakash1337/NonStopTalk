@@ -2,10 +2,20 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import {
+  PUBLIC_MODULE_GRAPH_ATTEMPTS,
+  PUBLIC_MODULE_GRAPH_RETRY_MS,
+  waitForPublicModuleGraph,
+} from "./smoke-production-support.mjs";
+
 const workflowURL = new URL("../.github/workflows/production-health.yml", import.meta.url);
 const workflow = await readFile(workflowURL, "utf8");
 const packageJSON = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 const productionProbe = await readFile(new URL("./smoke-production.mjs", import.meta.url), "utf8");
+const productionProbeSupport = await readFile(
+  new URL("./smoke-production-support.mjs", import.meta.url),
+  "utf8",
+);
 const stagingProbe = await readFile(new URL("./smoke-staging.mjs", import.meta.url), "utf8");
 
 test("production health workflow stays scheduled, bounded, and manually runnable", () => {
@@ -40,8 +50,10 @@ test("production health workflow runs only the existing read-only probe", () => 
   );
   assert.doesNotMatch(workflow, /\bnpm\s+(?:ci|install|clean-install)\b/iu);
   assert.doesNotMatch(workflow, /\bwrangler\b|\b(?:deploy|migrate|rollback)\b/iu);
-  assert.doesNotMatch(productionProbe, /\b(?:POST|PUT|PATCH|DELETE)\b/u);
-  assert.doesNotMatch(productionProbe, /\bAuthorization\b|ANALYTICS_ADMIN_TOKEN/u);
+  for (const source of [productionProbe, productionProbeSupport]) {
+    assert.doesNotMatch(source, /\b(?:POST|PUT|PATCH|DELETE)\b/u);
+    assert.doesNotMatch(source, /\bAuthorization\b|ANALYTICS_ADMIN_TOKEN/u);
+  }
 });
 
 test("production health workflow pins its two third-party actions", () => {
@@ -81,10 +93,91 @@ test("production probe bounds only deployment-propagation status retries", () =>
 });
 
 test("production probe verifies the required public JavaScript module graph", () => {
-  assert.match(productionProbe, /getJavaScriptAsset\("\/app\.js"\)/u);
-  assert.match(productionProbe, /getJavaScriptAsset\("\/coach-storage\.js"\)/u);
+  assert.match(
+    productionProbe,
+    /waitForPublicModuleGraph\(\{ loadJavaScriptAsset: getJavaScriptAsset \}\)/u,
+  );
+  assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/app\.js"\)/u);
+  assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/coach-storage\.js"\)/u);
+  assert.match(productionProbe, /get\(pathname, "text\/javascript", 1\)/u);
   assert.match(productionProbe, /mediaType === "text\/javascript"/u);
   assert.match(productionProbe, /!\/\^\\s\*\(\?:<!doctype\\s\+html\|<html\\b\)\/iu\.test\(source\)/u);
-  assert.match(productionProbe, /from\\s\+\["'\]\\\.\\\/coach-storage\\\.js\["'\]/u);
-  assert.match(productionProbe, /export async function openCoachDatabase/u);
+  assert.match(productionProbeSupport, /from\\s\+\["'\]\\\.\\\/coach-storage\\\.js\["'\]/u);
+  assert.match(productionProbeSupport, /export async function openCoachDatabase/u);
+});
+
+test("production probe retries a mixed public asset generation as one module graph", async () => {
+  const calls = { app: 0, storage: 0 };
+  const delays = [];
+
+  const result = await waitForPublicModuleGraph({
+    loadJavaScriptAsset: async (pathname) => {
+      if (pathname === "/app.js") {
+        calls.app += 1;
+        return calls.app < 3
+          ? "console.log('previous deployment');"
+          : "import { openCoachDatabase } from './coach-storage.js';";
+      }
+      assert.equal(pathname, "/coach-storage.js");
+      calls.storage += 1;
+      return "export async function openCoachDatabase() {}";
+    },
+    sleep: async (milliseconds) => delays.push(milliseconds),
+  });
+
+  assert.match(result.appSource, /coach-storage\.js/u);
+  assert.equal(calls.app, 3);
+  assert.equal(calls.storage, 3);
+  assert.deepEqual(delays, [1_000, 2_000]);
+  assert.equal(PUBLIC_MODULE_GRAPH_ATTEMPTS, 8);
+  assert.equal(PUBLIC_MODULE_GRAPH_RETRY_MS, 1_000);
+});
+
+test("production probe retries a temporary storage-asset SPA fallback", async () => {
+  const calls = { app: 0, storage: 0 };
+  const delays = [];
+
+  const result = await waitForPublicModuleGraph({
+    loadJavaScriptAsset: async (pathname) => {
+      if (pathname === "/app.js") {
+        calls.app += 1;
+        return "import { openCoachDatabase } from './coach-storage.js';";
+      }
+      assert.equal(pathname, "/coach-storage.js");
+      calls.storage += 1;
+      if (calls.storage === 1) {
+        throw new Error("/coach-storage.js did not return JavaScript");
+      }
+      return "export async function openCoachDatabase() {}";
+    },
+    sleep: async (milliseconds) => delays.push(milliseconds),
+  });
+
+  assert.match(result.coachStorageSource, /openCoachDatabase/u);
+  assert.equal(calls.app, 2);
+  assert.equal(calls.storage, 2);
+  assert.deepEqual(delays, [1_000]);
+});
+
+test("production probe keeps a persistent module-graph defect bounded and visible", async () => {
+  let calls = 0;
+  const delays = [];
+
+  await assert.rejects(
+    waitForPublicModuleGraph({
+      loadJavaScriptAsset: async (pathname) => {
+        calls += 1;
+        return pathname === "/app.js"
+          ? "import './unrelated.js';"
+          : "export async function openCoachDatabase() {}";
+      },
+      sleep: async (milliseconds) => delays.push(milliseconds),
+      attempts: 3,
+      retryMs: 7,
+    }),
+    /does not reference the required coaching storage module/u,
+  );
+
+  assert.equal(calls, 6);
+  assert.deepEqual(delays, [7, 14]);
 });

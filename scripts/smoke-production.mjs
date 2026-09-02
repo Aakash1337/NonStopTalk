@@ -1,5 +1,7 @@
 import process from "node:process";
 
+import { waitForPublicModuleGraph } from "./smoke-production-support.mjs";
+
 const configuredOrigin = process.argv[2]
   || process.env.NONSTOPTALK_PRODUCTION_ORIGIN
   || "https://dontstoptalking.org";
@@ -36,9 +38,9 @@ function hasScriptFromOrigin(html, documentURL, expectedOrigin) {
   });
 }
 
-async function get(pathname, accept) {
+async function get(pathname, accept, attempts = 5) {
   let lastError;
-  for (let attempt = 1; attempt <= 5; attempt += 1) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
       const response = await fetch(new URL(pathname, origin), {
         headers: { Accept: accept },
@@ -51,7 +53,7 @@ async function get(pathname, accept) {
     } catch (error) {
       lastError = error;
     }
-    if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
+    if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
   }
   throw lastError instanceof Error ? lastError : new Error(`${pathname} did not respond.`);
 }
@@ -79,7 +81,9 @@ async function getPlatformStatus() {
 }
 
 async function getJavaScriptAsset(pathname) {
-  const response = await get(pathname, "text/javascript");
+  // The outer module-graph loop owns retries so each attempt observes both
+  // assets from the same deployment-propagation window.
+  const response = await get(pathname, "text/javascript", 1);
   const mediaType = String(response.headers.get("content-type") || "")
     .split(";", 1)[0]
     .trim()
@@ -115,12 +119,7 @@ for (const pathname of ["/", "/practice", "/progress"]) {
     `${pathname} must permit only same-origin scripts and the configured Cloudflare Web Analytics beacon origin`);
 }
 
-const appSource = await getJavaScriptAsset("/app.js");
-assert(/\bfrom\s+["']\.\/coach-storage\.js["']/u.test(appSource),
-  "/app.js does not reference the required coaching storage module");
-const coachStorageSource = await getJavaScriptAsset("/coach-storage.js");
-assert(coachStorageSource.includes("export async function openCoachDatabase"),
-  "/coach-storage.js does not expose the expected storage boundary");
+await waitForPublicModuleGraph({ loadJavaScriptAsset: getJavaScriptAsset });
 
 const adminDocumentResponse = await get("/admin/analytics", "text/html");
 assert(adminDocumentResponse.headers.get("content-type")?.startsWith("text/html"),

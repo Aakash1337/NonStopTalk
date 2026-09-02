@@ -114,7 +114,11 @@ scheduled-workflow notifications to the current schedule actor (initial
 creator, a later cron editor, or the user who re-enables it); do not assume
 repository watchers receive them. The probe itself retries each public GET up
 to five times before failing, which absorbs a short network interruption
-without concealing a sustained outage.
+without concealing a sustained outage. It also fetches and validates the public
+`app.js`/`coach-storage.js` module graph together for up to eight bounded
+attempts. This accommodates the brief mixed asset generation an edge can expose
+immediately after a deployment while still failing a persistent missing module,
+wrong MIME type, HTML fallback, or missing security header.
 
 ## Staging promotion
 
