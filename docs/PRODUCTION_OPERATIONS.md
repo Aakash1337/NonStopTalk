@@ -217,7 +217,7 @@ Use this order:
    It repeats the version/resource checks, requires healthy schema-6
    `durable-outbox` readiness, and brackets every aggregate read with candidate
    deployment checks. It first starts one unsampled candidate-version JSON tail.
-   Pinned Wrangler 4.127.1 has no JSON readiness banner, so the helper requires
+   Pinned Wrangler 4.128.0 has no JSON readiness banner, so the helper requires
    the ordered transport ping and pong emitted by that same child/WebSocket;
    a reviewed preload keeps every other debug record out of the proof pipe. It
    then bounded-retries only a read-only `HEAD` status canary until that exact
@@ -331,7 +331,7 @@ Use this order:
    npm run smoke:staging-outbox
    ```
 
-   Wrangler 4.127.1 is pinned because the JSON-tail transport-readiness contract
+   Wrangler 4.128.0 is pinned because the JSON-tail transport-readiness contract
    is version-specific; any Wrangler update must repeat the preload, marker,
    stream-parser, and live read-only canary review before this drill may run.
    With current Wrangler, `--env staging` resolves the exact environment Worker

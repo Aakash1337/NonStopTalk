@@ -79,3 +79,12 @@ test("production probe bounds only deployment-propagation status retries", () =>
     "a real stale or backlog status must not be retried as deployment propagation",
   );
 });
+
+test("production probe verifies the required public JavaScript module graph", () => {
+  assert.match(productionProbe, /getJavaScriptAsset\("\/app\.js"\)/u);
+  assert.match(productionProbe, /getJavaScriptAsset\("\/coach-storage\.js"\)/u);
+  assert.match(productionProbe, /mediaType === "text\/javascript"/u);
+  assert.match(productionProbe, /!\/\^\\s\*\(\?:<!doctype\\s\+html\|<html\\b\)\/iu\.test\(source\)/u);
+  assert.match(productionProbe, /from\\s\+\["'\]\\\.\\\/coach-storage\\\.js\["'\]/u);
+  assert.match(productionProbe, /export async function openCoachDatabase/u);
+});

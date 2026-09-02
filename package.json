@@ -15,7 +15,7 @@
     "db:migrate:local": "wrangler d1 migrations apply PLATFORM_DB --local",
     "db:migrate:remote": "wrangler d1 migrations apply PLATFORM_DB --remote --env=",
     "db:migrate:staging": "wrangler d1 migrations apply PLATFORM_DB --remote --env staging",
-    "test:coach": "node --test cloudflare/public/coach-engine.test.js cloudflare/public/coach-loop.test.js",
+    "test:coach": "node --test cloudflare/public/coach-engine.test.js cloudflare/public/coach-loop.test.js cloudflare/public/coach-storage.test.js",
     "test:cloud-progress": "node --test cloudflare/public/cloud-progress.test.js",
     "test:admin": "node --test cloudflare/public/admin-analytics.test.js",
     "test:production-monitor": "node --test scripts/production-health-workflow.test.mjs",
@@ -53,13 +53,14 @@
     "tsx": "4.23.12",
     "typescript": "7.0.2",
     "vitest": "4.1.11",
-    "wrangler": "4.127.1"
+    "wrangler": "4.128.0"
   },
   "overrides": {
     "undici": "7.29.0"
   },
   "allowScripts": {
     "esbuild@0.28.1": true,
-    "workerd@1.20260828.1": true
+    "workerd@1.20260828.1": true,
+    "workerd@1.20260831.1": true
   }
 }

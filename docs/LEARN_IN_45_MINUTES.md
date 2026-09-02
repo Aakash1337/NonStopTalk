@@ -168,7 +168,7 @@ Retrieve → Assemble → Store
 | **5. Measure** | The engine aggregates observed time, coverage, speaking ratio, interior pauses, continuity, relative level, clipping, and optional transcript counts. | `CoachingAnalyzer.snapshot()` and `analyzeTranscript` in `coach-engine.js` |
 | **6. Retrieve** | The selected goal plus aggregate evidence becomes a lexical query that ranks six bundled coaching cards, keeps up to two results, and presents the top result as the primary context. | `retrieveCoachingGuidance` in `coach-engine.js` |
 | **7. Assemble** | Transparent rules choose Strength and Focus. A supported card normally contributes its unchanged drill; a safety rule can substitute a measurement-backed drill. One fixed comparison sentence is appended. | `buildAdvice` in `coach-engine.js` |
-| **8. Store + relate** | A compact summary is saved to IndexedDB with explicit standalone or baseline/retry metadata. Separate choices may retain local artifacts or back up the narrower summary allowlist to D1. Progress validates relationships before grouping/comparison. | Local helpers in `app.js`, `coach-loop.js`, and the opt-in client in `cloud-progress.js` |
+| **8. Store + relate** | A compact summary is saved to IndexedDB with explicit standalone or baseline/retry metadata. Separate choices may retain local artifacts or back up the narrower summary allowlist to D1. Progress validates relationships before grouping/comparison. | `coach-storage.js`, `coach-loop.js`, and the opt-in client in `cloud-progress.js` |
 
 ### Terms you need to explain
 
@@ -287,7 +287,7 @@ This is a **Worker with Static Assets**, not a Pages-only project and not a Cont
 | Compact cloud summary | No | Central D1, keyed to a hashed anonymous browser identity | Separate explicit choice; allowlisted metrics/advice and bounded derived patterns only; one device-level day-bucketed 30–31-day inactivity lease; new saves stop once 250 exist |
 | Multiplayer room state | Only for Play rooms | Private SQLite storage in the room Durable Object | Worker/DO traffic; expires after 30 days without a state change |
 
-Full-session retention and compact cloud backup are independent and start off. A standalone **Try again** and direct baseline retry preserve visible selections so the user can review or uncheck them; a retry resumed from Progress starts every optional data choice unchecked. Progress can delete one attempt's artifacts while preserving its compact summary and pair. Local artifacts have no automatic expiry. One UTC-day-bucketed device lease controls all of an anonymous browser's summaries, lasts at least 30 and less than 31 days after cloud use, and avoids per-summary renewal writes. The cloud cookie is not an account or recovery credential, so there is no cross-device Progress. IndexedDB remains best-effort, and deleting browser data cannot remove files already downloaded.
+Full-session retention and compact cloud backup are independent and start off. A standalone **Try again** and direct baseline retry preserve visible selections so the user can review or uncheck them; a retry resumed from Progress starts every optional data choice unchecked. Progress can delete one attempt's artifacts while preserving its compact summary and pair. Untouched v2 origins have no app-scheduled artifact expiry; profiles with newer lifecycle records keep their 30-day expiry during rollback. One UTC-day-bucketed device lease controls all of an anonymous browser's summaries, lasts at least 30 and less than 31 days after cloud use, and avoids per-summary renewal writes. The cloud cookie is not an account or recovery credential, so there is no cross-device Progress. IndexedDB remains best-effort, and deleting browser data cannot remove files already downloaded.
 
 ### Two editions that can both run locally
 
@@ -306,9 +306,9 @@ Checkpoint: Trace one Practice attempt and one Play action. Name exactly where e
 - sparse live acoustic cues and deterministic post-attempt advice;
 - six-card local lexical retrieval with grounding status;
 - optional strict on-device transcript-derived metrics;
-- local-first summaries, explicit loop grouping/comparison, export, artifact-only and two-store deletion, opted-in artifact downloads, and optional compact D1 backup;
+- local-first summaries, explicit loop grouping/comparison, export, artifact-only and all-local-store deletion, opted-in artifact downloads, and optional compact D1 backup;
 - Worker-with-Assets deployment and Durable Object multiplayer rooms;
-- 34 deterministic coaching/loop tests plus coaching/platform browser smoke, Worker tests, typechecking, Go checks, and Wrangler dry-run validation.
+- 34 deterministic coaching/loop tests plus two IndexedDB storage-contract tests, coaching/platform browser smoke, Worker tests, typechecking, Go checks, and Wrangler dry-run validation.
 
 ### Not proven or not implemented
 

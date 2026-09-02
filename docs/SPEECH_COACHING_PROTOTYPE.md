@@ -20,7 +20,7 @@ It currently supports:
 - Explicit safe grouping and selected-goal baseline/retry measurements with limited-evidence guardrails and no improvement verdict
 - Optional transcript-derived pace/filler/repetition evidence through strict on-device browser recognition; consented derived word patterns remain in the compact summary
 - Aggregate session summaries in IndexedDB, plus JSON export
-- Separate, off-by-default local retention of the attempt recording and available captured transcript, with partial-text warnings, per-attempt downloads, artifact-only deletion that preserves the summary/pair, and confirmed two-store history deletion
+- Separate, off-by-default local retention of the attempt recording and available captured transcript, with partial-text warnings, per-attempt downloads, artifact-only deletion that preserves the summary/pair, and confirmed all-local-store history deletion
 
 It does not prove that the current thresholds work equally well across microphones, rooms, languages, accents, disabilities, or browsers. The explicit pair and descriptive comparison are implemented, but they do not establish a learning outcome or prove that the retry improved.
 
@@ -135,7 +135,7 @@ The comparison is labeled **Limited evidence** when either attempt contains less
 
 `/progress` always reads summaries for the current site origin and browser profile. After this browser has opted into compact backup, it also reads reachable D1 summaries and merges them by session ID; local records win so local-only artifact controls survive. This anonymous cookie is not an account or cross-device credential. One device-level UTC-day-bucketed lease controls all of its cloud summaries and lasts at least 30 and less than 31 days after cloud use. New saves stop when 250 summaries already exist; valid unexpired legacy rows remain available rather than being forcibly deleted.
 
-The user can export merged summary JSON. When a completed attempt has separately retained artifacts, Progress shows local download and **Delete saved artifacts** controls and repeats any partial-transcript warning. Artifact-only deletion removes that attempt's artifact record and resets its artifact metadata in one IndexedDB transaction while preserving the compact summary and loop comparison. JSON never includes retained artifacts. Confirmed full-history deletion clears both local stores and, when backup is enabled and reachable, this anonymous browser's cloud summaries. Another domain, scheme, port, or browser profile has separate IndexedDB and cookie scope.
+The user can export merged summary JSON. When a completed attempt has separately retained artifacts, Progress shows local download and **Delete saved artifacts** controls and repeats any partial-transcript warning. Artifact-only deletion removes that attempt's artifact record and resets its artifact metadata in one IndexedDB transaction while preserving the compact summary and loop comparison. JSON never includes retained artifacts. Confirmed full-history deletion clears every local coaching store and, when backup is enabled and reachable, this anonymous browser's cloud summaries. Another domain, scheme, port, or browser profile has separate IndexedDB and cookie scope.
 
 ## Architecture and data flow
 
@@ -376,7 +376,7 @@ When selected:
 
 Recording retention does not enable transcription. If transcript analysis was off or produced no text, the artifact may contain audio only. If the recorder failed but captured transcript text exists, a transcript-only artifact can be saved. Canceling or navigating away stops the recorder, clears pending chunks, and saves no unfinished artifact.
 
-Progress can delete one attempt's saved recording/captured transcript without deleting its compact summary. The summary metadata is reset and the artifact record is removed in one transaction, so an explicit baseline/retry relationship and its measurement comparison remain available. Local artifacts still have no automatic expiration, quota dashboard, or app-level encryption, and downloaded files remain outside application control.
+Progress can delete one attempt's saved recording/captured transcript without deleting its compact summary. The summary metadata is reset and the artifact record is removed in one transaction, so an explicit baseline/retry relationship and its measurement comparison remain available. Untouched version-2 origins have no app-scheduled artifact expiration; if a newer schema has created lifecycle records, this compatibility release honors their 30-day expiry. There is no quota dashboard or app-level encryption, and downloaded files remain outside application control.
 
 ## Small local RAG, deterministic tips, and advice
 
@@ -512,6 +512,8 @@ index:    createdAt in both stores
 
 Opening version 2 upgrades an existing version-1 database by preserving `session-summaries` and adding the missing `session-artifacts` store. The browser smoke test exercises that upgrade path.
 
+`coach-storage.js` owns this persistence boundary. It normally opens version 2; if a newer compatible release already upgraded the origin, it reopens the current version after `VersionError`, validates both required stores, and closes on `versionchange`. An optional `artifact-lifecycle` store is understood but not created by this release. On untouched version-2 origins, automatic expiry therefore remains inactive. Once a newer schema has created that store, this rollback-compatible release maintains its content-free bookkeeping, enforces the future 128 MiB logical artifact limit, and atomically honors recorded expirations on save and read while preserving compact summaries. A real browser-quota failure aborts the artifact transaction, then preserves the compact summary in a summary-only retry and reports the reason in Review.
+
 Conceptual summary record:
 
 ```js
@@ -605,8 +607,8 @@ JSON export reads only `session-summaries` and adds product/export schema metada
 | Compact cloud backup | Independent, unchecked opt-in; sends only the narrower summary allowlist to D1 under a hashed anonymous browser identity; one device-level day-bucketed 30–31-day inactivity lease; new saves stop once 250 exist |
 | Export | Summary store only; excludes audio `Blob` and captured transcript text |
 | Individual download | Reads the opted-in artifact and creates a recording file or UTF-8 transcript file |
-| Delete one artifact | Removes one `session-artifacts` record and resets that summary's artifact metadata in one transaction; the compact summary/pair remains |
-| Delete all history | Clears `session-summaries` and `session-artifacts` after confirmation; previously downloaded files are outside its scope |
+| Delete one artifact | Removes one `session-artifacts` record, its optional lifecycle row when present, and resets that summary's artifact metadata in one transaction; the compact summary/pair remains |
+| Delete all history | Clears every local coaching store after confirmation; previously downloaded files are outside its scope |
 | Navigation/cancel | Stops recognition/recorder, discards unsaved chunks, stops microphone tracks/worklet/intervals/context, and rejects delayed permission/worklet activation |
 | Cloudflare Durable Object | Multiplayer room state only; receives no coaching data |
 | Central D1 | Explicitly backed-up compact summaries, consent, anonymous expiry, and aggregate platform facts; never media/captured transcripts |
@@ -619,14 +621,15 @@ See [AI and Privacy](AI_AND_PRIVACY.md) for how this differs from the local Go g
 Read the implementation in this order:
 
 1. **`cloudflare/public/index.html`** — the persistent document shell and primary navigation.
-2. **`cloudflare/public/app.js`** — the Practice/Progress lifecycle, local stores, and opt-in handoff.
-3. **`cloudflare/public/coach-loop.js`** — pure relationship validation, safe grouping, and descriptive selected-goal comparison guardrails.
-4. **`cloudflare/public/cloud-progress.js`** — the narrow cloud-summary allowlist and versioned API client.
-5. **`cloudflare/public/coach-audio-worklet.js`** — the small sample-to-RMS/peak processor.
-6. **`cloudflare/public/coach-engine.js`** — calibration, metrics, retrieval, tips, grounding, and advice.
-7. **`cloudflare/platform.ts`** — Worker-side validation, anonymous ownership, relationship columns, D1 retention, and aggregate analytics.
-8. **`scripts/smoke-coach.mjs`** — browser-level proof using synthetic media, the complete pair/resume flow, local stores, lifecycle races, and default/off network assertions.
-9. **`wrangler.jsonc`** — Static Assets SPA fallback plus Worker/Durable Object bindings for the separate multiplayer API.
+2. **`cloudflare/public/app.js`** — the Practice/Progress lifecycle and storage/cloud handoff.
+3. **`cloudflare/public/coach-storage.js`** — IndexedDB v2 persistence, typed fallback outcomes, and future-schema rollback compatibility.
+4. **`cloudflare/public/coach-loop.js`** — pure relationship validation, safe grouping, and descriptive selected-goal comparison guardrails.
+5. **`cloudflare/public/cloud-progress.js`** — the narrow cloud-summary allowlist and versioned API client.
+6. **`cloudflare/public/coach-audio-worklet.js`** — the small sample-to-RMS/peak processor.
+7. **`cloudflare/public/coach-engine.js`** — calibration, metrics, retrieval, tips, grounding, and advice.
+8. **`cloudflare/platform.ts`** — Worker-side validation, anonymous ownership, relationship columns, D1 retention, and aggregate analytics.
+9. **`scripts/smoke-coach.mjs`** — browser-level proof using synthetic media, the complete pair/resume flow, local stores, lifecycle races, and default/off network assertions.
+10. **`wrangler.jsonc`** — Static Assets SPA fallback plus Worker/Durable Object bindings for the separate multiplayer API.
 
 ## How to explain the implementation
 
@@ -674,8 +677,8 @@ npm run smoke
 
 What each coaching check demonstrates:
 
-- `test:coach` runs 34 tests across controlled frames/transcripts, the pure engine, legacy/explicit relationships, persistence gating, safe grouping, immutable comparisons, exact goal measures, and limited-evidence guardrails.
-- `smoke:coach` drives `/practice` with synthetic media through both the standalone live-cue path and the default baseline → Progress/reload/resume → review-only retry path. It covers local storage, comparison, artifact-only deletion, lifecycle behavior, and asserts that default/off local-first paths make no coaching-data API request.
+- `test:coach` runs 36 tests: 34 across controlled frames/transcripts, the pure engine, legacy/explicit relationships, persistence gating, safe grouping, immutable comparisons, exact goal measures, and limited-evidence guardrails, plus two storage-contract tests.
+- `smoke:coach` drives `/practice` with synthetic media through both the standalone live-cue path and the default baseline → Progress/reload/resume → review-only retry path. It covers local storage, comparison, artifact-only deletion, v1→v2 migration, future-schema rollback compatibility and version-change closure, optional lifecycle bookkeeping and recorded expiry, app-limit and real browser-quota summary-only fallbacks, composed warnings, and asserts that default/off local-first paths make no coaching-data API request.
 - `test:cloud-progress` checks the separate opt-in allowlist, relationship metadata/legacy compatibility, merged-history behavior, API calls, and preference state; platform tests cover Worker relationship validation, identity, expiry, analytics, and local-artifact stripping.
 - `smoke:platform` starts an isolated local Wrangler/D1 environment and exercises status, backup, relationship-field round trip and reserved D1 columns, export, aggregate analytics, privacy rejection, and cloud deletion.
 - `check:cloudflare` confirms that the Worker and all Static Assets, including the coaching modules, form a valid deploy bundle.
@@ -694,7 +697,7 @@ These tests do not replace real-device, accessibility, security, or fairness val
 - Progress implements explicit baseline/retry pairing and descriptive selected-goal changes, but those changes have not been validated as learning outcomes or improvement directions.
 - The local coaching-card library is intentionally small; retrieval is lexical rather than semantic and still requires relevance/fairness evaluation.
 - Derived filler/repetition labels may contain sensitive words even though they are not captured transcript text.
-- Retained artifacts support per-attempt deletion but have no automatic expiration, quota dashboard, or app-level encryption; anyone with access to the unlocked browser profile may reach them before deletion.
+- Retained artifacts support per-attempt deletion. Untouched version-2 origins have no app-scheduled expiration; a browser profile that already has newer lifecycle records keeps their 30-day expiry during rollback. There is no quota dashboard or app-level encryption, and anyone with access to the unlocked browser profile may reach artifacts before deletion or expiry.
 - No accounts, recovery, cross-device authentication/sync, educator view, or shared report exists. Anonymous D1 backup is tied to one browser identity.
 - No external coaching AI, Queue-backed provider work, or R2 media storage exists.
 - No formal WCAG, security, privacy, microphone/device, learning-outcome, or subgroup-fairness study has been completed.

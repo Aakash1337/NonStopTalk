@@ -78,6 +78,22 @@ async function getPlatformStatus() {
   return { response, status };
 }
 
+async function getJavaScriptAsset(pathname) {
+  const response = await get(pathname, "text/javascript");
+  const mediaType = String(response.headers.get("content-type") || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLocaleLowerCase();
+  assert(mediaType === "text/javascript" || mediaType === "application/javascript",
+    `${pathname} did not return JavaScript`);
+  assert(response.headers.get("x-content-type-options") === "nosniff",
+    `${pathname} is missing MIME-sniffing protection`);
+  const source = await response.text();
+  assert(source.trim().length > 0 && !/^\s*(?:<!doctype\s+html|<html\b)/iu.test(source),
+    `${pathname} returned an empty or HTML fallback document`);
+  return source;
+}
+
 for (const pathname of ["/", "/practice", "/progress"]) {
   const response = await get(pathname, "text/html");
   assert(response.headers.get("content-type")?.startsWith("text/html"), `${pathname} did not return HTML`);
@@ -98,6 +114,13 @@ for (const pathname of ["/", "/practice", "/progress"]) {
     && scriptSources[1] === WEB_ANALYTICS_ORIGIN,
     `${pathname} must permit only same-origin scripts and the configured Cloudflare Web Analytics beacon origin`);
 }
+
+const appSource = await getJavaScriptAsset("/app.js");
+assert(/\bfrom\s+["']\.\/coach-storage\.js["']/u.test(appSource),
+  "/app.js does not reference the required coaching storage module");
+const coachStorageSource = await getJavaScriptAsset("/coach-storage.js");
+assert(coachStorageSource.includes("export async function openCoachDatabase"),
+  "/coach-storage.js does not expose the expected storage boundary");
 
 const adminDocumentResponse = await get("/admin/analytics", "text/html");
 assert(adminDocumentResponse.headers.get("content-type")?.startsWith("text/html"),
@@ -154,5 +177,8 @@ console.log(JSON.stringify({
   origin: origin.origin,
   apiVersion: status.apiVersion,
   schemaVersion: status.schemaVersion,
-  checkedRoutes: ["/", "/practice", "/progress", "/admin/analytics", "/api/v1/platform/status"],
+  checkedRoutes: [
+    "/", "/practice", "/progress", "/app.js", "/coach-storage.js",
+    "/admin/analytics", "/api/v1/platform/status",
+  ],
 }));
