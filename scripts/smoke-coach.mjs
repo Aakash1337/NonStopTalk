@@ -1995,8 +1995,50 @@ async function runCalibrationReadinessContinueFlow(browser, origin) {
   const harness = await openLimitedCalibrationGate(browser, origin);
   const { context, page, pageErrors, apiRequests } = harness;
   try {
-    await page.getByRole("button", { name: "Continue with limited evidence" }).click();
+    const competingChoices = await page.evaluate(() => {
+      const gate = document.querySelector("[data-coach-calibration-readiness]");
+      const continueButton = gate?.querySelector('[data-command="coach-calibration-continue"]');
+      const retryButton = gate?.querySelector('[data-command="coach-calibration-retry"]');
+      if (!gate || !continueButton || !retryButton) return null;
+      const documentEvents = [];
+      let injected = false;
+      const click = () => new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: 0,
+      });
+      const injectContinue = (event) => {
+        if (event.target !== retryButton || injected) return;
+        injected = true;
+        continueButton.dispatchEvent(click());
+      };
+      const recordDocumentAction = (event) => {
+        const command = event.target?.closest?.("[data-command]")?.dataset.command;
+        if (command === "coach-calibration-continue" || command === "coach-calibration-retry") {
+          documentEvents.push(command);
+        }
+      };
+      document.addEventListener("click", injectContinue, { capture: true });
+      document.addEventListener("click", recordDocumentAction);
+      retryButton.dispatchEvent(click());
+      document.removeEventListener("click", injectContinue, { capture: true });
+      document.removeEventListener("click", recordDocumentAction);
+      return {
+        injected,
+        documentEvents,
+      };
+    });
+    assert(
+      competingChoices?.injected
+        && JSON.stringify(competingChoices.documentEvents)
+          === JSON.stringify(["coach-calibration-continue", "coach-calibration-retry"]),
+      `Both same-gate actions must reach the document app-handler path in adversarial order, got ${JSON.stringify(competingChoices)}`,
+    );
     await page.waitForSelector("[data-coach-live]");
+    await page.waitForTimeout(250);
+    assert(await page.locator("[data-coach-calibration], [data-coach-calibration-readiness]").count() === 0,
+      "A competing Retry event from the resolved gate must not replace the continuing attempt");
     assert(await page.evaluate(() => window.__coachGetUserMediaCalls) === 1,
       "Continuing with limited calibration must not reacquire the microphone");
     const continuedStarts = await page.evaluate(() => ({

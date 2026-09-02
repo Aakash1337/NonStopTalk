@@ -245,15 +245,18 @@ test("production probe verifies the required public JavaScript module graph", ()
   );
   assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/app\.js"\)/u);
   assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/coach-storage\.js"\)/u);
+  assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/coach-engine\.js"\)/u);
   assert.match(productionProbe, /get\(pathname, "text\/javascript", 1\)/u);
   assert.match(productionProbe, /mediaType === "text\/javascript"/u);
   assert.match(productionProbe, /!\/\^\\s\*\(\?:<!doctype\\s\+html\|<html\\b\)\/iu\.test\(source\)/u);
   assert.match(productionProbeSupport, /from\\s\+\["'\]\\\.\\\/coach-storage\\\.js\["'\]/u);
+  assert.match(productionProbeSupport, /import\\\(\\s\*\["'\]\\\.\\\/coach-engine\\\.js\["'\]\\s\*\\\)/u);
   assert.match(productionProbeSupport, /export async function openCoachDatabase/u);
+  assert.match(productionProbeSupport, /export\\s\+function\\s\+assessCalibrationReadiness/u);
 });
 
 test("production probe retries a mixed public asset generation as one module graph", async () => {
-  const calls = { app: 0, storage: 0 };
+  const calls = { app: 0, storage: 0, engine: 0 };
   const delays = [];
 
   const result = await waitForPublicModuleGraph({
@@ -262,39 +265,50 @@ test("production probe retries a mixed public asset generation as one module gra
         calls.app += 1;
         return calls.app < 3
           ? "console.log('previous deployment');"
-          : "import { openCoachDatabase } from './coach-storage.js';";
+          : "import { openCoachDatabase } from './coach-storage.js'; import('./coach-engine.js');";
       }
-      assert.equal(pathname, "/coach-storage.js");
-      calls.storage += 1;
-      return "export async function openCoachDatabase() {}";
+      if (pathname === "/coach-storage.js") {
+        calls.storage += 1;
+        return "export async function openCoachDatabase() {}";
+      }
+      assert.equal(pathname, "/coach-engine.js");
+      calls.engine += 1;
+      return "export function assessCalibrationReadiness() {}";
     },
     sleep: async (milliseconds) => delays.push(milliseconds),
   });
 
   assert.match(result.appSource, /coach-storage\.js/u);
+  assert.match(result.appSource, /coach-engine\.js/u);
+  assert.match(result.coachEngineSource, /assessCalibrationReadiness/u);
   assert.equal(calls.app, 3);
   assert.equal(calls.storage, 3);
+  assert.equal(calls.engine, 3);
   assert.deepEqual(delays, [1_000, 2_000]);
   assert.equal(PUBLIC_MODULE_GRAPH_ATTEMPTS, 8);
   assert.equal(PUBLIC_MODULE_GRAPH_RETRY_MS, 1_000);
 });
 
 test("production probe retries a temporary storage-asset SPA fallback", async () => {
-  const calls = { app: 0, storage: 0 };
+  const calls = { app: 0, storage: 0, engine: 0 };
   const delays = [];
 
   const result = await waitForPublicModuleGraph({
     loadJavaScriptAsset: async (pathname) => {
       if (pathname === "/app.js") {
         calls.app += 1;
-        return "import { openCoachDatabase } from './coach-storage.js';";
+        return "import { openCoachDatabase } from './coach-storage.js'; import('./coach-engine.js');";
       }
-      assert.equal(pathname, "/coach-storage.js");
-      calls.storage += 1;
-      if (calls.storage === 1) {
-        throw new Error("/coach-storage.js did not return JavaScript");
+      if (pathname === "/coach-storage.js") {
+        calls.storage += 1;
+        if (calls.storage === 1) {
+          throw new Error("/coach-storage.js did not return JavaScript");
+        }
+        return "export async function openCoachDatabase() {}";
       }
-      return "export async function openCoachDatabase() {}";
+      assert.equal(pathname, "/coach-engine.js");
+      calls.engine += 1;
+      return "export function assessCalibrationReadiness() {}";
     },
     sleep: async (milliseconds) => delays.push(milliseconds),
   });
@@ -302,6 +316,38 @@ test("production probe retries a temporary storage-asset SPA fallback", async ()
   assert.match(result.coachStorageSource, /openCoachDatabase/u);
   assert.equal(calls.app, 2);
   assert.equal(calls.storage, 2);
+  assert.equal(calls.engine, 2);
+  assert.deepEqual(delays, [1_000]);
+});
+
+test("production probe retries a temporary coaching-engine SPA fallback", async () => {
+  const calls = { app: 0, storage: 0, engine: 0 };
+  const delays = [];
+
+  const result = await waitForPublicModuleGraph({
+    loadJavaScriptAsset: async (pathname) => {
+      if (pathname === "/app.js") {
+        calls.app += 1;
+        return "import { openCoachDatabase } from './coach-storage.js'; import('./coach-engine.js');";
+      }
+      if (pathname === "/coach-storage.js") {
+        calls.storage += 1;
+        return "export async function openCoachDatabase() {}";
+      }
+      assert.equal(pathname, "/coach-engine.js");
+      calls.engine += 1;
+      if (calls.engine === 1) {
+        throw new Error("/coach-engine.js did not return JavaScript");
+      }
+      return "export function assessCalibrationReadiness() {}";
+    },
+    sleep: async (milliseconds) => delays.push(milliseconds),
+  });
+
+  assert.match(result.coachEngineSource, /assessCalibrationReadiness/u);
+  assert.equal(calls.app, 2);
+  assert.equal(calls.storage, 2);
+  assert.equal(calls.engine, 2);
   assert.deepEqual(delays, [1_000]);
 });
 
@@ -313,9 +359,9 @@ test("production probe keeps a persistent module-graph defect bounded and visibl
     waitForPublicModuleGraph({
       loadJavaScriptAsset: async (pathname) => {
         calls += 1;
-        return pathname === "/app.js"
-          ? "import './unrelated.js';"
-          : "export async function openCoachDatabase() {}";
+        if (pathname === "/app.js") return "import './unrelated.js';";
+        if (pathname === "/coach-storage.js") return "export async function openCoachDatabase() {}";
+        return "export function assessCalibrationReadiness() {}";
       },
       sleep: async (milliseconds) => delays.push(milliseconds),
       attempts: 3,
@@ -324,6 +370,29 @@ test("production probe keeps a persistent module-graph defect bounded and visibl
     /does not reference the required coaching storage module/u,
   );
 
-  assert.equal(calls, 6);
+  assert.equal(calls, 9);
   assert.deepEqual(delays, [7, 14]);
+});
+
+test("production probe rejects a coaching engine without the exact readiness export", async () => {
+  let calls = 0;
+
+  await assert.rejects(
+    waitForPublicModuleGraph({
+      loadJavaScriptAsset: async (pathname) => {
+        calls += 1;
+        if (pathname === "/app.js") {
+          return "import { openCoachDatabase } from './coach-storage.js'; import('./coach-engine.js');";
+        }
+        if (pathname === "/coach-storage.js") return "export async function openCoachDatabase() {}";
+        return "export function assessCalibrationReadinessLegacy() {}";
+      },
+      sleep: async () => {},
+      attempts: 1,
+      retryMs: 0,
+    }),
+    /coach-engine\.js does not expose assessCalibrationReadiness/u,
+  );
+
+  assert.equal(calls, 3);
 });

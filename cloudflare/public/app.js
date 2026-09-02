@@ -798,6 +798,8 @@ function ingestCoachingFrame(run, frame) {
 
 function startCalibrationSampling(run, { retry = false } = {}) {
   if (!run) return false;
+  const expectedPhase = retry ? "calibration-readiness" : "permission";
+  if (practice.phase !== expectedPhase) return false;
   if (!isCurrentCoachingRun(run)) {
     failCoachingRun(run, "Microphone input is no longer available. Check the input and try again.");
     return false;
@@ -1983,7 +1985,7 @@ async function handleClick(event) {
     return;
   }
   const button = event.target.closest("[data-command]");
-  if (!button || busy) return;
+  if (!button || !button.isConnected || busy) return;
   const command = button.dataset.command;
   try {
     setBusy(true);
