@@ -10,6 +10,7 @@ import {
 } from "./coach-loop.js";
 import {
   clearCoachingSummaries,
+  coachingStorageSchema,
   deleteCoachingArtifacts,
   readCoachingArtifact,
   readCoachingSummaries,
@@ -52,6 +53,8 @@ const PRACTICE_GOALS = [
   { id: "energy", name: "Steady delivery", detail: "Keep your vocal level consistent without clipping." },
 ];
 const ROOM_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{6}$/i;
+const HAS_REQUIRED_ARTIFACT_LIFECYCLE = coachingStorageSchema.version >= 3
+  && typeof coachingStorageSchema.lifecycleStore === "string";
 
 document.addEventListener("click", handleClick);
 document.addEventListener("submit", handleSubmit);
@@ -237,7 +240,7 @@ function renderPracticeSetup() {
         <legend>Optional full session retention</legend>
         <label class="choice-row">
           <input type="checkbox" name="retainArtifacts" ${practice.setup.retainArtifacts && canRecord ? "checked" : ""}>
-          <span><strong>Keep the recording and captured transcript when available</strong><small>${canRecord ? "Stores the browser-encoded attempt recording and, when local transcription is enabled and succeeds, its captured transcript for this site in this browser profile. Those artifacts are never uploaded. Depending on the local storage version already used by this browser profile, artifacts either remain until you delete them or follow a 30-day local retention policy. Under that newer policy, newly saved artifacts get 30 days and existing artifacts get 30 days from the storage upgrade; browser storage pressure or site-data deletion can remove them sooner. Progress downloads or deletes them per attempt and can also delete all local coaching data. Downloaded copies are yours to manage." : "This browser cannot create a local audio recording. Compact coaching summaries still work."}</small></span>
+          <span><strong>Keep the recording and captured transcript when available</strong><small>${canRecord ? `Stores the browser-encoded attempt recording and, when local transcription is enabled and succeeds, its captured transcript for this site in this browser profile. Those artifacts are never uploaded. ${HAS_REQUIRED_ARTIFACT_LIFECYCLE ? "Saved artifacts follow a 30-day local retention policy: newly saved artifacts get 30 days, and artifacts that existed before this storage upgrade get 30 days from the upgrade." : "Depending on the local storage version already used by this browser profile, artifacts either remain until you delete them or follow a 30-day local retention policy. Under that newer policy, newly saved artifacts get 30 days and existing artifacts get 30 days from the storage upgrade."} Browser storage pressure or site-data deletion can remove them sooner. Progress downloads or deletes them per attempt and can also delete all local coaching data. Downloaded copies are yours to manage.` : "This browser cannot create a local audio recording. Compact coaching summaries still work."}</small></span>
         </label>
       </fieldset>
       <fieldset class="consent-card" aria-label="Optional cloud summary backup">

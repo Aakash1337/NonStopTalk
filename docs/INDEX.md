@@ -27,13 +27,10 @@ browser coaching                                       local-first history
 Web Audio + optional                                          │
 on-device transcript analysis                                 │ reads
           │ writes                                             ▼
-          └──────────────────> IndexedDB v2 <──────────────────┘
-                               ├─ session-summaries
-                               └─ session-artifacts (opt-in)
-                                        │
-                     explicit summary backup only
-                                        ▼
-                               Worker API → central D1
+          └──────────────────> IndexedDB v3 <──────────────────┘
+                               ├─ session-summaries ── optional allowlist ──> Worker API → D1
+                               ├─ session-artifacts (opt-in)
+                               └─ artifact-lifecycle (content-free ledger)
 
 Play / + /room/ABC234
 social multiplayer ── /api + WebSocket ──> Worker ──> room Durable Object

@@ -2,9 +2,12 @@ const COACH_DB_NAME = "nonstoptalk-coaching";
 const COACH_STORE = "session-summaries";
 const COACH_ARTIFACT_STORE = "session-artifacts";
 const COACH_ARTIFACT_LIFECYCLE_STORE = "artifact-lifecycle";
-const COACH_DB_VERSION = 2;
+const COACH_ARTIFACT_EXPIRY_INDEX = "expiresAtMs";
+const COACH_DB_VERSION = 3;
 const ARTIFACT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const ARTIFACT_MAX_LOGICAL_BYTES = 128 * 1_024 * 1_024;
+const ARTIFACT_LIFECYCLE_SCHEMA_VERSION = 1;
+const transactionFailureCauses = new WeakMap();
 
 const EMPTY_ARTIFACT_METADATA = Object.freeze({
   audioStored: false,
@@ -14,9 +17,278 @@ const EMPTY_ARTIFACT_METADATA = Object.freeze({
   transcriptMayBePartial: false,
 });
 
+function artifactLogicalBytes(artifact) {
+  if (!artifact || typeof artifact !== "object") return null;
+  let audioBytes = 0;
+  let hasAudioBlob = false;
+  if (artifact.audioBlob !== undefined && artifact.audioBlob !== null) {
+    if (typeof globalThis.Blob !== "function" || !(artifact.audioBlob instanceof globalThis.Blob)) {
+      return null;
+    }
+    hasAudioBlob = true;
+    audioBytes = artifact.audioBlob.size;
+  }
+  const transcript = artifact.transcript === undefined || artifact.transcript === null
+    ? ""
+    : artifact.transcript;
+  if (typeof transcript !== "string") return null;
+  if (!hasAudioBlob && transcript.length === 0) return null;
+  const transcriptBytes = new TextEncoder().encode(transcript).byteLength;
+  const logicalBytes = audioBytes + transcriptBytes;
+  return Number.isSafeInteger(audioBytes)
+    && audioBytes >= 0
+    && Number.isSafeInteger(transcriptBytes)
+    && transcriptBytes >= 0
+    && Number.isSafeInteger(logicalBytes)
+    && logicalBytes >= 0
+    ? logicalBytes
+    : null;
+}
+
+function artifactLifecycleRecord(artifact, sessionId, retainedAtMs = Date.now(), legacyGrace = false) {
+  const logicalBytes = artifactLogicalBytes(artifact);
+  const expiresAtMs = retainedAtMs + ARTIFACT_RETENTION_MS;
+  if (typeof sessionId !== "string"
+    || sessionId.length === 0
+    || logicalBytes === null
+    || !Number.isSafeInteger(retainedAtMs)
+    || retainedAtMs < 0
+    || !Number.isSafeInteger(expiresAtMs)
+    || typeof legacyGrace !== "boolean") {
+    return null;
+  }
+  return {
+    id: sessionId,
+    retainedAtMs,
+    expiresAtMs,
+    logicalBytes,
+    lifecycleSchemaVersion: ARTIFACT_LIFECYCLE_SCHEMA_VERSION,
+    legacyGrace,
+  };
+}
+
+function isArtifactLifecycleRecord(record, expectedId = record?.id) {
+  // Later lifecycle schemas may add fields, but the v1 core fields and their
+  // retention/accounting semantics are the forward-compatibility contract.
+  if (!record
+    || typeof expectedId !== "string"
+    || expectedId.length === 0
+    || record.id !== expectedId
+    || !Number.isSafeInteger(record.retainedAtMs)
+    || record.retainedAtMs < 0
+    || !Number.isSafeInteger(record.expiresAtMs)
+    || record.expiresAtMs <= record.retainedAtMs
+    || !Number.isSafeInteger(record.logicalBytes)
+    || record.logicalBytes < 0
+    || !Number.isSafeInteger(record.lifecycleSchemaVersion)
+    || record.lifecycleSchemaVersion < ARTIFACT_LIFECYCLE_SCHEMA_VERSION
+    || typeof record.legacyGrace !== "boolean") {
+    return false;
+  }
+  const maximumExpiry = record.retainedAtMs + ARTIFACT_RETENTION_MS;
+  if (!Number.isSafeInteger(maximumExpiry) || record.expiresAtMs > maximumExpiry) return false;
+  return record.logicalBytes <= ARTIFACT_MAX_LOGICAL_BYTES || record.legacyGrace;
+}
+
+function summaryWithoutArtifacts(summary) {
+  return { ...summary, artifacts: { ...EMPTY_ARTIFACT_METADATA } };
+}
+
+function summaryWithArtifactMetadata(summary, artifact) {
+  const hasAudioBlob = typeof globalThis.Blob === "function"
+    && artifact?.audioBlob instanceof globalThis.Blob;
+  const transcript = typeof artifact?.transcript === "string" ? artifact.transcript : "";
+  const declaredMimeType = typeof artifact?.audioMimeType === "string" ? artifact.audioMimeType : "";
+  return {
+    ...summary,
+    artifacts: {
+      audioStored: hasAudioBlob,
+      audioBytes: hasAudioBlob ? artifact.audioBlob.size : 0,
+      audioMimeType: hasAudioBlob ? declaredMimeType || artifact.audioBlob.type : "",
+      transcriptStored: transcript.length > 0,
+      transcriptMayBePartial: Boolean(transcript && artifact?.transcriptMayBePartial),
+    },
+  };
+}
+
+function summaryClaimsArtifacts(summary) {
+  return summary?.artifacts?.audioStored === true || summary?.artifacts?.transcriptStored === true;
+}
+
+function abortTransaction(transaction, cause) {
+  if (cause && !transactionFailureCauses.has(transaction)) {
+    transactionFailureCauses.set(transaction, cause);
+  }
+  try {
+    transaction.abort();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function scrubSummaryArtifacts(store, id, transaction) {
+  try {
+    const request = store.get(id);
+    request.onsuccess = () => {
+      try {
+        if (request.result) store.put(summaryWithoutArtifacts(request.result));
+      } catch (error) {
+        abortTransaction(transaction, error);
+      }
+    };
+  } catch (error) {
+    abortTransaction(transaction, error);
+  }
+}
+
+function isActiveArtifactLifecycleRecord(record, expectedId, nowMs) {
+  return isArtifactLifecycleRecord(record, expectedId)
+    && record.retainedAtMs <= nowMs
+    && record.expiresAtMs > nowMs;
+}
+
+function upgradeCoachDatabase(request, event) {
+  const database = request.result;
+  const transaction = request.transaction;
+  if (!transaction) throw new Error("The coaching storage upgrade transaction is unavailable.");
+
+  const summaries = database.objectStoreNames.contains(COACH_STORE)
+    ? transaction.objectStore(COACH_STORE)
+    : database.createObjectStore(COACH_STORE, { keyPath: "id" });
+  if (!summaries.indexNames.contains("createdAt")) summaries.createIndex("createdAt", "createdAt");
+
+  const artifacts = database.objectStoreNames.contains(COACH_ARTIFACT_STORE)
+    ? transaction.objectStore(COACH_ARTIFACT_STORE)
+    : database.createObjectStore(COACH_ARTIFACT_STORE, { keyPath: "id" });
+  if (!artifacts.indexNames.contains("createdAt")) artifacts.createIndex("createdAt", "createdAt");
+
+  const lifecycle = database.objectStoreNames.contains(COACH_ARTIFACT_LIFECYCLE_STORE)
+    ? transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE)
+    : database.createObjectStore(COACH_ARTIFACT_LIFECYCLE_STORE, { keyPath: "id" });
+  if (summaries.keyPath !== "id" || artifacts.keyPath !== "id" || lifecycle.keyPath !== "id") {
+    abortTransaction(transaction, new Error("The coaching history database has incompatible store key paths."));
+    return;
+  }
+  if (lifecycle.indexNames.contains(COACH_ARTIFACT_EXPIRY_INDEX)) {
+    const existingIndex = lifecycle.index(COACH_ARTIFACT_EXPIRY_INDEX);
+    if (existingIndex.keyPath !== COACH_ARTIFACT_EXPIRY_INDEX
+      || existingIndex.unique
+      || existingIndex.multiEntry) {
+      lifecycle.deleteIndex(COACH_ARTIFACT_EXPIRY_INDEX);
+      lifecycle.createIndex(COACH_ARTIFACT_EXPIRY_INDEX, COACH_ARTIFACT_EXPIRY_INDEX);
+    }
+  } else {
+    lifecycle.createIndex(COACH_ARTIFACT_EXPIRY_INDEX, COACH_ARTIFACT_EXPIRY_INDEX);
+  }
+  if (event.oldVersion >= COACH_DB_VERSION) return;
+
+  const retainedAtMs = Date.now();
+  if (!Number.isSafeInteger(retainedAtMs) || retainedAtMs < 0) {
+    abortTransaction(transaction, new TypeError("The coaching artifact migration time is invalid."));
+    return;
+  }
+  const cursorRequest = artifacts.openCursor();
+  cursorRequest.onsuccess = () => {
+    const cursor = cursorRequest.result;
+    if (!cursor) return;
+    try {
+      const id = cursor.primaryKey;
+      const artifact = cursor.value;
+      const record = typeof id === "string" && id.length > 0 && artifact?.id === id
+        ? artifactLifecycleRecord(artifact, id, retainedAtMs, true)
+        : null;
+      if (!record) {
+        cursor.delete();
+        lifecycle.delete(id);
+        scrubSummaryArtifacts(summaries, id, transaction);
+        cursor.continue();
+        return;
+      }
+
+      const summaryRequest = summaries.get(id);
+      summaryRequest.onsuccess = () => {
+        try {
+          if (!summaryClaimsArtifacts(summaryRequest.result)) {
+            cursor.delete();
+            lifecycle.delete(id);
+            scrubSummaryArtifacts(summaries, id, transaction);
+            cursor.continue();
+            return;
+          }
+          const existingRequest = lifecycle.get(id);
+          existingRequest.onsuccess = () => {
+            try {
+              const existing = existingRequest.result;
+              if (isArtifactLifecycleRecord(existing, id)
+                && existing.retainedAtMs <= retainedAtMs) {
+                if (existing.expiresAtMs <= retainedAtMs) {
+                  cursor.delete();
+                  lifecycle.delete(id);
+                  scrubSummaryArtifacts(summaries, id, transaction);
+                } else {
+                  // A nonstandard v2 database may already contain a valid
+                  // lifecycle row. Preserve its earlier policy instead of
+                  // extending retention, while recomputing byte accounting
+                  // from the artifact being migrated.
+                  lifecycle.put({
+                    ...existing,
+                    logicalBytes: record.logicalBytes,
+                    legacyGrace: true,
+                  });
+                }
+              } else {
+                lifecycle.put(record);
+              }
+              cursor.continue();
+            } catch (error) {
+              abortTransaction(transaction, error);
+            }
+          };
+        } catch (error) {
+          abortTransaction(transaction, error);
+        }
+      };
+    } catch (error) {
+      abortTransaction(transaction, error);
+    }
+  };
+}
+
+function hasRequiredCoachSchema(database) {
+  if (database.version < COACH_DB_VERSION
+    || !database.objectStoreNames.contains(COACH_STORE)
+    || !database.objectStoreNames.contains(COACH_ARTIFACT_STORE)
+    || !database.objectStoreNames.contains(COACH_ARTIFACT_LIFECYCLE_STORE)) {
+    return false;
+  }
+  try {
+    const transaction = database.transaction(
+      [COACH_STORE, COACH_ARTIFACT_STORE, COACH_ARTIFACT_LIFECYCLE_STORE],
+      "readonly",
+    );
+    const summaries = transaction.objectStore(COACH_STORE);
+    const artifacts = transaction.objectStore(COACH_ARTIFACT_STORE);
+    const lifecycle = transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE);
+    if (summaries.keyPath !== "id"
+      || artifacts.keyPath !== "id"
+      || lifecycle.keyPath !== "id"
+      || !lifecycle.indexNames.contains(COACH_ARTIFACT_EXPIRY_INDEX)) {
+      return false;
+    }
+    const expiry = lifecycle.index(COACH_ARTIFACT_EXPIRY_INDEX);
+    return expiry.keyPath === COACH_ARTIFACT_EXPIRY_INDEX
+      && !expiry.unique
+      && !expiry.multiEntry;
+  } catch {
+    return false;
+  }
+}
+
 function openRequest(databaseFactory, version) {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let upgradeTransaction;
     const fail = (error) => {
       if (settled) return;
       settled = true;
@@ -26,15 +298,26 @@ function openRequest(databaseFactory, version) {
       ? databaseFactory.open(COACH_DB_NAME)
       : databaseFactory.open(COACH_DB_NAME, version);
 
-    request.onupgradeneeded = () => {
-      const database = request.result;
-      if (!database.objectStoreNames.contains(COACH_STORE)) {
-        const store = database.createObjectStore(COACH_STORE, { keyPath: "id" });
-        store.createIndex("createdAt", "createdAt");
+    request.onupgradeneeded = (event) => {
+      upgradeTransaction = request.transaction;
+      if (upgradeTransaction) {
+        upgradeTransaction.onerror = (errorEvent) => {
+          const cause = errorEvent.target?.error || upgradeTransaction.error;
+          if (cause && !transactionFailureCauses.has(upgradeTransaction)) {
+            transactionFailureCauses.set(upgradeTransaction, cause);
+          }
+        };
       }
-      if (!database.objectStoreNames.contains(COACH_ARTIFACT_STORE)) {
-        const store = database.createObjectStore(COACH_ARTIFACT_STORE, { keyPath: "id" });
-        store.createIndex("createdAt", "createdAt");
+      if (settled) {
+        if (upgradeTransaction) {
+          abortTransaction(upgradeTransaction, new Error("The blocked coaching storage upgrade was cancelled."));
+        }
+        return;
+      }
+      try {
+        upgradeCoachDatabase(request, event);
+      } catch (error) {
+        if (!upgradeTransaction || !abortTransaction(upgradeTransaction, error)) fail(error);
       }
     };
     request.onsuccess = () => {
@@ -43,18 +326,20 @@ function openRequest(databaseFactory, version) {
         database.close();
         return;
       }
-      if (database.version < COACH_DB_VERSION
-        || !database.objectStoreNames.contains(COACH_STORE)
-        || !database.objectStoreNames.contains(COACH_ARTIFACT_STORE)) {
+      if (!hasRequiredCoachSchema(database)) {
         database.close();
-        fail(new Error("The coaching history database is missing required stores."));
+        fail(new Error("The coaching history database is missing required stores or indexes."));
         return;
       }
       settled = true;
       database.onversionchange = () => database.close();
       resolve(database);
     };
-    request.onerror = () => fail(request.error || new Error("Could not open coaching history"));
+    request.onerror = () => fail(
+      (upgradeTransaction && transactionFailureCauses.get(upgradeTransaction))
+      || request.error
+      || new Error("Could not open coaching history"),
+    );
     request.onblocked = () => fail(new Error("A previous NonStopTalk tab is blocking the coaching storage upgrade."));
   });
 }
@@ -71,24 +356,40 @@ export async function openCoachDatabase(databaseFactory = globalThis.indexedDB) 
   }
 }
 
-export async function withCoachTransaction(storeNames, mode, callback, optionalStoreNames = []) {
+export async function withCoachTransaction(storeNames, mode, callback) {
   const database = await openCoachDatabase();
   try {
     return await new Promise((resolve, reject) => {
-      const availableOptionalStores = optionalStoreNames.filter((name) => database.objectStoreNames.contains(name));
-      const transaction = database.transaction([...storeNames, ...availableOptionalStores], mode);
+      const transaction = database.transaction(storeNames, mode);
       let result;
-      try {
-        result = callback(transaction, new Set(availableOptionalStores));
-      } catch (error) {
-        transaction.abort();
+      let pendingError;
+      let settled = false;
+      const rejectOnce = (error) => {
+        if (settled) return;
+        settled = true;
         reject(error);
-        return;
+      };
+      transaction.oncomplete = () => {
+        if (settled) return;
+        settled = true;
+        const isRequest = typeof globalThis.IDBRequest === "function"
+          && result instanceof globalThis.IDBRequest;
+        resolve(isRequest ? result.result : result);
+      };
+      transaction.onerror = (event) => {
+        pendingError ||= event.target?.error || transaction.error;
+      };
+      transaction.onabort = () => rejectOnce(
+        transactionFailureCauses.get(transaction)
+        || transaction.error
+        || pendingError
+        || new Error("Coaching history operation was cancelled"),
+      );
+      try {
+        result = callback(transaction);
+      } catch (error) {
+        if (!abortTransaction(transaction, error)) rejectOnce(error);
       }
-      const isRequest = typeof globalThis.IDBRequest === "function" && result instanceof globalThis.IDBRequest;
-      transaction.oncomplete = () => resolve(isRequest ? result.result : result);
-      transaction.onerror = () => reject(transaction.error || new Error("Coaching history operation failed"));
-      transaction.onabort = () => reject(transaction.error || new Error("Coaching history operation was cancelled"));
     });
   } finally {
     database.close();
@@ -97,12 +398,6 @@ export async function withCoachTransaction(storeNames, mode, callback, optionalS
 
 function withCoachStore(storeName, mode, callback) {
   return withCoachTransaction([storeName], mode, (transaction) => callback(transaction.objectStore(storeName)));
-}
-
-function artifactLogicalBytes(artifact) {
-  const audioBytes = artifact?.audioBlob instanceof Blob ? artifact.audioBlob.size : 0;
-  const transcriptBytes = artifact?.transcript ? new Blob([String(artifact.transcript)]).size : 0;
-  return audioBytes + transcriptBytes;
 }
 
 function requireSessionId(record, label) {
@@ -119,26 +414,12 @@ function normalizedSaveRecords(summary, artifact) {
   if (artifactId !== sessionId) {
     throw new TypeError("Coaching summary and artifact IDs must match.");
   }
+  const normalizedArtifact = { ...artifact, id: sessionId };
   return {
     sessionId,
-    summary: { ...summary, id: sessionId },
-    artifact: { ...artifact, id: sessionId },
+    summary: summaryWithArtifactMetadata({ ...summary, id: sessionId }, normalizedArtifact),
+    artifact: normalizedArtifact,
   };
-}
-
-function artifactLifecycleRecord(artifact, sessionId, retainedAtMs = Date.now()) {
-  return {
-    id: sessionId,
-    retainedAtMs,
-    expiresAtMs: retainedAtMs + ARTIFACT_RETENTION_MS,
-    logicalBytes: artifactLogicalBytes(artifact),
-    lifecycleSchemaVersion: 1,
-    legacyGrace: false,
-  };
-}
-
-function summaryWithoutArtifacts(summary) {
-  return { ...summary, artifacts: { ...EMPTY_ARTIFACT_METADATA } };
 }
 
 function isQuotaExceededError(error) {
@@ -152,17 +433,139 @@ function isQuotaExceededError(error) {
 
 async function saveSummaryOnly(summary, sessionId) {
   await withCoachTransaction(
-    [COACH_STORE, COACH_ARTIFACT_STORE],
+    [COACH_STORE, COACH_ARTIFACT_STORE, COACH_ARTIFACT_LIFECYCLE_STORE],
     "readwrite",
-    (transaction, optionalStores) => {
-      transaction.objectStore(COACH_STORE).put(summaryWithoutArtifacts(summary));
-      transaction.objectStore(COACH_ARTIFACT_STORE).delete(sessionId);
-      if (optionalStores.has(COACH_ARTIFACT_LIFECYCLE_STORE)) {
-        transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE).delete(sessionId);
+    (transaction) => {
+      const nowMs = Date.now();
+      if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
+        throw new TypeError("The coaching artifact expiry time is invalid.");
       }
+      reconcileArtifactState(transaction, nowMs, () => {
+        transaction.objectStore(COACH_STORE).put(summaryWithoutArtifacts(summary));
+        transaction.objectStore(COACH_ARTIFACT_STORE).delete(sessionId);
+        transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE).delete(sessionId);
+      });
     },
-    [COACH_ARTIFACT_LIFECYCLE_STORE],
   );
+}
+
+function reconcileArtifactState(transaction, nowMs, done) {
+  const summaries = transaction.objectStore(COACH_STORE);
+  const artifacts = transaction.objectStore(COACH_ARTIFACT_STORE);
+  const lifecycle = transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE);
+  const artifactBytesById = new Map();
+  const summariesRequest = summaries.getAll();
+  const lifecycleEntries = [];
+  let completedReads = 0;
+
+  const finishRead = () => {
+    completedReads += 1;
+    if (completedReads !== 3) return;
+    try {
+      const artifactSummaryIds = new Set();
+      for (const summary of summariesRequest.result) {
+        if (typeof summary?.id === "string"
+          && summary.id.length > 0
+          && summaryClaimsArtifacts(summary)) {
+          artifactSummaryIds.add(summary.id);
+        }
+      }
+
+      const retainedById = new Map();
+      let retainedBytes = 0;
+      let retainedBytesOverflow = false;
+      let expiredCount = 0;
+      for (const { key, value } of lifecycleEntries) {
+        const validKey = typeof key === "string" && key.length > 0;
+        const validRecord = validKey && isArtifactLifecycleRecord(value, key);
+        const artifactExists = validKey && artifactBytesById.has(key);
+        const artifactBytes = artifactExists ? artifactBytesById.get(key) : null;
+        const summaryExists = validKey && artifactSummaryIds.has(key);
+        if (!validRecord
+          || value.retainedAtMs > nowMs
+          || value.expiresAtMs <= nowMs
+          || !artifactExists
+          || artifactBytes !== value.logicalBytes
+          || !summaryExists) {
+          lifecycle.delete(key);
+          artifacts.delete(key);
+          if (validRecord
+            && value.retainedAtMs <= nowMs
+            && value.expiresAtMs <= nowMs
+            && artifactExists) {
+            expiredCount += 1;
+          }
+          continue;
+        }
+        retainedById.set(key, artifactBytes);
+        const nextBytes = retainedBytes + artifactBytes;
+        if (!Number.isSafeInteger(nextBytes)) retainedBytesOverflow = true;
+        else retainedBytes = nextBytes;
+      }
+
+      for (const key of artifactBytesById.keys()) {
+        if (!retainedById.has(key)) {
+          artifacts.delete(key);
+          lifecycle.delete(key);
+        }
+      }
+      for (const summary of summariesRequest.result) {
+        if (summaryClaimsArtifacts(summary)
+          && (typeof summary?.id !== "string" || !retainedById.has(summary.id))) {
+          summaries.put(summaryWithoutArtifacts(summary));
+        }
+      }
+
+      done({ retainedById, retainedBytes, retainedBytesOverflow, expiredCount });
+    } catch (error) {
+      abortTransaction(transaction, error);
+    }
+  };
+
+  // Stream artifact records so byte accounting is checked against the real
+  // Blob/transcript payload without materializing the complete blob store at
+  // once. Only the content-free ID/byte map survives each cursor step.
+  const artifactCursorRequest = artifacts.openCursor();
+  artifactCursorRequest.onsuccess = () => {
+    try {
+      const cursor = artifactCursorRequest.result;
+      if (!cursor) {
+        finishRead();
+        return;
+      }
+      const key = cursor.primaryKey;
+      const artifact = cursor.value;
+      const logicalBytes = typeof key === "string"
+        && key.length > 0
+        && artifact?.id === key
+        ? artifactLogicalBytes(artifact)
+        : null;
+      if (logicalBytes === null) {
+        cursor.delete();
+        lifecycle.delete(key);
+      } else {
+        artifactBytesById.set(key, logicalBytes);
+      }
+      cursor.continue();
+    } catch (error) {
+      abortTransaction(transaction, error);
+    }
+  };
+  summariesRequest.onsuccess = finishRead;
+  const lifecycleCursorRequest = lifecycle.openCursor();
+  lifecycleCursorRequest.onsuccess = () => {
+    try {
+      const cursor = lifecycleCursorRequest.result;
+      if (!cursor) {
+        finishRead();
+        return;
+      }
+      lifecycleEntries.push({ key: cursor.primaryKey, value: cursor.value });
+      cursor.continue();
+    } catch (error) {
+      abortTransaction(transaction, error);
+    }
+  };
 }
 
 export async function saveCoachingSession(summary, artifact) {
@@ -175,62 +578,32 @@ export async function saveCoachingSession(summary, artifact) {
     return { summarySaved: true, artifactStatus: "not-requested" };
   }
 
+  if (artifactLogicalBytes(records.artifact) === null) {
+    throw new TypeError("The coaching artifact payload is invalid.");
+  }
   try {
     return await withCoachTransaction(
-      [COACH_STORE, COACH_ARTIFACT_STORE],
+      [COACH_STORE, COACH_ARTIFACT_STORE, COACH_ARTIFACT_LIFECYCLE_STORE],
       "readwrite",
-      (transaction, optionalStores) => {
+      (transaction) => {
+        // Timestamp only after openCoachDatabase has finished any v2→v3
+        // migration. Otherwise a first save can predate the shared migration
+        // timestamp by a few milliseconds and misclassify its backfill as
+        // future-dated corruption.
+        const record = artifactLifecycleRecord(records.artifact, records.sessionId);
+        if (!record) throw new TypeError("The coaching artifact payload is invalid.");
         const outcome = { summarySaved: true, artifactStatus: "stored" };
         const summaries = transaction.objectStore(COACH_STORE);
         const artifacts = transaction.objectStore(COACH_ARTIFACT_STORE);
-        if (!optionalStores.has(COACH_ARTIFACT_LIFECYCLE_STORE)) {
-          summaries.put(records.summary);
-          artifacts.put(records.artifact);
-          return outcome;
-        }
-
         const lifecycle = transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE);
-        const record = artifactLifecycleRecord(records.artifact, records.sessionId);
-        if (!Number.isSafeInteger(record.logicalBytes)
-          || record.logicalBytes < 0
-          || record.logicalBytes > ARTIFACT_MAX_LOGICAL_BYTES) {
-          outcome.artifactStatus = "app-limit";
-          summaries.put(summaryWithoutArtifacts(records.summary));
-          artifacts.delete(record.id);
-          lifecycle.delete(record.id);
-          return outcome;
-        }
-        const request = lifecycle.getAll();
-        request.onsuccess = () => {
-          let retainedBytes = 0;
-          let ledgerValid = true;
-          for (const item of request.result) {
-            if (!item || typeof item.id !== "string" || !item.id
-              || !Number.isSafeInteger(item.logicalBytes) || item.logicalBytes < 0
-              || item.logicalBytes > ARTIFACT_MAX_LOGICAL_BYTES
-              || !Number.isSafeInteger(item.expiresAtMs) || item.expiresAtMs < 0) {
-              ledgerValid = false;
-              break;
-            }
-            if (item.id === record.id) continue;
-            if (item.expiresAtMs <= record.retainedAtMs) {
-              artifacts.delete(item.id);
-              lifecycle.delete(item.id);
-              const expiredSummary = summaries.get(item.id);
-              expiredSummary.onsuccess = () => {
-                if (expiredSummary.result) {
-                  summaries.put(summaryWithoutArtifacts(expiredSummary.result));
-                }
-              };
-              continue;
-            }
-            retainedBytes += item.logicalBytes;
-            if (!Number.isSafeInteger(retainedBytes) || retainedBytes > ARTIFACT_MAX_LOGICAL_BYTES) {
-              ledgerValid = false;
-              break;
-            }
-          }
-          if (!ledgerValid || retainedBytes > ARTIFACT_MAX_LOGICAL_BYTES - record.logicalBytes) {
+        reconcileArtifactState(transaction, record.retainedAtMs, (state) => {
+          const replacedBytes = state.retainedById.get(record.id) || 0;
+          const otherBytes = state.retainedBytes - replacedBytes;
+          if (record.logicalBytes > ARTIFACT_MAX_LOGICAL_BYTES
+            || state.retainedBytesOverflow
+            || !Number.isSafeInteger(otherBytes)
+            || otherBytes < 0
+            || otherBytes > ARTIFACT_MAX_LOGICAL_BYTES - record.logicalBytes) {
             outcome.artifactStatus = "app-limit";
             summaries.put(summaryWithoutArtifacts(records.summary));
             artifacts.delete(record.id);
@@ -240,10 +613,9 @@ export async function saveCoachingSession(summary, artifact) {
           summaries.put(records.summary);
           artifacts.put(records.artifact);
           lifecycle.put(record);
-        };
+        });
         return outcome;
       },
-      [COACH_ARTIFACT_LIFECYCLE_STORE],
     );
   } catch (error) {
     if (!isQuotaExceededError(error)) throw error;
@@ -252,44 +624,21 @@ export async function saveCoachingSession(summary, artifact) {
   }
 }
 
-async function cleanupExpiredCoachingArtifacts(nowMs = Date.now()) {
-  if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
-    throw new TypeError("The coaching artifact expiry time is invalid.");
-  }
+async function cleanupExpiredCoachingArtifacts() {
   const outcome = { expiredCount: 0 };
   await withCoachTransaction(
-    [COACH_STORE, COACH_ARTIFACT_STORE],
+    [COACH_STORE, COACH_ARTIFACT_STORE, COACH_ARTIFACT_LIFECYCLE_STORE],
     "readwrite",
-    (transaction, optionalStores) => {
-      if (!optionalStores.has(COACH_ARTIFACT_LIFECYCLE_STORE)) return outcome;
-      const summaries = transaction.objectStore(COACH_STORE);
-      const artifacts = transaction.objectStore(COACH_ARTIFACT_STORE);
-      const lifecycle = transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE);
-      const expiryIndex = lifecycle.indexNames.contains("expiresAtMs")
-        ? lifecycle.index("expiresAtMs")
-        : null;
-      const range = typeof globalThis.IDBKeyRange?.upperBound === "function"
-        ? globalThis.IDBKeyRange.upperBound(nowMs)
-        : null;
-      const request = expiryIndex && range ? expiryIndex.getAll(range) : lifecycle.getAll();
-      request.onsuccess = () => {
-        for (const item of request.result) {
-          if (!item || typeof item.id !== "string" || item.id.length === 0
-            || !Number.isSafeInteger(item.expiresAtMs) || item.expiresAtMs > nowMs) continue;
-          outcome.expiredCount += 1;
-          artifacts.delete(item.id);
-          lifecycle.delete(item.id);
-          const summaryRequest = summaries.get(item.id);
-          summaryRequest.onsuccess = () => {
-            if (summaryRequest.result) {
-              summaries.put(summaryWithoutArtifacts(summaryRequest.result));
-            }
-          };
-        }
-      };
+    (transaction) => {
+      const nowMs = Date.now();
+      if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
+        throw new TypeError("The coaching artifact expiry time is invalid.");
+      }
+      reconcileArtifactState(transaction, nowMs, (state) => {
+        outcome.expiredCount = state.expiredCount;
+      });
       return outcome;
     },
-    [COACH_ARTIFACT_LIFECYCLE_STORE],
   );
   return outcome.expiredCount;
 }
@@ -308,83 +657,104 @@ export async function readCoachingArtifact(id) {
   const sessionId = String(id || "");
   const outcome = { artifact: undefined };
   await withCoachTransaction(
-    [COACH_STORE, COACH_ARTIFACT_STORE],
+    [COACH_STORE, COACH_ARTIFACT_STORE, COACH_ARTIFACT_LIFECYCLE_STORE],
     "readwrite",
-    (transaction, optionalStores) => {
+    (transaction) => {
+      const nowMs = Date.now();
+      if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
+        throw new TypeError("The coaching artifact expiry time is invalid.");
+      }
       const summaries = transaction.objectStore(COACH_STORE);
       const artifacts = transaction.objectStore(COACH_ARTIFACT_STORE);
-      const expireArtifact = (lifecycle) => {
+      const lifecycle = transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE);
+      const discardArtifact = () => {
         artifacts.delete(sessionId);
         lifecycle.delete(sessionId);
-        const summaryRequest = summaries.get(sessionId);
-        summaryRequest.onsuccess = () => {
-          if (summaryRequest.result) {
-            summaries.put(summaryWithoutArtifacts(summaryRequest.result));
-          }
-        };
+        scrubSummaryArtifacts(summaries, sessionId, transaction);
       };
-      const readArtifact = (lifecycle, record) => {
-        const request = artifacts.get(sessionId);
-        request.onsuccess = () => {
-          if (record && record.expiresAtMs <= Date.now()) {
-            expireArtifact(lifecycle);
-          } else {
-            outcome.artifact = request.result;
-          }
-        };
-      };
-      if (!optionalStores.has(COACH_ARTIFACT_LIFECYCLE_STORE)) {
-        readArtifact(null, null);
-        return outcome;
-      }
 
-      const lifecycle = transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE);
       const lifecycleRequest = lifecycle.get(sessionId);
       lifecycleRequest.onsuccess = () => {
-        const record = lifecycleRequest.result;
-        if (record
-          && record.id === sessionId
-          && Number.isSafeInteger(record.expiresAtMs)
-          && record.expiresAtMs > Date.now()) {
-          readArtifact(lifecycle, record);
-          return;
+        try {
+          const record = lifecycleRequest.result;
+          if (!isActiveArtifactLifecycleRecord(record, sessionId, nowMs)) {
+            discardArtifact();
+            return;
+          }
+          const summaryRequest = summaries.get(sessionId);
+          summaryRequest.onsuccess = () => {
+            try {
+              if (!summaryClaimsArtifacts(summaryRequest.result)) {
+                discardArtifact();
+                return;
+              }
+              const artifactRequest = artifacts.get(sessionId);
+              artifactRequest.onsuccess = () => {
+                try {
+                  const artifact = artifactRequest.result;
+                  const logicalBytes = artifactLogicalBytes(artifact);
+                  const completedAtMs = Date.now();
+                  if (!Number.isSafeInteger(completedAtMs) || completedAtMs < 0) {
+                    throw new TypeError("The coaching artifact expiry time is invalid.");
+                  }
+                  if (!isActiveArtifactLifecycleRecord(record, sessionId, completedAtMs)
+                    || !artifact
+                    || artifact.id !== sessionId
+                    || logicalBytes !== record.logicalBytes) {
+                    discardArtifact();
+                    return;
+                  }
+                  outcome.artifact = artifact;
+                } catch (error) {
+                  abortTransaction(transaction, error);
+                }
+              };
+            } catch (error) {
+              abortTransaction(transaction, error);
+            }
+          };
+        } catch (error) {
+          abortTransaction(transaction, error);
         }
-        // Once a newer schema owns lifecycle data, missing, malformed, and
-        // expired rows all fail closed so sensitive content cannot be returned
-        // without a valid unexpired retention record.
-        expireArtifact(lifecycle);
       };
       return outcome;
     },
-    [COACH_ARTIFACT_LIFECYCLE_STORE],
   );
   return outcome.artifact;
 }
 
 export function deleteCoachingArtifacts(id) {
   const sessionId = String(id || "");
-  return withCoachTransaction([COACH_STORE, COACH_ARTIFACT_STORE], "readwrite", (transaction, optionalStores) => {
-    const summaries = transaction.objectStore(COACH_STORE);
-    const artifacts = transaction.objectStore(COACH_ARTIFACT_STORE);
-    const request = summaries.get(sessionId);
-    request.onsuccess = () => {
-      if (request.result) summaries.put({ ...request.result, artifacts: { ...EMPTY_ARTIFACT_METADATA } });
-      artifacts.delete(sessionId);
-      if (optionalStores.has(COACH_ARTIFACT_LIFECYCLE_STORE)) {
-        transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE).delete(sessionId);
-      }
-    };
-  }, [COACH_ARTIFACT_LIFECYCLE_STORE]);
+  return withCoachTransaction(
+    [COACH_STORE, COACH_ARTIFACT_STORE, COACH_ARTIFACT_LIFECYCLE_STORE],
+    "readwrite",
+    (transaction) => {
+      const summaries = transaction.objectStore(COACH_STORE);
+      const artifacts = transaction.objectStore(COACH_ARTIFACT_STORE);
+      const request = summaries.get(sessionId);
+      request.onsuccess = () => {
+        try {
+          if (request.result) summaries.put(summaryWithoutArtifacts(request.result));
+          artifacts.delete(sessionId);
+          transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE).delete(sessionId);
+        } catch (error) {
+          abortTransaction(transaction, error);
+        }
+      };
+    },
+  );
 }
 
 export function clearCoachingSummaries() {
-  return withCoachTransaction([COACH_STORE, COACH_ARTIFACT_STORE], "readwrite", (transaction, optionalStores) => {
-    transaction.objectStore(COACH_STORE).clear();
-    transaction.objectStore(COACH_ARTIFACT_STORE).clear();
-    if (optionalStores.has(COACH_ARTIFACT_LIFECYCLE_STORE)) {
+  return withCoachTransaction(
+    [COACH_STORE, COACH_ARTIFACT_STORE, COACH_ARTIFACT_LIFECYCLE_STORE],
+    "readwrite",
+    (transaction) => {
+      transaction.objectStore(COACH_STORE).clear();
+      transaction.objectStore(COACH_ARTIFACT_STORE).clear();
       transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE).clear();
-    }
-  }, [COACH_ARTIFACT_LIFECYCLE_STORE]);
+    },
+  );
 }
 
 export const coachingStorageSchema = Object.freeze({
@@ -392,7 +762,18 @@ export const coachingStorageSchema = Object.freeze({
   version: COACH_DB_VERSION,
   summaryStore: COACH_STORE,
   artifactStore: COACH_ARTIFACT_STORE,
-  optionalLifecycleStore: COACH_ARTIFACT_LIFECYCLE_STORE,
+  lifecycleStore: COACH_ARTIFACT_LIFECYCLE_STORE,
+  lifecycleExpiryIndex: COACH_ARTIFACT_EXPIRY_INDEX,
+  lifecycleSchemaVersion: ARTIFACT_LIFECYCLE_SCHEMA_VERSION,
   artifactRetentionMs: ARTIFACT_RETENTION_MS,
   artifactMaxLogicalBytes: ARTIFACT_MAX_LOGICAL_BYTES,
+});
+
+export const coachingStoragePolicy = Object.freeze({
+  artifactLogicalBytes,
+  artifactLifecycleRecord,
+  isArtifactLifecycleRecord,
+  isQuotaExceededError,
+  summaryWithoutArtifacts,
+  summaryWithArtifactMetadata,
 });

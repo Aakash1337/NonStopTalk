@@ -307,11 +307,11 @@ async function runPracticeFlow(browser, origin) {
   const retentionCheckbox = page.getByLabel("Optional full session retention").getByRole("checkbox");
   assert(!(await retentionCheckbox.isChecked()), "Raw audio/full transcript retention must be opt-in");
   const retentionDisclosure = (await page.getByLabel("Optional full session retention").innerText()).toLocaleLowerCase();
-  assert(retentionDisclosure.includes("either remain until you delete them or follow a 30-day local retention policy")
+  assert(retentionDisclosure.includes("saved artifacts follow a 30-day local retention policy")
     && retentionDisclosure.includes("newly saved artifacts get 30 days")
-    && retentionDisclosure.includes("existing artifacts get 30 days from the storage upgrade")
+    && retentionDisclosure.includes("artifacts that existed before this storage upgrade get 30 days from the upgrade")
     && retentionDisclosure.includes("never uploaded"),
-  "Retention consent must disclose both compatible local-lifecycle policies and the no-upload boundary");
+  "Retention consent must disclose the required 30-day local lifecycle and the no-upload boundary");
   await page.getByLabel("Optional transcript analysis").getByRole("checkbox").check();
   await retentionCheckbox.check();
   await page.getByRole("button", { name: /Calibrate microphone/ }).click();
@@ -416,6 +416,35 @@ async function runPracticeFlow(browser, origin) {
   assert((await storedSummaries(page)).length === 0, "Deleting local history must clear summaries");
   assert((await storedArtifacts(page)).length === 0, "Deleting local history must clear full artifacts");
   await context.close();
+}
+
+async function runMixedGenerationRetentionDisclosureFlow(browser, origin) {
+  const releaseASource = await readFile(
+    path.join(root, "scripts", "fixtures", "coach-storage-release-a.js"),
+    "utf8",
+  );
+  const context = await browser.newContext();
+  await context.route("**/coach-storage.js", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/javascript; charset=utf-8",
+      headers: { "Cache-Control": "no-store" },
+      body: releaseASource,
+    });
+  });
+  try {
+    const page = await context.newPage();
+    await page.goto(`${origin}/practice`, { waitUntil: "domcontentloaded" });
+    const disclosure = normalizeHyphenatedText(
+      await page.getByLabel("Optional full session retention").innerText(),
+    );
+    assert(disclosure.includes("depending on the local storage version already used by this browser profile")
+      && disclosure.includes("artifacts either remain until you delete them or follow a 30 day local retention policy")
+      && disclosure.includes("never uploaded"),
+    "App B paired with the Release-A storage module must retain the conservative lifecycle disclosure");
+  } finally {
+    await context.close();
+  }
 }
 
 async function runPracticeLoopFlow(browser, origin) {
@@ -622,7 +651,7 @@ async function runVersionOneMigrationFlow(browser, origin) {
   await page.waitForSelector("[data-coach-progress]");
   const migration = await page.evaluate(async () => {
     const database = await new Promise((resolve, reject) => {
-      const request = indexedDB.open("nonstoptalk-coaching", 2);
+      const request = indexedDB.open("nonstoptalk-coaching");
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
@@ -635,13 +664,25 @@ async function runVersionOneMigrationFlow(browser, origin) {
         request.onsuccess = () => resolve(request.result);
         request.onerror = () => reject(request.error);
       });
-      return { stores, legacySummary };
+      const lifecycle = database.transaction("artifact-lifecycle", "readonly")
+        .objectStore("artifact-lifecycle");
+      return {
+        version: database.version,
+        stores,
+        lifecycleIndexes: [...lifecycle.indexNames],
+        legacySummary,
+      };
     } finally {
       database.close();
     }
   });
-  assert(migration.stores.includes("session-summaries") && migration.stores.includes("session-artifacts"), "IndexedDB v1 history should upgrade to both v2 stores");
-  assert(migration.legacySummary?.advice?.focus === "Legacy focus preserved", "IndexedDB v2 migration must preserve legacy v1 summaries");
+  assert(migration.version === 3
+    && migration.stores.includes("session-summaries")
+    && migration.stores.includes("session-artifacts")
+    && migration.stores.includes("artifact-lifecycle")
+    && migration.lifecycleIndexes.includes("expiresAtMs"),
+    "IndexedDB v1 history should upgrade to the complete v3 schema");
+  assert(migration.legacySummary?.advice?.focus === "Legacy focus preserved", "IndexedDB v3 migration must preserve legacy v1 summaries");
   await context.close();
 }
 
@@ -653,9 +694,10 @@ async function runFutureVersionCompatibilityFlow(browser, origin) {
   await page.goto(origin);
   await page.evaluate(async () => {
     await new Promise((resolve, reject) => {
-      const request = indexedDB.open("nonstoptalk-coaching", 3);
+      const request = indexedDB.open("nonstoptalk-coaching", 4);
       request.onupgradeneeded = () => {
         const database = request.result;
+        const retainedAtMs = Date.now() - 2_592_000_001;
         const summaries = database.createObjectStore("session-summaries", { keyPath: "id" });
         summaries.createIndex("createdAt", "createdAt");
         const artifacts = database.createObjectStore("session-artifacts", { keyPath: "id" });
@@ -663,7 +705,7 @@ async function runFutureVersionCompatibilityFlow(browser, origin) {
         const lifecycle = database.createObjectStore("artifact-lifecycle", { keyPath: "id" });
         lifecycle.createIndex("expiresAtMs", "expiresAtMs");
         summaries.put({
-          id: "future-v3-summary",
+          id: "future-v4-summary",
           createdAt: "2026-08-10T12:00:00.000Z",
           scenario: "presentation",
           goal: "energy",
@@ -671,7 +713,7 @@ async function runFutureVersionCompatibilityFlow(browser, origin) {
           advice: { focus: "Future-version summary preserved" },
         });
         summaries.put({
-          id: "expired-v3-artifact",
+          id: "expired-v4-artifact",
           createdAt: "2026-07-01T12:00:00.000Z",
           scenario: "interview",
           goal: "pace",
@@ -680,7 +722,7 @@ async function runFutureVersionCompatibilityFlow(browser, origin) {
           artifacts: { audioStored: true, audioBytes: 7, audioMimeType: "audio/webm", transcriptStored: true, transcriptMayBePartial: false },
         });
         artifacts.put({
-          id: "expired-v3-artifact",
+          id: "expired-v4-artifact",
           createdAt: "2026-07-01T12:00:00.000Z",
           audioBlob: new Blob(["expired"], { type: "audio/webm" }),
           audioMimeType: "audio/webm",
@@ -688,9 +730,9 @@ async function runFutureVersionCompatibilityFlow(browser, origin) {
           transcriptMayBePartial: false,
         });
         lifecycle.put({
-          id: "expired-v3-artifact",
-          retainedAtMs: Date.now() - 2_592_000_001,
-          expiresAtMs: Date.now() - 1,
+          id: "expired-v4-artifact",
+          retainedAtMs,
+          expiresAtMs: retainedAtMs + 2_592_000_000,
           logicalBytes: 29,
           lifecycleSchemaVersion: 1,
           legacyGrace: true,
@@ -707,7 +749,7 @@ async function runFutureVersionCompatibilityFlow(browser, origin) {
   await page.goto(`${origin}/progress`);
   await page.waitForSelector("[data-coach-progress]");
   assert((await page.locator("body").innerText()).includes("Future-version summary preserved"),
-    "The v2 compatibility release must read required stores after a future database upgrade");
+    "The v3 storage release must read required stores after a future database upgrade");
   const expiredState = await page.evaluate(async () => {
     const database = await new Promise((resolve, reject) => {
       const request = indexedDB.open("nonstoptalk-coaching");
@@ -717,9 +759,9 @@ async function runFutureVersionCompatibilityFlow(browser, origin) {
     try {
       return await new Promise((resolve, reject) => {
         const transaction = database.transaction(["session-summaries", "session-artifacts", "artifact-lifecycle"], "readonly");
-        const summary = transaction.objectStore("session-summaries").get("expired-v3-artifact");
-        const artifact = transaction.objectStore("session-artifacts").get("expired-v3-artifact");
-        const lifecycle = transaction.objectStore("artifact-lifecycle").get("expired-v3-artifact");
+        const summary = transaction.objectStore("session-summaries").get("expired-v4-artifact");
+        const artifact = transaction.objectStore("session-artifacts").get("expired-v4-artifact");
+        const lifecycle = transaction.objectStore("artifact-lifecycle").get("expired-v4-artifact");
         transaction.oncomplete = () => resolve({
           summary: summary.result,
           artifact: artifact.result,
@@ -735,7 +777,7 @@ async function runFutureVersionCompatibilityFlow(browser, origin) {
     && expiredState.summary?.artifacts?.transcriptStored === false
     && !expiredState.artifact
     && !expiredState.lifecycle,
-  "The rollback-compatible summary read must atomically expire future-schema artifact state while preserving its compact summary");
+    "The v3-compatible summary read must atomically expire newer-schema artifact state while preserving its compact summary");
 
   const bookkeeping = await page.evaluate(async () => {
     const { clearCoachingSummaries, deleteCoachingArtifacts, readCoachingArtifact, saveCoachingSession } = await import("/coach-storage.js");
@@ -901,11 +943,26 @@ async function runFutureVersionCompatibilityFlow(browser, origin) {
       const request = indexedDB.open("nonstoptalk-coaching");
       request.onsuccess = () => {
         const database = request.result;
-        const transaction = database.transaction("artifact-lifecycle", "readwrite");
+        const capacityId = "existing-capacity";
+        const retainedAtMs = Date.now();
+        const transaction = database.transaction(["session-summaries", "session-artifacts", "artifact-lifecycle"], "readwrite");
+        transaction.objectStore("session-summaries").put({
+          id: capacityId,
+          createdAt: new Date(retainedAtMs).toISOString(),
+          artifacts: { audioStored: true, audioBytes: 134_217_728, audioMimeType: "audio/webm", transcriptStored: false, transcriptMayBePartial: false },
+        });
+        transaction.objectStore("session-artifacts").put({
+          id: capacityId,
+          createdAt: new Date(retainedAtMs).toISOString(),
+          audioBlob: new Blob([new ArrayBuffer(134_217_728)], { type: "audio/webm" }),
+          audioMimeType: "audio/webm",
+          transcript: "",
+          transcriptMayBePartial: false,
+        });
         transaction.objectStore("artifact-lifecycle").put({
-          id: "existing-capacity",
-          retainedAtMs: Date.now(),
-          expiresAtMs: Date.now() + 2_592_000_000,
+          id: capacityId,
+          retainedAtMs,
+          expiresAtMs: retainedAtMs + 2_592_000_000,
           logicalBytes: 134_217_728,
           lifecycleSchemaVersion: 1,
           legacyGrace: false,
@@ -1016,40 +1073,40 @@ async function runFutureVersionCompatibilityFlow(browser, origin) {
       clearedCounts,
     };
   });
-  assert(bookkeeping.saveResult?.artifactStatus === "stored", "A rollback-compatible save should report retained artifacts");
+  assert(bookkeeping.saveResult?.artifactStatus === "stored", "A v3 save should report retained artifacts");
   assert(bookkeeping.beforeDelete?.lifecycleSchemaVersion === 1 && bookkeeping.beforeDelete?.logicalBytes === 9,
-    "A rollback-compatible save must maintain optional future artifact bookkeeping without storing content in it");
+    "A v3 save must maintain required content-free artifact lifecycle bookkeeping");
   assert(!bookkeeping.afterDelete.lifecycle && bookkeeping.afterDelete.summary?.artifacts?.audioStored === false,
-    "A rollback-compatible delete must clear optional future bookkeeping and summary metadata atomically");
+    "A v3 delete must clear required lifecycle bookkeeping and summary metadata atomically");
   assert(bookkeeping.saveAfterPrune?.artifactStatus === "stored"
     && bookkeeping.savePrunedState.summary?.artifacts?.audioStored === false
     && !bookkeeping.savePrunedState.artifact
     && !bookkeeping.savePrunedState.lifecycle,
-  "A rollback-compatible save must exclude expired bytes and atomically clear their artifact state before applying the cap");
+    "A v3 save must exclude expired bytes and atomically clear their artifact state before applying the cap");
   assert(bookkeeping.replacementStored?.artifactStatus === "stored"
     && bookkeeping.replacementSummaryOnly?.artifactStatus === "not-requested"
     && bookkeeping.replacementState.summary?.artifacts?.audioStored === false
     && !bookkeeping.replacementState.artifact
     && !bookkeeping.replacementState.lifecycle,
-  "A summary-only replacement must remove any same-ID sensitive artifact state atomically");
+    "A summary-only replacement must remove any same-ID sensitive artifact state atomically");
   assert(bookkeeping.mismatchedIdRejected && bookkeeping.nonStringIdRejected,
     "Storage writes must reject mismatched or non-string IDs before creating orphan records");
   assert(bookkeeping.cappedResult?.artifactStatus === "app-limit"
     && bookkeeping.cappedState.summary?.artifacts?.audioStored === false
     && !bookkeeping.cappedState.artifact
     && !bookkeeping.cappedState.lifecycle,
-  "A rollback-compatible save must preserve its compact summary without new artifact data at the future app limit");
+    "A v3 save must preserve its compact summary without new artifact data at the required app limit");
   assert(!bookkeeping.expiredArtifactRead,
-    "A direct artifact read must never return an artifact whose future lifecycle row has expired");
+    "A direct artifact read must never return an artifact whose required lifecycle row has expired");
   assert(bookkeeping.clearedCounts.every((count) => count === 0),
-    "A rollback-compatible full deletion must clear summaries, artifacts, and optional lifecycle rows");
+    "A v3 full deletion must clear summaries, artifacts, and required lifecycle rows");
 
   const upgrade = await page.evaluate(async () => {
     const { openCoachDatabase } = await import("/coach-storage.js");
     const heldDatabase = await openCoachDatabase();
     const openedVersion = heldDatabase.version;
     const upgradedVersion = await new Promise((resolve, reject) => {
-      const request = indexedDB.open("nonstoptalk-coaching", 4);
+      const request = indexedDB.open("nonstoptalk-coaching", 5);
       request.onsuccess = () => {
         const version = request.result.version;
         request.result.close();
@@ -1060,7 +1117,7 @@ async function runFutureVersionCompatibilityFlow(browser, origin) {
     });
     return { openedVersion, upgradedVersion };
   });
-  assert(upgrade.openedVersion === 3 && upgrade.upgradedVersion === 4,
+  assert(upgrade.openedVersion === 4 && upgrade.upgradedVersion === 5,
     "The compatibility release must open newer schemas and close its connection on versionchange");
   assert(pageErrors.length === 0, `Future-version compatibility flow emitted errors: ${JSON.stringify(pageErrors)}`);
   await context.close();
@@ -1078,16 +1135,33 @@ async function runComposedStorageWarningFlow(browser, origin) {
       const request = indexedDB.open("nonstoptalk-coaching", 3);
       request.onupgradeneeded = () => {
         const database = request.result;
+        const capacityId = "existing-capacity";
+        const retainedAtMs = Date.now();
         const summaries = database.createObjectStore("session-summaries", { keyPath: "id" });
         summaries.createIndex("createdAt", "createdAt");
         const artifacts = database.createObjectStore("session-artifacts", { keyPath: "id" });
         artifacts.createIndex("createdAt", "createdAt");
         const lifecycle = database.createObjectStore("artifact-lifecycle", { keyPath: "id" });
         lifecycle.createIndex("expiresAtMs", "expiresAtMs");
+        summaries.put({
+          id: capacityId,
+          createdAt: new Date(retainedAtMs).toISOString(),
+          scenario: "interview",
+          goal: "pace",
+          artifacts: { audioStored: true, audioBytes: 134_217_728, audioMimeType: "audio/webm", transcriptStored: false, transcriptMayBePartial: false },
+        });
+        artifacts.put({
+          id: capacityId,
+          createdAt: new Date(retainedAtMs).toISOString(),
+          audioBlob: new Blob([new ArrayBuffer(134_217_728)], { type: "audio/webm" }),
+          audioMimeType: "audio/webm",
+          transcript: "",
+          transcriptMayBePartial: false,
+        });
         lifecycle.put({
-          id: "existing-capacity",
-          retainedAtMs: Date.now(),
-          expiresAtMs: Date.now() + 2_592_000_000,
+          id: capacityId,
+          retainedAtMs,
+          expiresAtMs: retainedAtMs + 2_592_000_000,
           logicalBytes: 134_217_728,
           lifecycleSchemaVersion: 1,
           legacyGrace: false,
@@ -1116,11 +1190,14 @@ async function runComposedStorageWarningFlow(browser, origin) {
   assert(review.includes("128 mib artifact limit is full"),
     "The review must also disclose why its opted-in artifact was not stored");
   const summaries = await storedSummaries(page);
-  assert(summaries.length === 1 && summaries[0]?.artifacts?.audioStored === false
-    && summaries[0]?.artifacts?.transcriptStored === false,
-  "The app-limit fallback must preserve one compact summary with truthful artifact metadata");
-  assert((await storedArtifacts(page)).length === 0,
-    "The app-limit fallback must not retain the rejected recording or transcript");
+  const savedAttempt = summaries.find((summary) => summary.id !== "existing-capacity");
+  assert(summaries.length === 2
+    && savedAttempt?.artifacts?.audioStored === false
+    && savedAttempt?.artifacts?.transcriptStored === false,
+    "The app-limit fallback must preserve the new compact summary with truthful artifact metadata");
+  const artifacts = await storedArtifacts(page);
+  assert(artifacts.length === 1 && artifacts[0]?.id === "existing-capacity",
+    "The app-limit fallback must preserve existing artifacts without retaining the rejected recording or transcript");
   assert(pageErrors.length === 0, `Composed storage-warning flow emitted errors: ${JSON.stringify(pageErrors)}`);
   await context.close();
 }
@@ -1445,6 +1522,7 @@ try {
   await waitForServer(`${origin}/practice`, child, () => logs);
   browser = await launchBrowser();
   await runPracticeFlow(browser, origin);
+  await runMixedGenerationRetentionDisclosureFlow(browser, origin);
   await runPracticeLoopFlow(browser, origin);
   await runDefaultRetentionFlow(browser, origin);
   await runTranscriptFinalizationTimeoutFlow(browser, origin);
