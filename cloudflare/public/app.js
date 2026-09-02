@@ -10,6 +10,11 @@ import {
 } from "./coach-loop.js";
 import * as coachingStorage from "./coach-storage.js";
 import {
+  AUTO_MICROPHONE_ID,
+  createMicrophoneSelection,
+  microphoneDeviceLabel,
+} from "./microphone-selection.js";
+import {
   SETUP_KIT_MAX_NAME_CODE_POINTS,
   SETUP_KIT_STORAGE_KEY,
   createSetupKitStore,
@@ -32,7 +37,14 @@ const {
 const app = document.querySelector("#app");
 const announcer = document.querySelector("#announcer");
 const toast = document.querySelector("#toast");
+const microphoneDialog = createMicrophoneDialogElement();
+const microphoneList = microphoneDialog.querySelector("[data-microphone-list]");
+const microphoneStatus = microphoneDialog.querySelector("[data-microphone-status]");
 const setupKitStore = createSetupKitStore();
+const microphoneSelection = createMicrophoneSelection({
+  getStorage: () => window.localStorage,
+  getMediaDevices: () => navigator.mediaDevices,
+});
 
 let room = null;
 let roomCode = "";
@@ -55,6 +67,10 @@ let progressSessions = [];
 let progressArtifactSessions = new Map();
 let pendingPracticeResume = null;
 let roomSetupView = freshRoomSetupView();
+let microphoneDialogToken = null;
+let microphoneDialogOpener = null;
+let microphoneDialogScope = null;
+let microphoneRefreshGeneration = 0;
 
 const PRACTICE_SCENARIOS = [
   { id: "interview", name: "Interview answer", prompt: "Tell me about a time you solved a difficult problem." },
@@ -79,12 +95,17 @@ window.addEventListener("popstate", () => {
   loadRoute();
 });
 window.addEventListener("storage", handleSetupStorage);
+window.addEventListener("storage", handleMicrophoneStorage);
 window.addEventListener("pagehide", shutdown);
+microphoneDialog.addEventListener("cancel", () => { microphoneDialogToken = null; });
+microphoneDialog.addEventListener("close", handleMicrophoneDialogClose);
+navigator.mediaDevices?.addEventListener?.("devicechange", handleMicrophoneDeviceChange);
 
 loadRoute();
 
 async function loadRoute() {
   const generation = ++routeGeneration;
+  closeMicrophoneDialog({ restoreFocus: false });
   stopRoomLifecycle();
   roomSetupView = freshRoomSetupView();
   const finishingIntoProgress = practice.phase === "finishing" && /^\/progress\/?$/i.test(location.pathname);
@@ -179,6 +200,297 @@ function ensureRoomSetupView() {
   return roomSetupView;
 }
 
+function createMicrophoneDialogElement() {
+  // The exact app asset owns its dialog markup, so a newly deployed app never
+  // depends on a separately propagated HTML shell generation.
+  document.querySelector("[data-microphone-dialog]")?.remove();
+  const dialog = document.createElement("dialog");
+  dialog.id = "microphone-dialog";
+  dialog.className = "microphone-dialog";
+  dialog.dataset.microphoneDialog = "";
+  dialog.setAttribute("aria-labelledby", "microphone-dialog-title");
+  dialog.setAttribute("aria-describedby", "microphone-dialog-description");
+  dialog.innerHTML = `<section class="microphone-dialog-panel">
+    <p class="eyebrow">On this device</p>
+    <h2 id="microphone-dialog-title">Choose a microphone</h2>
+    <p class="hint" id="microphone-dialog-description">The browser may ask for microphone access so it can show input names. NonStopTalk stores only the chosen device ID in this browser, never its label.</p>
+    <label for="microphone-device-list">Audio input
+      <select id="microphone-device-list" data-microphone-list>
+        <option value="">Auto-detect</option>
+      </select>
+    </label>
+    <p class="microphone-dialog-status" data-microphone-status role="status" aria-live="polite" aria-atomic="true">Auto-detect lets the browser choose an input.</p>
+    <div class="action-row microphone-dialog-actions">
+      <button class="button primary" type="button" data-command="microphone-use">Use microphone</button>
+      <button class="button ghost" type="button" data-command="microphone-cancel">Cancel</button>
+    </div>
+  </section>`;
+  document.body.append(dialog);
+  return dialog;
+}
+
+function microphoneDriverIdentity(state = room) {
+  const turn = state?.activeTurn;
+  const viewer = state?.viewer;
+  if (state?.phase !== "playing" || !turn || !viewer) return "";
+  if (viewer.isHost) return `host:${String(viewer.playerId || "")}`;
+  if (viewer.playerId && viewer.playerId === turn.playerId) return `player:${viewer.playerId}`;
+  return "";
+}
+
+function captureMicrophoneDialogScope(opener) {
+  if (!opener?.isConnected || !app.contains(opener)) return null;
+  const kind = opener.dataset.microphoneScope;
+  if (kind === "practice" && isPracticeRoute() && practice.phase === "setup") {
+    return Object.freeze({ kind, routeGeneration });
+  }
+  const driver = microphoneDriverIdentity();
+  if (kind !== "room" || !driver || !room?.activeTurn) return null;
+  return Object.freeze({
+    kind,
+    routeGeneration,
+    roomCode,
+    turnId: room.activeTurn.id,
+    driver,
+  });
+}
+
+function isCurrentMicrophoneDialogScope(scope = microphoneDialogScope) {
+  if (!scope || scope.routeGeneration !== routeGeneration) return false;
+  if (scope.kind === "practice") return isPracticeRoute() && practice.phase === "setup";
+  return scope.kind === "room"
+    && scope.roomCode === roomCode
+    && scope.turnId === room?.activeTurn?.id
+    && scope.driver === microphoneDriverIdentity();
+}
+
+function currentMicrophoneOpener(scope, original = null) {
+  if (!isCurrentMicrophoneDialogScope(scope)) return null;
+  if (original?.isConnected && !original.disabled) return original;
+  const replacement = app.querySelector(
+    `[data-command="microphone-open"][data-microphone-scope="${scope.kind}"]`,
+  );
+  return replacement && !replacement.disabled ? replacement : null;
+}
+
+function restoreMicrophoneDialogFocus(scope, opener, { fallbackToHeading = true } = {}) {
+  queueMicrotask(() => {
+    const target = currentMicrophoneOpener(scope, opener);
+    if (target) target.focus({ preventScroll: true });
+    else if (fallbackToHeading) focusMainHeading();
+  });
+}
+
+function isActiveMicrophoneDialog(token) {
+  return microphoneDialogToken === token
+    && microphoneDialog.open
+    && isCurrentMicrophoneDialogScope();
+}
+
+function setMicrophoneStatus(message, error = false) {
+  if (!microphoneStatus) return;
+  microphoneStatus.textContent = String(message || "");
+  microphoneStatus.classList.toggle("error", error);
+}
+
+function populateMicrophoneList(devices = microphoneSelection.devices, preferredId = microphoneSelection.selectedId) {
+  const selectedId = microphoneSelection.selectedId;
+  const fragment = document.createDocumentFragment();
+  const automatic = document.createElement("option");
+  automatic.value = AUTO_MICROPHONE_ID;
+  automatic.textContent = "Auto-detect";
+  fragment.append(automatic);
+  let selectedIsListed = selectedId === AUTO_MICROPHONE_ID;
+  for (const device of devices) {
+    const option = document.createElement("option");
+    option.value = device.deviceId;
+    option.textContent = microphoneDeviceLabel(devices, device.deviceId);
+    fragment.append(option);
+    if (device.deviceId === selectedId) selectedIsListed = true;
+  }
+  if (!selectedIsListed) {
+    const unavailable = document.createElement("option");
+    unavailable.value = selectedId;
+    unavailable.textContent = "Saved microphone (currently unavailable)";
+    fragment.append(unavailable);
+  }
+  microphoneList.replaceChildren(fragment);
+  const preferredStillExists = Array.from(microphoneList.options)
+    .some((option) => option.value === preferredId);
+  microphoneList.value = preferredStillExists ? preferredId : selectedId;
+}
+
+function syncMicrophoneChoiceLabels() {
+  const label = microphoneSelection.selectedLabel;
+  for (const target of document.querySelectorAll("[data-microphone-selected-label]")) {
+    target.textContent = label;
+  }
+}
+
+function renderMicrophoneChoice({ disabled = false, scope = "practice" } = {}) {
+  const pickerUnavailable = disabled
+    || !navigator.mediaDevices?.getUserMedia
+    || typeof microphoneDialog.showModal !== "function";
+  return `<div class="microphone-choice" data-microphone-choice>
+    <span class="microphone-choice-copy"><strong>Microphone</strong><small data-microphone-selected-label>${escapeHTML(microphoneSelection.selectedLabel)}</small></span>
+    <button class="button ghost small" type="button" data-command="microphone-open" data-microphone-scope="${scope === "room" ? "room" : "practice"}" aria-haspopup="dialog" aria-controls="microphone-dialog" ${pickerUnavailable ? "disabled" : ""}>Choose microphone</button>
+  </div>`;
+}
+
+function microphonePickerErrorMessage(error) {
+  if (error?.name === "NotAllowedError") return "Microphone access was not granted. You can keep Auto-detect selected and try again when you start.";
+  if (error?.name === "SecurityError") return "This browser blocked microphone access for the page.";
+  if (error?.name === "NotFoundError" || error?.name === "DevicesNotFoundError") return "No microphone is currently available. Connect one and try again.";
+  if (error?.name === "NotReadableError") return "The microphone is busy or could not be opened. Close other audio apps and try again.";
+  return "Microphone names could not be loaded. Auto-detect remains available.";
+}
+
+function microphoneListMessage(devices, selectedId = microphoneSelection.selectedId) {
+  if (!devices.length) return "No named inputs are visible yet. Auto-detect will ask again when you start.";
+  if (selectedId !== AUTO_MICROPHONE_ID
+    && !devices.some((device) => device.deviceId === selectedId)) {
+    return "The saved microphone is not currently listed. Starting will fall back once to Auto-detect if it is unavailable.";
+  }
+  return `${devices.length} microphone ${devices.length === 1 ? "input" : "inputs"} available. Labels stay in memory only.`;
+}
+
+async function openMicrophoneDialog(opener) {
+  if (typeof microphoneDialog.showModal !== "function") {
+    throw new Error("This browser cannot open the microphone picker.");
+  }
+  if (microphoneDialog.open) return;
+  const scope = captureMicrophoneDialogScope(opener);
+  if (!scope) throw new Error("The microphone picker is no longer available here.");
+  const token = Symbol("microphone-dialog");
+  const refreshGeneration = ++microphoneRefreshGeneration;
+  microphoneDialogToken = token;
+  microphoneDialogOpener = opener;
+  microphoneDialogScope = scope;
+  populateMicrophoneList();
+  setMicrophoneStatus("Checking the microphones available to this browser…");
+  microphoneDialog.showModal();
+  microphoneList.focus();
+
+  let devices = [];
+  try {
+    devices = await microphoneSelection.enumerate({
+      isCurrent: () => isActiveMicrophoneDialog(token),
+    });
+  } catch {
+    devices = microphoneSelection.devices;
+  }
+  if (!isActiveMicrophoneDialog(token) || refreshGeneration !== microphoneRefreshGeneration) return;
+  populateMicrophoneList(devices, microphoneList.value);
+  syncMicrophoneChoiceLabels();
+
+  const needsAccess = devices.length === 0 || devices.some((device) => !device.label);
+  if (!needsAccess) {
+    setMicrophoneStatus(microphoneListMessage(devices, microphoneList.value));
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    setMicrophoneStatus("This browser does not expose microphone input.", true);
+    return;
+  }
+
+  setMicrophoneStatus("Allow microphone access to reveal available input names. This preview is stopped immediately.");
+  try {
+    devices = await microphoneSelection.enumerate({
+      requestPermission: true,
+      isCurrent: () => isActiveMicrophoneDialog(token),
+    });
+  } catch (error) {
+    if (!isActiveMicrophoneDialog(token)) return;
+    setMicrophoneStatus(microphonePickerErrorMessage(error), true);
+    return;
+  }
+  if (!isActiveMicrophoneDialog(token) || refreshGeneration !== microphoneRefreshGeneration) return;
+  populateMicrophoneList(devices, microphoneList.value);
+  syncMicrophoneChoiceLabels();
+  setMicrophoneStatus(microphoneListMessage(devices, microphoneList.value));
+}
+
+function closeMicrophoneDialog({ restoreFocus = true, focusHeading = false } = {}) {
+  const scope = microphoneDialogScope;
+  const opener = microphoneDialogOpener;
+  microphoneDialogToken = null;
+  microphoneRefreshGeneration += 1;
+  microphoneDialogOpener = null;
+  microphoneDialogScope = null;
+  if (microphoneDialog.open) microphoneDialog.close();
+  if (restoreFocus) restoreMicrophoneDialogFocus(scope, opener);
+  else if (focusHeading) queueMicrotask(() => focusMainHeading());
+}
+
+function handleMicrophoneDialogClose() {
+  const scope = microphoneDialogScope;
+  const opener = microphoneDialogOpener;
+  microphoneDialogToken = null;
+  microphoneRefreshGeneration += 1;
+  microphoneDialogOpener = null;
+  microphoneDialogScope = null;
+  if (scope || opener) restoreMicrophoneDialogFocus(scope, opener);
+}
+
+function applyMicrophoneDialogSelection() {
+  if (!microphoneDialog?.open || !microphoneList) return;
+  const result = microphoneSelection.select(microphoneList.value);
+  const label = microphoneSelection.selectedLabel;
+  syncMicrophoneChoiceLabels();
+  closeMicrophoneDialog();
+  const message = result.persisted
+    ? `${label} selected for microphone starts in this browser.`
+    : `${label} selected for this tab, but the browser could not remember it.`;
+  showToast(message);
+  announce(message);
+}
+
+async function handleMicrophoneDeviceChange() {
+  if (!microphoneDialog?.open || !microphoneDialogToken) return;
+  const token = microphoneDialogToken;
+  const refreshGeneration = ++microphoneRefreshGeneration;
+  const provisionalId = microphoneList.value;
+  setMicrophoneStatus("Refreshing microphone inputs…");
+  try {
+    const devices = await microphoneSelection.enumerate({
+      isCurrent: () => isActiveMicrophoneDialog(token),
+    });
+    if (!isActiveMicrophoneDialog(token) || refreshGeneration !== microphoneRefreshGeneration) return;
+    populateMicrophoneList(devices, provisionalId);
+    syncMicrophoneChoiceLabels();
+    setMicrophoneStatus(microphoneListMessage(devices, microphoneList.value));
+  } catch {
+    if (isActiveMicrophoneDialog(token) && refreshGeneration === microphoneRefreshGeneration) {
+      setMicrophoneStatus("Microphone inputs could not be refreshed. The saved choice was left unchanged.", true);
+    }
+  }
+}
+
+function handleMicrophoneStorage(event) {
+  if (event.key !== null && event.key !== microphoneSelection.storageKey) return;
+  microphoneSelection.reload();
+  syncMicrophoneChoiceLabels();
+  if (microphoneDialog?.open) populateMicrophoneList();
+}
+
+async function acquireSelectedMicrophone(baseAudioConstraints = true, isCurrent = () => true) {
+  const result = await microphoneSelection.acquire(baseAudioConstraints, { isCurrent });
+  if (result.fellBack) {
+    syncMicrophoneChoiceLabels();
+    showToast("The requested microphone is unavailable; this start is using Auto-detect.");
+  }
+  return result.stream;
+}
+
+function reconcileMicrophoneDialog() {
+  if (!microphoneDialog.open || !microphoneDialogScope) return;
+  if (!isCurrentMicrophoneDialogScope()) {
+    closeMicrophoneDialog({ restoreFocus: false, focusHeading: true });
+    return;
+  }
+  microphoneDialogOpener = currentMicrophoneOpener(microphoneDialogScope, microphoneDialogOpener);
+}
+
 function freshPracticeState(setup = {}, loop = null) {
   return {
     phase: "setup",
@@ -270,6 +582,7 @@ function renderPracticeSetup() {
           <select name="duration" ${locked}>${[30, 45, 60, 90].map((seconds) => `<option value="${seconds}" ${practice.setup.duration === seconds ? "selected" : ""}>${seconds} seconds</option>`).join("")}</select>
         </label>
       </div>
+      ${renderMicrophoneChoice({ disabled: !hasMicrophone, scope: "practice" })}
       <fieldset class="consent-card" aria-label="Optional transcript analysis" ${speech.supported ? "" : "disabled"}>
         <legend>Optional transcript analysis</legend>
         <label class="choice-row">
@@ -666,10 +979,14 @@ async function beginCoachingSession(values) {
   try {
     const engine = await loadCoachEngine();
     if (pendingCoachingToken !== token || generation !== routeGeneration || !isPracticeRoute()) return;
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
-      video: false,
-    });
+    stream = await acquireSelectedMicrophone(
+      {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: false,
+      },
+      () => pendingCoachingToken === token && generation === routeGeneration && isPracticeRoute(),
+    );
     if (pendingCoachingToken !== token || generation !== routeGeneration || !isPracticeRoute()) {
       stream.getTracks().forEach((track) => track.stop());
       return;
@@ -1407,8 +1724,15 @@ function levelLabel(value) { return value > .92 ? "High" : value > .35 ? "Clear"
 function confidenceLabel(value) { const text = String(value || "unknown"); return `${text.charAt(0).toUpperCase()}${text.slice(1)} measurement confidence`; }
 function microphoneErrorMessage(error) {
   if (error?.name === "NotAllowedError") return "Microphone permission was denied. Allow access in your browser settings, then try again.";
-  if (error?.name === "NotFoundError") return "No microphone was found. Connect one and try again.";
-  return error?.message || "The microphone could not be started.";
+  if (error?.name === "SecurityError") return "This browser blocked microphone access for the page. Check the site's browser permissions.";
+  if (error?.name === "NotFoundError" || error?.name === "DevicesNotFoundError") return "No microphone was found. Connect one and try again.";
+  if (error?.name === "NotReadableError" || error?.name === "TrackStartError") return "The microphone is busy or could not be opened. Close other audio apps and try again.";
+  if (error?.name === "AbortError") return "Microphone startup was interrupted. Try again, or use the manual timer.";
+  if (error?.name === "NotSupportedError") return "Microphone input is unavailable in this browser. Use the manual timer.";
+  if (error?.name === "OverconstrainedError" || error?.name === "ConstraintNotSatisfiedError") return "The microphone could not satisfy the requested audio settings. Choose Auto-detect or another input.";
+  if (error?.message === "Audio monitoring is unavailable. Use the manual timer.") return error.message;
+  if (error?.message === "This browser cannot analyze microphone audio.") return error.message;
+  return "The microphone could not be started. Try again, choose Auto-detect, or use the manual timer.";
 }
 
 async function renderProgress(generation = routeGeneration) {
@@ -1946,8 +2270,12 @@ function renderGame(current) {
 }
 
 function renderTurnControls(turn) {
+  const microphoneChoice = renderMicrophoneChoice({
+    disabled: controller?.turnId === turn.id,
+    scope: "room",
+  });
   if (turn.begunAt === null) {
-    return `<div class="action-row">
+    return `${microphoneChoice}<div class="action-row">
       <button class="button primary" type="button" data-command="start-mic">Start with microphone</button>
       <button class="button" type="button" data-command="start-manual">Manual timer</button>
       <button class="button ghost" type="button" data-command="redraw">Redraw topic</button>
@@ -1955,7 +2283,7 @@ function renderTurnControls(turn) {
     </div>`;
   }
   const runningLocally = controller?.turnId === turn.id;
-  return `<div class="action-row">
+  return `${microphoneChoice}<div class="action-row">
     ${runningLocally ? "" : `<button class="button" type="button" data-command="resume-mic">Resume microphone</button><button class="button" type="button" data-command="resume-manual">Resume manual</button>`}
     <button class="button ghost" type="button" data-command="end-turn">End turn</button>
     ${room.viewer.isHost ? `<button class="button ghost" type="button" data-command="mark-complete">Mark complete</button>` : ""}
@@ -2242,8 +2570,29 @@ async function handleClick(event) {
     return;
   }
   const button = event.target.closest("[data-command]");
-  if (!button || !button.isConnected || busy) return;
+  if (!button || !button.isConnected) return;
   const command = button.dataset.command;
+  if (command === "microphone-open") {
+    try {
+      await openMicrophoneDialog(button);
+    } catch {
+      if (button.isConnected) showToast("The microphone picker could not be opened. Try again or keep Auto-detect selected.");
+    }
+    return;
+  }
+  if (command === "microphone-use") {
+    try {
+      applyMicrophoneDialogSelection();
+    } catch {
+      showToast("That microphone choice is no longer available. Refresh the list and try again.");
+    }
+    return;
+  }
+  if (command === "microphone-cancel") {
+    closeMicrophoneDialog();
+    return;
+  }
+  if (busy) return;
   try {
     setBusy(true);
     if (command === "copy-room") {
@@ -2397,16 +2746,18 @@ async function startMicrophone(notifyBegin) {
   if (!turn) return;
   const code = roomCode;
   const generation = routeGeneration;
-  if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone input is unavailable. Use the manual timer.");
+  const driver = microphoneDriverIdentity();
+  if (!driver) return;
   let stream;
   let context;
+  const remainsCurrent = () => isCurrentMicrophoneDriver(code, generation, turn.id, driver);
   const releasePendingMicrophone = async () => {
     stream?.getTracks().forEach((track) => track.stop());
     if (context && context.state !== "closed") await context.close().catch(() => {});
   };
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    if (!isCurrentTurn(code, generation, turn.id)) {
+    stream = await acquireSelectedMicrophone(true, remainsCurrent);
+    if (!remainsCurrent()) {
       await releasePendingMicrophone();
       return;
     }
@@ -2418,20 +2769,21 @@ async function startMicrophone(notifyBegin) {
     const analyser = context.createAnalyser();
     analyser.fftSize = 1024;
     source.connect(analyser);
-    if (!isCurrentTurn(code, generation, turn.id)) {
+    if (!remainsCurrent()) {
       await releasePendingMicrophone();
       return;
     }
     if (notifyBegin && turn.begunAt === null) {
       await doAction({ type: "begin-turn", turnId: turn.id });
     }
-    if (!isCurrentTurn(code, generation, turn.id)) {
+    if (!remainsCurrent()) {
       await releasePendingMicrophone();
       return;
     }
     stopController();
     controller = {
       turnId: turn.id,
+      driver,
       mode: "mic",
       submitting: false,
       stream,
@@ -2446,13 +2798,17 @@ async function startMicrophone(notifyBegin) {
   } catch (error) {
     await releasePendingMicrophone();
     if (stream && controller?.stream === stream) controller = null;
-    if (code !== roomCode || generation !== routeGeneration) return;
-    throw error;
+    if (!remainsCurrent()) return;
+    throw new Error(microphoneErrorMessage(error));
   }
 }
 
 function isCurrentTurn(code, generation, turnId) {
   return code === roomCode && generation === routeGeneration && room?.activeTurn?.id === turnId;
+}
+
+function isCurrentMicrophoneDriver(code, generation, turnId, driver) {
+  return isCurrentTurn(code, generation, turnId) && driver === microphoneDriverIdentity();
 }
 
 function monitorMicrophone() {
@@ -2543,6 +2899,7 @@ function acceptRoom(next) {
   room = next;
   clockOffset = room.serverNow - Date.now();
   renderRoom();
+  reconcileMicrophoneDialog();
   if (routeHeadingHadFocus) {
     const heading = app.querySelector("h1");
     if (heading) {
@@ -2576,7 +2933,11 @@ async function refreshRoomState() {
 }
 
 function reconcileController() {
-  if (controller && (!room.activeTurn || room.activeTurn.id !== controller.turnId)) stopController();
+  if (controller && (
+    !room.activeTurn
+    || room.activeTurn.id !== controller.turnId
+    || (controller.mode === "mic" && controller.driver !== microphoneDriverIdentity())
+  )) stopController();
 }
 
 function stopController() {
@@ -2846,6 +3207,7 @@ function escapeHTML(value) {
 }
 
 function shutdown() {
+  closeMicrophoneDialog({ restoreFocus: false });
   stopRoomLifecycle();
   stopCoachingLifecycle();
 }

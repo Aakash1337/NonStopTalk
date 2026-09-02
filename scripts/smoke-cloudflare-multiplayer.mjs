@@ -141,6 +141,130 @@ function trackApiRequests(page) {
   return requests;
 }
 
+async function installSyntheticMicrophone(context, profile) {
+  await context.addInitScript(({ microphoneProfile }) => {
+    const clone = (value) => JSON.parse(JSON.stringify(value));
+    const events = [];
+    const devices = [
+      {
+        kind: "audioinput",
+        deviceId: `${microphoneProfile}-mic`,
+        groupId: `${microphoneProfile}-private-group`,
+        label: `Studio <script>${microphoneProfile}</script> microphone`,
+      },
+      {
+        kind: "audioinput",
+        deviceId: `${microphoneProfile}-backup`,
+        groupId: `${microphoneProfile}-backup-group`,
+        label: "Backup microphone",
+      },
+      {
+        kind: "videoinput",
+        deviceId: `${microphoneProfile}-camera`,
+        groupId: `${microphoneProfile}-camera-group`,
+        label: "Camera that must not become an audio option",
+      },
+    ];
+    let streamNumber = 0;
+    let releasePending = null;
+
+    const harness = {
+      profile: microphoneProfile,
+      events,
+      blockNextUserMedia: false,
+      releasePendingUserMedia() {
+        if (!releasePending) throw new Error("No synthetic microphone request is waiting.");
+        const release = releasePending;
+        releasePending = null;
+        release();
+      },
+    };
+    Object.defineProperty(window, "__microphoneHarness", {
+      configurable: true,
+      value: harness,
+    });
+
+    const mediaDevices = new EventTarget();
+    mediaDevices.enumerateDevices = async () => {
+      events.push({ type: "enumerate-devices" });
+      return devices.map((device) => ({ ...device }));
+    };
+    mediaDevices.getUserMedia = async (constraints) => {
+      const request = clone(constraints);
+      events.push({ type: "get-user-media", constraints: request });
+      const streamId = `${microphoneProfile}-stream-${++streamNumber}`;
+      const track = {
+        stop() {
+          events.push({ type: "track-stopped", streamId });
+        },
+      };
+      const stream = {
+        id: streamId,
+        getTracks() { return [track]; },
+      };
+      const makeReady = () => {
+        events.push({ type: "stream-ready", streamId });
+        return stream;
+      };
+      if (!harness.blockNextUserMedia) return makeReady();
+      harness.blockNextUserMedia = false;
+      return new Promise((resolve) => {
+        releasePending = () => resolve(makeReady());
+      });
+    };
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: mediaDevices,
+    });
+
+    class SyntheticAudioContext {
+      constructor() {
+        this.state = "suspended";
+        events.push({ type: "audio-context-created" });
+      }
+
+      async resume() {
+        this.state = "running";
+        events.push({ type: "audio-context-resumed" });
+      }
+
+      createMediaStreamSource(stream) {
+        events.push({ type: "media-source-created", streamId: stream?.id || "" });
+        return {
+          connect() {
+            events.push({ type: "audio-graph-connected", streamId: stream?.id || "" });
+          },
+        };
+      }
+
+      createAnalyser() {
+        return {
+          fftSize: 0,
+          getByteTimeDomainData(samples) { samples.fill(140); },
+        };
+      }
+
+      async close() {
+        this.state = "closed";
+        events.push({ type: "audio-context-closed" });
+      }
+    }
+    window.AudioContext = SyntheticAudioContext;
+    window.webkitAudioContext = SyntheticAudioContext;
+
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      const url = new URL(typeof input === "string" ? input : input.url, location.href);
+      let body = null;
+      try { body = JSON.parse(init?.body || "null"); } catch { /* Only JSON room actions matter here. */ }
+      if (/^\/api\/rooms\/[A-HJ-NP-Z2-9]{6}\/action$/u.test(url.pathname)) {
+        events.push({ type: "room-action", body });
+      }
+      return originalFetch(input, init);
+    };
+  }, { microphoneProfile: profile });
+}
+
 async function readDownloadText(download) {
   const stream = await download.createReadStream();
   assert.ok(stream, "The browser download must expose a readable stream.");
@@ -302,6 +426,10 @@ async function runBrowserFlow(origin, signal) {
     throwIfAborted(signal, "Browser flow");
     hostContext = await browser.newContext({ viewport: { width: 1280, height: 900 } });
     guestContext = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    await Promise.all([
+      installSyntheticMicrophone(hostContext, "host"),
+      installSyntheticMicrophone(guestContext, "guest"),
+    ]);
     const host = await hostContext.newPage();
     const guest = await guestContext.newPage();
     const hostTracker = trackBrowser(host, "host");
@@ -331,8 +459,13 @@ async function runBrowserFlow(origin, signal) {
     await waitForSocket(guestTracker, code, signal);
     await host.getByLabel("Rename Cloud Guest").waitFor();
     await host.getByRole("button", { name: "Make Cloud Guest the host" }).waitFor();
-    const joinedGuest = await readRoom(guest, code);
+    const [joinedHost, joinedGuest] = await Promise.all([
+      readRoom(host, code),
+      readRoom(guest, code),
+    ]);
+    const hostPlayerId = joinedHost.payload.room?.viewer?.playerId;
     const guestPlayerId = joinedGuest.payload.room?.viewer?.playerId;
+    assert.ok(hostPlayerId, "The room host must have a player identity.");
     assert.ok(guestPlayerId, "The joined guest must have a player identity.");
 
     const hostCookie = (await hostContext.cookies(origin)).find((cookie) => cookie.name === "nonstoptalk_token");
@@ -664,6 +797,185 @@ async function runBrowserFlow(origin, signal) {
     assert.equal(await guest.getByRole("button", { name: "Manual timer" }).count(), 0);
     assert.equal(await guest.getByRole("button", { name: "Mark complete" }).count(), 0);
 
+    // The microphone preference is local to the current driver. It survives a
+    // harmless room rerender, restores focus to the replacement opener, and
+    // never creates a room action or exposes its device metadata to the guest.
+    assert.equal(await host.getByRole("button", { name: "Choose microphone" }).count(), 1,
+      "The current room driver must be able to choose a microphone.");
+    assert.equal(await guest.getByRole("button", { name: "Choose microphone" }).count(), 0,
+      "A non-host spectator must not receive the current driver's microphone controls.");
+    requestCount = hostApiRequests.length;
+    const microphoneDialog = host.getByRole("dialog", { name: "Choose a microphone" });
+    let microphoneOpener = host.getByRole("button", { name: "Choose microphone" });
+    await microphoneOpener.click();
+    await microphoneDialog.waitFor();
+    const microphoneList = microphoneDialog.getByLabel("Audio input");
+    await microphoneDialog.getByRole("option", {
+      name: "Studio <script>host</script> microphone",
+    }).waitFor({ state: "attached" });
+    assert.equal(await microphoneDialog.locator("script").count(), 0,
+      "A browser-provided microphone label must remain inert text.");
+    assert(await microphoneList.evaluate((control) => document.activeElement === control),
+      "Opening the picker must move keyboard focus into its device list.");
+
+    const hostSocketFramesBeforePickerRerender = hostTracker.sockets
+      .reduce((total, socket) => total + socket.frames, 0);
+    await postRoomAction(hostContext, origin, code, {
+      type: "score",
+      playerId: guestPlayerId,
+      delta: 0,
+    });
+    await eventually(
+      () => hostTracker.sockets.reduce((total, socket) => total + socket.frames, 0)
+        > hostSocketFramesBeforePickerRerender,
+      "The harmless score action did not trigger a WebSocket rerender",
+      signal,
+    );
+    assert(await microphoneDialog.isVisible(),
+      "A benign WebSocket rerender must not close the active microphone picker.");
+    assert(await microphoneList.evaluate((control) => document.activeElement === control),
+      "A benign WebSocket rerender must preserve focus inside the microphone picker.");
+    await microphoneDialog.getByRole("button", { name: "Cancel" }).click();
+    await microphoneDialog.waitFor({ state: "hidden" });
+    microphoneOpener = host.getByRole("button", { name: "Choose microphone" });
+    await eventually(
+      () => microphoneOpener.evaluate((button) => document.activeElement === button),
+      "Cancel did not restore focus to the replacement microphone opener",
+      signal,
+    );
+
+    microphoneOpener = host.getByRole("button", { name: "Choose microphone" });
+    await microphoneOpener.click();
+    await microphoneDialog.waitFor();
+    await microphoneDialog.getByLabel("Audio input").press("Escape");
+    await microphoneDialog.waitFor({ state: "hidden" });
+    await eventually(
+      () => microphoneOpener.evaluate((button) => document.activeElement === button),
+      "Escape did not restore focus to the microphone opener",
+      signal,
+    );
+
+    // A host transfer changes the driver's authority identity. Even though the
+    // active speaker can still drive their own turn, the old dialog scope must
+    // close instead of carrying authority across that state transition.
+    await microphoneOpener.click();
+    await microphoneDialog.waitFor();
+    await postRoomAction(hostContext, origin, code, {
+      type: "transfer-host",
+      playerId: guestPlayerId,
+    });
+    await microphoneDialog.waitFor({ state: "hidden" });
+    const roomHeading = host.getByRole("heading", { level: 1, name: `Room ${code}` });
+    await eventually(
+      () => roomHeading.evaluate((heading) => document.activeElement === heading),
+      "Authority invalidation did not focus the current room heading",
+      signal,
+    );
+    await postRoomAction(guestContext, origin, code, {
+      type: "transfer-host",
+      playerId: hostPlayerId,
+    });
+    await host.getByRole("button", { name: "Choose microphone" }).waitFor();
+
+    microphoneOpener = host.getByRole("button", { name: "Choose microphone" });
+    await microphoneOpener.click();
+    await microphoneDialog.waitFor();
+    await microphoneDialog.getByLabel("Audio input").selectOption("host-mic");
+    await microphoneDialog.getByRole("button", { name: "Use microphone" }).click();
+    await microphoneDialog.waitFor({ state: "hidden" });
+    await eventually(
+      () => microphoneOpener.evaluate((button) => document.activeElement === button),
+      "Applying a microphone choice did not restore focus to its opener",
+      signal,
+    );
+    assertNoNewApiRequests(hostApiRequests, requestCount, "Choosing a browser-local microphone");
+    assert.equal(await host.evaluate(() => localStorage.getItem("nonstoptalk.microphone.v1")), "host-mic",
+      "Only the chosen opaque device ID should be persisted in the driver's browser.");
+    assert.equal(await guest.evaluate(() => localStorage.getItem("nonstoptalk.microphone.v1")), null,
+      "The microphone preference must not cross browser identities.");
+    assert.equal((await host.locator("[data-microphone-selected-label]").textContent())?.trim(),
+      "Studio <script>host</script> microphone");
+    const roomAfterLocalSelection = await readRoom(host, code);
+    assert.equal(roomAfterLocalSelection.payload.room?.activeTurn?.begunAt, null,
+      "Choosing a local microphone must not begin or mutate the room turn.");
+    assert(!JSON.stringify(roomAfterLocalSelection.payload).includes("host-mic"),
+      "The selected device ID must not appear in the room API response.");
+    assert(!JSON.stringify(roomAfterLocalSelection.payload).includes("host-private-group"),
+      "Browser microphone group metadata must not appear in the room API response.");
+
+    // Hold the selected-device promise open to prove that begin-turn is sent
+    // only after a usable stream exists and the local audio graph is connected.
+    requestCount = hostApiRequests.length;
+    const microphoneEventOffset = await host.evaluate(() => window.__microphoneHarness.events.length);
+    await host.evaluate(() => { window.__microphoneHarness.blockNextUserMedia = true; });
+    await host.getByRole("button", { name: "Start with microphone" }).click();
+    await host.waitForFunction((offset) => window.__microphoneHarness.events
+      .slice(offset).some((event) => event.type === "get-user-media"), microphoneEventOffset);
+    await delay(100, undefined, signal ? { signal } : undefined);
+    assertNoNewApiRequests(hostApiRequests, requestCount,
+      "A microphone start waiting for usable media");
+    const beforeMediaRelease = await host.evaluate((offset) =>
+      window.__microphoneHarness.events.slice(offset), microphoneEventOffset);
+    assert.equal(beforeMediaRelease.some((event) => event.type === "stream-ready"), false);
+    assert.equal(beforeMediaRelease.some((event) => event.type === "room-action"), false,
+      "begin-turn must not be attempted while microphone acquisition is pending.");
+
+    await host.evaluate(() => window.__microphoneHarness.releasePendingUserMedia());
+    await host.getByRole("button", { name: "End turn" }).waitFor();
+    const microphoneEvents = await host.evaluate((offset) =>
+      window.__microphoneHarness.events.slice(offset), microphoneEventOffset);
+    const eventIndex = (type) => microphoneEvents.findIndex((event) => event.type === type);
+    const microphoneRequest = microphoneEvents.find((event) => event.type === "get-user-media");
+    assert.deepEqual(microphoneRequest?.constraints, {
+      audio: { deviceId: { exact: "host-mic" } },
+      video: false,
+    }, "The chosen opaque ID must become an exact audio device constraint.");
+    assert(eventIndex("stream-ready") >= 0);
+    assert(eventIndex("audio-context-resumed") > eventIndex("stream-ready"));
+    assert(eventIndex("audio-graph-connected") > eventIndex("audio-context-resumed"));
+    assert(eventIndex("room-action") > eventIndex("audio-graph-connected"),
+      "The room turn must begin only after the microphone audio graph is usable.");
+    const microphoneStartRequests = hostApiRequests.slice(requestCount);
+    assert.equal(microphoneStartRequests.length, 1,
+      "Starting with a usable microphone must send exactly one room action.");
+    assert.deepEqual(microphoneStartRequests[0], {
+      method: "POST",
+      path: `/api/rooms/${code}/action`,
+      body: {
+        type: "begin-turn",
+        turnId: roomAfterLocalSelection.payload.room.activeTurn.id,
+      },
+    });
+    const serializedMicrophoneRequests = JSON.stringify(microphoneStartRequests);
+    for (const privateValue of [
+      "host-mic",
+      "host-private-group",
+      "Studio <script>host</script> microphone",
+      "deviceId",
+    ]) {
+      assert(!serializedMicrophoneRequests.includes(privateValue),
+        `Room traffic exposed browser-local microphone metadata: ${privateValue}`);
+    }
+
+    const activeStreamId = microphoneEvents.find((event) => event.type === "stream-ready")?.streamId;
+    assert(activeStreamId, "The selected microphone start must expose a synthetic active stream.");
+    await postRoomAction(hostContext, origin, code, {
+      type: "transfer-host",
+      playerId: guestPlayerId,
+    });
+    await eventually(
+      () => host.evaluate((streamId) => window.__microphoneHarness.events
+        .some((event) => event.type === "track-stopped" && event.streamId === streamId), activeStreamId),
+      "Losing the authority identity did not stop the active local microphone stream",
+      signal,
+    );
+    await host.getByRole("button", { name: "Resume microphone" }).waitFor();
+    await postRoomAction(guestContext, origin, code, {
+      type: "transfer-host",
+      playerId: hostPlayerId,
+    });
+    await host.getByRole("button", { name: "Mark complete" }).waitFor();
+
     await host.getByRole("button", { name: "Mark complete" }).click();
     await Promise.all([
       eventually(() => host.locator(".score-callout").textContent().then((text) => text?.trim() === "Cloud Host earned 35 points"),
@@ -697,6 +1009,37 @@ async function runBrowserFlow(origin, signal) {
     ]);
     assert.equal((await guest.locator(".turn-card .room-state-title").textContent())?.trim(), TOPIC);
     assert.equal((await host.locator(".turn-card .room-state-title").textContent())?.trim(), TOPIC);
+
+    // This same non-host browser had no picker while spectating the first turn.
+    // Once it becomes the active speaker, it receives an isolated local picker
+    // containing only Auto-detect and devices exposed by its own browser.
+    const guestMicrophoneOpener = guest.getByRole("button", { name: "Choose microphone" });
+    assert.equal(await guestMicrophoneOpener.count(), 1,
+      "The non-host active speaker must receive microphone controls for their own turn.");
+    assert.equal((await guest.locator("[data-microphone-selected-label]").textContent())?.trim(), "Auto-detect");
+    assert.equal(await guest.evaluate(() => localStorage.getItem("nonstoptalk.microphone.v1")), null,
+      "The host's selected device must not become the guest speaker's preference.");
+    await guestMicrophoneOpener.click();
+    const guestMicrophoneDialog = guest.getByRole("dialog", { name: "Choose a microphone" });
+    await guestMicrophoneDialog.waitFor();
+    const guestMicrophoneList = guestMicrophoneDialog.getByLabel("Audio input");
+    assert.equal(await guestMicrophoneList.inputValue(), "",
+      "The guest speaker's isolated picker must default to Auto-detect.");
+    assert.deepEqual(await guestMicrophoneList.locator("option").evaluateAll((options) =>
+      options.map((option) => ({ value: option.value, label: option.textContent }))), [
+      { value: "", label: "Auto-detect" },
+      { value: "guest-mic", label: "Studio <script>guest</script> microphone" },
+      { value: "guest-backup", label: "Backup microphone" },
+    ]);
+    assert.equal(await guestMicrophoneList.locator('option[value="host-mic"]').count(), 0,
+      "The active guest must not see a device ID from the host's browser profile.");
+    await guestMicrophoneList.press("Escape");
+    await guestMicrophoneDialog.waitFor({ state: "hidden" });
+    await eventually(
+      () => guestMicrophoneOpener.evaluate((button) => document.activeElement === button),
+      "Closing the guest speaker's picker did not restore focus",
+      signal,
+    );
 
     await guest.getByRole("button", { name: "Manual timer" }).click();
     const endTurn = guest.getByRole("button", { name: "End turn" });

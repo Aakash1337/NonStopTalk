@@ -35,7 +35,9 @@ const stagingProbe = await readFile(new URL("./smoke-staging.mjs", import.meta.u
 const VALID_APP_MODULE_GRAPH = [
   "import * as coachingStorage from './coach-storage.js';",
   "import { createSetupKitStore } from './setup-kits.js';",
+  "import { createMicrophoneSelection } from './microphone-selection.js';",
   "const setupKitStore = createSetupKitStore();",
+  "const microphoneSelection = createMicrophoneSelection({ getStorage: () => null });",
   "let coachEnginePromise = null;",
   "let coachingRun = null;",
   "function loadCoachEngine() {",
@@ -52,11 +54,13 @@ const VALID_APP_MODULE_GRAPH = [
 const VALID_COACH_STORAGE_MODULE = "export async function openCoachDatabase() {}";
 const VALID_COACH_ENGINE_MODULE = "export function assessCalibrationReadiness() {}";
 const VALID_SETUP_KITS_MODULE = "export function createSetupKitStore() {}";
+const VALID_MICROPHONE_SELECTION_MODULE = "export function createMicrophoneSelection() {}";
 const PUBLIC_JAVASCRIPT_ASSET_PATHS = [
   "/app.js",
   "/coach-storage.js",
   "/coach-engine.js",
   "/setup-kits.js",
+  "/microphone-selection.js",
 ];
 const checkedOutJavaScriptAssets = new Map(await Promise.all(
   PUBLIC_JAVASCRIPT_ASSET_PATHS.map(async (pathname) => [
@@ -64,6 +68,15 @@ const checkedOutJavaScriptAssets = new Map(await Promise.all(
     await readFile(new URL(`../cloudflare/public${pathname}`, import.meta.url), "utf8"),
   ]),
 ));
+
+function validPublicModuleSource(pathname) {
+  if (pathname === "/app.js") return VALID_APP_MODULE_GRAPH;
+  if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
+  if (pathname === "/coach-engine.js") return VALID_COACH_ENGINE_MODULE;
+  if (pathname === "/setup-kits.js") return VALID_SETUP_KITS_MODULE;
+  if (pathname === "/microphone-selection.js") return VALID_MICROPHONE_SELECTION_MODULE;
+  assert.fail(`unexpected public module path: ${pathname}`);
+}
 
 test("production health workflow stays scheduled, bounded, and manually runnable", () => {
   assert.match(workflow, /^  schedule:\n    - cron: "17,47 \* \* \* \*"$/mu);
@@ -284,6 +297,7 @@ test("production probe verifies the required public JavaScript module graph", ()
   assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/coach-storage\.js"\)/u);
   assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/coach-engine\.js"\)/u);
   assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/setup-kits\.js"\)/u);
+  assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/microphone-selection\.js"\)/u);
   assert.match(productionProbe, /get\(pathname, "text\/javascript", 1\)/u);
   assert.match(productionProbe, /mediaType === "text\/javascript"/u);
   assert.match(productionProbe, /!\/\^\\s\*\(\?:<!doctype\\s\+html\|<html\\b\)\/iu\.test\(source\)/u);
@@ -294,16 +308,20 @@ test("production probe verifies the required public JavaScript module graph", ()
   assert.match(productionProbeSupport, /hasMemberCall\(appTokens, "assessCalibrationReadiness"\)/u);
   assert.match(productionProbeSupport, /hasNamedModuleImport\(\s*appTokens,\s*"\.\/setup-kits\.js",\s*"createSetupKitStore",/u);
   assert.match(productionProbeSupport, /hasAssignedFactoryCall\(appTokens, "setupKitStore", "createSetupKitStore"\)/u);
+  assert.match(productionProbeSupport, /hasNamedModuleImport\(\s*appTokens,\s*"\.\/microphone-selection\.js",\s*"createMicrophoneSelection",/u);
+  assert.match(productionProbeSupport, /hasAssignedFactoryCall\(\s*appTokens,\s*"microphoneSelection",\s*"createMicrophoneSelection",/u);
   assert.match(productionProbeSupport, /hasExportedFunction\(coachStorageTokens, "openCoachDatabase", \{ async: true \}\)/u);
   assert.match(productionProbeSupport, /hasExportedFunction\(coachEngineTokens, "assessCalibrationReadiness"\)/u);
   assert.match(productionProbeSupport, /hasExportedFunction\(setupKitsTokens, "createSetupKitStore"\)/u);
+  assert.match(productionProbeSupport, /hasExportedFunction\(microphoneSelectionTokens, "createMicrophoneSelection"\)/u);
   assert.match(productionProbeSupport, /spawnSync\(process\.execPath, \["--check", "--input-type=module"\]/u);
   assert.match(productionProbeSupport, /PUBLIC_JAVASCRIPT_ASSET_MAX_BYTES = 512 \* 1024/u);
   assert.match(productionProbe, /readBoundedJavaScriptBody\(response, pathname\)/u);
   assert.match(productionProbe, /"\/setup-kits\.js"/u);
+  assert.match(productionProbe, /"\/microphone-selection\.js"/u);
 });
 
-test("production probe requires an exact checked-out four-asset generation", async () => {
+test("production probe requires an exact checked-out five-asset generation", async () => {
   const result = await waitForExactPublicModuleGraph({
     loadJavaScriptAsset: async (pathname) => checkedOutJavaScriptAssets.get(pathname),
     expectedJavaScriptAssets: checkedOutJavaScriptAssets,
@@ -313,6 +331,10 @@ test("production probe requires an exact checked-out four-asset generation", asy
   });
   assert.equal(result.appSource, checkedOutJavaScriptAssets.get("/app.js"));
   assert.equal(result.setupKitsSource, checkedOutJavaScriptAssets.get("/setup-kits.js"));
+  assert.equal(
+    result.microphoneSelectionSource,
+    checkedOutJavaScriptAssets.get("/microphone-selection.js"),
+  );
 
   let calls = 0;
   await assert.rejects(
@@ -320,19 +342,32 @@ test("production probe requires an exact checked-out four-asset generation", asy
       loadJavaScriptAsset: async (pathname) => {
         calls += 1;
         const source = checkedOutJavaScriptAssets.get(pathname);
-        return pathname === "/setup-kits.js" ? `${source}\n` : source;
+        return pathname === "/microphone-selection.js" ? `${source}\n` : source;
       },
       expectedJavaScriptAssets: checkedOutJavaScriptAssets,
       sleep: async () => {},
       attempts: 1,
       retryMs: 0,
     }),
-    /setup-kits\.js does not match the checked-out release source/u,
+    /microphone-selection\.js does not match the checked-out release source/u,
   );
-  assert.equal(calls, 4);
+  assert.equal(calls, 5);
   assert.throws(
     () => waitForExactPublicModuleGraph({ loadJavaScriptAsset: async () => "" }),
     /expectedJavaScriptAssets must be a Map/u,
+  );
+
+  const legacyFourAssetMap = new Map(checkedOutJavaScriptAssets);
+  legacyFourAssetMap.delete("/microphone-selection.js");
+  await assert.rejects(
+    waitForExactPublicModuleGraph({
+      loadJavaScriptAsset: async (pathname) => checkedOutJavaScriptAssets.get(pathname),
+      expectedJavaScriptAssets: legacyFourAssetMap,
+      sleep: async () => {},
+      attempts: 1,
+      retryMs: 0,
+    }),
+    /must contain exactly the reviewed public module paths/u,
   );
 });
 
@@ -374,7 +409,7 @@ test("production probe streams JavaScript through a decompressed-byte ceiling", 
 });
 
 test("production probe retries a mixed public asset generation as one module graph", async () => {
-  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0 };
+  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0, microphoneSelection: 0 };
   const delays = [];
 
   const result = await waitForPublicModuleGraph({
@@ -393,9 +428,13 @@ test("production probe retries a mixed public asset generation as one module gra
         calls.engine += 1;
         return VALID_COACH_ENGINE_MODULE;
       }
-      assert.equal(pathname, "/setup-kits.js");
-      calls.setupKits += 1;
-      return VALID_SETUP_KITS_MODULE;
+      if (pathname === "/setup-kits.js") {
+        calls.setupKits += 1;
+        return VALID_SETUP_KITS_MODULE;
+      }
+      assert.equal(pathname, "/microphone-selection.js");
+      calls.microphoneSelection += 1;
+      return VALID_MICROPHONE_SELECTION_MODULE;
     },
     sleep: async (milliseconds) => delays.push(milliseconds),
   });
@@ -405,17 +444,20 @@ test("production probe retries a mixed public asset generation as one module gra
   assert.match(result.coachEngineSource, /assessCalibrationReadiness/u);
   assert.match(result.appSource, /setup-kits\.js/u);
   assert.match(result.setupKitsSource, /createSetupKitStore/u);
+  assert.match(result.appSource, /microphone-selection\.js/u);
+  assert.match(result.microphoneSelectionSource, /createMicrophoneSelection/u);
   assert.equal(calls.app, 3);
   assert.equal(calls.storage, 3);
   assert.equal(calls.engine, 3);
   assert.equal(calls.setupKits, 3);
+  assert.equal(calls.microphoneSelection, 3);
   assert.deepEqual(delays, [1_000, 2_000]);
   assert.equal(PUBLIC_MODULE_GRAPH_ATTEMPTS, 8);
   assert.equal(PUBLIC_MODULE_GRAPH_RETRY_MS, 1_000);
 });
 
 test("production probe retries a temporary storage-asset SPA fallback", async () => {
-  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0 };
+  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0, microphoneSelection: 0 };
   const delays = [];
 
   const result = await waitForPublicModuleGraph({
@@ -435,9 +477,13 @@ test("production probe retries a temporary storage-asset SPA fallback", async ()
         calls.engine += 1;
         return VALID_COACH_ENGINE_MODULE;
       }
-      assert.equal(pathname, "/setup-kits.js");
-      calls.setupKits += 1;
-      return VALID_SETUP_KITS_MODULE;
+      if (pathname === "/setup-kits.js") {
+        calls.setupKits += 1;
+        return VALID_SETUP_KITS_MODULE;
+      }
+      assert.equal(pathname, "/microphone-selection.js");
+      calls.microphoneSelection += 1;
+      return VALID_MICROPHONE_SELECTION_MODULE;
     },
     sleep: async (milliseconds) => delays.push(milliseconds),
   });
@@ -447,11 +493,12 @@ test("production probe retries a temporary storage-asset SPA fallback", async ()
   assert.equal(calls.storage, 2);
   assert.equal(calls.engine, 2);
   assert.equal(calls.setupKits, 2);
+  assert.equal(calls.microphoneSelection, 2);
   assert.deepEqual(delays, [1_000]);
 });
 
 test("production probe retries a temporary coaching-engine SPA fallback", async () => {
-  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0 };
+  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0, microphoneSelection: 0 };
   const delays = [];
 
   const result = await waitForPublicModuleGraph({
@@ -471,9 +518,13 @@ test("production probe retries a temporary coaching-engine SPA fallback", async 
         }
         return VALID_COACH_ENGINE_MODULE;
       }
-      assert.equal(pathname, "/setup-kits.js");
-      calls.setupKits += 1;
-      return VALID_SETUP_KITS_MODULE;
+      if (pathname === "/setup-kits.js") {
+        calls.setupKits += 1;
+        return VALID_SETUP_KITS_MODULE;
+      }
+      assert.equal(pathname, "/microphone-selection.js");
+      calls.microphoneSelection += 1;
+      return VALID_MICROPHONE_SELECTION_MODULE;
     },
     sleep: async (milliseconds) => delays.push(milliseconds),
   });
@@ -483,11 +534,12 @@ test("production probe retries a temporary coaching-engine SPA fallback", async 
   assert.equal(calls.storage, 2);
   assert.equal(calls.engine, 2);
   assert.equal(calls.setupKits, 2);
+  assert.equal(calls.microphoneSelection, 2);
   assert.deepEqual(delays, [1_000]);
 });
 
 test("production probe retries a temporary setup-kit SPA fallback", async () => {
-  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0 };
+  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0, microphoneSelection: 0 };
   const delays = [];
 
   const result = await waitForPublicModuleGraph({
@@ -504,12 +556,16 @@ test("production probe retries a temporary setup-kit SPA fallback", async () => 
         calls.engine += 1;
         return VALID_COACH_ENGINE_MODULE;
       }
-      assert.equal(pathname, "/setup-kits.js");
-      calls.setupKits += 1;
-      if (calls.setupKits === 1) {
-        throw new Error("/setup-kits.js did not return JavaScript");
+      if (pathname === "/setup-kits.js") {
+        calls.setupKits += 1;
+        if (calls.setupKits === 1) {
+          throw new Error("/setup-kits.js did not return JavaScript");
+        }
+        return VALID_SETUP_KITS_MODULE;
       }
-      return VALID_SETUP_KITS_MODULE;
+      assert.equal(pathname, "/microphone-selection.js");
+      calls.microphoneSelection += 1;
+      return VALID_MICROPHONE_SELECTION_MODULE;
     },
     sleep: async (milliseconds) => delays.push(milliseconds),
   });
@@ -519,6 +575,48 @@ test("production probe retries a temporary setup-kit SPA fallback", async () => 
   assert.equal(calls.storage, 2);
   assert.equal(calls.engine, 2);
   assert.equal(calls.setupKits, 2);
+  assert.equal(calls.microphoneSelection, 2);
+  assert.deepEqual(delays, [1_000]);
+});
+
+test("production probe retries a temporary microphone-selection SPA fallback", async () => {
+  const calls = { app: 0, storage: 0, engine: 0, setupKits: 0, microphoneSelection: 0 };
+  const delays = [];
+
+  const result = await waitForPublicModuleGraph({
+    loadJavaScriptAsset: async (pathname) => {
+      if (pathname === "/app.js") {
+        calls.app += 1;
+        return VALID_APP_MODULE_GRAPH;
+      }
+      if (pathname === "/coach-storage.js") {
+        calls.storage += 1;
+        return VALID_COACH_STORAGE_MODULE;
+      }
+      if (pathname === "/coach-engine.js") {
+        calls.engine += 1;
+        return VALID_COACH_ENGINE_MODULE;
+      }
+      if (pathname === "/setup-kits.js") {
+        calls.setupKits += 1;
+        return VALID_SETUP_KITS_MODULE;
+      }
+      assert.equal(pathname, "/microphone-selection.js");
+      calls.microphoneSelection += 1;
+      if (calls.microphoneSelection === 1) {
+        throw new Error("/microphone-selection.js did not return JavaScript");
+      }
+      return VALID_MICROPHONE_SELECTION_MODULE;
+    },
+    sleep: async (milliseconds) => delays.push(milliseconds),
+  });
+
+  assert.match(result.microphoneSelectionSource, /createMicrophoneSelection/u);
+  assert.equal(calls.app, 2);
+  assert.equal(calls.storage, 2);
+  assert.equal(calls.engine, 2);
+  assert.equal(calls.setupKits, 2);
+  assert.equal(calls.microphoneSelection, 2);
   assert.deepEqual(delays, [1_000]);
 });
 
@@ -531,9 +629,7 @@ test("production probe keeps a persistent module-graph defect bounded and visibl
       loadJavaScriptAsset: async (pathname) => {
         calls += 1;
         if (pathname === "/app.js") return "import './unrelated.js';";
-        if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
-        if (pathname === "/coach-engine.js") return VALID_COACH_ENGINE_MODULE;
-        return VALID_SETUP_KITS_MODULE;
+        return validPublicModuleSource(pathname);
       },
       sleep: async (milliseconds) => delays.push(milliseconds),
       attempts: 3,
@@ -542,7 +638,7 @@ test("production probe keeps a persistent module-graph defect bounded and visibl
     /does not reference the required coaching storage module/u,
   );
 
-  assert.equal(calls, 12);
+  assert.equal(calls, 15);
   assert.deepEqual(delays, [7, 14]);
 });
 
@@ -562,9 +658,7 @@ test("production probe ignores module-graph markers inside comments, strings, te
       loadJavaScriptAsset: async (pathname) => {
         calls += 1;
         if (pathname === "/app.js") return decoyApp;
-        if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
-        if (pathname === "/coach-engine.js") return VALID_COACH_ENGINE_MODULE;
-        return VALID_SETUP_KITS_MODULE;
+        return validPublicModuleSource(pathname);
       },
       sleep: async () => {},
       attempts: 1,
@@ -573,7 +667,7 @@ test("production probe ignores module-graph markers inside comments, strings, te
     /app\.js does not reference the required coaching storage module/u,
   );
 
-  assert.equal(calls, 4);
+  assert.equal(calls, 5);
 });
 
 test("production probe rejects import.meta ASI and side-effect import shadow decoys", async () => {
@@ -623,9 +717,7 @@ test("production probe rejects import.meta ASI and side-effect import shadow dec
         loadJavaScriptAsset: async (pathname) => {
           calls += 1;
           if (pathname === "/app.js") return source;
-          if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
-          if (pathname === "/coach-engine.js") return VALID_COACH_ENGINE_MODULE;
-          return VALID_SETUP_KITS_MODULE;
+          return validPublicModuleSource(pathname);
         },
         sleep: async () => {},
         attempts: 1,
@@ -633,7 +725,7 @@ test("production probe rejects import.meta ASI and side-effect import shadow dec
       }),
       /app\.js does not reference the required coaching storage module/u,
     );
-    assert.equal(calls, 4);
+    assert.equal(calls, 5);
   }
 });
 
@@ -668,9 +760,7 @@ test("production probe rejects nested setup shadows and dead inner engine loader
       waitForPublicModuleGraph({
         loadJavaScriptAsset: async (pathname) => {
           if (pathname === "/app.js") return source;
-          if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
-          if (pathname === "/coach-engine.js") return VALID_COACH_ENGINE_MODULE;
-          return VALID_SETUP_KITS_MODULE;
+          return validPublicModuleSource(pathname);
         },
         sleep: async () => {},
         attempts: 1,
@@ -686,9 +776,7 @@ test("production probe accepts ordinary division and increment syntax around the
   const result = await waitForPublicModuleGraph({
     loadJavaScriptAsset: async (pathname) => {
       if (pathname === "/app.js") return appSource;
-      if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
-      if (pathname === "/coach-engine.js") return VALID_COACH_ENGINE_MODULE;
-      return VALID_SETUP_KITS_MODULE;
+      return validPublicModuleSource(pathname);
     },
     sleep: async () => {},
     attempts: 1,
@@ -706,9 +794,7 @@ test("production probe rejects oversized assets before tokenization", async () =
       loadJavaScriptAsset: async (pathname) => {
         calls += 1;
         if (pathname === "/app.js") return oversizedApp;
-        if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
-        if (pathname === "/coach-engine.js") return VALID_COACH_ENGINE_MODULE;
-        return VALID_SETUP_KITS_MODULE;
+        return validPublicModuleSource(pathname);
       },
       sleep: async () => {},
       attempts: 1,
@@ -716,7 +802,7 @@ test("production probe rejects oversized assets before tokenization", async () =
     }),
     /app\.js exceeds the reviewed JavaScript asset boundary/u,
   );
-  assert.equal(calls, 4);
+  assert.equal(calls, 5);
 });
 
 test("production probe ignores export markers inside non-code text", async () => {
@@ -724,6 +810,7 @@ test("production probe ignores export markers inside non-code text", async () =>
     ["/coach-storage.js", "// export async function openCoachDatabase() {}\nconst marker = 'export async function openCoachDatabase() {}';", /coach-storage\.js does not expose/u],
     ["/coach-engine.js", "const marker = `export function assessCalibrationReadiness() {}`;", /coach-engine\.js does not expose/u],
     ["/setup-kits.js", "const marker = /export function createSetupKitStore()/u;", /setup-kits\.js does not expose/u],
+    ["/microphone-selection.js", "const marker = 'export function createMicrophoneSelection() {}';", /microphone-selection\.js does not expose/u],
   ]) {
     let calls = 0;
     await assert.rejects(
@@ -732,9 +819,7 @@ test("production probe ignores export markers inside non-code text", async () =>
           calls += 1;
           if (pathname === "/app.js") return VALID_APP_MODULE_GRAPH;
           if (pathname === target) return source;
-          if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
-          if (pathname === "/coach-engine.js") return VALID_COACH_ENGINE_MODULE;
-          return VALID_SETUP_KITS_MODULE;
+          return validPublicModuleSource(pathname);
         },
         sleep: async () => {},
         attempts: 1,
@@ -742,7 +827,7 @@ test("production probe ignores export markers inside non-code text", async () =>
       }),
       expected,
     );
-    assert.equal(calls, 4);
+    assert.equal(calls, 5);
   }
 });
 
@@ -753,9 +838,7 @@ test("production probe rejects syntactically invalid assets even when every mark
       loadJavaScriptAsset: async (pathname) => {
         calls += 1;
         if (pathname === "/app.js") return `${VALID_APP_MODULE_GRAPH}\nconst broken = ;`;
-        if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
-        if (pathname === "/coach-engine.js") return VALID_COACH_ENGINE_MODULE;
-        return VALID_SETUP_KITS_MODULE;
+        return validPublicModuleSource(pathname);
       },
       sleep: async () => {},
       attempts: 1,
@@ -763,7 +846,7 @@ test("production probe rejects syntactically invalid assets even when every mark
     }),
     /app\.js is not valid JavaScript module syntax/u,
   );
-  assert.equal(calls, 4);
+  assert.equal(calls, 5);
 });
 
 test("production probe rejects an app without the required setup-kit import", async () => {
@@ -779,9 +862,7 @@ test("production probe rejects an app without the required setup-kit import", as
             "",
           );
         }
-        if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
-        if (pathname === "/coach-engine.js") return VALID_COACH_ENGINE_MODULE;
-        return VALID_SETUP_KITS_MODULE;
+        return validPublicModuleSource(pathname);
       },
       sleep: async () => {},
       attempts: 1,
@@ -790,7 +871,7 @@ test("production probe rejects an app without the required setup-kit import", as
     /app\.js does not reference the required setup-kit module/u,
   );
 
-  assert.equal(calls, 4);
+  assert.equal(calls, 5);
 });
 
 test("production probe rejects an app that imports but does not consume setup-kit storage", async () => {
@@ -806,9 +887,7 @@ test("production probe rejects an app that imports but does not consume setup-ki
             "",
           );
         }
-        if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
-        if (pathname === "/coach-engine.js") return VALID_COACH_ENGINE_MODULE;
-        return VALID_SETUP_KITS_MODULE;
+        return validPublicModuleSource(pathname);
       },
       sleep: async () => {},
       attempts: 1,
@@ -817,7 +896,7 @@ test("production probe rejects an app that imports but does not consume setup-ki
     /app\.js does not consume the setup-kit storage boundary/u,
   );
 
-  assert.equal(calls, 4);
+  assert.equal(calls, 5);
 });
 
 test("production probe rejects a setup-kit module without the exact store export", async () => {
@@ -827,10 +906,10 @@ test("production probe rejects a setup-kit module without the exact store export
     waitForPublicModuleGraph({
       loadJavaScriptAsset: async (pathname) => {
         calls += 1;
-        if (pathname === "/app.js") return VALID_APP_MODULE_GRAPH;
-        if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
-        if (pathname === "/coach-engine.js") return VALID_COACH_ENGINE_MODULE;
-        return "export function createLegacySetupKitStore() {}";
+        if (pathname === "/setup-kits.js") {
+          return "export function createLegacySetupKitStore() {}";
+        }
+        return validPublicModuleSource(pathname);
       },
       sleep: async () => {},
       attempts: 1,
@@ -839,7 +918,85 @@ test("production probe rejects a setup-kit module without the exact store export
     /setup-kits\.js does not expose createSetupKitStore/u,
   );
 
-  assert.equal(calls, 4);
+  assert.equal(calls, 5);
+});
+
+test("production probe rejects microphone import markers hidden in non-code text", async () => {
+  let calls = 0;
+  const appSource = VALID_APP_MODULE_GRAPH.replace(
+    "import { createMicrophoneSelection } from './microphone-selection.js';\n",
+    [
+      "const microphoneImportMarker = \"import { createMicrophoneSelection } from './microphone-selection.js';\";",
+      "// import { createMicrophoneSelection } from './microphone-selection.js';",
+    ].join("\n") + "\n",
+  );
+
+  await assert.rejects(
+    waitForPublicModuleGraph({
+      loadJavaScriptAsset: async (pathname) => {
+        calls += 1;
+        if (pathname === "/app.js") return appSource;
+        return validPublicModuleSource(pathname);
+      },
+      sleep: async () => {},
+      attempts: 1,
+      retryMs: 0,
+    }),
+    /app\.js does not reference the required microphone-selection module/u,
+  );
+
+  assert.equal(calls, 5);
+});
+
+test("production probe rejects a nested microphone factory-call decoy", async () => {
+  let calls = 0;
+  const appSource = VALID_APP_MODULE_GRAPH.replace(
+    "const microphoneSelection = createMicrophoneSelection({ getStorage: () => null });\n",
+    [
+      "function unusedMicrophoneFactory() {",
+      "  const microphoneSelection = createMicrophoneSelection({ getStorage: () => null });",
+      "  return microphoneSelection;",
+      "}",
+    ].join("\n") + "\n",
+  );
+
+  await assert.rejects(
+    waitForPublicModuleGraph({
+      loadJavaScriptAsset: async (pathname) => {
+        calls += 1;
+        if (pathname === "/app.js") return appSource;
+        return validPublicModuleSource(pathname);
+      },
+      sleep: async () => {},
+      attempts: 1,
+      retryMs: 0,
+    }),
+    /app\.js does not consume the microphone-selection boundary/u,
+  );
+
+  assert.equal(calls, 5);
+});
+
+test("production probe rejects a microphone module without the exact factory export", async () => {
+  let calls = 0;
+
+  await assert.rejects(
+    waitForPublicModuleGraph({
+      loadJavaScriptAsset: async (pathname) => {
+        calls += 1;
+        if (pathname === "/microphone-selection.js") {
+          return "export function createLegacyMicrophoneSelection() {}";
+        }
+        return validPublicModuleSource(pathname);
+      },
+      sleep: async () => {},
+      attempts: 1,
+      retryMs: 0,
+    }),
+    /microphone-selection\.js does not expose createMicrophoneSelection/u,
+  );
+
+  assert.equal(calls, 5);
 });
 
 test("production probe rejects a legacy app that imports but does not consume calibration readiness", async () => {
@@ -855,9 +1012,7 @@ test("production probe rejects a legacy app that imports but does not consume ca
             "",
           );
         }
-        if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
-        if (pathname === "/coach-engine.js") return VALID_COACH_ENGINE_MODULE;
-        return VALID_SETUP_KITS_MODULE;
+        return validPublicModuleSource(pathname);
       },
       sleep: async () => {},
       attempts: 1,
@@ -866,7 +1021,7 @@ test("production probe rejects a legacy app that imports but does not consume ca
     /app\.js does not consume the calibration-readiness boundary/u,
   );
 
-  assert.equal(calls, 4);
+  assert.equal(calls, 5);
 });
 
 test("production probe rejects a coaching engine without the exact readiness export", async () => {
@@ -879,9 +1034,8 @@ test("production probe rejects a coaching engine without the exact readiness exp
         if (pathname === "/app.js") {
           return VALID_APP_MODULE_GRAPH;
         }
-        if (pathname === "/coach-storage.js") return VALID_COACH_STORAGE_MODULE;
         if (pathname === "/coach-engine.js") return "export function assessCalibrationReadinessLegacy() {}";
-        return VALID_SETUP_KITS_MODULE;
+        return validPublicModuleSource(pathname);
       },
       sleep: async () => {},
       attempts: 1,
@@ -890,5 +1044,5 @@ test("production probe rejects a coaching engine without the exact readiness exp
     /coach-engine\.js does not expose assessCalibrationReadiness/u,
   );
 
-  assert.equal(calls, 4);
+  assert.equal(calls, 5);
 });

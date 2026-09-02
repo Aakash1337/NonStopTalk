@@ -36,30 +36,45 @@ export async function waitForPublicModuleGraph({
       // Fetch all assets on every attempt. A newly promoted Worker can briefly
       // expose two different static-asset generations at an edge, so validating
       // only one successful response can report a false deployment failure.
-      const [appSource, coachStorageSource, coachEngineSource, setupKitsSource] = await Promise.all([
+      const [
+        appSource,
+        coachStorageSource,
+        coachEngineSource,
+        setupKitsSource,
+        microphoneSelectionSource,
+      ] = await Promise.all([
         loadJavaScriptAsset("/app.js"),
         loadJavaScriptAsset("/coach-storage.js"),
         loadJavaScriptAsset("/coach-engine.js"),
         loadJavaScriptAsset("/setup-kits.js"),
+        loadJavaScriptAsset("/microphone-selection.js"),
       ]);
       assertJavaScriptAssetBoundary("/app.js", appSource);
       assertJavaScriptAssetBoundary("/coach-storage.js", coachStorageSource);
       assertJavaScriptAssetBoundary("/coach-engine.js", coachEngineSource);
       assertJavaScriptAssetBoundary("/setup-kits.js", setupKitsSource);
+      assertJavaScriptAssetBoundary("/microphone-selection.js", microphoneSelectionSource);
       if (expectedJavaScriptAssets !== null) {
         assertExpectedJavaScriptAsset(expectedJavaScriptAssets, "/app.js", appSource);
         assertExpectedJavaScriptAsset(expectedJavaScriptAssets, "/coach-storage.js", coachStorageSource);
         assertExpectedJavaScriptAsset(expectedJavaScriptAssets, "/coach-engine.js", coachEngineSource);
         assertExpectedJavaScriptAsset(expectedJavaScriptAssets, "/setup-kits.js", setupKitsSource);
+        assertExpectedJavaScriptAsset(
+          expectedJavaScriptAssets,
+          "/microphone-selection.js",
+          microphoneSelectionSource,
+        );
       }
       assertJavaScriptModuleSyntax("/app.js", appSource);
       assertJavaScriptModuleSyntax("/coach-storage.js", coachStorageSource);
       assertJavaScriptModuleSyntax("/coach-engine.js", coachEngineSource);
       assertJavaScriptModuleSyntax("/setup-kits.js", setupKitsSource);
+      assertJavaScriptModuleSyntax("/microphone-selection.js", microphoneSelectionSource);
       const appTokens = tokenizeJavaScript(appSource);
       const coachStorageTokens = tokenizeJavaScript(coachStorageSource);
       const coachEngineTokens = tokenizeJavaScript(coachEngineSource);
       const setupKitsTokens = tokenizeJavaScript(setupKitsSource);
+      const microphoneSelectionTokens = tokenizeJavaScript(microphoneSelectionSource);
       if (!hasNamespaceModuleImport(
         appTokens,
         "./coach-storage.js",
@@ -89,6 +104,20 @@ export async function waitForPublicModuleGraph({
       if (!hasAssignedFactoryCall(appTokens, "setupKitStore", "createSetupKitStore")) {
         throw new Error("/app.js does not consume the setup-kit storage boundary");
       }
+      if (!hasNamedModuleImport(
+        appTokens,
+        "./microphone-selection.js",
+        "createMicrophoneSelection",
+      )) {
+        throw new Error("/app.js does not reference the required microphone-selection module");
+      }
+      if (!hasAssignedFactoryCall(
+        appTokens,
+        "microphoneSelection",
+        "createMicrophoneSelection",
+      )) {
+        throw new Error("/app.js does not consume the microphone-selection boundary");
+      }
       if (!hasExportedFunction(coachStorageTokens, "openCoachDatabase", { async: true })) {
         throw new Error("/coach-storage.js does not expose the expected storage boundary");
       }
@@ -98,7 +127,16 @@ export async function waitForPublicModuleGraph({
       if (!hasExportedFunction(setupKitsTokens, "createSetupKitStore")) {
         throw new Error("/setup-kits.js does not expose createSetupKitStore");
       }
-      return { appSource, coachStorageSource, coachEngineSource, setupKitsSource };
+      if (!hasExportedFunction(microphoneSelectionTokens, "createMicrophoneSelection")) {
+        throw new Error("/microphone-selection.js does not expose createMicrophoneSelection");
+      }
+      return {
+        appSource,
+        coachStorageSource,
+        coachEngineSource,
+        setupKitsSource,
+        microphoneSelectionSource,
+      };
     } catch (error) {
       lastError = asError(error);
     }
@@ -141,7 +179,13 @@ function validateExpectedJavaScriptAssets(expected) {
   if (!(expected instanceof Map)) {
     throw new TypeError("expectedJavaScriptAssets must be a Map of checked-out release sources");
   }
-  const reviewedPaths = ["/app.js", "/coach-storage.js", "/coach-engine.js", "/setup-kits.js"];
+  const reviewedPaths = [
+    "/app.js",
+    "/coach-storage.js",
+    "/coach-engine.js",
+    "/setup-kits.js",
+    "/microphone-selection.js",
+  ];
   if (expected.size !== reviewedPaths.length
     || reviewedPaths.some((pathname) => !expected.has(pathname))) {
     throw new TypeError("expectedJavaScriptAssets must contain exactly the reviewed public module paths");
@@ -356,8 +400,7 @@ function hasAssignedFactoryCall(tokens, localBinding, factoryName) {
     && isIdentifier(tokens[index + 1], localBinding)
     && isPunctuator(tokens[index + 2], "=")
     && isIdentifier(tokens[index + 3], factoryName)
-    && isPunctuator(tokens[index + 4], "(")
-    && isPunctuator(tokens[index + 5], ")"));
+    && isPunctuator(tokens[index + 4], "("));
 }
 
 function hasExportedFunction(tokens, name, { async = false } = {}) {

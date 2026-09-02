@@ -33,6 +33,7 @@ node --version
 npm ci
 npm run test:coach
 npm run test:cloud-progress
+npm run test:microphone-selection
 npm run db:migrate:local
 npm run dev -- --local --ip 127.0.0.1 --port 8787
 ```
@@ -616,7 +617,8 @@ JSON export reads only `session-summaries` and adds product/export schema metada
 | Boundary | Prototype behavior |
 | --- | --- |
 | Opening Practice | Does not open the microphone |
-| Microphone | Browser permission requested after an explanation |
+| Microphone choice | Shared with Cloudflare Play; persists only the opaque device ID in this origin, keeps labels in memory, and makes no application/analytics request |
+| Microphone | Browser permission requested after an explicit picker or calibration action and an explanation; a picker preview stops immediately |
 | Low calibration readiness | Pauses before the attempt; retry reuses the connected stream, continue accepts limited evidence, and cancel releases the stream. Recording and transcription have not started while the choice waits |
 | Default audio path | Reduced in the audio graph; not recorded, persisted, or uploaded |
 | Live measurement frames | Kept in page memory for the active attempt |
@@ -642,16 +644,17 @@ See [AI and Privacy](AI_AND_PRIVACY.md) for how this differs from the local Go g
 Read the implementation in this order:
 
 1. **`cloudflare/public/index.html`** — the persistent document shell and primary navigation.
-2. **`cloudflare/public/app.js`** — the Practice/Progress lifecycle and storage/cloud handoff.
-3. **`cloudflare/public/coach-storage.js`** — IndexedDB v3 lifecycle persistence, typed summary-only outcomes, migration, and Release-A/future-schema rollback compatibility.
-4. **`cloudflare/public/coach-loop.js`** — pure relationship validation, safe grouping, and descriptive selected-goal comparison guardrails.
-5. **`cloudflare/public/cloud-progress.js`** — the narrow cloud-summary allowlist and versioned API client.
-6. **`cloudflare/public/coach-audio-worklet.js`** — the small sample-to-RMS/peak processor.
-7. **`cloudflare/public/coach-engine.js`** — calibration readiness, confidence caps, metrics, retrieval, tips, grounding, and advice.
-8. **`cloudflare/platform.ts`** — Worker-side validation, anonymous ownership, relationship columns, D1 retention, and aggregate analytics.
-9. **`scripts/smoke-coach.mjs`** — browser-level proof using synthetic media, the complete pair/resume flow, local stores, lifecycle races, and default/off network assertions.
-10. **`scripts/smoke-coach-storage.mjs`** — hash-pinned, same-origin browser proof for v3 migration, retention/cap/corruption behavior, and Release-A rollback/restoration.
-11. **`wrangler.jsonc`** — Static Assets SPA fallback plus Worker/Durable Object bindings for the separate multiplayer API.
+2. **`cloudflare/public/app.js`** — the Practice/Progress lifecycle, shared microphone UI, and storage/cloud handoff.
+3. **`cloudflare/public/microphone-selection.js`** — dependency-injected opaque-ID storage, bounded device discovery, exact constraints, cancellation, and one-attempt unavailable-device fallback.
+4. **`cloudflare/public/coach-storage.js`** — IndexedDB v3 lifecycle persistence, typed summary-only outcomes, migration, and Release-A/future-schema rollback compatibility.
+5. **`cloudflare/public/coach-loop.js`** — pure relationship validation, safe grouping, and descriptive selected-goal comparison guardrails.
+6. **`cloudflare/public/cloud-progress.js`** — the narrow cloud-summary allowlist and versioned API client.
+7. **`cloudflare/public/coach-audio-worklet.js`** — the small sample-to-RMS/peak processor.
+8. **`cloudflare/public/coach-engine.js`** — calibration readiness, confidence caps, metrics, retrieval, tips, grounding, and advice.
+9. **`cloudflare/platform.ts`** — Worker-side validation, anonymous ownership, relationship columns, D1 retention, and aggregate analytics.
+10. **`scripts/smoke-coach.mjs`** — browser-level proof using synthetic media, the complete pair/resume flow, local stores, lifecycle races, and default/off network assertions.
+11. **`scripts/smoke-coach-storage.mjs`** — hash-pinned, same-origin browser proof for v3 migration, retention/cap/corruption behavior, and Release-A rollback/restoration.
+12. **`wrangler.jsonc`** — Static Assets SPA fallback plus Worker/Durable Object bindings for the separate multiplayer API.
 
 ## How to explain the implementation
 
@@ -677,6 +680,7 @@ Run the focused checks:
 npm ci
 npm run test:coach
 npm run test:cloud-progress
+npm run test:microphone-selection
 npm run smoke:coach
 npm run typecheck:cloudflare
 npm run check:cloudflare
@@ -690,6 +694,7 @@ go test -race ./...
 go vet ./...
 npm run test:coach
 npm run test:cloud-progress
+npm run test:microphone-selection
 npm run typecheck:cloudflare
 npm run test:cloudflare
 npm run check:cloudflare
@@ -702,6 +707,7 @@ npm run smoke
 What each coaching check demonstrates:
 
 - `test:coach` runs 46 tests: 38 across controlled frames/transcripts, calibration readiness and low-confidence attempt caps, the pure engine, legacy/explicit relationships, persistence gating, safe grouping, immutable comparisons, exact goal measures, and limited-evidence guardrails, plus eight storage-contract tests for the required v3 schema, atomic progress snapshot, exact retention, Blob/UTF-8 byte accounting, conservative lifecycle validation, metadata scrubbing, and quota classification.
+- `test:microphone-selection` runs 23 dependency-injected tests for bounded opaque-ID persistence, memory-only labels, device filtering/deduplication, exact constraint preservation, permission-preview cleanup, refresh ordering, one-attempt unavailable-device fallback, newer-preference preservation, and stale-request cancellation.
 - `smoke:coach` drives `/practice` with synthetic media through the medium/high fast path, low-evidence readiness screen, retry on the same microphone, explicit limited continuation, cancel, and competing/stale action guards. It proves that recording/transcription stay stopped before the choice; the screen is keyboard-operable, focused, accessible, and usable at 320 pixels; Review exposes confidence factors/reasons; and the calibration path makes no coaching-data API request. The same smoke continues through both the standalone live-cue path and default baseline → Progress/reload/resume → review-only retry path and covers UI integration, comparison, artifact-only deletion, v1→v3 opening, active-v3 operation against a compatible future schema, expiry, app-limit/browser-quota summary-only messages, composed warnings, and default/off network assertions.
 - `smoke:coach-storage` serves immutable Release-A and current modules on one origin. It covers fresh schema/atomic triads, shared-timestamp v2→v3 Unicode backfill, exact expiry, fail-closed corruption, summary-only cleanup, exact cap edges, grace migration/no eviction, a real two-tab cap race, upgrade abort/retry, malformed/blocked/incompatible schemas, and hash-pinned v3 → Release A → v3 rollback/restoration.
 - `test:cloud-progress` checks the separate opt-in allowlist, relationship metadata/legacy compatibility, merged-history behavior, API calls, and preference state; platform tests cover Worker relationship validation, identity, expiry, analytics, and local-artifact stripping.

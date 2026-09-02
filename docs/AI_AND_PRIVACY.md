@@ -11,6 +11,8 @@ NonStopTalk does not upload microphone audio in any of these paths. In coaching 
 
 The Cloudflare game's named setup kits are another, independent local-data surface. They contain no audio or coaching data, but their names, settings, and custom topics can still be personal or sensitive. They live unencrypted in `localStorage` for that site origin and browser profile; they are not an account, sync service, or cloud backup.
 
+The shared Cloudflare microphone selector is a smaller independent local-data surface. It stores at most one bounded opaque browser device ID under a versioned origin-local key. The enumerated device list and bounded labels remain only in page memory, group IDs are discarded, and permission remains browser-controlled; neither the one locally retained selection nor any in-memory device value is sent to an application endpoint, Durable Object, D1, Analytics Engine, or model. A blocked storage write keeps the choice only for the current tab; a missing saved device clears the choice and retries browser Auto-detect at most once.
+
 ## At a glance
 
 | Situation | Microphone audio | Transcript | External AI |
@@ -21,6 +23,7 @@ The Cloudflare game's named setup kits are another, independent local-data surfa
 | Coaching with compact cloud backup | Never uploaded | Captured text is never uploaded; consented bounded derived counts/pattern labels may be included in the allowlisted summary | None; the summary goes only to the NonStopTalk Worker/D1 platform |
 | Classic game with microphone detection | Read locally by Web Audio | None | None |
 | Manual game timer | Not required | None | None |
+| Cloudflare microphone selection | A short preview may be opened and stopped after an explicit picker action to reveal browser-provided labels; selected capture remains local | None | None; only an opaque device ID can be retained in this browser |
 | Cloudflare setup-kit save/delete or topic-text import/export | Not involved | Not involved | None; the operation stays in browser storage or a device file and makes no application network/analytics request |
 | Cloudflare setup-kit Apply | Not involved | Not involved | None; one same-origin room action sends only the selected settings/topics to the room Durable Object |
 | Cloudflare topic draft, offline/default | Not involved | Not involved | None; deterministic templates expand the host's theme |
@@ -70,7 +73,7 @@ Apply is a separate, explicit room mutation. The browser sends the selected dura
 
 ## Coaching consent and boundary
 
-Opening `/practice` does not start the microphone. The setup explains that analysis is on-device, and the browser asks for microphone permission only after the user starts calibration. Permission remains controlled by the browser and can be revoked.
+Opening `/practice` does not start the microphone. The setup explains that analysis is on-device. The browser can ask for permission after the user explicitly opens the microphone picker so it can reveal input labels, or when the user starts calibration without doing that first. A picker preview is stopped immediately; permission remains controlled by the browser and can be revoked.
 
 The recommended baseline/retry format also limits feedback as a privacy- and measurement-preserving product rule: both attempts are `review-only`. While speaking, the page shows the prompt, goal, timer, and microphone-connected state but does not mount the live meter, live statistics, or coaching-tip surface. The alternative single coached format uses sparse live cues and is stored as a standalone attempt. This distinction is local application state; it does not introduce another network or model boundary.
 

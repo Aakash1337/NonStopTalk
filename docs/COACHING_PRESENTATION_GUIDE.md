@@ -150,6 +150,7 @@ npm ci
 npx playwright install chromium
 npm run test:coach
 npm run test:cloud-progress
+npm run test:microphone-selection
 npm run smoke:coach
 npm run smoke:coach-storage
 npm run db:migrate:local
