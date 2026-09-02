@@ -27,8 +27,8 @@ import {
 export const STAGING_WORKER = "nonstoptalk-staging";
 export const FAULT_CONFIG_FILENAME = ".nonstoptalk-staging-receiver-fault.jsonc";
 export const CHECKPOINT_FILENAME_PREFIX = ".nonstoptalk-staging-rollback-drill-";
-export const RELEASE_B_STAGING_VERSION = "e237d4e3-f933-4b35-b618-a61ea4da14ba";
-export const RELEASE_B_SCRIPT_ETAG = "03a3943724ed480d2d13c68be14e6f501d2259fc43271630bdc5a63716b6a119";
+export const RELEASE_B_STAGING_VERSION = "f0c9fd39-cd0c-46b2-949d-756ea6ab1e5e";
+export const RELEASE_B_SCRIPT_ETAG = "280b663aa9070bd051dc053deba6d3bc335d5d6855d4bde1b4fc4676772174f6";
 export const RELEASE_A_STAGING_VERSION = "3116a969-0f6f-4977-959a-97fc3643ad79";
 export const RELEASE_A_SCRIPT_ETAG = "197656136b6ace480ffbbc503c29f2d6c348fbc9c00aeb2fe7d318b4efcf78c1";
 export const STAGING_D1_DATABASE_ID = "f9c14523-6f11-4cbe-99a1-85853a73ba96";
@@ -875,8 +875,8 @@ function faultRetryAlarmEvidence(document) {
 		record.event === "room_milestone_outbox_retry_scheduled"
 	));
 	if (
-		outboxLogs.length !== 2
-		|| deliveryFailed.length !== 1
+		outboxLogs.length !== 1
+		|| deliveryFailed.length !== 0
 		|| retryScheduled.length !== 1
 		|| retryScheduled[0].failure !== "database-unavailable"
 		|| !safeInteger(retryScheduled[0].attemptCount)
@@ -1042,10 +1042,13 @@ export function findFaultSeededJoinProof(documents, version, expectedProofDigest
 	const retryAlarms = [];
 	for (const [index, document] of documents.entries()) {
 		// A version-filtered tail can include an already-scheduled alarm from an
-		// older room after the fault version becomes active. Validate its shape so
-		// terminal or malformed background activity still fails closed, but never
-		// let another Durable Object satisfy or invalidate the seeded-room chain.
-		const retryAlarm = faultRetryAlarmEvidence(document);
+		// older room after the fault version becomes active. A complete successful
+		// alarm attributed to another object cannot satisfy this causal proof and
+		// is ignored; exact D1 deltas independently guard any aggregate effect.
+		const unrelatedAlarm = isAlarmTrace(document)
+			&& isSuccessfulDurableObjectTrace(document)
+			&& durableObjectProofDigest(document.durableObjectId) !== checkedDigest;
+		const retryAlarm = unrelatedAlarm ? null : faultRetryAlarmEvidence(document);
 		if (
 			retryAlarm
 			&& durableObjectProofDigest(retryAlarm.durableObjectId) === checkedDigest
@@ -1097,10 +1100,7 @@ export function findFaultSeededJoinProof(documents, version, expectedProofDigest
 export function findFaultTraceProof(documents, version) {
 	assertSafeTailDocuments(documents, version);
 	const creates = [];
-	const retryAlarms = [];
 	for (const [index, document] of documents.entries()) {
-		const retryAlarm = faultRetryAlarmEvidence(document);
-		if (retryAlarm) retryAlarms.push({ index, ...retryAlarm });
 		if (!isSuccessfulDurableObjectTrace(document)) continue;
 		const request = document.event.request;
 		if (isObject(request) && request.method === "POST") {
@@ -1123,11 +1123,16 @@ export function findFaultTraceProof(documents, version) {
 		}
 	}
 	if (creates.length > 1) return fail("Concurrent staging room creation made the fault proof ambiguous.");
-	if (creates.length === 0 || retryAlarms.length === 0) return null;
+	if (creates.length === 0) return null;
 	const create = creates[0];
-	const matchingRetryAlarms = retryAlarms.filter((alarm) => (
-		alarm.durableObjectId === create.durableObjectId
-	));
+	const matchingRetryAlarms = [];
+	for (const [index, document] of documents.entries()) {
+		const unrelatedAlarm = isAlarmTrace(document)
+			&& isSuccessfulDurableObjectTrace(document)
+			&& document.durableObjectId !== create.durableObjectId;
+		const retryAlarm = unrelatedAlarm ? null : faultRetryAlarmEvidence(document);
+		if (retryAlarm) matchingRetryAlarms.push({ index, ...retryAlarm });
+	}
 	if (matchingRetryAlarms.length === 0) return null;
 	if (
 		matchingRetryAlarms[0].attemptCount !== 1

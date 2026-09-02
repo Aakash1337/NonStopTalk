@@ -356,10 +356,12 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 				new Date(now),
 			);
 		} catch (error) {
-			await this.finalizeMilestoneRetry(head, "database-unavailable", Date.now());
-			logWorkerEvent("warn", "room_milestone_outbox_delivery_failed", {
-				error: safeWorkerErrorName(error),
-			});
+			await this.finalizeMilestoneRetry(
+				head,
+				"database-unavailable",
+				Date.now(),
+				safeWorkerErrorName(error),
+			);
 			return;
 		}
 
@@ -426,21 +428,56 @@ export class RoomDurableObject extends DurableObject<WorkerEnv> {
 		head: RoomMilestoneOutboxHead,
 		failure: RoomMilestoneRetryFailure,
 		now: number,
+		error?: string,
 	): Promise<void> {
-		let outcome: ReturnType<typeof recordRoomMilestoneRetry> | undefined;
-		await this.ctx.storage.transaction(async (transaction) => {
-			outcome = recordRoomMilestoneRetry(this.ctx.storage.sql, head, failure, now);
+		const before = readRoomMilestoneOutboxHead(this.ctx.storage.sql);
+		const expectedWasCurrent = Boolean(
+			before
+			&& before.sequence === head.sequence
+			&& before.eventId === head.eventId
+			&& before.payloadJson === head.payloadJson
+			&& before.attemptCount === head.attemptCount,
+		);
+		let outcome = await this.ctx.storage.transaction(async (transaction) => {
+			const attempt = recordRoomMilestoneRetry(this.ctx.storage.sql, head, failure, now);
 			const room = this.load();
 			if (room) await this.reconcileRoomAlarm(room, transaction);
 			else await transaction.deleteAlarm();
+			return attempt;
 		});
-		if (outcome?.outcome === "retry") {
+		const committed = readRoomMilestoneOutboxHead(this.ctx.storage.sql);
+		// Async storage transaction closures can replay. Classify the observable
+		// transition from the before/after committed row, not closure-local output.
+		if (
+			expectedWasCurrent
+			&& committed
+			&& committed.sequence === head.sequence
+			&& committed.eventId === head.eventId
+			&& committed.payloadJson === head.payloadJson
+			&& committed.attemptCount === head.attemptCount + 1
+			&& committed.lastFailure === failure
+		) {
+			outcome = {
+				outcome: "retry",
+				attemptCount: committed.attemptCount,
+				nextAttemptAtMs: committed.nextAttemptAtMs,
+			};
+		} else if (outcome.outcome === "retry") {
+			outcome = { outcome: "stale" };
+		}
+		if (outcome.outcome === "retry") {
 			logWorkerEvent("warn", "room_milestone_outbox_retry_scheduled", {
 				failure,
 				attemptCount: outcome.attemptCount,
+				error,
 			});
-		} else if (outcome?.outcome === "dead-lettered") {
+		} else if (outcome.outcome === "dead-lettered") {
 			logWorkerEvent("warn", "room_milestone_outbox_dead_lettered", { reason: outcome.reason });
+		} else {
+			logWorkerEvent("warn", "room_milestone_outbox_retry_stale", {
+				failure,
+				error,
+			});
 		}
 	}
 

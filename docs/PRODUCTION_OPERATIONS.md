@@ -185,7 +185,7 @@ Use this order:
    a ticket or log.
 4. Prove the rollback bridge with the release-pinned, staging-only
    receiver-fault drill. This drill accepts only Release B
-   `e237d4e3-f933-4b35-b618-a61ea4da14ba` and Release A
+   `f0c9fd39-cd0c-46b2-949d-756ea6ab1e5e` and Release A
    `3116a969-0f6f-4977-959a-97fc3643ad79`. Create the private temporary config,
    upload it without activating it, and run the read-only resource preflight:
 
@@ -193,10 +193,10 @@ Use this order:
    npm run drill:staging-outbox-rollback -- make-fault-config
    npx wrangler versions upload --strict --env staging --config .nonstoptalk-staging-receiver-fault.jsonc
    # Record FAULT_UUID from the upload. Nothing has been activated yet.
-   npm run drill:staging-outbox-rollback -- validate-fault e237d4e3-f933-4b35-b618-a61ea4da14ba <FAULT_UUID> 3116a969-0f6f-4977-959a-97fc3643ad79
+   npm run drill:staging-outbox-rollback -- validate-fault f0c9fd39-cd0c-46b2-949d-756ea6ab1e5e <FAULT_UUID> 3116a969-0f6f-4977-959a-97fc3643ad79
 
    # Terminal 1: start while Release B is still alone at 100%; leave it running.
-   npm run drill:staging-outbox-rollback -- prepare e237d4e3-f933-4b35-b618-a61ea4da14ba <FAULT_UUID> 3116a969-0f6f-4977-959a-97fc3643ad79
+   npm run drill:staging-outbox-rollback -- prepare f0c9fd39-cd0c-46b2-949d-756ea6ab1e5e <FAULT_UUID> 3116a969-0f6f-4977-959a-97fc3643ad79
 
    # Terminal 2: run only after Terminal 1 reports fault-observer-ready.
    npx wrangler versions deploy <FAULT_UUID>@100% --env staging --message "Staging receiver-fault rollback drill" --yes
@@ -254,23 +254,27 @@ Use this order:
 
    Only after that barrier does `prepare` immediately `POST /join` with the same
    guest. It requires an ordered, complete fault-version trace containing the
-   same object's successful state read, successful join, and first
-   `database-unavailable` delivery failure plus attempt-1 retry schedule. The D1
+   same object's successful state read, successful join, and first single,
+   post-commit `database-unavailable` attempt-1 retry schedule. The D1
    baseline must remain unchanged immediately and through the bounded observation
    window. The local reader may accumulate a later, separate alarm document
    before the helper next evaluates attempt 1; matching-object evidence is
    accepted only when it is a contiguous attempt-2, attempt-3, ...
    `database-unavailable` retry. Because a
    version-filtered tail can also receive an already-scheduled alarm from an
-   older room, the helper structurally validates but does not use a valid
-   other-object retry. It can neither satisfy nor invalidate the seeded-room
-   chain, and any unique D1 effect remains guarded by the exact aggregate deltas.
+   older room, the helper requires a complete, successful Durable Object
+   envelope before ignoring another object's proof logs. That alarm can neither
+   satisfy nor invalidate the seeded-room chain, and any unique D1 effect remains
+   guarded by the exact aggregate deltas.
+   A compare-and-swap that loses before committing emits a distinct
+   `room_milestone_outbox_retry_stale` record and can never satisfy the proof.
    A missing attempt 1, a duplicate or gap on the proved object, another failure,
    a malformed retry, or a terminal record fails closed. Those facts
    establish one pending local `joined` row; a timed wait or a fresh random
    object is never accepted as proof. Sampling, truncation, exceptions,
-   terminal/unexpected outbox logs, concurrent room mutations, cleanup,
-   aggregate movement, split traffic, or a third version fails closed.
+   terminal/unexpected outbox logs on the seeded object, unidentifiable alarm
+   metadata, concurrent room mutations, cleanup, aggregate movement, split
+   traffic, or a third version fails closed.
 
    Tail data is bounded and immediately projected to proof-only fields. Request
    headers, cookies, client/TLS metadata, room data, event IDs, payloads, and
@@ -298,7 +302,7 @@ Use this order:
 
    ```sh
    # Terminal 1: leave this running before rollback.
-   npm run drill:staging-outbox-rollback -- verify e237d4e3-f933-4b35-b618-a61ea4da14ba <FAULT_UUID> 3116a969-0f6f-4977-959a-97fc3643ad79
+   npm run drill:staging-outbox-rollback -- verify f0c9fd39-cd0c-46b2-949d-756ea6ab1e5e <FAULT_UUID> 3116a969-0f6f-4977-959a-97fc3643ad79
 
    # Terminal 2: run only after Terminal 1 reports rollback-observer-ready.
    npx wrangler rollback 3116a969-0f6f-4977-959a-97fc3643ad79 --env staging --message "Staging outbox rollback drill" --yes
@@ -320,7 +324,7 @@ Use this order:
    the exact-mode smoke:
 
    ```sh
-   npx wrangler versions deploy e237d4e3-f933-4b35-b618-a61ea4da14ba@100% --env staging --message "Restore reviewed Release-B staging candidate" --yes
+   npx wrangler versions deploy f0c9fd39-cd0c-46b2-949d-756ea6ab1e5e@100% --env staging --message "Restore reviewed Release-B staging candidate" --yes
    npm run smoke:staging-outbox
    ```
 
@@ -565,8 +569,8 @@ Worker code emits one JSON object per operational event. Search by the stable
 | `worker_request_failed` | An unexpected edge/API dependency failed behind a request ID | Correlate request ID and Worker version; check dependent services |
 | `room_milestone_delivery_failed` | Best-effort D1/analytics milestone failed | Do not interrupt play; inspect aggregate impact |
 | `room_milestone_outbox_dropped` | An exact-mode event group was dropped for bounded capacity or canonicalization reasons while gameplay committed | Check only reason/count and queue health; do not dump room state or payloads |
-| `room_milestone_outbox_delivery_failed` | A local-outbox head could not reach the internal receiver | Confirm the persisted retry is scheduled; do not expose the room or event ID |
-| `room_milestone_outbox_retry_scheduled` | The bridge/consumer persisted another bounded attempt | Check D1/schema/key health; later FIFO events remain blocked behind the head |
+| `room_milestone_outbox_retry_scheduled` | The bridge/consumer persisted another bounded attempt; this is the single post-commit failure record | Check D1/schema/key health; later FIFO events remain blocked behind the head |
+| `room_milestone_outbox_retry_stale` | A retry compare-and-swap did not own the current FIFO head | Treat it as non-proof observability; investigate repeated occurrences without exposing the room or event ID |
 | `room_milestone_outbox_dead_lettered` | A head reached a terminal conflict, validation failure, deadline, or attempt limit | Investigate the reason field without dumping private Durable Object storage |
 | `product_analytics_rollup_failed` | Best-effort D1 telemetry write failed | Do not treat analytics as a ledger |
 | `analytics_engine_write_failed` | Analytics Engine delivery failed | D1 rollup may still exist |

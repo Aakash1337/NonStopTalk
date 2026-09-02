@@ -352,28 +352,23 @@ function joinTrace(overrides = {}) {
 function retryAlarmTrace(overrides = {}) {
 	return traceDocument({
 		event: { scheduledTime: 1_788_271_200_000 },
-		logs: [
-			{ event: "room_milestone_outbox_delivery_failed", error: "Error" },
-			{
-				event: "room_milestone_outbox_retry_scheduled",
-				failure: "database-unavailable",
-				attemptCount: 1,
-			},
-		],
+		logs: [{
+			event: "room_milestone_outbox_retry_scheduled",
+			failure: "database-unavailable",
+			attemptCount: 1,
+			error: "PlatformError",
+		}],
 		...overrides,
 	});
 }
 
 function retryAlarmAtAttempt(attemptCount, overrides = {}) {
 	return retryAlarmTrace({
-		logs: [
-			{ event: "room_milestone_outbox_delivery_failed" },
-			{
-				event: "room_milestone_outbox_retry_scheduled",
-				failure: "database-unavailable",
-				attemptCount,
-			},
-		],
+		logs: [{
+			event: "room_milestone_outbox_retry_scheduled",
+			failure: "database-unavailable",
+			attemptCount,
+		}],
 		...overrides,
 	});
 }
@@ -504,14 +499,7 @@ test("fault trace proof requires one 201 create and one same-object first retry 
 	assert.match(findFaultTraceProof([
 		createTrace(),
 		retryAlarmTrace(),
-		retryAlarmTrace({ logs: [
-			{ event: "room_milestone_outbox_delivery_failed" },
-			{
-				event: "room_milestone_outbox_retry_scheduled",
-				failure: "database-unavailable",
-				attemptCount: 2,
-			},
-		] }),
+		retryAlarmAtAttempt(2),
 	], FAULT_VERSION), /^[0-9a-f]{64}$/u);
 	assert.equal(hasRollbackTraceProof([rollbackAlarmTrace()], ROLLBACK_VERSION, proof), true);
 	assert.equal(hasRollbackTraceProof([rollbackAlarmTrace({ durableObjectId: OTHER_DO_ID })], ROLLBACK_VERSION, proof), false);
@@ -581,19 +569,11 @@ test("fault trace proof requires one 201 create and one same-object first retry 
 	assert.throws(() => findFaultTraceProof([
 		createTrace(),
 		retryAlarmTrace(),
-		retryAlarmTrace({ logs: [
-			{ event: "room_milestone_outbox_delivery_failed" },
-			{
-				event: "room_milestone_outbox_retry_scheduled",
-				failure: "database-unavailable",
-				attemptCount: 3,
-			},
-		] }),
+		retryAlarmAtAttempt(3),
 	], FAULT_VERSION), /not caused by the one created/u);
 	assert.throws(() => findFaultTraceProof([
 		createTrace(),
 		retryAlarmTrace({ logs: [
-			{ event: "room_milestone_outbox_delivery_failed" },
 			{
 				event: "room_milestone_outbox_retry_scheduled",
 				failure: "database-unavailable",
@@ -604,11 +584,19 @@ test("fault trace proof requires one 201 create and one same-object first retry 
 	], FAULT_VERSION), /terminal outbox event/u);
 	assert.throws(() => findFaultTraceProof([
 		createTrace(),
+		retryAlarmTrace({ logs: [{
+			event: "room_milestone_outbox_retry_stale",
+			failure: "database-unavailable",
+		}] }),
+	], FAULT_VERSION), /terminal outbox event/u);
+	assert.match(findFaultTraceProof([
+		createTrace(),
 		retryAlarmTrace({
 			durableObjectId: OTHER_DO_ID,
 			logs: [{ event: "room_milestone_outbox_delivery_failed" }],
 		}),
-	], FAULT_VERSION), /split or incomplete/u);
+		retryAlarmTrace(),
+	], FAULT_VERSION), /^[0-9a-f]{64}$/u);
 	assert.throws(() => findFaultTraceProof([
 		createTrace({ logs: [{ event: "room_alarm_schedule_failed" }] }),
 		retryAlarmTrace(),
@@ -632,14 +620,7 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 		stateTrace(),
 		joinTrace(),
 		retryAlarmTrace(),
-		retryAlarmTrace({ logs: [
-			{ event: "room_milestone_outbox_delivery_failed" },
-			{
-				event: "room_milestone_outbox_retry_scheduled",
-				failure: "database-unavailable",
-				attemptCount: 2,
-			},
-		] }),
+		retryAlarmAtAttempt(2),
 	], FAULT_VERSION, seedProof), seedProof);
 	assert.equal(findFaultSeededJoinProof([
 		retryAlarmAtAttempt(7, { durableObjectId: OTHER_DO_ID }),
@@ -669,27 +650,13 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 	assert.throws(() => findFaultSeededJoinProof([
 		stateTrace(),
 		joinTrace(),
-		retryAlarmTrace({ logs: [
-			{ event: "room_milestone_outbox_delivery_failed" },
-			{
-				event: "room_milestone_outbox_retry_scheduled",
-				failure: "database-unavailable",
-				attemptCount: 2,
-			},
-		] }),
+		retryAlarmAtAttempt(2),
 	], FAULT_VERSION, seedProof), /sequential first-retry/u);
 	assert.throws(() => findFaultSeededJoinProof([
 		stateTrace(),
 		joinTrace(),
 		retryAlarmTrace(),
-		retryAlarmTrace({ logs: [
-			{ event: "room_milestone_outbox_delivery_failed" },
-			{
-				event: "room_milestone_outbox_retry_scheduled",
-				failure: "database-unavailable",
-				attemptCount: 3,
-			},
-		] }),
+		retryAlarmAtAttempt(3),
 	], FAULT_VERSION, seedProof), /sequential first-retry/u);
 	assert.throws(() => findFaultSeededJoinProof([
 		stateTrace(),
@@ -718,16 +685,13 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 		stateTrace(),
 		joinTrace(),
 		retryAlarmTrace(),
-		retryAlarmTrace({ logs: [
-			{ event: "room_milestone_outbox_delivery_failed" },
-			{
-				event: "room_milestone_outbox_retry_scheduled",
-				failure: "private-failure-value",
-				attemptCount: 2,
-			},
-		] }),
+		retryAlarmTrace({ logs: [{
+			event: "room_milestone_outbox_retry_scheduled",
+			failure: "private-failure-value",
+			attemptCount: 2,
+		}] }),
 	], FAULT_VERSION, seedProof), /split or incomplete/u);
-	assert.match(wrongFailureError.message, /Safe retry shape: \{"outboxLogCount":2,"deliveryFailedCount":1,"retryScheduledCount":1,"databaseUnavailable":false,"attemptCountKind":"positive-safe-integer"\}/u);
+	assert.match(wrongFailureError.message, /Safe retry shape: \{"outboxLogCount":1,"deliveryFailedCount":0,"retryScheduledCount":1,"databaseUnavailable":false,"attemptCountKind":"positive-safe-integer"\}/u);
 	assert.doesNotMatch(wrongFailureError.message, /private-failure-value/u);
 	assert.throws(() => findFaultSeededJoinProof([
 		stateTrace(),
@@ -741,12 +705,32 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 	assert.throws(() => findFaultSeededJoinProof([
 		stateTrace(),
 		joinTrace(),
+		retryAlarmTrace({ logs: [{
+			event: "room_milestone_outbox_retry_stale",
+			failure: "database-unavailable",
+		}] }),
+	], FAULT_VERSION, seedProof), /terminal outbox event/u);
+	assert.equal(findFaultSeededJoinProof([
+		stateTrace(),
+		joinTrace(),
 		retryAlarmTrace(),
 		retryAlarmTrace({
 			durableObjectId: OTHER_DO_ID,
 			logs: [{ event: "room_milestone_outbox_delivery_failed" }],
 		}),
-	], FAULT_VERSION, seedProof), /split or incomplete/u);
+	], FAULT_VERSION, seedProof), seedProof);
+	assert.equal(findFaultSeededJoinProof([
+		stateTrace(),
+		joinTrace(),
+		retryAlarmTrace(),
+		retryAlarmTrace({
+			durableObjectId: OTHER_DO_ID,
+			logs: [{
+				event: "room_milestone_outbox_retry_stale",
+				failure: "database-unavailable",
+			}],
+		}),
+	], FAULT_VERSION, seedProof), seedProof);
 	for (const [attemptCount, expectedKind] of [
 		[undefined, "missing"],
 		[null, "null"],
@@ -771,15 +755,12 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 		const invalidAttemptError = captureThrown(() => findFaultSeededJoinProof([
 			stateTrace(),
 			joinTrace(),
-			retryAlarmTrace({ logs: [
-				{ event: "room_milestone_outbox_delivery_failed" },
-				retryRecord,
-			] }),
+			retryAlarmTrace({ logs: [retryRecord] }),
 		], FAULT_VERSION, seedProof), /split or incomplete/u);
 		assert.match(invalidAttemptError.message, new RegExp(`"attemptCountKind":"${expectedKind}"`, "u"));
 		assert.doesNotMatch(invalidAttemptError.message, /private-attempt-value/u);
 	}
-	assert.throws(() => findFaultSeededJoinProof([
+	assert.equal(findFaultSeededJoinProof([
 		stateTrace(),
 		joinTrace(),
 		retryAlarmTrace(),
@@ -790,7 +771,7 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 				{ event: "room_milestone_outbox_dead_lettered" },
 			],
 		}),
-	], FAULT_VERSION, seedProof), /terminal outbox event/u);
+	], FAULT_VERSION, seedProof), seedProof);
 	for (const invalidBackgroundAlarm of [
 		retryAlarmTrace({ durableObjectId: OTHER_DO_ID, outcome: "canceled" }),
 		retryAlarmTrace({ durableObjectId: OTHER_DO_ID, outcome: "exception" }),
@@ -802,7 +783,7 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 		retryAlarmTrace(),
 		invalidBackgroundAlarm,
 	], FAULT_VERSION, seedProof), /successful Room Durable Object metadata/u);
-	assert.throws(() => findFaultSeededJoinProof([
+	assert.equal(findFaultSeededJoinProof([
 		stateTrace(),
 		joinTrace(),
 		retryAlarmTrace(),
@@ -817,7 +798,7 @@ test("seeded-room proof requires candidate ACK, then fault state, join, and firs
 				},
 			],
 		}),
-	], FAULT_VERSION, seedProof), /split or incomplete/u);
+	], FAULT_VERSION, seedProof), seedProof);
 	assert.throws(() => findFaultSeededJoinProof([
 		stateTrace(),
 		createTrace(),
@@ -1216,7 +1197,7 @@ test("candidate attachment exhaustion stops the JSON tail before any create", as
 	}), (error) => {
 		assert.match(error.message, /no exact-version attachment barrier/u);
 		assert.match(error.message, /"projectedTraceCount":0/u);
-		assert.doesNotMatch(error.message, /private|e237d4e3/u);
+		assert.doesNotMatch(error.message, /private|f0c9fd39/u);
 		return true;
 	});
 	assert.ok(attachmentAttempts >= 1);
@@ -1274,7 +1255,7 @@ test("candidate seed timeout reports only bounded aggregate proof progress and n
 		assert.match(error.message, /"successfulCreateCount":1/u);
 		assert.match(error.message, /"cleanAlarmCount":0/u);
 		assert.match(error.message, /"matchingCleanAlarmCount":0/u);
-		assert.doesNotMatch(error.message, /ABC234|must-not-survive|aaaaaaaa|e237d4e3/u);
+		assert.doesNotMatch(error.message, /ABC234|must-not-survive|aaaaaaaa|f0c9fd39/u);
 		return true;
 	});
 	assert.equal(createAttempts, 1);
@@ -1390,7 +1371,7 @@ test("prepare seeds and drains under B, signals a ready fault observer, then pro
 		expectedReceiptsAfterRollback: 1,
 		expectedRoomJoinedEventsAfterRollback: 1,
 	});
-	assert.doesNotMatch(JSON.stringify(result), /ABC234|private-player|aaaa|bbbb|e237d4e3|22222222/u);
+	assert.doesNotMatch(JSON.stringify(result), /ABC234|private-player|aaaa|bbbb|f0c9fd39|22222222/u);
 });
 
 test("prepare fails closed on an undrained seed or a deployment change between state and join", async () => {
@@ -1515,7 +1496,7 @@ test("verify observes fault-to-pinned-A drain, rechecks proof, then proves legac
 		legacyRoomFactsAdded: 1,
 		legacyRoomCreatedEventsAdded: 1,
 	});
-	assert.doesNotMatch(JSON.stringify(summary), /ABC234|aaaa|e237d4e3|22222222/u);
+	assert.doesNotMatch(JSON.stringify(summary), /ABC234|aaaa|f0c9fd39|22222222/u);
 });
 
 test("verify refuses a changed pre-rollback snapshot and any third deployment", async () => {

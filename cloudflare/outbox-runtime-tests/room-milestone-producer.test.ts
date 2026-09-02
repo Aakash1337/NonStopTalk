@@ -13,6 +13,7 @@ import { mapPublicRoomStateToFact } from "../platform";
 import {
 	enqueueRoomMilestones,
 	initializeRoomMilestoneOutbox,
+	readRoomMilestoneOutboxHead,
 	readRoomMilestoneOutboxMetadata,
 	type RoomMilestoneRandomBytes,
 } from "../room-milestone-outbox";
@@ -142,6 +143,15 @@ function deterministicEventIds(): RoomMilestoneRandomBytes {
 		new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
 			.setUint32(bytes.byteLength - 4, sequence);
 	};
+}
+
+function workerLogRecords(calls: unknown[][]): Record<string, unknown>[] {
+	return calls.flatMap((call) => {
+		const value = call[0];
+		return value !== null && typeof value === "object" && !Array.isArray(value)
+			? [value as Record<string, unknown>]
+			: [];
+	});
 }
 
 async function replayNextTransactionOnce(
@@ -355,6 +365,60 @@ describe("atomic normal-room outbox producer", () => {
 
 		expect((await localSnapshot(stub)).rows).toEqual([]);
 		expect(await scalar("SELECT COUNT(*) AS value FROM room_milestone_receipts")).toBe(1);
+	});
+
+	it("emits one post-commit record for retry and stale compare-and-swap outcomes", async () => {
+		const stub = roomStub("LAGR24");
+		await createRoom(stub, "LAGR24");
+		const warnings = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			await runInDurableObject(stub, async (instance, state) => {
+				const head = readRoomMilestoneOutboxHead(state.storage.sql);
+				if (!head) throw new Error("Expected a queued milestone for the log contract test.");
+				const finalize: unknown = Reflect.get(instance, "finalizeMilestoneRetry");
+				if (typeof finalize !== "function") {
+					throw new Error("The retry finalizer is unavailable for the log contract test.");
+				}
+				await Reflect.apply(finalize, instance, [
+					head,
+					"database-unavailable",
+					Date.now(),
+					"PlatformError",
+				]);
+				expect(readRoomMilestoneOutboxHead(state.storage.sql)?.attemptCount).toBe(1);
+				await Reflect.apply(finalize, instance, [
+					head,
+					"database-unavailable",
+					Date.now(),
+					"PlatformError",
+				]);
+			});
+
+			const records = workerLogRecords(warnings.mock.calls)
+				.filter((record) => typeof record.event === "string"
+					&& record.event.startsWith("room_milestone_outbox_"))
+				.map(({ timestamp: _timestamp, ...record }) => record);
+			expect(records).toEqual([
+				{
+					failure: "database-unavailable",
+					attemptCount: 1,
+					error: "PlatformError",
+					level: "warn",
+					event: "room_milestone_outbox_retry_scheduled",
+				},
+				{
+					failure: "database-unavailable",
+					error: "PlatformError",
+					level: "warn",
+					event: "room_milestone_outbox_retry_stale",
+				},
+			]);
+			expect(records.some((record) => (
+				record.event === "room_milestone_outbox_delivery_failed"
+			))).toBe(false);
+		} finally {
+			warnings.mockRestore();
+		}
 	});
 
 	it("replays a producer event without repeating D1 after local ACK failure", async () => {
