@@ -3,10 +3,22 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  PUBLIC_EXCLUDED_JAVASCRIPT_ASSET_MAX_COUNT,
+  readPublicJavaScriptAssets,
+} from "./public-javascript-assets.mjs";
+import {
+  PUBLIC_EXCLUDED_JAVASCRIPT_ATTEMPTS,
+  PUBLIC_EXCLUDED_JAVASCRIPT_MAX_CONCURRENCY,
+  PUBLIC_EXCLUDED_JAVASCRIPT_RETRY_MS,
   PUBLIC_JAVASCRIPT_ASSET_MAX_BYTES,
+  PUBLIC_JAVASCRIPT_ASSET_MAX_CONCURRENCY,
   PUBLIC_MODULE_GRAPH_ATTEMPTS,
   PUBLIC_MODULE_GRAPH_RETRY_MS,
+  PRODUCTION_SMOKE_BUDGET_MS,
+  assertExcludedJavaScriptResponse,
   readBoundedJavaScriptBody,
+  readVerifiedJavaScriptResponse,
+  waitForExcludedJavaScriptAssets,
   waitForExactPublicModuleGraph,
   waitForPublicModuleGraph,
 } from "./smoke-production-support.mjs";
@@ -24,6 +36,10 @@ const packageJSON = JSON.parse(await readFile(new URL("../package.json", import.
 const productionProbe = await readFile(new URL("./smoke-production.mjs", import.meta.url), "utf8");
 const productionProbeSupport = await readFile(
   new URL("./smoke-production-support.mjs", import.meta.url),
+  "utf8",
+);
+const productionAssetDiscovery = await readFile(
+  new URL("./public-javascript-assets.mjs", import.meta.url),
   "utf8",
 );
 const productionProbePolicy = await readFile(
@@ -55,19 +71,7 @@ const VALID_COACH_STORAGE_MODULE = "export async function openCoachDatabase() {}
 const VALID_COACH_ENGINE_MODULE = "export function assessCalibrationReadiness() {}";
 const VALID_SETUP_KITS_MODULE = "export function createSetupKitStore() {}";
 const VALID_MICROPHONE_SELECTION_MODULE = "export function createMicrophoneSelection() {}";
-const PUBLIC_JAVASCRIPT_ASSET_PATHS = [
-  "/app.js",
-  "/coach-storage.js",
-  "/coach-engine.js",
-  "/setup-kits.js",
-  "/microphone-selection.js",
-];
-const checkedOutJavaScriptAssets = new Map(await Promise.all(
-  PUBLIC_JAVASCRIPT_ASSET_PATHS.map(async (pathname) => [
-    pathname,
-    await readFile(new URL(`../cloudflare/public${pathname}`, import.meta.url), "utf8"),
-  ]),
-));
+const checkedOutJavaScriptAssets = await readPublicJavaScriptAssets();
 
 function validPublicModuleSource(pathname) {
   if (pathname === "/app.js") return VALID_APP_MODULE_GRAPH;
@@ -87,6 +91,10 @@ test("production health workflow stays scheduled, bounded, and manually runnable
   assert.match(workflow, /^  group: production-health$/mu);
   assert.match(workflow, /^  cancel-in-progress: true$/mu);
   assert.match(workflow, /^    timeout-minutes: 5$/mu);
+  const workflowTimeoutMs = 5 * 60_000;
+  assert.equal(PRODUCTION_SMOKE_BUDGET_MS, 180_000);
+  assert.ok(PRODUCTION_SMOKE_BUDGET_MS <= workflowTimeoutMs - 120_000,
+    "the overall probe budget must leave at least two minutes of workflow headroom");
 });
 
 test("production health workflow has read-only repository access and no credentials", () => {
@@ -113,7 +121,12 @@ test("production health workflow runs only the existing read-only probe", () => 
     /^          NONSTOPTALK_EXPECTED_ANALYTICS_DELIVERY: \$\{\{ matrix\.expected_delivery \}\}$/mu);
   assert.doesNotMatch(workflow, /\bnpm\s+(?:ci|install|clean-install)\b/iu);
   assert.doesNotMatch(workflow, /\bwrangler\b|\b(?:deploy|migrate|rollback)\b/iu);
-  for (const source of [productionProbe, productionProbeSupport, productionProbePolicy]) {
+  for (const source of [
+    productionProbe,
+    productionProbeSupport,
+    productionProbePolicy,
+    productionAssetDiscovery,
+  ]) {
     assert.doesNotMatch(source, /\b(?:POST|PUT|PATCH|DELETE)\b/iu);
     assert.doesNotMatch(source, /\bmethod\s*:/iu);
     assert.doesNotMatch(source, /\bAuthorization\b|ANALYTICS_ADMIN_TOKEN/u);
@@ -287,20 +300,34 @@ test("production probe bounds only deployment-propagation status retries", () =>
   );
 });
 
-test("production probe verifies the required public JavaScript module graph", () => {
+test("production probe verifies every deployed JavaScript asset and the required module graph", () => {
   assert.match(
     productionProbe,
-    /waitForExactPublicModuleGraph\(\{\s*loadJavaScriptAsset: getJavaScriptAsset,\s*expectedJavaScriptAssets,/u,
+    /await waitForExactPublicModuleGraph\(\{\s*loadJavaScriptAsset: getJavaScriptAsset,\s*expectedJavaScriptAssets,\s*deadlineMs: probeDeadlineMs,\s*now: \(\) => performance\.now\(\),/u,
   );
-  assert.match(productionProbe, /readFile\(new URL\(`\.\.\/cloudflare\/public\$\{pathname\}`/u);
-  assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/app\.js"\)/u);
-  assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/coach-storage\.js"\)/u);
-  assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/coach-engine\.js"\)/u);
-  assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/setup-kits\.js"\)/u);
-  assert.match(productionProbeSupport, /loadJavaScriptAsset\("\/microphone-selection\.js"\)/u);
-  assert.match(productionProbe, /get\(pathname, "text\/javascript", 1\)/u);
-  assert.match(productionProbe, /mediaType === "text\/javascript"/u);
-  assert.match(productionProbe, /!\/\^\\s\*\(\?:<!doctype\\s\+html\|<html\\b\)\/iu\.test\(source\)/u);
+  assert.match(productionProbe, /readPublicJavaScriptAssetInventory\(\)/u);
+  assert.match(productionAssetDiscovery, /collectJavaScriptFiles\(/u);
+  assert.match(productionAssetDiscovery,
+    /segments\.some\(\(segment\) => JAVASCRIPT_TEST_NAME\.test\(segment\)\)/u);
+  assert.match(productionAssetDiscovery,
+    /\.assetsignore must contain exactly \$\{REQUIRED_ASSETS_IGNORE_RULE\}/u);
+  for (const pathname of [
+    "/app.js",
+    "/coach-storage.js",
+    "/coach-engine.js",
+    "/setup-kits.js",
+    "/microphone-selection.js",
+  ]) {
+    assert.match(productionProbeSupport, new RegExp(JSON.stringify(pathname).replace(".", "\\."), "u"));
+  }
+  assert.match(productionProbeSupport, /await runSettledPathSweep\(\{/u);
+  assert.match(productionProbeSupport,
+    /failures\.find\(\(failure\) => failure !== undefined\)/u);
+  assert.equal(PUBLIC_JAVASCRIPT_ASSET_MAX_CONCURRENCY, 8);
+  assert.match(productionProbe,
+    /get\(pathname, "text\/javascript", 1, remainingAssetMs\)/u);
+  assert.match(productionProbeSupport, /mediaType !== "text\/javascript"/u);
+  assert.match(productionProbeSupport, /\^\\s\*\(\?:<!doctype\\s\+html\|<html\\b\)\/iu\.test\(source\)/u);
   assert.match(productionProbeSupport, /hasNamespaceModuleImport\(\s*appTokens,\s*"\.\/coach-storage\.js",\s*"coachingStorage",/u);
   assert.match(productionProbeSupport, /hasDynamicModuleLoader\(\s*appTokens,\s*"loadCoachEngine",\s*"coachEnginePromise",\s*"\.\/coach-engine\.js",/u);
   assert.match(productionProbeSupport, /hasAwaitedFactoryAssignment\(appTokens, "engine", "loadCoachEngine"\)/u);
@@ -315,13 +342,33 @@ test("production probe verifies the required public JavaScript module graph", ()
   assert.match(productionProbeSupport, /hasExportedFunction\(setupKitsTokens, "createSetupKitStore"\)/u);
   assert.match(productionProbeSupport, /hasExportedFunction\(microphoneSelectionTokens, "createMicrophoneSelection"\)/u);
   assert.match(productionProbeSupport, /spawnSync\(process\.execPath, \["--check", "--input-type=module"\]/u);
-  assert.match(productionProbeSupport, /PUBLIC_JAVASCRIPT_ASSET_MAX_BYTES = 512 \* 1024/u);
-  assert.match(productionProbe, /readBoundedJavaScriptBody\(response, pathname\)/u);
-  assert.match(productionProbe, /"\/setup-kits\.js"/u);
-  assert.match(productionProbe, /"\/microphone-selection\.js"/u);
+  assert.match(productionAssetDiscovery, /PUBLIC_JAVASCRIPT_ASSET_MAX_BYTES = 512 \* 1024/u);
+  assert.match(productionProbe, /readVerifiedJavaScriptResponse\(response, pathname\)/u);
+  assert.match(
+    productionProbe,
+    /async function getExcludedJavaScriptAsset\(pathname, remainingAssetMs\) \{[\s\S]*?return get\(pathname, "text\/javascript", 1, remainingAssetMs\);\s*\}/u,
+  );
+  assert.match(
+    productionProbe,
+    /const verifiedExcludedJavaScriptAssets = await waitForExcludedJavaScriptAssets\(\{\s*loadExcludedJavaScriptAsset: getExcludedJavaScriptAsset,\s*excludedJavaScriptAssetPaths,\s*deadlineMs: probeDeadlineMs,\s*now: \(\) => performance\.now\(\),/u,
+  );
+  assert.match(productionProbe,
+    /const probeDeadlineMs = performance\.now\(\) \+ PRODUCTION_SMOKE_BUDGET_MS;/u);
+  assert.match(productionProbe,
+    /Math\.min\(timeoutMs, NETWORK_ATTEMPT_TIMEOUT_MS, remainingProbeMs\(\)\)/u);
+  assert.match(productionProbe,
+    /const body = await response\.(?:text|json)\(\);\s*remainingProbeMs\(\);/u);
+  assert.match(productionProbeSupport,
+    /timeout: Math\.max\(1, Math\.floor\(timeoutMs\)\)/u);
+  assert.match(productionProbeSupport,
+    /Math\.min\(JAVASCRIPT_SYNTAX_TIMEOUT_MS, remainingDeadlineMs\(deadlineMs, now\)\)/u);
+  assert.match(productionProbeSupport, /const monotonicNow = \(\) => performance\.now\(\);/u);
+  assert.match(productionProbeSupport, /assertExcludedJavaScriptResponse\(response, pathname\)/u);
+  assert.match(productionProbe, /\.\.\.expectedJavaScriptAssets\.keys\(\)/u);
 });
 
-test("production probe requires an exact checked-out five-asset generation", async () => {
+test("production probe requires the complete exact checked-out JavaScript generation", async () => {
+  assert.equal(checkedOutJavaScriptAssets.size, 10);
   const result = await waitForExactPublicModuleGraph({
     loadJavaScriptAsset: async (pathname) => checkedOutJavaScriptAssets.get(pathname),
     expectedJavaScriptAssets: checkedOutJavaScriptAssets,
@@ -335,6 +382,7 @@ test("production probe requires an exact checked-out five-asset generation", asy
     result.microphoneSelectionSource,
     checkedOutJavaScriptAssets.get("/microphone-selection.js"),
   );
+  assert.deepEqual(result.observedJavaScriptAssets, checkedOutJavaScriptAssets);
 
   let calls = 0;
   await assert.rejects(
@@ -342,33 +390,129 @@ test("production probe requires an exact checked-out five-asset generation", asy
       loadJavaScriptAsset: async (pathname) => {
         calls += 1;
         const source = checkedOutJavaScriptAssets.get(pathname);
-        return pathname === "/microphone-selection.js" ? `${source}\n` : source;
+        return pathname === "/coach-audio-worklet.js" ? `${source}\n` : source;
       },
       expectedJavaScriptAssets: checkedOutJavaScriptAssets,
       sleep: async () => {},
       attempts: 1,
       retryMs: 0,
     }),
-    /microphone-selection\.js does not match the checked-out release source/u,
+    /coach-audio-worklet\.js does not match the checked-out release source/u,
   );
-  assert.equal(calls, 5);
+  assert.equal(calls, checkedOutJavaScriptAssets.size);
   assert.throws(
     () => waitForExactPublicModuleGraph({ loadJavaScriptAsset: async () => "" }),
     /expectedJavaScriptAssets must be a Map/u,
   );
 
-  const legacyFourAssetMap = new Map(checkedOutJavaScriptAssets);
-  legacyFourAssetMap.delete("/microphone-selection.js");
+  const incompleteAssetMap = new Map(checkedOutJavaScriptAssets);
+  incompleteAssetMap.delete("/microphone-selection.js");
   await assert.rejects(
     waitForExactPublicModuleGraph({
       loadJavaScriptAsset: async (pathname) => checkedOutJavaScriptAssets.get(pathname),
-      expectedJavaScriptAssets: legacyFourAssetMap,
+      expectedJavaScriptAssets: incompleteAssetMap,
       sleep: async () => {},
       attempts: 1,
       retryMs: 0,
     }),
-    /must contain exactly the reviewed public module paths/u,
+    /must include every reviewed public module path/u,
   );
+});
+
+test("production probe refetches every discovered asset after a mixed generation", async () => {
+  const calls = new Map([...checkedOutJavaScriptAssets.keys()].map((pathname) => [pathname, 0]));
+  const delays = [];
+  const result = await waitForExactPublicModuleGraph({
+    loadJavaScriptAsset: async (pathname) => {
+      calls.set(pathname, calls.get(pathname) + 1);
+      const source = checkedOutJavaScriptAssets.get(pathname);
+      if (pathname === "/admin-analytics.js" && calls.get(pathname) === 1) return `${source}\n`;
+      return source;
+    },
+    expectedJavaScriptAssets: checkedOutJavaScriptAssets,
+    sleep: async (milliseconds) => delays.push(milliseconds),
+    attempts: 2,
+    retryMs: 7,
+  });
+
+  assert.deepEqual(result.observedJavaScriptAssets, checkedOutJavaScriptAssets);
+  assert.deepEqual([...calls.values()], Array(checkedOutJavaScriptAssets.size).fill(2));
+  assert.deepEqual(delays, [7]);
+});
+
+test("positive asset retries never overlap an unresolved previous sweep", async () => {
+  const calls = new Map([
+    "/app.js",
+    "/coach-storage.js",
+    "/coach-engine.js",
+    "/setup-kits.js",
+    "/microphone-selection.js",
+  ].map((pathname) => [pathname, 0]));
+  const delays = [];
+  let releaseFirstApp;
+  const firstApp = new Promise((resolve) => { releaseFirstApp = resolve; });
+  const verification = waitForPublicModuleGraph({
+    loadJavaScriptAsset: async (pathname) => {
+      calls.set(pathname, calls.get(pathname) + 1);
+      if (calls.get(pathname) === 1 && pathname === "/app.js") return firstApp;
+      if (calls.get(pathname) === 1 && pathname === "/coach-storage.js") {
+        throw new Error("temporary storage response failure");
+      }
+      return validPublicModuleSource(pathname);
+    },
+    sleep: async (milliseconds) => delays.push(milliseconds),
+    attempts: 2,
+    retryMs: 7,
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual([...calls.values()], [1, 1, 1, 1, 1],
+    "attempt two must wait for every started attempt-one load and body read");
+  assert.deepEqual(delays, []);
+  releaseFirstApp(VALID_APP_MODULE_GRAPH);
+
+  const result = await verification;
+  assert.match(result.appSource, /coach-storage\.js/u);
+  assert.deepEqual([...calls.values()], [2, 2, 2, 2, 2]);
+  assert.deepEqual(delays, [7]);
+});
+
+test("positive asset sweep reports the first path error deterministically after settling", async () => {
+  let rejectApp;
+  const lateAppFailure = new Promise((_resolve, reject) => { rejectApp = reject; });
+  const verification = waitForPublicModuleGraph({
+    loadJavaScriptAsset: async (pathname) => {
+      if (pathname === "/app.js") return lateAppFailure;
+      if (pathname === "/coach-storage.js") throw new Error("later-path failure");
+      return validPublicModuleSource(pathname);
+    },
+    attempts: 1,
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  rejectApp(new Error("first-path failure"));
+  await assert.rejects(verification, /first-path failure/u);
+});
+
+test("positive asset sweep caps concurrency at eight", async () => {
+  let active = 0;
+  let peakActive = 0;
+  let calls = 0;
+  await waitForExactPublicModuleGraph({
+    loadJavaScriptAsset: async (pathname) => {
+      calls += 1;
+      active += 1;
+      peakActive = Math.max(peakActive, active);
+      await new Promise((resolve) => setImmediate(resolve));
+      active -= 1;
+      return checkedOutJavaScriptAssets.get(pathname);
+    },
+    expectedJavaScriptAssets: checkedOutJavaScriptAssets,
+    attempts: 1,
+  });
+
+  assert.equal(calls, checkedOutJavaScriptAssets.size);
+  assert.equal(peakActive, PUBLIC_JAVASCRIPT_ASSET_MAX_CONCURRENCY);
 });
 
 test("production probe streams JavaScript through a decompressed-byte ceiling", async () => {
@@ -406,6 +550,349 @@ test("production probe streams JavaScript through a decompressed-byte ceiling", 
     (await readBoundedJavaScriptBody(new Response(exactBoundary), "/exact.js")).length,
     PUBLIC_JAVASCRIPT_ASSET_MAX_BYTES,
   );
+});
+
+test("production probe verifies JavaScript response MIME, nosniff, encoding, and body shape", async () => {
+  for (const contentType of [
+    "text/javascript",
+    "application/javascript; charset=utf-8",
+    "TEXT/JAVASCRIPT",
+  ]) {
+    const source = await readVerifiedJavaScriptResponse(new Response("export {};\n", {
+      headers: {
+        "content-type": contentType,
+        "x-content-type-options": "nosniff",
+      },
+    }), "/asset.js");
+    assert.equal(source, "export {};\n");
+  }
+
+  for (const [headers, expectedError] of [
+    [{ "x-content-type-options": "nosniff" }, /did not return JavaScript/u],
+    [{ "content-type": "text/html", "x-content-type-options": "nosniff" }, /did not return JavaScript/u],
+    [{ "content-type": "text/javascript" }, /missing MIME-sniffing protection/u],
+    [{ "content-type": "text/javascript", "x-content-type-options": "invalid" }, /missing MIME-sniffing protection/u],
+  ]) {
+    await assert.rejects(
+      readVerifiedJavaScriptResponse(new Response("export {};\n", { headers }), "/asset.js"),
+      expectedError,
+    );
+  }
+
+  for (const body of ["", "   \n", "<!doctype html><title>fallback</title>", "<html></html>"]) {
+    await assert.rejects(
+      readVerifiedJavaScriptResponse(new Response(body, {
+        headers: {
+          "content-type": "text/javascript",
+          "x-content-type-options": "nosniff",
+        },
+      }), "/asset.js"),
+      /empty or HTML fallback document/u,
+    );
+  }
+
+  for (const [body, expectedError] of [
+    [new Uint8Array([0xef, 0xbb, 0xbf, 0x65]), /byte-order mark/u],
+    [new Uint8Array([0xc3, 0x28]), /not canonical UTF-8 JavaScript/u],
+  ]) {
+    await assert.rejects(
+      readVerifiedJavaScriptResponse(new Response(body, {
+        headers: {
+          "content-type": "text/javascript",
+          "x-content-type-options": "nosniff",
+        },
+      }), "/asset.js"),
+      expectedError,
+    );
+  }
+
+  for (const headers of [
+    { "content-type": "text/html", "x-content-type-options": "nosniff" },
+    { "content-type": "text/javascript" },
+  ]) {
+    let cancelCalls = 0;
+    await assert.rejects(
+      readVerifiedJavaScriptResponse({
+        headers: new Headers(headers),
+        body: { cancel: async () => { cancelCalls += 1; } },
+      }, "/asset.js"),
+    );
+    assert.equal(cancelCalls, 1, "a rejected response must release its unread body");
+  }
+});
+
+test("production probe requires ignored scripts to resolve only to protected HTML", async () => {
+  let cancelCalls = 0;
+  await assertExcludedJavaScriptResponse({
+    headers: new Headers({
+      "content-type": "text/html; charset=utf-8",
+      "x-content-type-options": "nosniff",
+    }),
+    body: { cancel: async () => { cancelCalls += 1; } },
+  }, "/runtime.test.js");
+  assert.equal(cancelCalls, 1);
+
+  for (const [headers, expectedError] of [
+    [{ "content-type": "text/javascript", "x-content-type-options": "nosniff" }, /not excluded/u],
+    [{ "content-type": "text/html" }, /missing MIME-sniffing protection/u],
+  ]) {
+    cancelCalls = 0;
+    await assert.rejects(
+      assertExcludedJavaScriptResponse({
+        headers: new Headers(headers),
+        body: { cancel: async () => { cancelCalls += 1; } },
+      }, "/runtime.test.js"),
+      expectedError,
+    );
+    assert.equal(cancelCalls, 1);
+  }
+});
+
+test("excluded-script probe completes one normal bounded sweep", async () => {
+  const pathnames = [
+    "/zeta.TEST.MJS",
+    "/suite.test.mjs/fixture.JS",
+    "/alpha.test.js",
+  ];
+  const calls = [];
+  let active = 0;
+  let peakActive = 0;
+  const verified = await waitForExcludedJavaScriptAssets({
+    loadExcludedJavaScriptAsset: async (pathname) => {
+      calls.push(pathname);
+      active += 1;
+      peakActive = Math.max(peakActive, active);
+      await new Promise((resolve) => setImmediate(resolve));
+      active -= 1;
+      return new Response("<!doctype html><title>NonStopTalk</title>", {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    },
+    excludedJavaScriptAssetPaths: pathnames,
+  });
+
+  assert.deepEqual(verified, [...pathnames].sort());
+  assert.deepEqual(calls, [...pathnames].sort());
+  assert.equal(peakActive, pathnames.length);
+  assert.equal(PUBLIC_EXCLUDED_JAVASCRIPT_ATTEMPTS, 8);
+  assert.equal(PUBLIC_EXCLUDED_JAVASCRIPT_RETRY_MS, 1_000);
+  assert.equal(PUBLIC_EXCLUDED_JAVASCRIPT_MAX_CONCURRENCY, 8);
+});
+
+test("excluded-script probe retries the complete set after a mixed generation", async () => {
+  const pathnames = ["/alpha.test.js", "/bravo.test.mjs", "/charlie.TEST.JS"];
+  const calls = new Map(pathnames.map((pathname) => [pathname, 0]));
+  const delays = [];
+  const verified = await waitForExcludedJavaScriptAssets({
+    loadExcludedJavaScriptAsset: async (pathname) => {
+      calls.set(pathname, calls.get(pathname) + 1);
+      const firstMixedGeneration = pathname === "/bravo.test.mjs"
+        && calls.get(pathname) === 1;
+      return new Response(firstMixedGeneration ? "export {};" : "<!doctype html>", {
+        headers: {
+          "content-type": firstMixedGeneration ? "text/javascript" : "text/html",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    },
+    excludedJavaScriptAssetPaths: pathnames,
+    sleep: async (milliseconds) => delays.push(milliseconds),
+    attempts: 2,
+    retryMs: 7,
+    concurrency: 2,
+  });
+
+  assert.deepEqual(verified, pathnames);
+  assert.deepEqual([...calls.values()], [2, 2, 2]);
+  assert.deepEqual(delays, [7]);
+});
+
+test("excluded-script probe caps concurrency at eight", async () => {
+  const pathnames = Array.from(
+    { length: 19 },
+    (_, index) => `/concurrency-${String(index).padStart(2, "0")}.test.js`,
+  );
+  let active = 0;
+  let peakActive = 0;
+  let calls = 0;
+  await waitForExcludedJavaScriptAssets({
+    loadExcludedJavaScriptAsset: async () => {
+      calls += 1;
+      active += 1;
+      peakActive = Math.max(peakActive, active);
+      await new Promise((resolve) => setImmediate(resolve));
+      active -= 1;
+      return new Response("<!doctype html>", {
+        headers: {
+          "content-type": "text/html",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    },
+    excludedJavaScriptAssetPaths: pathnames,
+  });
+
+  assert.equal(calls, pathnames.length);
+  assert.equal(peakActive, PUBLIC_EXCLUDED_JAVASCRIPT_MAX_CONCURRENCY);
+});
+
+test("excluded-script probe validates only canonical ignored JavaScript paths", async () => {
+  let calls = 0;
+  const loadExcludedJavaScriptAsset = async () => {
+    calls += 1;
+    throw new Error("must not fetch an invalid path");
+  };
+  for (const pathname of [
+    "/app.js",
+    "/runtime.test.ts",
+    "/runtime.test.js?cache=1",
+    "/../runtime.test.js",
+    "/%72untime.test.js",
+    "//runtime.test.js",
+    "https://example.com/runtime.test.js",
+  ]) {
+    await assert.rejects(
+      waitForExcludedJavaScriptAssets({
+        loadExcludedJavaScriptAsset,
+        excludedJavaScriptAssetPaths: [pathname],
+      }),
+      /invalid canonical ignored JavaScript path/u,
+    );
+  }
+  await assert.rejects(
+    waitForExcludedJavaScriptAssets({
+      loadExcludedJavaScriptAsset,
+      excludedJavaScriptAssetPaths: ["/runtime.test.js", "/runtime.test.js"],
+    }),
+    /must not contain duplicate paths/u,
+  );
+  await assert.rejects(
+    waitForExcludedJavaScriptAssets({
+      loadExcludedJavaScriptAsset,
+      excludedJavaScriptAssetPaths: Array.from(
+        { length: PUBLIC_EXCLUDED_JAVASCRIPT_ASSET_MAX_COUNT + 1 },
+        (_, index) => `/over-count-${index}.test.js`,
+      ),
+    }),
+    /exceeds the reviewed script-count boundary/u,
+  );
+  assert.equal(calls, 0);
+});
+
+test("excluded-script probe stops after a bounded persistent failure", async () => {
+  const pathnames = ["/alpha.test.js", "/bravo.test.mjs"];
+  const calls = new Map(pathnames.map((pathname) => [pathname, 0]));
+  const delays = [];
+  await assert.rejects(
+    waitForExcludedJavaScriptAssets({
+      loadExcludedJavaScriptAsset: async (pathname) => {
+        calls.set(pathname, calls.get(pathname) + 1);
+        return new Response("export {};", {
+          headers: {
+            "content-type": "text/javascript",
+            "x-content-type-options": "nosniff",
+          },
+        });
+      },
+      excludedJavaScriptAssetPaths: pathnames,
+      sleep: async (milliseconds) => delays.push(milliseconds),
+      attempts: 3,
+      retryMs: 5,
+      concurrency: 2,
+    }),
+    /alpha\.test\.js was not excluded/u,
+  );
+  assert.deepEqual([...calls.values()], [3, 3]);
+  assert.deepEqual(delays, [5, 10]);
+
+  for (const options of [
+    { attempts: PUBLIC_EXCLUDED_JAVASCRIPT_ATTEMPTS + 1 },
+    { retryMs: PUBLIC_EXCLUDED_JAVASCRIPT_RETRY_MS + 1 },
+    { concurrency: PUBLIC_EXCLUDED_JAVASCRIPT_MAX_CONCURRENCY + 1 },
+  ]) {
+    await assert.rejects(
+      waitForExcludedJavaScriptAssets({
+        loadExcludedJavaScriptAsset: async () => assert.fail("invalid bounds must not fetch"),
+        excludedJavaScriptAssetPaths: ["/runtime.test.js"],
+        ...options,
+      }),
+      /must be a safe integer from/u,
+    );
+  }
+});
+
+test("shared probe deadline bounds asset retries and their backoff", async () => {
+  let currentTimeMs = 0;
+  let calls = 0;
+  const delays = [];
+  await assert.rejects(
+    waitForExcludedJavaScriptAssets({
+      loadExcludedJavaScriptAsset: async (_pathname, remainingMs) => {
+        calls += 1;
+        assert.ok(remainingMs > 0 && remainingMs <= 6);
+        return new Response("export {};", {
+          headers: {
+            "content-type": "text/javascript",
+            "x-content-type-options": "nosniff",
+          },
+        });
+      },
+      excludedJavaScriptAssetPaths: ["/alpha.test.js", "/bravo.test.mjs"],
+      sleep: async (milliseconds) => {
+        delays.push(milliseconds);
+        currentTimeMs += milliseconds;
+      },
+      attempts: PUBLIC_EXCLUDED_JAVASCRIPT_ATTEMPTS,
+      retryMs: 5,
+      deadlineMs: 6,
+      now: () => currentTimeMs,
+      concurrency: 2,
+    }),
+    /exceeded its shared deadline/u,
+  );
+
+  assert.equal(calls, 4, "the deadline must stop retries before the configured attempt cap");
+  assert.deepEqual(delays, [5, 1], "the final backoff must be clamped to remaining time");
+});
+
+test("positive and excluded phases consume the same shared deadline", async () => {
+  let currentTimeMs = 0;
+  const positiveRemaining = [];
+  const excludedRemaining = [];
+  const deadlineMs = 100;
+  await waitForPublicModuleGraph({
+    loadJavaScriptAsset: async (pathname, remainingMs) => {
+      positiveRemaining.push(remainingMs);
+      currentTimeMs += 1;
+      return validPublicModuleSource(pathname);
+    },
+    attempts: 1,
+    deadlineMs,
+    now: () => currentTimeMs,
+  });
+  await waitForExcludedJavaScriptAssets({
+    loadExcludedJavaScriptAsset: async (_pathname, remainingMs) => {
+      excludedRemaining.push(remainingMs);
+      currentTimeMs += 1;
+      return new Response("<!doctype html>", {
+        headers: {
+          "content-type": "text/html",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    },
+    excludedJavaScriptAssetPaths: ["/alpha.test.js", "/bravo.test.mjs"],
+    attempts: 1,
+    deadlineMs,
+    now: () => currentTimeMs,
+  });
+
+  assert.equal(positiveRemaining[0], deadlineMs);
+  assert.ok(excludedRemaining[0] < positiveRemaining.at(-1),
+    "the excluded phase must receive only the budget left by the positive phase");
 });
 
 test("production probe retries a mixed public asset generation as one module graph", async () => {

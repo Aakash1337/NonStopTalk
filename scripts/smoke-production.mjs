@@ -1,12 +1,15 @@
-import { readFile } from "node:fs/promises";
 import process from "node:process";
+import { performance } from "node:perf_hooks";
 
+import { readPublicJavaScriptAssetInventory } from "./public-javascript-assets.mjs";
 import {
   assertExpectedAnalyticsDelivery,
   resolveExpectedAnalyticsDelivery,
 } from "./smoke-production-policy.mjs";
 import {
-  readBoundedJavaScriptBody,
+  PRODUCTION_SMOKE_BUDGET_MS,
+  readVerifiedJavaScriptResponse,
+  waitForExcludedJavaScriptAssets,
   waitForExactPublicModuleGraph,
 } from "./smoke-production-support.mjs";
 
@@ -19,28 +22,51 @@ const expectedAnalyticsDelivery = resolveExpectedAnalyticsDelivery(
   process.env.NONSTOPTALK_EXPECTED_ANALYTICS_DELIVERY,
 );
 const WEB_ANALYTICS_ORIGIN = "https://static.cloudflareinsights.com";
+const NETWORK_ATTEMPT_TIMEOUT_MS = 15_000;
 const PLATFORM_STATUS_ATTEMPTS = 5;
 const PLATFORM_STATUS_RETRY_MS = 1_000;
 const SUPPORTED_PLATFORM_SCHEMA_VERSIONS = new Set([5, 6]);
-const PUBLIC_JAVASCRIPT_ASSET_PATHS = [
-  "/app.js",
-  "/coach-storage.js",
-  "/coach-engine.js",
-  "/setup-kits.js",
-  "/microphone-selection.js",
-];
-const expectedJavaScriptAssets = new Map(await Promise.all(
-  PUBLIC_JAVASCRIPT_ASSET_PATHS.map(async (pathname) => [
-    pathname,
-    await readFile(new URL(`../cloudflare/public${pathname}`, import.meta.url), "utf8"),
-  ]),
-));
+const probeDeadlineMs = performance.now() + PRODUCTION_SMOKE_BUDGET_MS;
+const {
+  productionAssets: expectedJavaScriptAssets,
+  excludedJavaScriptAssetPaths,
+} = await readPublicJavaScriptAssetInventory();
 if (!/^https:$/.test(origin.protocol) || origin.pathname !== "/") {
   throw new Error("NONSTOPTALK_PRODUCTION_ORIGIN must be an HTTPS origin without a path.");
 }
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+function remainingProbeMs() {
+  const remainingMs = Math.floor(probeDeadlineMs - performance.now());
+  if (remainingMs < 1) throw new Error("production smoke probe exceeded its shared deadline");
+  return remainingMs;
+}
+
+async function sleepWithinProbe(delayMs) {
+  const remainingMs = remainingProbeMs();
+  const clampedDelayMs = Math.min(delayMs, remainingMs);
+  await new Promise((resolve) => setTimeout(resolve, clampedDelayMs));
+  if (clampedDelayMs < delayMs) {
+    throw new Error("production smoke probe exceeded its shared deadline");
+  }
+  remainingProbeMs();
+}
+
+async function readResponseText(response) {
+  remainingProbeMs();
+  const body = await response.text();
+  remainingProbeMs();
+  return body;
+}
+
+async function readResponseJson(response) {
+  remainingProbeMs();
+  const body = await response.json();
+  remainingProbeMs();
+  return body;
 }
 
 function contentSecurityPolicySources(policy, directiveName) {
@@ -63,14 +89,18 @@ function hasScriptFromOrigin(html, documentURL, expectedOrigin) {
   });
 }
 
-async function get(pathname, accept, attempts = 5) {
+async function get(pathname, accept, attempts = 5, timeoutMs = NETWORK_ATTEMPT_TIMEOUT_MS) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const requestTimeoutMs = Math.max(
+      1,
+      Math.min(timeoutMs, NETWORK_ATTEMPT_TIMEOUT_MS, remainingProbeMs()),
+    );
     try {
       const response = await fetch(new URL(pathname, origin), {
         headers: { Accept: accept },
         redirect: "error",
-        signal: AbortSignal.timeout(15_000),
+        signal: AbortSignal.timeout(requestTimeoutMs),
       });
       if (response.ok) return response;
       await response.body?.cancel().catch(() => undefined);
@@ -78,7 +108,7 @@ async function get(pathname, accept, attempts = 5) {
     } catch (error) {
       lastError = error;
     }
-    if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
+    if (attempt < attempts) await sleepWithinProbe(attempt * 1_000);
   }
   throw lastError instanceof Error ? lastError : new Error(`${pathname} did not respond.`);
 }
@@ -88,7 +118,7 @@ async function getPlatformStatus() {
   let status;
   for (let attempt = 1; attempt <= PLATFORM_STATUS_ATTEMPTS; attempt += 1) {
     response = await get("/api/v1/platform/status", "application/json");
-    status = await response.json();
+    status = await readResponseJson(response);
     // A just-deployed compatibility Worker can briefly observe the migrated
     // schema while still returning the previous status shape at another edge.
     // Retry only that recognizable propagation state; real degraded cleanup
@@ -99,34 +129,29 @@ async function getPlatformStatus() {
       return { response, status };
     }
     if (attempt < PLATFORM_STATUS_ATTEMPTS) {
-      await new Promise((resolve) => setTimeout(resolve, PLATFORM_STATUS_RETRY_MS));
+      await sleepWithinProbe(PLATFORM_STATUS_RETRY_MS);
     }
   }
   return { response, status };
 }
 
-async function getJavaScriptAsset(pathname) {
+async function getJavaScriptAsset(pathname, remainingAssetMs) {
   // The outer module-graph loop owns retries so each attempt observes all
   // assets from the same deployment-propagation window.
-  const response = await get(pathname, "text/javascript", 1);
-  const mediaType = String(response.headers.get("content-type") || "")
-    .split(";", 1)[0]
-    .trim()
-    .toLocaleLowerCase();
-  assert(mediaType === "text/javascript" || mediaType === "application/javascript",
-    `${pathname} did not return JavaScript`);
-  assert(response.headers.get("x-content-type-options") === "nosniff",
-    `${pathname} is missing MIME-sniffing protection`);
-  const source = await readBoundedJavaScriptBody(response, pathname);
-  assert(source.trim().length > 0 && !/^\s*(?:<!doctype\s+html|<html\b)/iu.test(source),
-    `${pathname} returned an empty or HTML fallback document`);
-  return source;
+  const response = await get(pathname, "text/javascript", 1, remainingAssetMs);
+  return readVerifiedJavaScriptResponse(response, pathname);
+}
+
+async function getExcludedJavaScriptAsset(pathname, remainingAssetMs) {
+  // The outer whole-set loop owns propagation retries. Each request therefore
+  // makes one bounded GET and releases its body in the response validator.
+  return get(pathname, "text/javascript", 1, remainingAssetMs);
 }
 
 for (const pathname of ["/", "/practice", "/progress"]) {
   const response = await get(pathname, "text/html");
   assert(response.headers.get("content-type")?.startsWith("text/html"), `${pathname} did not return HTML`);
-  const html = await response.text();
+  const html = await readResponseText(response);
   assert(html.includes("<title>NonStopTalk</title>"), `${pathname} did not return the NonStopTalk shell`);
   assert(response.headers.get("x-content-type-options") === "nosniff", `${pathname} is missing security headers`);
   assert(response.headers.get("strict-transport-security")?.includes("max-age=31536000"),
@@ -147,12 +172,20 @@ for (const pathname of ["/", "/practice", "/progress"]) {
 await waitForExactPublicModuleGraph({
   loadJavaScriptAsset: getJavaScriptAsset,
   expectedJavaScriptAssets,
+  deadlineMs: probeDeadlineMs,
+  now: () => performance.now(),
+});
+const verifiedExcludedJavaScriptAssets = await waitForExcludedJavaScriptAssets({
+  loadExcludedJavaScriptAsset: getExcludedJavaScriptAsset,
+  excludedJavaScriptAssetPaths,
+  deadlineMs: probeDeadlineMs,
+  now: () => performance.now(),
 });
 
 const adminDocumentResponse = await get("/admin/analytics", "text/html");
 assert(adminDocumentResponse.headers.get("content-type")?.startsWith("text/html"),
   "/admin/analytics did not return HTML");
-const adminDocument = await adminDocumentResponse.text();
+const adminDocument = await readResponseText(adminDocumentResponse);
 assert(adminDocument.includes("<title>Operator analytics · NonStopTalk</title>"),
   "/admin/analytics did not return its dedicated document");
 assert(adminDocument.includes("/admin-analytics-page.js") && !adminDocument.includes('src="/app.js"'),
@@ -179,7 +212,7 @@ const directAdminAsset = await get("/admin/analytics/index.html", "text/html");
 assert(directAdminAsset.headers.get("content-security-policy") === adminCsp,
   "the direct admin asset path bypasses the isolated document policy");
 assert(!hasScriptFromOrigin(
-  await directAdminAsset.text(),
+  await readResponseText(directAdminAsset),
   new URL("/admin/analytics/index.html", origin),
   WEB_ANALYTICS_ORIGIN,
 ),
@@ -202,6 +235,7 @@ const observedAnalyticsDelivery = assertExpectedAnalyticsDelivery(
 );
 assert(statusResponse.headers.get("cache-control") === "no-store", "platform status must not be cached");
 assert(Boolean(statusResponse.headers.get("x-request-id")), "platform status is missing its request ID");
+remainingProbeMs();
 
 console.log(JSON.stringify({
   status: "ok",
@@ -210,7 +244,9 @@ console.log(JSON.stringify({
   schemaVersion: status.schemaVersion,
   analyticsDelivery: observedAnalyticsDelivery,
   checkedRoutes: [
-    "/", "/practice", "/progress", "/app.js", "/coach-storage.js", "/coach-engine.js",
-    "/setup-kits.js", "/microphone-selection.js", "/admin/analytics", "/api/v1/platform/status",
+    "/", "/practice", "/progress", ...expectedJavaScriptAssets.keys(),
+    ...verifiedExcludedJavaScriptAssets,
+    "/admin/analytics", "/api/v1/platform/status",
   ],
+  verifiedExcludedJavaScriptAssets,
 }));

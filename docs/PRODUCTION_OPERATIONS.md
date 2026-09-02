@@ -103,9 +103,9 @@ dead-letter handling for a version-1 local outbox. A failed Analytics Engine
 write remains non-fatal and is not retried.
 
 The committed production and staging configurations select the exact,
-case-sensitive `ROOM_MILESTONE_DELIVERY_MODE=outbox` value. Staging reports
-healthy `durable-outbox`; production must report the same after deployment and
-before the attended canary. In exact mode, a
+case-sensitive `ROOM_MILESTONE_DELIVERY_MODE=outbox` value. During the dated
+2026-09-02 activation proofs, both reported healthy `durable-outbox`; the
+read-only monitor requires every current deployment to keep doing so. In exact mode, a
 milestone-producing mutation commits room state, the complete canonical event
 group (or bounded all-or-drop counter), and the shared alarm atomically before
 the response or WebSocket broadcast. The activation adds no D1 migration,
@@ -116,7 +116,8 @@ delivered milestone. Progress/consent D1 analytics and Analytics Engine remain
 best-effort in both environments. On 2026-09-02, the staging drill proved one
 pending Release-B joined event drained exactly once after rollback to Release A,
 proved an independent Release-A legacy control, restored Release B, and repeated
-the exact seven-receipt, one-room-fact, six-rollup smoke.
+the exact seven-receipt, one-room-fact, six-rollup smoke. The separate attended
+production activation canary then passed with the same exact aggregate deltas.
 
 After deployment, run the read-only production probe:
 
@@ -148,18 +149,33 @@ scheduled-workflow notifications to the current schedule actor (initial
 creator, a later cron editor, or the user who re-enables it); do not assume
 repository watchers receive them. The probe retries ordinary page and API GETs
 up to five times before failing, which absorbs a short network interruption
-without concealing a sustained outage. It separately fetches and validates the
-public `app.js` + `coach-storage.js` + `coach-engine.js` + `setup-kits.js` +
-`microphone-selection.js`
-module graph as one generation for up to eight bounded attempts. It requires
-every served module to match the corresponding checked-out release source
-byte-for-byte, then checks the reviewed unbundled import/consumption/export
-shapes and syntax within a 512 KiB decompressed-body ceiling. The source-shape
-check is a deployment canary, not a general JavaScript reachability proof;
-CI and the browser smokes exercise the runtime integrations. This accommodates
-the brief mixed asset generation an edge can expose immediately after a deployment while still
-failing a persistent mixed generation, missing module, wrong export/MIME type,
-HTML fallback, or missing security header.
+without concealing a sustained outage. It recursively discovers every deployable
+`.js` or `.mjs` file under `cloudflare/public` and validates that complete Static Assets
+set as one generation for up to eight bounded attempts. There are currently ten:
+the public SPA modules, the coaching audio worklet, and the two isolated admin
+modules. `cloudflare/public/.assetsignore` excludes exact `*.test.js` and
+`*.test.mjs` paths from both deployments with Wrangler's case-insensitive
+gitignore semantics. The deployment contract locks that packaging boundary, and
+each live probe also requires every discovered excluded script path to resolve
+to protected HTML rather than executable JavaScript. Source
+discovery is capped at 64 scripts, 16 directory levels, 512 bytes per encoded
+public path, and 4 MiB across the checked-out JavaScript generation. Every
+checked-out and served JavaScript asset must be canonical UTF-8 without a BOM;
+every served asset must match its checked-out release source byte-for-byte, use
+a JavaScript media type, carry `X-Content-Type-Options: nosniff`, contain a
+non-empty non-HTML body, parse as module syntax, and stay within the 512 KiB
+decompressed-body ceiling. The existing semantic checks additionally verify the
+reviewed core SPA import/consumption/export graph. These source and shape checks
+are deployment canaries, not general JavaScript reachability proofs; CI and the
+browser smokes exercise the runtime integrations. The bounded whole-generation
+retry accommodates the brief mixed asset generation an edge can expose
+immediately after a deployment while still failing a persistent mixed
+generation, missing or unexpectedly exposed asset, wrong source/MIME type, HTML fallback, oversized
+body, noncanonical encoding or BOM, invalid syntax, or missing security header.
+The recursive source manifest automatically brings a future deployable `.js` or
+`.mjs` asset not matched by the exact test exclusions into both production and
+staging monitoring; the fixed current-inventory test then requires an explicit
+review before CI accepts that expanded set.
 
 ## Staging promotion
 
@@ -194,12 +210,11 @@ receipt, room-fact, and rollup deltas described below. The isolated local
 best-effort runtime remains the no-outbox/no-receipt compatibility control;
 production is exact.
 
-### Room-milestone outbox activation and attended production canary
+### Completed room-milestone outbox activation evidence
 
 Staging completed its separate exact-mode configuration activation after the
-producer-capable Worker ran safely in `best-effort`. The committed production
-configuration prepares the corresponding full-version activation, which is not
-considered proved until its attended canary passes. An exact room
+producer-capable Worker ran safely in `best-effort`, and production completed its
+separate full-version activation and attended canary on 2026-09-02. An exact room
 claims ownership with a comma-only v1 sentinel in the existing private milestone
 header only after that object version owns delivery. Release A already parses
 the sentinel as an empty event list and removes the header; Release B recognizes
@@ -210,11 +225,10 @@ an intentional gradual deployment, traffic split, or mixed-configuration
 rollout so activation evidence and rollback remain unambiguous. Activate and
 roll back one complete environment/version at a time.
 
-The following order records the completed staging proof, remains the template
-for a new environment, and ends with the current production release gate. Its
-pinned production-`best-effort` precondition and staging version IDs describe
-the dated 2026-09-02 drill; they are historical evidence, not current production
-policy.
+The following order records the completed staging proof and production
+activation. Its pinned production-`best-effort` precondition and staging version
+IDs describe the dated 2026-09-02 release; they are historical evidence, not a
+routine deployment checklist or current production policy.
 
 1. Confirm staging is on the reviewed Release-B code, D1 reports schema exactly
    6, and its independent `ROOM_FACT_HASH_KEY` secret has 32 through 1,024 UTF-8
@@ -407,30 +421,50 @@ policy.
    after a checkpoint exists, preserve that checkpoint for diagnosis and restore
    the candidate first. Remove only the two narrowly named Git-ignored files
    after the result is resolved. Never select a pre-Release-A version.
-5. The production activation must follow that staging gate as one complete
-   reviewed version without an intentional traffic split. For this activation release,
-   independently verify that the prior healthy Worker version
-   `58df8c9f-b4d7-4f3e-b15c-32dfec579355` is still deployable, that the new
-   version alone is at 100%, and that schema 6, the secure production room-fact
-   key, zero pending migrations, cleanup health, and read-only
-   `durable-outbox` status are all ready. Then run the target-locked canary
-   attended:
 
-   ```sh
-   npm run smoke:production-outbox -- 58df8c9f-b4d7-4f3e-b15c-32dfec579355
-   ```
+5. Production activated the reviewed release as one complete version without an
+   intentional traffic split. The durable record is:
 
-   The canary accepts only the exact production origin and production D1
-   resources, creates one synthetic room lifecycle, and compares exact bounded
-   receipt/rollup/fact deltas with a delayed confirmation. This is an attended
-   quiet-window aggregate proof, not per-event cryptographic attribution: a
-   permanently missing canary event plus an unrelated identical event could
-   theoretically substitute. Do not put it on a schedule or run it concurrently
-   with another aggregate-mutating probe. Watch outbox retry, dead-letter, drop,
-   D1, and room-error events while it runs. Its UUID argument is the
-   release-specific immediate code-rollback bookmark, not a permanent constant
-   and not a D1 Time Travel bookmark; every later release must record and pass a
-   freshly reviewed rollback version.
+   | Evidence | Completed value |
+   | --- | --- |
+   | Reviewed source | PR [#37](https://github.com/Aakash1337/NonStopTalk/pull/37), commit `78b4506c7584a69c7206bca2ec4b503411cbbd60` |
+   | Repository-connected Cloudflare build | `d09f9aa9-4cf3-4a63-b490-1966f071dd0b` |
+   | Production deployment | `3caa4b53-bfbf-4d02-9869-d95563c101d4` |
+   | Activation Worker version | `9b263bb3-5bbb-499f-9784-5600a2c4c4b7`, alone at 100% |
+   | Verified Release-A-compatible rollback floor | `58df8c9f-b4d7-4f3e-b15c-32dfec579355` |
+   | Attended quiet-window canary | +7 receipts, +1 room fact, +6 rollup events: +1 `room_created`, +1 `room_joined`, +1 `game_started`, +2 `turn_completed`, +1 `game_finished` |
+
+   Before mutation, the release gate verified schema 6, zero pending migrations,
+   a secure room-fact key, cleanup health, exact `durable-outbox` readiness, the
+   root production resources and secret inventory, the rollback floor, and the
+   activation version alone at 100%. The target-locked canary created one
+   synthetic lifecycle and confirmed the exact bounded deltas again after a
+   delay. This is quiet-window aggregate evidence, not per-event cryptographic
+   attribution: a permanently missing canary event plus an unrelated identical
+   event could theoretically substitute. No such overlap was observed, but the
+   privacy-minimal aggregate schema intentionally cannot prove attribution.
+
+The completed production canary must not be rerun for routine releases,
+availability checks, or reassurance. Use `npm run smoke:production` and the
+scheduled/manual `Production health` workflow for those read-only checks. A
+future high-risk delivery-policy activation or restoration may reuse the
+generic canary design only after a reviewed release freshly pins its expected
+script artifact and independently verified rollback version. Reserve a quiet
+window outside cleanup and UTC rollover, verify one candidate at 100% and all
+readiness/resource gates, and then run exactly once with that newly reviewed
+bookmark:
+
+```sh
+npm run smoke:production-outbox -- <FRESHLY_REVIEWED_ROLLBACK_VERSION_ID>
+```
+
+The placeholder is not accepted by the command. Update and review the
+release-specific constants and their unit contract first; never reuse the
+completed activation's pins by convenience. The argument is a code-version
+rollback bookmark, not a D1 Time Travel bookmark. Keep the proof attended,
+outside automation and schedules, and watch outbox retry, dead-letter, drop, D1,
+and room-error events while it runs. Discard an overlapped or ambiguous run
+rather than weakening the exact-delta assertions.
 
 If the room-fact key is missing or outside its byte boundary after activation,
 public status changes to `degraded-outbox`, but the receiver still applies and
@@ -655,9 +689,14 @@ twice per hour as one two-row matrix. The production row probes
 Workers.dev origin, and both require `durable-outbox` room-milestone delivery.
 `fail-fast: false` lets either row report even when
 the other fails. Each row has a five-minute bound, checks the public pages, the
-isolated dashboard document, security headers, and canonical status response,
-and fails on a healthy-but-wrong delivery policy as well as normal readiness
-failures. It has read-only repository permission, persists no checkout
+isolated dashboard document, security headers, canonical status response, and
+the complete recursively discovered deployable `.js`/`.mjs` asset generation,
+plus the protected-HTML negative probes for every case-insensitive `*.test.js`
+and `*.test.mjs` path excluded by `.assetsignore`. It fails on exact source,
+canonical UTF-8 or BOM, MIME, `nosniff`, body/count/path/aggregate bounds,
+module syntax, packaging, core SPA semantic checks, or
+healthy-but-wrong delivery-policy drift as well as normal readiness failures.
+It has read-only repository permission, persists no checkout
 credential, installs no dependency, possesses no secret, and makes no mutation.
 The manual dispatch uses the same fixed matrix; it cannot accept an arbitrary
 origin or relax the expected policy.
@@ -747,21 +786,17 @@ new schema or fix forward. Do not delete a D1 database, Durable Object namespace
 or migration record during incident response. Marker 6 already excludes Workers
 that require exact marker 5.
 
-Staging has crossed the exact-mode boundary and can contain version-1 local
-outbox rows. The production activation crosses that boundary as soon as its
-deployed code can create a row, so this release must treat Release A as the
-minimum safe code rollback floor for both environments. For this activation
-release, the independently reviewed immediate
-production code-rollback version is
-`58df8c9f-b4d7-4f3e-b15c-32dfec579355`. Reconfirm that exact version and its
-resource bindings before use, then an attended activation-related rollback is:
-
-```sh
-npx wrangler rollback 58df8c9f-b4d7-4f3e-b15c-32dfec579355 --message "Rollback production outbox activation" --yes
-```
-
-This release-specific bookmark is not permanent configuration and is not a D1
-Time Travel bookmark. A compatible rollback may intentionally restore
+Staging and production have crossed the exact-mode boundary and can contain
+version-1 local outbox rows, so Release A is the minimum safe code-compatibility
+floor for both environments. The activation release independently verified
+`58df8c9f-b4d7-4f3e-b15c-32dfec579355` as that production best-effort floor.
+This is historical activation evidence, not the automatic rollback target for
+a later code or asset release, permanent configuration, or a D1 Time Travel
+bookmark. For an ordinary later regression, use the version-list procedure
+above and prefer the most recent verified healthy exact-outbox version that is
+compatible with the current schema and resources. If incident response truly
+requires the older best-effort floor, reconfirm its exact ID and bindings before
+an attended full-version rollback. A compatible rollback may intentionally restore
 `best-effort`: existing rows continue to drain through the Release-A-compatible
 consumer while new milestones use the legacy path. During that incident window,
 the twice-hourly production monitor will fail its normal `durable-outbox` policy
@@ -773,8 +808,11 @@ mixed-configuration rollback and never select a pre-Release-A Worker; it can
 overwrite the shared alarm and strand rows. Do not delete the namespace, local
 tables, pending rows, receipts, or dead letters as a rollback technique. The
 staging rollback drill completed successfully on 2026-09-02; repeat the
-read-only status and appropriate aggregate checks after any real rollback, then
-rerun the exact attended canary only after exact mode is restored.
+read-only status and appropriate aggregate checks after any real rollback. If an
+incident deliberately restores `best-effort`, returning to exact mode is a
+high-risk delivery-policy restoration and must use the freshly reviewed,
+re-pinned attended procedure above; ordinary exact-to-exact releases do not
+repeat the mutating canary.
 
 ## Retention checks
 

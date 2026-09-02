@@ -1,15 +1,198 @@
 import { spawnSync } from "node:child_process";
+import { performance } from "node:perf_hooks";
 import process from "node:process";
 
+import {
+  PUBLIC_EXCLUDED_JAVASCRIPT_ASSET_MAX_COUNT,
+  PUBLIC_JAVASCRIPT_ASSET_MAX_BYTES,
+  PUBLIC_JAVASCRIPT_ASSET_MAX_COUNT,
+  PUBLIC_JAVASCRIPT_ASSET_MAX_TOTAL_BYTES,
+  isReviewedExcludedJavaScriptPath,
+  isReviewedProductionJavaScriptPath,
+} from "./public-javascript-assets.mjs";
+
+export const PUBLIC_EXCLUDED_JAVASCRIPT_ATTEMPTS = 8;
+export const PUBLIC_EXCLUDED_JAVASCRIPT_RETRY_MS = 1_000;
+export const PUBLIC_EXCLUDED_JAVASCRIPT_MAX_CONCURRENCY = 8;
+export const PUBLIC_JAVASCRIPT_ASSET_MAX_CONCURRENCY = 8;
 export const PUBLIC_MODULE_GRAPH_ATTEMPTS = 8;
 export const PUBLIC_MODULE_GRAPH_RETRY_MS = 1_000;
-export const PUBLIC_JAVASCRIPT_ASSET_MAX_BYTES = 512 * 1024;
+export const PRODUCTION_SMOKE_BUDGET_MS = 180_000;
+export { PUBLIC_JAVASCRIPT_ASSET_MAX_BYTES };
+
+const REQUIRED_PUBLIC_MODULE_PATHS = [
+  "/app.js",
+  "/coach-storage.js",
+  "/coach-engine.js",
+  "/setup-kits.js",
+  "/microphone-selection.js",
+];
 
 const JAVASCRIPT_SYNTAX_TIMEOUT_MS = 5_000;
 const utf8 = new TextEncoder();
+const monotonicNow = () => performance.now();
 
 function asError(error) {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function validateDeadline(deadlineMs, now) {
+  if (typeof now !== "function") throw new TypeError("now must be a function");
+  if (deadlineMs !== Number.POSITIVE_INFINITY
+    && (!Number.isFinite(deadlineMs) || deadlineMs < 0)) {
+    throw new TypeError("deadlineMs must be a non-negative finite number or Infinity");
+  }
+}
+
+function remainingDeadlineMs(deadlineMs, now) {
+  if (deadlineMs === Number.POSITIVE_INFINITY) return Number.POSITIVE_INFINITY;
+  const currentTime = now();
+  if (!Number.isFinite(currentTime)) throw new TypeError("now must return a finite number");
+  const remainingMs = Math.floor(deadlineMs - currentTime);
+  if (remainingMs < 1) {
+    throw new Error("production smoke probe exceeded its shared deadline");
+  }
+  return remainingMs;
+}
+
+async function sleepWithinDeadline({ sleep, delayMs, deadlineMs, now }) {
+  const remainingMs = remainingDeadlineMs(deadlineMs, now);
+  const clampedDelayMs = Math.min(delayMs, remainingMs);
+  await sleep(clampedDelayMs);
+  if (clampedDelayMs < delayMs) {
+    throw new Error("production smoke probe exceeded its shared deadline");
+  }
+  remainingDeadlineMs(deadlineMs, now);
+}
+
+async function cancelResponseBody(response) {
+  try {
+    await response?.body?.cancel?.();
+  } catch {
+    // The validation error remains the useful failure when transport cleanup fails.
+  }
+}
+
+function validateExcludedJavaScriptAssetPaths(pathnames) {
+  if (!Array.isArray(pathnames)) {
+    throw new TypeError("excludedJavaScriptAssetPaths must be an array");
+  }
+  if (pathnames.length > PUBLIC_EXCLUDED_JAVASCRIPT_ASSET_MAX_COUNT) {
+    throw new TypeError("excludedJavaScriptAssetPaths exceeds the reviewed script-count boundary");
+  }
+  const uniquePaths = new Set();
+  for (const pathname of pathnames) {
+    if (!isReviewedExcludedJavaScriptPath(pathname)) {
+      throw new TypeError(
+        "excludedJavaScriptAssetPaths contains an invalid canonical ignored JavaScript path",
+      );
+    }
+    if (uniquePaths.has(pathname)) {
+      throw new TypeError("excludedJavaScriptAssetPaths must not contain duplicate paths");
+    }
+    uniquePaths.add(pathname);
+  }
+}
+
+async function runSettledPathSweep({
+  pathnames,
+  visitPath,
+  concurrency,
+}) {
+  const values = new Array(pathnames.length);
+  const failures = new Array(pathnames.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, pathnames.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < pathnames.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const pathname = pathnames[index];
+      try {
+        values[index] = await visitPath(pathname);
+      } catch (error) {
+        failures[index] = asError(error);
+      }
+    }
+  }));
+  const firstFailure = failures.find((failure) => failure !== undefined);
+  if (firstFailure) throw firstFailure;
+  return values;
+}
+
+export async function waitForExcludedJavaScriptAssets({
+  loadExcludedJavaScriptAsset,
+  excludedJavaScriptAssetPaths,
+  sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  attempts = PUBLIC_EXCLUDED_JAVASCRIPT_ATTEMPTS,
+  retryMs = PUBLIC_EXCLUDED_JAVASCRIPT_RETRY_MS,
+  concurrency = PUBLIC_EXCLUDED_JAVASCRIPT_MAX_CONCURRENCY,
+  deadlineMs = Number.POSITIVE_INFINITY,
+  now = monotonicNow,
+}) {
+  if (typeof loadExcludedJavaScriptAsset !== "function") {
+    throw new TypeError("loadExcludedJavaScriptAsset must be a function");
+  }
+  if (typeof sleep !== "function") {
+    throw new TypeError("sleep must be a function");
+  }
+  if (!Number.isSafeInteger(attempts)
+    || attempts < 1
+    || attempts > PUBLIC_EXCLUDED_JAVASCRIPT_ATTEMPTS) {
+    throw new TypeError(
+      `attempts must be a safe integer from 1 through ${PUBLIC_EXCLUDED_JAVASCRIPT_ATTEMPTS}`,
+    );
+  }
+  if (!Number.isSafeInteger(retryMs)
+    || retryMs < 0
+    || retryMs > PUBLIC_EXCLUDED_JAVASCRIPT_RETRY_MS) {
+    throw new TypeError(
+      `retryMs must be a safe integer from 0 through ${PUBLIC_EXCLUDED_JAVASCRIPT_RETRY_MS}`,
+    );
+  }
+  if (!Number.isSafeInteger(concurrency)
+    || concurrency < 1
+    || concurrency > PUBLIC_EXCLUDED_JAVASCRIPT_MAX_CONCURRENCY) {
+    throw new TypeError(
+      `concurrency must be a safe integer from 1 through ${PUBLIC_EXCLUDED_JAVASCRIPT_MAX_CONCURRENCY}`,
+    );
+  }
+  validateDeadline(deadlineMs, now);
+  validateExcludedJavaScriptAssetPaths(excludedJavaScriptAssetPaths);
+  const pathnames = [...excludedJavaScriptAssetPaths].sort();
+
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      // Complete every bounded sweep before deciding whether to retry. If an
+      // edge briefly mixes releases, the next attempt rechecks the entire set.
+      await runSettledPathSweep({
+        pathnames,
+        visitPath: async (pathname) => {
+          const response = await loadExcludedJavaScriptAsset(
+            pathname,
+            remainingDeadlineMs(deadlineMs, now),
+          );
+          await assertExcludedJavaScriptResponse(response, pathname);
+        },
+        concurrency,
+      });
+      remainingDeadlineMs(deadlineMs, now);
+      return pathnames;
+    } catch (error) {
+      lastError = asError(error);
+    }
+    if (attempt < attempts) {
+      await sleepWithinDeadline({
+        sleep,
+        delayMs: attempt * retryMs,
+        deadlineMs,
+        now,
+      });
+    }
+  }
+
+  throw lastError || new Error("the excluded public JavaScript assets did not become ready");
 }
 
 export async function waitForPublicModuleGraph({
@@ -18,6 +201,9 @@ export async function waitForPublicModuleGraph({
   attempts = PUBLIC_MODULE_GRAPH_ATTEMPTS,
   retryMs = PUBLIC_MODULE_GRAPH_RETRY_MS,
   expectedJavaScriptAssets = null,
+  concurrency = PUBLIC_JAVASCRIPT_ASSET_MAX_CONCURRENCY,
+  deadlineMs = Number.POSITIVE_INFINITY,
+  now = monotonicNow,
 }) {
   if (typeof loadJavaScriptAsset !== "function") {
     throw new TypeError("loadJavaScriptAsset must be a function");
@@ -28,7 +214,30 @@ export async function waitForPublicModuleGraph({
   if (!Number.isSafeInteger(retryMs) || retryMs < 0) {
     throw new TypeError("retryMs must be a non-negative safe integer");
   }
+  if (!Number.isSafeInteger(concurrency)
+    || concurrency < 1
+    || concurrency > PUBLIC_JAVASCRIPT_ASSET_MAX_CONCURRENCY) {
+    throw new TypeError(
+      `concurrency must be a safe integer from 1 through ${PUBLIC_JAVASCRIPT_ASSET_MAX_CONCURRENCY}`,
+    );
+  }
+  validateDeadline(deadlineMs, now);
   if (expectedJavaScriptAssets !== null) validateExpectedJavaScriptAssets(expectedJavaScriptAssets);
+  const syntaxValidatedSources = new Map();
+  if (expectedJavaScriptAssets !== null) {
+    // Checked-out release syntax is deterministic. Validate it once before any
+    // network retry so a local defect fails immediately and propagation retries
+    // spend their budget only on changing edge observations.
+    for (const [pathname, source] of expectedJavaScriptAssets) {
+      assertJavaScriptModuleSyntax(
+        pathname,
+        source,
+        Math.min(JAVASCRIPT_SYNTAX_TIMEOUT_MS, remainingDeadlineMs(deadlineMs, now)),
+      );
+      remainingDeadlineMs(deadlineMs, now);
+      syntaxValidatedSources.set(pathname, source);
+    }
+  }
 
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -36,40 +245,40 @@ export async function waitForPublicModuleGraph({
       // Fetch all assets on every attempt. A newly promoted Worker can briefly
       // expose two different static-asset generations at an edge, so validating
       // only one successful response can report a false deployment failure.
-      const [
-        appSource,
-        coachStorageSource,
-        coachEngineSource,
-        setupKitsSource,
-        microphoneSelectionSource,
-      ] = await Promise.all([
-        loadJavaScriptAsset("/app.js"),
-        loadJavaScriptAsset("/coach-storage.js"),
-        loadJavaScriptAsset("/coach-engine.js"),
-        loadJavaScriptAsset("/setup-kits.js"),
-        loadJavaScriptAsset("/microphone-selection.js"),
-      ]);
-      assertJavaScriptAssetBoundary("/app.js", appSource);
-      assertJavaScriptAssetBoundary("/coach-storage.js", coachStorageSource);
-      assertJavaScriptAssetBoundary("/coach-engine.js", coachEngineSource);
-      assertJavaScriptAssetBoundary("/setup-kits.js", setupKitsSource);
-      assertJavaScriptAssetBoundary("/microphone-selection.js", microphoneSelectionSource);
-      if (expectedJavaScriptAssets !== null) {
-        assertExpectedJavaScriptAsset(expectedJavaScriptAssets, "/app.js", appSource);
-        assertExpectedJavaScriptAsset(expectedJavaScriptAssets, "/coach-storage.js", coachStorageSource);
-        assertExpectedJavaScriptAsset(expectedJavaScriptAssets, "/coach-engine.js", coachEngineSource);
-        assertExpectedJavaScriptAsset(expectedJavaScriptAssets, "/setup-kits.js", setupKitsSource);
-        assertExpectedJavaScriptAsset(
-          expectedJavaScriptAssets,
-          "/microphone-selection.js",
-          microphoneSelectionSource,
-        );
+      const assetPaths = expectedJavaScriptAssets === null
+        ? REQUIRED_PUBLIC_MODULE_PATHS
+        : [...expectedJavaScriptAssets.keys()].sort();
+      const observedSources = await runSettledPathSweep({
+        pathnames: assetPaths,
+        concurrency,
+        visitPath: (pathname) => loadJavaScriptAsset(
+          pathname,
+          remainingDeadlineMs(deadlineMs, now),
+        ),
+      });
+      const observedJavaScriptAssets = new Map(
+        assetPaths.map((pathname, index) => [pathname, observedSources[index]]),
+      );
+      for (const [pathname, source] of observedJavaScriptAssets) {
+        assertJavaScriptAssetBoundary(pathname, source);
+        if (expectedJavaScriptAssets !== null) {
+          assertExpectedJavaScriptAsset(expectedJavaScriptAssets, pathname, source);
+        }
+        if (syntaxValidatedSources.get(pathname) !== source) {
+          assertJavaScriptModuleSyntax(
+            pathname,
+            source,
+            Math.min(JAVASCRIPT_SYNTAX_TIMEOUT_MS, remainingDeadlineMs(deadlineMs, now)),
+          );
+          remainingDeadlineMs(deadlineMs, now);
+          syntaxValidatedSources.set(pathname, source);
+        }
       }
-      assertJavaScriptModuleSyntax("/app.js", appSource);
-      assertJavaScriptModuleSyntax("/coach-storage.js", coachStorageSource);
-      assertJavaScriptModuleSyntax("/coach-engine.js", coachEngineSource);
-      assertJavaScriptModuleSyntax("/setup-kits.js", setupKitsSource);
-      assertJavaScriptModuleSyntax("/microphone-selection.js", microphoneSelectionSource);
+      const appSource = observedJavaScriptAssets.get("/app.js");
+      const coachStorageSource = observedJavaScriptAssets.get("/coach-storage.js");
+      const coachEngineSource = observedJavaScriptAssets.get("/coach-engine.js");
+      const setupKitsSource = observedJavaScriptAssets.get("/setup-kits.js");
+      const microphoneSelectionSource = observedJavaScriptAssets.get("/microphone-selection.js");
       const appTokens = tokenizeJavaScript(appSource);
       const coachStorageTokens = tokenizeJavaScript(coachStorageSource);
       const coachEngineTokens = tokenizeJavaScript(coachEngineSource);
@@ -130,7 +339,9 @@ export async function waitForPublicModuleGraph({
       if (!hasExportedFunction(microphoneSelectionTokens, "createMicrophoneSelection")) {
         throw new Error("/microphone-selection.js does not expose createMicrophoneSelection");
       }
+      remainingDeadlineMs(deadlineMs, now);
       return {
+        observedJavaScriptAssets,
         appSource,
         coachStorageSource,
         coachEngineSource,
@@ -142,7 +353,12 @@ export async function waitForPublicModuleGraph({
     }
 
     if (attempt < attempts) {
-      await sleep(attempt * retryMs);
+      await sleepWithinDeadline({
+        sleep,
+        delayMs: attempt * retryMs,
+        deadlineMs,
+        now,
+      });
     }
   }
 
@@ -156,11 +372,11 @@ export function waitForExactPublicModuleGraph(options) {
   return waitForPublicModuleGraph(options);
 }
 
-function assertJavaScriptModuleSyntax(pathname, source) {
+function assertJavaScriptModuleSyntax(pathname, source, timeoutMs = JAVASCRIPT_SYNTAX_TIMEOUT_MS) {
   const result = spawnSync(process.execPath, ["--check", "--input-type=module"], {
     input: source,
     encoding: "utf8",
-    timeout: JAVASCRIPT_SYNTAX_TIMEOUT_MS,
+    timeout: Math.max(1, Math.floor(timeoutMs)),
     maxBuffer: 64 * 1024,
     windowsHide: true,
   });
@@ -179,19 +395,22 @@ function validateExpectedJavaScriptAssets(expected) {
   if (!(expected instanceof Map)) {
     throw new TypeError("expectedJavaScriptAssets must be a Map of checked-out release sources");
   }
-  const reviewedPaths = [
-    "/app.js",
-    "/coach-storage.js",
-    "/coach-engine.js",
-    "/setup-kits.js",
-    "/microphone-selection.js",
-  ];
-  if (expected.size !== reviewedPaths.length
-    || reviewedPaths.some((pathname) => !expected.has(pathname))) {
-    throw new TypeError("expectedJavaScriptAssets must contain exactly the reviewed public module paths");
+  if (expected.size > PUBLIC_JAVASCRIPT_ASSET_MAX_COUNT) {
+    throw new TypeError("expectedJavaScriptAssets exceeds the reviewed script-count boundary");
   }
-  for (const pathname of reviewedPaths) {
-    assertJavaScriptAssetBoundary(pathname, expected.get(pathname));
+  if (REQUIRED_PUBLIC_MODULE_PATHS.some((pathname) => !expected.has(pathname))) {
+    throw new TypeError("expectedJavaScriptAssets must include every reviewed public module path");
+  }
+  let totalBytes = 0;
+  for (const [pathname, source] of expected) {
+    if (!isReviewedProductionJavaScriptPath(pathname)) {
+      throw new TypeError("expectedJavaScriptAssets contains an invalid deployable JavaScript path");
+    }
+    assertJavaScriptAssetBoundary(pathname, source);
+    totalBytes += utf8.encode(source).byteLength;
+    if (totalBytes > PUBLIC_JAVASCRIPT_ASSET_MAX_TOTAL_BYTES) {
+      throw new TypeError("expectedJavaScriptAssets exceeds the reviewed aggregate byte boundary");
+    }
   }
 }
 
@@ -212,7 +431,7 @@ export async function readBoundedJavaScriptBody(response, pathname) {
     throw new Error(`${pathname} did not expose a readable JavaScript body`);
   }
   const reader = response.body.getReader();
-  const decoder = new TextDecoder();
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   let bytes = 0;
   let source = "";
   try {
@@ -232,8 +451,52 @@ export async function readBoundedJavaScriptBody(response, pathname) {
     }
     source += decoder.decode();
     return source;
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    if (error instanceof TypeError) {
+      throw new Error(`${pathname} is not canonical UTF-8 JavaScript`);
+    }
+    throw error;
   } finally {
     reader.releaseLock();
+  }
+}
+
+export async function readVerifiedJavaScriptResponse(response, pathname) {
+  const mediaType = String(response?.headers?.get?.("content-type") || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  if (mediaType !== "text/javascript" && mediaType !== "application/javascript") {
+    await cancelResponseBody(response);
+    throw new Error(`${pathname} did not return JavaScript`);
+  }
+  if (response.headers.get("x-content-type-options") !== "nosniff") {
+    await cancelResponseBody(response);
+    throw new Error(`${pathname} is missing MIME-sniffing protection`);
+  }
+  const source = await readBoundedJavaScriptBody(response, pathname);
+  if (source.charCodeAt(0) === 0xfeff) {
+    throw new Error(`${pathname} must not contain a UTF-8 byte-order mark`);
+  }
+  if (source.trim().length === 0 || /^\s*(?:<!doctype\s+html|<html\b)/iu.test(source)) {
+    throw new Error(`${pathname} returned an empty or HTML fallback document`);
+  }
+  return source;
+}
+
+export async function assertExcludedJavaScriptResponse(response, pathname) {
+  const mediaType = String(response?.headers?.get?.("content-type") || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  const hasNoSniff = response?.headers?.get?.("x-content-type-options") === "nosniff";
+  await cancelResponseBody(response);
+  if (mediaType !== "text/html") {
+    throw new Error(`${pathname} was not excluded from executable static assets`);
+  }
+  if (!hasNoSniff) {
+    throw new Error(`${pathname} fallback is missing MIME-sniffing protection`);
   }
 }
 

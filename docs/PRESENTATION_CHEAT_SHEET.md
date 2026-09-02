@@ -94,7 +94,7 @@ The optional choices start off and do different jobs. A standalone **Try again**
 
 > Durable Objects coordinate multiplayer Play rooms only. The player opens `/room/ABC234`; the browser uses `/api/rooms/ABC234/{state|join|action|socket}`. The Worker validates the request, selects one SQLite-backed object by room code through the internal `ROOMS` binding, and forwards the operation. The Durable Object has no separate public URL. Practice and Progress do not create or call one.
 
-The committed production and staging policy selects the same exact room-milestone lane: the room mutation and bounded local event group share one SQLite transaction and existing alarm, then each delivered milestone gets one 90-day D1 receipt so replay cannot repeat its eligible room fact or daily rollup. Staging is proved; production still needs its attended post-merge canary. Progress/consent D1 counters and all Analytics Engine writes remain best-effort.
+The committed production and staging policy selects the same exact room-milestone lane: the room mutation and bounded local event group share one SQLite transaction and existing alarm, then each delivered milestone gets one 90-day D1 receipt so replay cannot repeat its eligible room fact or daily rollup. Both environments completed their separate attended exact-mode proofs on 2026-09-02. Progress/consent D1 counters and all Analytics Engine writes remain best-effort.
 
 Deployment description: **Worker with Static Assets plus a SQLite Durable Object**, not Pages-only and not a Container.
 
@@ -122,7 +122,7 @@ npm run deploy
 
 For a repository-connected build, create a **Worker** project, use repository root `/`, select Node 22 or newer (24 matches CI), leave the output directory unset, and run the Cloudflare, coach, and cloud-progress tests in the build command. Provision D1, apply its migrations, and configure both secrets once per environment before using `npm run deploy`.
 
-For this production outbox-activation release only, the attended target-locked canary is `npm run smoke:production-outbox -- 58df8c9f-b4d7-4f3e-b15c-32dfec579355`. That UUID is the release-specific immediate code-rollback bookmark, not a permanent value or D1 bookmark; later releases must record a fresh reviewed rollback version.
+The production outbox-activation canary already completed on 2026-09-02. Do not rerun that mutating proof for routine releases. Use the read-only `npm run smoke:production` probe and the `Production health` workflow; the production runbook owns the separately reviewed procedure for a future high-risk delivery-policy change.
 
 ## Safe claims
 
