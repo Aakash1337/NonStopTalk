@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 
 import { chromium } from "playwright";
 
+import { SETUP_KIT_MAX_TOPIC_FILE_BYTES } from "../cloudflare/public/setup-kits.js";
+
 import {
   getFreePort,
   isAddressInUse,
@@ -432,6 +434,18 @@ async function runBrowserFlow(origin, signal) {
     // WebSocket rerender and proves the imported draft and focus survive it.
     requestCount = hostApiRequests.length;
     const topicImport = host.locator("[data-topic-import]");
+    const draftBeforeOversizedImport = await host.getByLabel("Custom topics, one per line").inputValue();
+    await topicImport.setInputFiles({
+      name: "too-large.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.alloc(SETUP_KIT_MAX_TOPIC_FILE_BYTES + 1, 0x61),
+    });
+    await host.locator("[data-topic-status]").filter({ hasText: "Topic files must be 64 KiB or smaller." }).waitFor();
+    assert.equal(await host.getByLabel("Custom topics, one per line").inputValue(), draftBeforeOversizedImport,
+      "An oversized topic file must be rejected before replacing the editor draft.");
+    assertNoNewApiRequests(hostApiRequests, requestCount, "Rejecting an oversized local topic file");
+
+    requestCount = hostApiRequests.length;
     await topicImport.setInputFiles({
       name: "portable-topics.txt",
       mimeType: "text/plain",

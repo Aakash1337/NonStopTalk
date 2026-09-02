@@ -5,6 +5,7 @@ export const SETUP_KIT_MAX_NAME_CODE_POINTS = 40;
 export const SETUP_KIT_MAX_TOPICS = 500;
 export const SETUP_KIT_MAX_TOPIC_CODE_POINTS = 200;
 export const SETUP_KIT_MAX_TOPIC_TEXT_CHARACTERS = 20_000;
+export const SETUP_KIT_MAX_TOPIC_FILE_BYTES = 64 * 1024;
 export const SETUP_KIT_MAX_STORAGE_BYTES = 512 * 1024;
 export const SETUP_KIT_PACK_IDS = Object.freeze([
   "everyday",
@@ -22,6 +23,8 @@ export const SETUP_KIT_ERROR_CODES = Object.freeze({
   INVALID_TOPIC_PACK: "INVALID_TOPIC_PACK",
   INVALID_TOPICS: "INVALID_TOPICS",
   TOPIC_TEXT_TOO_LONG: "TOPIC_TEXT_TOO_LONG",
+  TOPIC_FILE_TOO_LARGE: "TOPIC_FILE_TOO_LARGE",
+  TOPIC_FILE_READ_FAILED: "TOPIC_FILE_READ_FAILED",
   TOPIC_TOO_LONG: "TOPIC_TOO_LONG",
   TOO_MANY_TOPICS: "TOO_MANY_TOPICS",
   DUPLICATE_NAME: "DUPLICATE_NAME",
@@ -44,6 +47,8 @@ const ERROR_MESSAGES = Object.freeze({
   [SETUP_KIT_ERROR_CODES.INVALID_TOPICS]: "Setup kit custom topics are invalid.",
   [SETUP_KIT_ERROR_CODES.TOPIC_TEXT_TOO_LONG]:
     `Custom topic text must be ${SETUP_KIT_MAX_TOPIC_TEXT_CHARACTERS.toLocaleString("en-US")} characters or fewer.`,
+  [SETUP_KIT_ERROR_CODES.TOPIC_FILE_TOO_LARGE]: "Topic files must be 64 KiB or smaller.",
+  [SETUP_KIT_ERROR_CODES.TOPIC_FILE_READ_FAILED]: "That topic file could not be read.",
   [SETUP_KIT_ERROR_CODES.TOPIC_TOO_LONG]:
     `Each custom topic must be ${SETUP_KIT_MAX_TOPIC_CODE_POINTS} characters or fewer.`,
   [SETUP_KIT_ERROR_CODES.TOO_MANY_TOPICS]:
@@ -125,6 +130,27 @@ export function parseTopicText(value) {
   if (!topics.length) fail(SETUP_KIT_ERROR_CODES.INVALID_TOPICS);
   assertTopicTextLength(topics);
   return [...topics];
+}
+
+/** Read one browser File only after enforcing its immutable byte length. */
+export async function readTopicTextFile(file) {
+  if (!file
+    || !Number.isSafeInteger(file.size)
+    || file.size < 0
+    || typeof file.text !== "function") {
+    fail(SETUP_KIT_ERROR_CODES.TOPIC_FILE_READ_FAILED);
+  }
+  if (file.size > SETUP_KIT_MAX_TOPIC_FILE_BYTES) {
+    fail(SETUP_KIT_ERROR_CODES.TOPIC_FILE_TOO_LARGE);
+  }
+  let content;
+  try {
+    content = await file.text();
+  } catch {
+    fail(SETUP_KIT_ERROR_CODES.TOPIC_FILE_READ_FAILED);
+  }
+  if (typeof content !== "string") fail(SETUP_KIT_ERROR_CODES.TOPIC_FILE_READ_FAILED);
+  return parseTopicText(content);
 }
 
 /** Serialize validated topics as bounded, self-round-tripping plain text. */

@@ -7,6 +7,7 @@ import {
   SETUP_KIT_MAX_NAME_CODE_POINTS,
   SETUP_KIT_MAX_STORAGE_BYTES,
   SETUP_KIT_MAX_TOPIC_CODE_POINTS,
+  SETUP_KIT_MAX_TOPIC_FILE_BYTES,
   SETUP_KIT_MAX_TOPIC_TEXT_CHARACTERS,
   SETUP_KIT_MAX_TOPICS,
   SETUP_KIT_PACK_IDS,
@@ -16,6 +17,7 @@ import {
   createSetupKitStore,
   normalizeSetupKit,
   parseTopicText,
+  readTopicTextFile,
   serializeTopicText,
 } from "./setup-kits.js";
 
@@ -86,12 +88,52 @@ test("exports the reviewed v1 setup-kit limits and fixed error-code vocabulary",
   assert.equal(SETUP_KIT_MAX_TOPICS, 500);
   assert.equal(SETUP_KIT_MAX_TOPIC_CODE_POINTS, 200);
   assert.equal(SETUP_KIT_MAX_TOPIC_TEXT_CHARACTERS, 20_000);
+  assert.equal(SETUP_KIT_MAX_TOPIC_FILE_BYTES, 64 * 1024);
   assert.equal(SETUP_KIT_MAX_STORAGE_BYTES, 512 * 1024);
   assert.deepEqual(SETUP_KIT_PACK_IDS, ["everyday", "story", "absurd", "debate", "expert", "custom"]);
   assert.ok(Object.isFrozen(SETUP_KIT_PACK_IDS));
   assert.ok(Object.isFrozen(SETUP_KIT_ERROR_CODES));
   assert.equal(new Set(Object.values(SETUP_KIT_ERROR_CODES)).size,
     Object.values(SETUP_KIT_ERROR_CODES).length);
+});
+
+test("topic-file reads are byte-bounded before materializing text", async () => {
+  let reads = 0;
+  await assert.rejects(
+    readTopicTextFile({
+      size: SETUP_KIT_MAX_TOPIC_FILE_BYTES + 1,
+      async text() {
+        reads += 1;
+        return "must not be read";
+      },
+    }),
+    (error) => error instanceof SetupKitError
+      && error.code === SETUP_KIT_ERROR_CODES.TOPIC_FILE_TOO_LARGE,
+  );
+  assert.equal(reads, 0);
+
+  assert.deepEqual(await readTopicTextFile({
+    size: SETUP_KIT_MAX_TOPIC_FILE_BYTES,
+    async text() {
+      reads += 1;
+      return " First topic \r\nSECOND\nfirst topic ";
+    },
+  }), ["First topic", "SECOND"]);
+  assert.equal(reads, 1);
+
+  for (const file of [null, {}, { size: -1, text() {} }, { size: 1.5, text() {} }]) {
+    await assert.rejects(
+      readTopicTextFile(file),
+      (error) => error instanceof SetupKitError
+        && error.code === SETUP_KIT_ERROR_CODES.TOPIC_FILE_READ_FAILED,
+    );
+  }
+  await assert.rejects(
+    readTopicTextFile({ size: 1, async text() { throw new Error("private file error"); } }),
+    (error) => error instanceof SetupKitError
+      && error.code === SETUP_KIT_ERROR_CODES.TOPIC_FILE_READ_FAILED
+      && !error.message.includes("private file error"),
+  );
 });
 
 test("normalization returns an exact detached allowlist and canonicalizes built-in packs", () => {

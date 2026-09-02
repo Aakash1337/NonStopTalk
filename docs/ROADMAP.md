@@ -96,7 +96,7 @@ This phase remains free-or-cheap by default: it uses existing Cloudflare primiti
 - Editable Cloudflare topic drafts from deterministic templates, optional direct GLM-4.7 or Workers AI GLM-5.3-Flash routine generation, or explicitly selected Gemma 4 31B escalation
 - Browser-local saved presets in the Go edition and host-only named setup kits in the Cloudflare source. A Cloudflare kit stores the currently applied duration, silence, rounds, topic-pack choice, and custom topics in unencrypted `localStorage` for that origin/browser only; it is best effort, unsynced, and has no recovery
 - Plain-text custom-topic import/export in both editions. In Cloudflare, import fills only the editor draft until explicit use, while the downloaded `.txt` is outside app deletion/control
-- Cloudflare local limits of 25 kits, 40 Unicode code points per name, 500 custom topics of 200 code points each, 20,000 editor characters, and 512 KiB for the serialized store. Local save/delete/import/export calls no API, model, analytics sink, D1, or Durable Object; one explicit Apply sends the selected settings/topics to the existing same-origin room object
+- Cloudflare local limits of 25 kits, 40 Unicode code points per name, 500 custom topics of 200 code points each, 20,000 editor characters, 64 KiB per imported topic file, and 512 KiB for the serialized store. Local save/delete/import/export calls no API, model, analytics sink, D1, or Durable Object; one explicit Apply sends the selected settings/topics to the existing same-origin room object
 - Per-room history for the last 20 completed games
 - Local web JSON snapshots with restore and 10-second autosave
 

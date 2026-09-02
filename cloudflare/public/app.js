@@ -15,6 +15,7 @@ import {
   createSetupKitStore,
   normalizeSetupKit,
   parseTopicText,
+  readTopicTextFile,
   serializeTopicText,
 } from "./setup-kits.js";
 
@@ -1815,7 +1816,7 @@ function renderSetup() {
                 <input id="room-topic-import" type="file" accept=".txt,text/plain" aria-describedby="topic-file-hint" data-topic-import data-setup-focus="topic-import">
               </label>
             </div>
-            <p class="hint" id="topic-file-hint">Import changes only this editor. Choose Use custom list to apply the draft to the room.</p>
+            <p class="hint" id="topic-file-hint">Import changes only this editor. Files are limited to 64 KiB. Choose Use custom list to apply the draft to the room.</p>
             <p class="setup-feedback${setupView.topicStatusError ? " error" : ""}" data-topic-status role="status" aria-live="polite" aria-atomic="true">${escapeHTML(setupView.topicStatus)}</p>
           </form>
         </div>
@@ -2118,9 +2119,8 @@ async function handleSetupChange(event) {
   try {
     setBusy(true);
     if (!/\.txt$/iu.test(file.name)) throw new Error("Choose a plain-text .txt topic file.");
-    const content = await file.text();
+    const topics = await readTopicTextFile(file);
     if (!isCurrentHostSetup(code, generation)) return;
-    const topics = parseTopicText(content);
     const setupView = ensureRoomSetupView();
     setupView.topicDraft = topics.join("\n");
     const textarea = app.querySelector("#room-custom-topics");
