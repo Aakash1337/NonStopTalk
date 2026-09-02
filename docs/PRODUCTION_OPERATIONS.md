@@ -92,7 +92,10 @@ group (or bounded all-or-drop counter), and the shared alarm atomically before
 the response or WebSocket broadcast. This release adds no D1 migration,
 Cloudflare service, binding, Queue, paid product, or separate alarm
 configuration. Progress/consent analytics and Analytics Engine remain
-best-effort in both environments.
+best-effort in both environments. On 2026-09-02, the staging drill proved one
+pending Release-B joined event drained exactly once after rollback to Release A,
+proved an independent Release-A legacy control, restored Release B, and repeated
+the exact seven-receipt, one-room-fact, six-rollup smoke.
 
 After deployment, run the read-only production probe:
 
@@ -672,9 +675,10 @@ new milestones use the legacy path. The ownership response keeps ordinary
 Release-A/Release-B propagation skew safe, but avoid an intentional
 mixed-configuration rollback and never select a pre-Release-A Worker; it can
 overwrite the shared alarm and strand rows. Do not delete the namespace, local
-tables, pending rows, or dead letters as a rollback technique. Complete the
-staging rollback drill above before production activation, and repeat the
-read-only status/receipt/rollup checks after any real rollback.
+tables, pending rows, or dead letters as a rollback technique. The staging
+rollback drill completed successfully on 2026-09-02. Production activation is
+still a separate review and deployment decision; repeat the read-only
+status/receipt/rollup checks after any real rollback.
 
 ## Retention checks
 
