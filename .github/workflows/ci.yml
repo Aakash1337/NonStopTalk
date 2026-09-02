@@ -58,5 +58,6 @@ jobs:
       - run: npm run smoke:multiplayer
       - run: npm run smoke:accessibility
       - run: npm run smoke:coach
+      - run: npm run smoke:coach-storage
       - run: npm run smoke:admin
       - run: npm run smoke

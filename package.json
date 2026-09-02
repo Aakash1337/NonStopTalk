@@ -36,6 +36,7 @@
     "smoke:accessibility": "node scripts/smoke-accessibility.mjs",
     "smoke:multiplayer": "node scripts/smoke-cloudflare-multiplayer.mjs",
     "smoke:coach": "node scripts/smoke-coach.mjs",
+    "smoke:coach-storage": "node scripts/smoke-coach-storage.mjs",
     "smoke:admin": "node scripts/smoke-admin.mjs",
     "smoke:platform": "node scripts/smoke-platform.mjs",
     "smoke:production": "node scripts/smoke-production.mjs",

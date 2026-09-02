@@ -81,13 +81,13 @@ What is retrieved? **A coaching card.** What is generated? **A bounded assembly 
 | --- | --- |
 | Default attempt | Compact allowlisted measurement/advice summary in this origin's IndexedDB |
 | Transcript analysis checked | Strict on-device recognition may add pace/counts and bounded derived word patterns; no remote fallback |
-| Full-session retention checked | Separate store may keep a browser-encoded attempt recording and available captured transcript; calibration is excluded |
+| Full-session retention checked | Separate store may keep a browser-encoded attempt recording and available captured transcript; calibration is excluded; a required content-free ledger gives the artifact exactly 30 days |
 | Compact cloud backup checked | Sends only allowlisted measurements/advice and bounded derived word-pattern fields to D1 under an anonymous browser identity |
 | JSON export | Summaries only; no recording or captured transcript |
 | Delete saved artifacts | Removes one attempt's local recording/transcript and resets artifact metadata; preserves its compact summary and paired comparison |
 | Delete history | Clears all local coaching stores and, when cloud backup is enabled/reachable, this browser identity's compact D1 summaries; cannot delete downloaded files |
 
-The optional choices start off and do different jobs. A standalone **Try again** and a direct baseline retry preserve visible selections so the user can review or uncheck them; a retry resumed from Progress starts all optional data choices unchecked. Cloud backup is not an account: access is tied to this anonymous browser identity. One UTC-day-bucketed device lease controls all its summaries and lasts at least 30 and less than 31 days after cloud use. New saves stop when 250 summaries already exist; migration does not forcibly delete valid unexpired legacy rows. There is no cross-device authentication or sync. Untouched v2 origins have no app-scheduled artifact expiry; profiles with newer lifecycle records keep their 30-day expiry during rollback. A transcript that fails to finalize after captured text arrives can be retained locally with a visible **possibly partial** warning.
+The optional choices start off and do different jobs. A standalone **Try again** and a direct baseline retry preserve visible selections so the user can review or uncheck them; a retry resumed from Progress starts all optional data choices unchecked. Cloud backup is not an account: access is tied to this anonymous browser identity. One UTC-day-bucketed device lease controls all its summaries and lasts at least 30 and less than 31 days after cloud use. New cloud saves stop when 250 summaries already exist; migration does not forcibly delete valid unexpired cloud rows. There is no cross-device authentication or sync. Locally, IndexedDB v3 gives new artifacts exactly 30 days from save and v1/v2 artifacts exactly 30 days from upgrade. Its 128 MiB logical cap never evicts valid unexpired artifacts: an app-limit or browser-quota failure keeps the summary only. Incompatible or inconsistent artifact state fails closed, while Release A remains a safe code rollback for an already-upgraded database. Browser storage is best-effort and can disappear sooner; expiry cleanup runs on a later access. A transcript that fails to finalize after captured text arrives can be retained locally with a visible **possibly partial** warning.
 
 ## Durable Object answer
 
@@ -106,6 +106,7 @@ npm run test:coach
 npm run test:cloud-progress
 npm run check:cloudflare
 npm run smoke:platform
+npm run smoke:coach-storage
 npx wrangler login
 npm run db:create
 # copy the returned database UUID into wrangler.jsonc
@@ -148,7 +149,7 @@ No coaching audio, recording, or captured transcript does. Cloud backup is off b
 
 **Can I keep the recording and transcript?**
 
-The separate unchecked retention choice records the active attempt. It keeps a captured transcript only when the experimental transcript-analysis option was also enabled, strict local recognition returned text, and retention was selected. Available artifacts remain in origin-local IndexedDB and download individually. Progress can delete one attempt's artifacts while preserving its compact summary and pair; downloaded files remain outside application control. The recording is browser-encoded, not raw PCM.
+The separate unchecked retention choice records the active attempt. It keeps a captured transcript only when the experimental transcript-analysis option was also enabled, strict local recognition returned text, and retention was selected. Available artifacts remain in origin-local IndexedDB and download individually. IndexedDB v3 gives each new artifact exactly 30 days and tracks only policy metadata in its lifecycle ledger; the browser may remove best-effort storage earlier. Progress can delete one attempt's artifacts while preserving its compact summary and pair; downloaded files remain outside application control. The recording is browser-encoded, not raw PCM.
 
 **Why AudioWorklet?**
 

@@ -177,13 +177,10 @@ Workers Static Assets
                  + supported drill + fixed comparison sentence → review
                   ├─ card labeled used guidance or retrieved context
                   ├─ explicit loop/baseline/role/feedback relationship
-                  └─ IndexedDB v2 → safe relationship grouping → /progress
-                       ├─ session-summaries (every saved attempt)
-                       └─ session-artifacts (only after separate opt-in)
-                              │
-                 optional compact-summary allowlist
-                              ▼
-                  Worker /api/v1/progress/sessions → D1
+                  └─ IndexedDB v3 → safe relationship grouping → /progress
+                       ├─ session-summaries ── optional allowlist ──> Worker API → D1
+                       ├─ session-artifacts (only after separate opt-in)
+                       └─ artifact-lifecycle (content-free policy ledger)
 
 Default/off: no coaching-data API request
 No audio, recording, or captured-transcript upload
@@ -376,7 +373,7 @@ When selected:
 
 Recording retention does not enable transcription. If transcript analysis was off or produced no text, the artifact may contain audio only. If the recorder failed but captured transcript text exists, a transcript-only artifact can be saved. Canceling or navigating away stops the recorder, clears pending chunks, and saves no unfinished artifact.
 
-Progress can delete one attempt's saved recording/captured transcript without deleting its compact summary. The summary metadata is reset and the artifact record is removed in one transaction, so an explicit baseline/retry relationship and its measurement comparison remain available. Untouched version-2 origins have no app-scheduled artifact expiration; if a newer schema has created lifecycle records, this compatibility release honors their 30-day expiry. There is no quota dashboard or app-level encryption, and downloaded files remain outside application control.
+Progress can delete one attempt's saved recording/captured transcript without deleting its compact summary. The summary metadata, artifact, and required lifecycle row change in one transaction, so an explicit baseline/retry relationship and its measurement comparison remain available. IndexedDB v3 gives new artifacts exactly 30 days and gives valid v1/v2 artifacts exactly 30 days from migration. New artifacts share a 128 MiB logical cap without eviction; app-limit and browser-quota outcomes retain the compact summary only and report that the artifact was not retained. Browser storage is best-effort and may disappear earlier, and expiry cleanup occurs on a later storage access. There is no quota dashboard or app-level encryption, and downloaded files remain outside application control.
 
 ## Small local RAG, deterministic tips, and advice
 
@@ -498,21 +495,29 @@ The fixed comparison suffix makes the retry measurable:
 | Collect a longer baseline | Use the longer attempt as the baseline for one comparable retry |
 | No priority | Compare the same selected measurement with this attempt |
 
-## IndexedDB v2 storage schema
+## IndexedDB v3 storage schema
 
 Database and stores:
 
 ```text
-database: nonstoptalk-coaching (version 2)
+database: nonstoptalk-coaching (version 3)
 stores:   session-summaries
           session-artifacts
-key:      id in both stores
-index:    createdAt in both stores
+          artifact-lifecycle
+key:      id in all three stores
+indexes:  createdAt in summary/artifact stores
+          expiresAtMs in artifact-lifecycle
 ```
 
-Opening version 2 upgrades an existing version-1 database by preserving `session-summaries` and adding the missing `session-artifacts` store. The browser smoke test exercises that upgrade path.
+Opening version 3 upgrades an existing version-1 or version-2 database by preserving `session-summaries`, adding missing stores/indexes, and backfilling every structurally valid retained artifact in the same atomic upgrade. Every artifact that needs a backfilled row uses one upgrade timestamp and receives `expiresAtMs = retainedAtMs + 2_592_000_000`, exactly 30 days. A valid earlier lifecycle deadline is preserved rather than extended. Structural incompatibility or a failed migration aborts the upgrade and leaves the prior version intact.
 
-`coach-storage.js` owns this persistence boundary. It normally opens version 2; if a newer compatible release already upgraded the origin, it reopens the current version after `VersionError`, validates both required stores, and closes on `versionchange`. An optional `artifact-lifecycle` store is understood but not created by this release. On untouched version-2 origins, automatic expiry therefore remains inactive. Once a newer schema has created that store, this rollback-compatible release maintains its content-free bookkeeping, enforces the future 128 MiB logical artifact limit, and atomically honors recorded expirations on save and read while preserving compact summaries. A real browser-quota failure aborts the artifact transaction, then preserves the compact summary in a summary-only retry and reports the reason in Review.
+`coach-storage.js` owns this persistence boundary. `artifact-lifecycle` is required, content-free bookkeeping: each row contains the matching ID, retained/expiry times, logical byte count, lifecycle schema version, and migration-grace flag, but never audio, MIME type, transcript text, or derived words. Logical size is `audioBlob.size` plus the transcript's exact UTF-8 byte length. A new artifact receives exactly 30 days from its save timestamp. Expired artifacts become unavailable and are removed on the next storage operation, along with their lifecycle row and summary artifact-presence flags; compact analysis and pair relationships remain.
+
+New retained artifacts share a 128 MiB logical cap. Reconciliation and save occur in one read/write transaction, so overlapping tabs cannot commit beyond the limit. The app does not evict another valid, unexpired artifact to make room. Structurally valid migrated content is marked `legacyGrace` and is preserved for its one-time 30-day window even if it is over the individual or aggregate cap; new saves remain blocked until they fit. An app-limit outcome commits only the compact summary. If the browser raises `QuotaExceededError`, the complete artifact transaction aborts before a second summary-only transaction is attempted. Review distinguishes `app-limit` from `browser-quota`; if the summary-only retry also fails, the save fails rather than claiming persistence.
+
+Storage corruption fails closed. Incompatible required stores or key paths abort/reject opening, and an incompatible already-current/future expiry index is rejected. Malformed, future-dated, expired, orphaned, summary-mismatched, or byte-mismatched artifacts are not returned; reconciliation removes the artifact and ledger row and clears only the summary's artifact flags. Connections close on `versionchange`. Active v3 code can reopen a compatible newer version after `VersionError`, and the deployed Release-A floor can similarly operate on an already-upgraded v3 or compatible newer origin without requesting a downgrade. IndexedDB stays at its current version, and rollback cannot restore an artifact already expired or deleted.
+
+“Compatible newer version” has a narrow, frozen meaning: the three stores keep `id` key paths; the lifecycle `expiresAtMs` index remains single-entry and non-unique; lifecycle-v1 core fields keep their existing types/meaning; expiry remains no later than the exact 30-day boundary; and logical bytes remain exact `Blob.size + UTF-8 transcript bytes`. Additive fields/stores/indexes are allowed. Reinterpreting those invariants requires a new rollback floor.
 
 Conceptual summary record:
 
@@ -607,7 +612,7 @@ JSON export reads only `session-summaries` and adds product/export schema metada
 | Compact cloud backup | Independent, unchecked opt-in; sends only the narrower summary allowlist to D1 under a hashed anonymous browser identity; one device-level day-bucketed 30–31-day inactivity lease; new saves stop once 250 exist |
 | Export | Summary store only; excludes audio `Blob` and captured transcript text |
 | Individual download | Reads the opted-in artifact and creates a recording file or UTF-8 transcript file |
-| Delete one artifact | Removes one `session-artifacts` record, its optional lifecycle row when present, and resets that summary's artifact metadata in one transaction; the compact summary/pair remains |
+| Delete one artifact | Removes one `session-artifacts` record and its required lifecycle row, and resets that summary's artifact metadata in one transaction; the compact summary/pair remains |
 | Delete all history | Clears every local coaching store after confirmation; previously downloaded files are outside its scope |
 | Navigation/cancel | Stops recognition/recorder, discards unsaved chunks, stops microphone tracks/worklet/intervals/context, and rejects delayed permission/worklet activation |
 | Cloudflare Durable Object | Multiplayer room state only; receives no coaching data |
@@ -622,14 +627,15 @@ Read the implementation in this order:
 
 1. **`cloudflare/public/index.html`** — the persistent document shell and primary navigation.
 2. **`cloudflare/public/app.js`** — the Practice/Progress lifecycle and storage/cloud handoff.
-3. **`cloudflare/public/coach-storage.js`** — IndexedDB v2 persistence, typed fallback outcomes, and future-schema rollback compatibility.
+3. **`cloudflare/public/coach-storage.js`** — IndexedDB v3 lifecycle persistence, typed summary-only outcomes, migration, and Release-A/future-schema rollback compatibility.
 4. **`cloudflare/public/coach-loop.js`** — pure relationship validation, safe grouping, and descriptive selected-goal comparison guardrails.
 5. **`cloudflare/public/cloud-progress.js`** — the narrow cloud-summary allowlist and versioned API client.
 6. **`cloudflare/public/coach-audio-worklet.js`** — the small sample-to-RMS/peak processor.
 7. **`cloudflare/public/coach-engine.js`** — calibration, metrics, retrieval, tips, grounding, and advice.
 8. **`cloudflare/platform.ts`** — Worker-side validation, anonymous ownership, relationship columns, D1 retention, and aggregate analytics.
 9. **`scripts/smoke-coach.mjs`** — browser-level proof using synthetic media, the complete pair/resume flow, local stores, lifecycle races, and default/off network assertions.
-10. **`wrangler.jsonc`** — Static Assets SPA fallback plus Worker/Durable Object bindings for the separate multiplayer API.
+10. **`scripts/smoke-coach-storage.mjs`** — hash-pinned, same-origin browser proof for v3 migration, retention/cap/corruption behavior, and Release-A rollback/restoration.
+11. **`wrangler.jsonc`** — Static Assets SPA fallback plus Worker/Durable Object bindings for the separate multiplayer API.
 
 ## How to explain the implementation
 
@@ -672,13 +678,15 @@ npm run test:cloudflare
 npm run check:cloudflare
 npm run smoke:platform
 npm run smoke:coach
+npm run smoke:coach-storage
 npm run smoke
 ```
 
 What each coaching check demonstrates:
 
-- `test:coach` runs 36 tests: 34 across controlled frames/transcripts, the pure engine, legacy/explicit relationships, persistence gating, safe grouping, immutable comparisons, exact goal measures, and limited-evidence guardrails, plus two storage-contract tests.
-- `smoke:coach` drives `/practice` with synthetic media through both the standalone live-cue path and the default baseline → Progress/reload/resume → review-only retry path. It covers local storage, comparison, artifact-only deletion, v1→v2 migration, future-schema rollback compatibility and version-change closure, optional lifecycle bookkeeping and recorded expiry, app-limit and real browser-quota summary-only fallbacks, composed warnings, and asserts that default/off local-first paths make no coaching-data API request.
+- `test:coach` runs 41 tests: 34 across controlled frames/transcripts, the pure engine, legacy/explicit relationships, persistence gating, safe grouping, immutable comparisons, exact goal measures, and limited-evidence guardrails, plus seven storage-contract tests for the required v3 schema, exact retention, Blob/UTF-8 byte accounting, conservative lifecycle validation, metadata scrubbing, and quota classification.
+- `smoke:coach` drives `/practice` with synthetic media through both the standalone live-cue path and the default baseline → Progress/reload/resume → review-only retry path. It covers UI integration, comparison, artifact-only deletion, v1→v3 opening, active-v3 operation against a compatible future schema, expiry, app-limit/browser-quota summary-only messages, composed warnings, and asserts that default/off local-first paths make no coaching-data API request.
+- `smoke:coach-storage` serves immutable Release-A and current modules on one origin. It covers fresh schema/atomic triads, shared-timestamp v2→v3 Unicode backfill, exact expiry, fail-closed corruption, summary-only cleanup, exact cap edges, grace migration/no eviction, a real two-tab cap race, upgrade abort/retry, malformed/blocked/incompatible schemas, and hash-pinned v3 → Release A → v3 rollback/restoration.
 - `test:cloud-progress` checks the separate opt-in allowlist, relationship metadata/legacy compatibility, merged-history behavior, API calls, and preference state; platform tests cover Worker relationship validation, identity, expiry, analytics, and local-artifact stripping.
 - `smoke:platform` starts an isolated local Wrangler/D1 environment and exercises status, backup, relationship-field round trip and reserved D1 columns, export, aggregate analytics, privacy rejection, and cloud deletion.
 - `check:cloudflare` confirms that the Worker and all Static Assets, including the coaching modules, form a valid deploy bundle.
@@ -697,7 +705,7 @@ These tests do not replace real-device, accessibility, security, or fairness val
 - Progress implements explicit baseline/retry pairing and descriptive selected-goal changes, but those changes have not been validated as learning outcomes or improvement directions.
 - The local coaching-card library is intentionally small; retrieval is lexical rather than semantic and still requires relevance/fairness evaluation.
 - Derived filler/repetition labels may contain sensitive words even though they are not captured transcript text.
-- Retained artifacts support per-attempt deletion. Untouched version-2 origins have no app-scheduled expiration; a browser profile that already has newer lifecycle records keeps their 30-day expiry during rollback. There is no quota dashboard or app-level encryption, and anyone with access to the unlocked browser profile may reach artifacts before deletion or expiry.
+- Retained artifacts support per-attempt deletion, exact 30-day app retention, and a no-eviction 128 MiB logical cap. IndexedDB remains best-effort: storage pressure, private mode, browser policy, site-data deletion, or database failure can remove or block data earlier, and deadline cleanup happens only on a later storage operation. There is no quota dashboard, persistent-storage request, configurable retention, or app-level encryption, and anyone with access to the unlocked browser profile may reach artifacts before deletion or expiry.
 - No accounts, recovery, cross-device authentication/sync, educator view, or shared report exists. Anonymous D1 backup is tied to one browser identity.
 - No external coaching AI, Queue-backed provider work, or R2 media storage exists.
 - No formal WCAG, security, privacy, microphone/device, learning-outcome, or subgroup-fairness study has been completed.
