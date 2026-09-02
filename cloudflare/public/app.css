@@ -259,8 +259,20 @@ textarea { resize: vertical; line-height: 1.5; }
 .attempt-focus p { color: var(--ink); }
 .artifact-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .35rem; }
 .artifact-actions .button { padding-inline: .55rem; }
+.artifact-retention-detail { flex-basis: 100%; margin: .2rem 0 0; color: var(--muted); font-size: .72rem; line-height: 1.45; }
 .empty-progress { padding: 4rem 1rem; text-align: center; }
 .empty-progress p { color: var(--muted); }
+.artifact-storage-card { margin-bottom: 1rem; padding: clamp(1.25rem, 4vw, 2rem); }
+.artifact-storage-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 1rem; }
+.artifact-storage-head h2 { margin-top: .25rem; }
+.artifact-storage-head > span { color: var(--muted); font-size: .76rem; }
+.artifact-storage-card progress { width: 100%; height: .75rem; margin: 1rem 0 .75rem; overflow: hidden; border: 0; border-radius: 999px; color: var(--acid); background: #0b0c0a; }
+.artifact-storage-card progress::-webkit-progress-bar { border-radius: 999px; background: #0b0c0a; }
+.artifact-storage-card progress::-webkit-progress-value { border-radius: 999px; background: var(--acid); }
+.artifact-storage-card progress::-moz-progress-bar { border-radius: 999px; background: var(--acid); }
+.artifact-storage-details { display: flex; flex-wrap: wrap; gap: .35rem 1rem; }
+.artifact-storage-details p { margin: 0; color: var(--ink); font-size: .78rem; }
+.artifact-storage-card > .hint { margin: .75rem 0 0; }
 .storage-controls { padding: 1.5rem 0; }
 .storage-controls h2 { margin-bottom: .3rem; }
 .storage-controls p { margin: 0; }
@@ -330,7 +342,7 @@ textarea { resize: vertical; line-height: 1.5; }
   .coach-hero > div:first-child { min-height: 22rem; }
   .coach-fields { grid-template-columns: 1fr; }
   .practice-format, .comparison-grid { grid-template-columns: 1fr; }
-  .coach-start-row, .review-actions, .storage-controls, .review-head, .progress-hero, .transcript-evidence { align-items: stretch; flex-direction: column; }
+  .coach-start-row, .review-actions, .storage-controls, .review-head, .progress-hero, .transcript-evidence, .artifact-storage-head { align-items: stretch; flex-direction: column; }
   .grounding-evidence { grid-template-columns: 1fr; }
   .coach-start, .review-actions .button, .progress-hero .button { width: 100%; }
   .practice-grid { display: flex; flex-direction: column; }

@@ -4,6 +4,7 @@ import {
   coachingStoragePolicy,
   coachingStorageSchema,
   openCoachDatabase,
+  readCoachingProgressSnapshot,
 } from "./coach-storage.js";
 
 test("the storage module exposes the required v3 lifecycle contract", () => {
@@ -22,6 +23,10 @@ test("the storage module exposes the required v3 lifecycle contract", () => {
 
 test("the storage module fails explicitly when IndexedDB is unavailable", async () => {
   await assert.rejects(openCoachDatabase(null), /IndexedDB unavailable/u);
+});
+
+test("the storage module exposes the atomic progress snapshot reader", () => {
+  assert.equal(typeof readCoachingProgressSnapshot, "function");
 });
 
 test("logical artifact bytes use Blob size plus exact UTF-8 transcript bytes", () => {

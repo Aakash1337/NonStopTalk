@@ -278,6 +278,287 @@ async function runFreshSchemaAndTriad(browser, origin) {
   }
 }
 
+async function runProgressSnapshot(browser, origin) {
+  const context = await createContext(browser, origin);
+  try {
+    const page = await openHome(context, origin);
+    const result = await page.evaluate(async ({ retentionMs }) => {
+      const storage = await import("/coach-storage.js?storage-smoke=progress-snapshot");
+      const helpers = globalThis.__coachStorageSmoke;
+      const empty = await storage.readCoachingProgressSnapshot();
+      const retainedAtMs = 1_800_050_000_000;
+      const activeRetainedAtMs = retainedAtMs + 1_000;
+      const expiryBoundaryMs = retainedAtMs + retentionMs;
+      const makeSummary = (id) => ({
+        id,
+        createdAt: "2026-09-02T00:00:00.000Z",
+        scenario: "interview",
+        goal: "pace",
+        advice: { focus: `Preserve ${id}` },
+        artifacts: {
+          audioStored: true,
+          audioBytes: 1,
+          audioMimeType: "audio/webm",
+          transcriptStored: false,
+          transcriptMayBePartial: false,
+        },
+      });
+      const makeArtifact = (id, contents = id) => ({
+        id,
+        createdAt: "2026-09-02T00:00:00.000Z",
+        audioBlob: new Blob([contents], { type: "audio/webm" }),
+        audioMimeType: "audio/webm",
+        transcript: "",
+        transcriptMayBePartial: false,
+      });
+
+      const nativeNow = Date.now;
+      let artifactGetAllCalls = 0;
+      let artifactCursorCalls = 0;
+      let clockCalls = 0;
+      let snapshot;
+      try {
+        Date.now = () => retainedAtMs;
+        await storage.saveCoachingSession(
+          makeSummary("crosses-snapshot-expiry"),
+          makeArtifact("crosses-snapshot-expiry", "x"),
+        );
+
+        Date.now = () => activeRetainedAtMs;
+        await storage.saveCoachingSession(makeSummary("unicode-blob"), {
+          id: "unicode-blob",
+          createdAt: "2026-09-02T00:00:00.000Z",
+          audioBlob: new Blob(["abc"], { type: "audio/webm" }),
+          audioMimeType: "audio/webm",
+          transcript: "é🙂",
+          transcriptMayBePartial: false,
+        });
+        await storage.saveCoachingSession(makeSummary("transcript-only"), {
+          id: "transcript-only",
+          createdAt: "2026-09-02T00:00:00.000Z",
+          audioBlob: null,
+          audioMimeType: "",
+          transcript: "plain",
+          transcriptMayBePartial: true,
+        });
+        await storage.saveCoachingSession(
+          makeSummary("corrupt-payload"),
+          makeArtifact("corrupt-payload", "c"),
+        );
+        await storage.saveCoachingSession(
+          makeSummary("mismatched-ledger"),
+          makeArtifact("mismatched-ledger", "m"),
+        );
+
+        const database = await helpers.openRaw();
+        const transaction = database.transaction(
+          ["session-summaries", "session-artifacts", "artifact-lifecycle"],
+          "readwrite",
+        );
+        const summaries = transaction.objectStore("session-summaries");
+        const artifacts = transaction.objectStore("session-artifacts");
+        const lifecycle = transaction.objectStore("artifact-lifecycle");
+
+        const unicodeSummary = summaries.get("unicode-blob");
+        unicodeSummary.onsuccess = () => summaries.put({
+          ...unicodeSummary.result,
+          artifacts: {
+            audioStored: false,
+            audioBytes: 999,
+            audioMimeType: "audio/wrong",
+            transcriptStored: true,
+            transcriptMayBePartial: true,
+          },
+        });
+        const transcriptOnlySummary = summaries.get("transcript-only");
+        transcriptOnlySummary.onsuccess = () => summaries.put({
+          ...transcriptOnlySummary.result,
+          artifacts: {
+            ...transcriptOnlySummary.result.artifacts,
+            unexpectedSensitiveField: "must not survive normalization",
+          },
+        });
+        summaries.put({
+          id: "metadata-only-corruption",
+          createdAt: "2026-09-02T00:00:00.000Z",
+          advice: { focus: "Preserve compact analysis" },
+          artifacts: {
+            audioStored: false,
+            audioBytes: 999,
+            audioMimeType: "audio/stale",
+            transcriptStored: false,
+            transcriptMayBePartial: true,
+          },
+        });
+        artifacts.put({
+          id: "corrupt-payload",
+          createdAt: "2026-09-02T00:00:00.000Z",
+          audioBlob: "not-a-blob",
+          audioMimeType: "audio/webm",
+          transcript: "",
+          transcriptMayBePartial: false,
+        });
+        artifacts.put(makeArtifact("orphan-payload", "o"));
+        const futureDuringSnapshotId = "future-during-snapshot";
+        summaries.put(makeSummary(futureDuringSnapshotId));
+        artifacts.put(makeArtifact(futureDuringSnapshotId, "f"));
+        lifecycle.put({
+          id: futureDuringSnapshotId,
+          retainedAtMs: expiryBoundaryMs,
+          expiresAtMs: expiryBoundaryMs + retentionMs,
+          logicalBytes: 1,
+          lifecycleSchemaVersion: 1,
+          legacyGrace: false,
+        });
+
+        const mismatchedLedger = lifecycle.get("mismatched-ledger");
+        mismatchedLedger.onsuccess = () => lifecycle.put({
+          ...mismatchedLedger.result,
+          logicalBytes: mismatchedLedger.result.logicalBytes + 1,
+        });
+        const unicodeLifecycle = lifecycle.get("unicode-blob");
+        unicodeLifecycle.onsuccess = () => lifecycle.put({
+          ...unicodeLifecycle.result,
+          lifecycleSchemaVersion: 2,
+          futureCompatibleField: "ignored",
+        });
+        lifecycle.put({
+          id: "orphan-lifecycle",
+          retainedAtMs: activeRetainedAtMs,
+          expiresAtMs: activeRetainedAtMs + retentionMs,
+          logicalBytes: 1,
+          lifecycleSchemaVersion: 1,
+          legacyGrace: false,
+        });
+        await helpers.transactionDone(transaction);
+        database.close();
+
+        const nativeArtifactGetAll = IDBObjectStore.prototype.getAll;
+        const nativeArtifactOpenCursor = IDBObjectStore.prototype.openCursor;
+        IDBObjectStore.prototype.getAll = function guardedGetAll(...args) {
+          if (this.name === "session-artifacts") {
+            artifactGetAllCalls += 1;
+            throw new Error("Progress snapshots must not materialize the complete artifact store");
+          }
+          return nativeArtifactGetAll.apply(this, args);
+        };
+        IDBObjectStore.prototype.openCursor = function countedOpenCursor(...args) {
+          if (this.name === "session-artifacts") artifactCursorCalls += 1;
+          return nativeArtifactOpenCursor.apply(this, args);
+        };
+        Date.now = () => {
+          clockCalls += 1;
+          return clockCalls === 1 ? expiryBoundaryMs - 1 : expiryBoundaryMs;
+        };
+        try {
+          snapshot = await storage.readCoachingProgressSnapshot();
+        } finally {
+          IDBObjectStore.prototype.getAll = nativeArtifactGetAll;
+          IDBObjectStore.prototype.openCursor = nativeArtifactOpenCursor;
+        }
+      } finally {
+        Date.now = nativeNow;
+      }
+      return {
+        empty,
+        snapshot,
+        stored: await helpers.inspect(),
+        artifactGetAllCalls,
+        artifactCursorCalls,
+        clockCalls,
+        retainedAtMs,
+        activeRetainedAtMs,
+      };
+    }, { retentionMs: RETENTION_MS });
+
+    assert.deepEqual(result.empty, {
+      summaries: [],
+      artifactUsage: {
+        logicalBytes: 0,
+        limitBytes: MAX_LOGICAL_BYTES,
+        artifactCount: 0,
+        nextExpiresAtMs: null,
+        legacyGraceCount: 0,
+        cleanedCount: 0,
+        sessions: [],
+      },
+    });
+    assert.equal(result.artifactGetAllCalls, 0,
+      "a progress snapshot must never load the complete Blob store with getAll");
+    assert.equal(result.artifactCursorCalls, 1,
+      "a progress snapshot must validate actual payload bytes in exactly one artifact cursor pass");
+    assert.equal(result.clockCalls, 2,
+      "a progress snapshot must recheck expiry after its payload cursor finishes");
+    assert.deepEqual(result.snapshot.artifactUsage, {
+      logicalBytes: 14,
+      limitBytes: MAX_LOGICAL_BYTES,
+      artifactCount: 2,
+      nextExpiresAtMs: result.activeRetainedAtMs + RETENTION_MS,
+      legacyGraceCount: 0,
+      cleanedCount: 5,
+      sessions: [
+        {
+          id: "transcript-only",
+          logicalBytes: 5,
+          retainedAtMs: result.activeRetainedAtMs,
+          expiresAtMs: result.activeRetainedAtMs + RETENTION_MS,
+          legacyGrace: false,
+        },
+        {
+          id: "unicode-blob",
+          logicalBytes: 9,
+          retainedAtMs: result.activeRetainedAtMs,
+          expiresAtMs: result.activeRetainedAtMs + RETENTION_MS,
+          legacyGrace: false,
+        },
+      ],
+    });
+    assert.deepEqual(byId(result.snapshot.summaries, "unicode-blob")?.artifacts, {
+      audioStored: true,
+      audioBytes: 3,
+      audioMimeType: "audio/webm",
+      transcriptStored: true,
+      transcriptMayBePartial: false,
+    }, "the snapshot must normalize summary metadata from actual Blob and transcript content");
+    assert.deepEqual(byId(result.snapshot.summaries, "transcript-only")?.artifacts, {
+      audioStored: false,
+      audioBytes: 0,
+      audioMimeType: "",
+      transcriptStored: true,
+      transcriptMayBePartial: true,
+    });
+    for (const id of [
+      "crosses-snapshot-expiry",
+      "corrupt-payload",
+      "future-during-snapshot",
+      "mismatched-ledger",
+      "metadata-only-corruption",
+    ]) {
+      assertEmptyArtifactMetadata(byId(result.snapshot.summaries, id),
+        `${id} must return truthful content-free artifact metadata`);
+    }
+    assert.equal(byId(result.snapshot.summaries, "metadata-only-corruption")?.advice?.focus,
+      "Preserve compact analysis");
+    assert.deepEqual(result.stored.artifacts.map((artifact) => artifact.id), ["transcript-only", "unicode-blob"]);
+    assert.deepEqual(result.stored.lifecycle.map((record) => record.id), ["transcript-only", "unicode-blob"]);
+    assert.equal(byId(result.stored.lifecycle, "unicode-blob")?.lifecycleSchemaVersion, 2,
+      "compatible future lifecycle rows must retain their schema version");
+    assert.equal(byId(result.stored.lifecycle, "unicode-blob")?.futureCompatibleField, "ignored");
+    assert.deepEqual(
+      byId(result.stored.summaries, "unicode-blob")?.artifacts,
+      byId(result.snapshot.summaries, "unicode-blob")?.artifacts,
+      "the returned truthful summary and atomically committed summary must match",
+    );
+    assertEmptyArtifactMetadata(byId(result.stored.summaries, "metadata-only-corruption"),
+      "summary metadata normalization must commit in the snapshot transaction");
+    assert.equal(Object.hasOwn(result.snapshot.artifactUsage.sessions[0], "transcript"), false);
+    assert.equal(Object.hasOwn(result.snapshot.artifactUsage.sessions[0], "audioBlob"), false);
+    console.log("  one-pass truthful progress snapshot accounting and cleanup passed");
+  } finally {
+    await context.close();
+  }
+}
+
 async function runVersionTwoBackfill(browser, origin) {
   const context = await createContext(browser, origin);
   try {
@@ -1027,7 +1308,9 @@ async function runLegacyOverCap(browser, origin) {
       let clockMs = 1_800_225_000_000;
       Date.now = () => clockMs++;
       let candidate;
+      let progressSnapshot;
       try {
+        progressSnapshot = await storage.readCoachingProgressSnapshot();
         candidate = await storage.saveCoachingSession({
           id: candidateId,
           createdAt: new Date().toISOString(),
@@ -1053,6 +1336,7 @@ async function runLegacyOverCap(browser, origin) {
       check.close();
       return {
         candidate,
+        progressSnapshot,
         legacyArtifact: legacyArtifact.result,
         legacyLifecycle: legacyLifecycle.result,
         candidateArtifact: candidateArtifact.result,
@@ -1061,6 +1345,14 @@ async function runLegacyOverCap(browser, origin) {
     }, { maximum: MAX_LOGICAL_BYTES });
 
     assert.equal(result.candidate.artifactStatus, "app-limit");
+    assert.equal(result.progressSnapshot.artifactUsage.logicalBytes, MAX_LOGICAL_BYTES + 1);
+    assert.equal(result.progressSnapshot.artifactUsage.limitBytes, MAX_LOGICAL_BYTES);
+    assert.equal(result.progressSnapshot.artifactUsage.artifactCount, 1);
+    assert.equal(result.progressSnapshot.artifactUsage.legacyGraceCount, 1);
+    assert.equal(result.progressSnapshot.artifactUsage.cleanedCount, 0);
+    assert.deepEqual(result.progressSnapshot.artifactUsage.sessions.map((session) => session.id), [
+      "grandfathered-over-cap",
+    ]);
     assert.equal(result.legacyArtifact, "grandfathered-over-cap");
     assert.equal(result.legacyLifecycle.logicalBytes, MAX_LOGICAL_BYTES + 1);
     assert.equal(result.legacyLifecycle.legacyGrace, true);
@@ -1584,6 +1876,7 @@ try {
   browser = await launchBrowser();
   console.log("IndexedDB v3 native browser storage smoke:");
   await withCaseDeadline("fresh schema and triad", runFreshSchemaAndTriad(browser, origin));
+  await withCaseDeadline("progress snapshot", runProgressSnapshot(browser, origin));
   await withCaseDeadline("v2 backfill", runVersionTwoBackfill(browser, origin));
   await withCaseDeadline("first-operation migration timing", runFirstOperationMigrationTiming(browser, origin));
   await withCaseDeadline("expiry boundary", runExpiryBoundary(browser, origin));

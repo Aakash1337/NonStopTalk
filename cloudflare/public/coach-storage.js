@@ -16,6 +16,7 @@ const EMPTY_ARTIFACT_METADATA = Object.freeze({
   transcriptStored: false,
   transcriptMayBePartial: false,
 });
+const EMPTY_ARTIFACT_METADATA_KEYS = Object.freeze(Object.keys(EMPTY_ARTIFACT_METADATA));
 
 function artifactLogicalBytes(artifact) {
   if (!artifact || typeof artifact !== "object") return null;
@@ -94,21 +95,36 @@ function summaryWithoutArtifacts(summary) {
   return { ...summary, artifacts: { ...EMPTY_ARTIFACT_METADATA } };
 }
 
-function summaryWithArtifactMetadata(summary, artifact) {
+function artifactSummaryMetadata(artifact) {
   const hasAudioBlob = typeof globalThis.Blob === "function"
     && artifact?.audioBlob instanceof globalThis.Blob;
   const transcript = typeof artifact?.transcript === "string" ? artifact.transcript : "";
   const declaredMimeType = typeof artifact?.audioMimeType === "string" ? artifact.audioMimeType : "";
   return {
-    ...summary,
-    artifacts: {
-      audioStored: hasAudioBlob,
-      audioBytes: hasAudioBlob ? artifact.audioBlob.size : 0,
-      audioMimeType: hasAudioBlob ? declaredMimeType || artifact.audioBlob.type : "",
-      transcriptStored: transcript.length > 0,
-      transcriptMayBePartial: Boolean(transcript && artifact?.transcriptMayBePartial),
-    },
+    audioStored: hasAudioBlob,
+    audioBytes: hasAudioBlob ? artifact.audioBlob.size : 0,
+    audioMimeType: hasAudioBlob ? declaredMimeType || artifact.audioBlob.type : "",
+    transcriptStored: transcript.length > 0,
+    transcriptMayBePartial: Boolean(transcript && artifact?.transcriptMayBePartial),
   };
+}
+
+function summaryWithArtifactMetadata(summary, artifact) {
+  return { ...summary, artifacts: artifactSummaryMetadata(artifact) };
+}
+
+function summaryHasArtifactMetadata(summary, expected) {
+  const actual = summary?.artifacts;
+  return actual
+    && typeof actual === "object"
+    && !Array.isArray(actual)
+    && Object.keys(actual).length === EMPTY_ARTIFACT_METADATA_KEYS.length
+    && EMPTY_ARTIFACT_METADATA_KEYS.every((key) => Object.hasOwn(actual, key))
+    && actual.audioStored === expected.audioStored
+    && actual.audioBytes === expected.audioBytes
+    && actual.audioMimeType === expected.audioMimeType
+    && actual.transcriptStored === expected.transcriptStored
+    && actual.transcriptMayBePartial === expected.transcriptMayBePartial;
 }
 
 function summaryClaimsArtifacts(summary) {
@@ -449,19 +465,25 @@ async function saveSummaryOnly(summary, sessionId) {
   );
 }
 
-function reconcileArtifactState(transaction, nowMs, done) {
+function reconcileArtifactState(transaction, nowMs, done, recheckExpiry = false) {
   const summaries = transaction.objectStore(COACH_STORE);
   const artifacts = transaction.objectStore(COACH_ARTIFACT_STORE);
   const lifecycle = transaction.objectStore(COACH_ARTIFACT_LIFECYCLE_STORE);
-  const artifactBytesById = new Map();
+  const artifactDetailsById = new Map();
   const summariesRequest = summaries.getAll();
   const lifecycleEntries = [];
+  let invalidArtifactCount = 0;
   let completedReads = 0;
 
   const finishRead = () => {
     completedReads += 1;
     if (completedReads !== 3) return;
     try {
+      const completedAtMs = recheckExpiry ? Date.now() : nowMs;
+      if (!Number.isSafeInteger(completedAtMs) || completedAtMs < 0) {
+        throw new TypeError("The coaching artifact expiry time is invalid.");
+      }
+      const effectiveNowMs = Math.max(nowMs, completedAtMs);
       const artifactSummaryIds = new Set();
       for (const summary of summariesRequest.result) {
         if (typeof summary?.id === "string"
@@ -472,18 +494,23 @@ function reconcileArtifactState(transaction, nowMs, done) {
       }
 
       const retainedById = new Map();
+      const retainedLifecycleById = new Map();
       let retainedBytes = 0;
       let retainedBytesOverflow = false;
       let expiredCount = 0;
       for (const { key, value } of lifecycleEntries) {
         const validKey = typeof key === "string" && key.length > 0;
         const validRecord = validKey && isArtifactLifecycleRecord(value, key);
-        const artifactExists = validKey && artifactBytesById.has(key);
-        const artifactBytes = artifactExists ? artifactBytesById.get(key) : null;
+        const artifactDetails = validKey ? artifactDetailsById.get(key) : undefined;
+        const artifactExists = Boolean(artifactDetails);
+        const artifactBytes = artifactDetails?.logicalBytes ?? null;
         const summaryExists = validKey && artifactSummaryIds.has(key);
         if (!validRecord
+          // A row must already be valid when the operation begins. Letting a
+          // future-dated row age into validity during a long Blob scan would
+          // weaken the fail-closed corruption boundary.
           || value.retainedAtMs > nowMs
-          || value.expiresAtMs <= nowMs
+          || value.expiresAtMs <= effectiveNowMs
           || !artifactExists
           || artifactBytes !== value.logicalBytes
           || !summaryExists) {
@@ -491,32 +518,62 @@ function reconcileArtifactState(transaction, nowMs, done) {
           artifacts.delete(key);
           if (validRecord
             && value.retainedAtMs <= nowMs
-            && value.expiresAtMs <= nowMs
+            && value.expiresAtMs <= effectiveNowMs
             && artifactExists) {
             expiredCount += 1;
           }
           continue;
         }
         retainedById.set(key, artifactBytes);
+        retainedLifecycleById.set(key, {
+          id: key,
+          logicalBytes: artifactBytes,
+          retainedAtMs: value.retainedAtMs,
+          expiresAtMs: value.expiresAtMs,
+          legacyGrace: value.legacyGrace,
+        });
         const nextBytes = retainedBytes + artifactBytes;
         if (!Number.isSafeInteger(nextBytes)) retainedBytesOverflow = true;
         else retainedBytes = nextBytes;
       }
 
-      for (const key of artifactBytesById.keys()) {
+      let cleanedCount = invalidArtifactCount;
+      for (const key of artifactDetailsById.keys()) {
         if (!retainedById.has(key)) {
           artifacts.delete(key);
           lifecycle.delete(key);
-        }
-      }
-      for (const summary of summariesRequest.result) {
-        if (summaryClaimsArtifacts(summary)
-          && (typeof summary?.id !== "string" || !retainedById.has(summary.id))) {
-          summaries.put(summaryWithoutArtifacts(summary));
+          cleanedCount += 1;
         }
       }
 
-      done({ retainedById, retainedBytes, retainedBytesOverflow, expiredCount });
+      const reconciledSummaries = summariesRequest.result.map((summary) => {
+        const retainedDetails = typeof summary?.id === "string"
+          ? artifactDetailsById.get(summary.id)
+          : undefined;
+        let reconciledSummary;
+        if (retainedById.has(summary?.id) && retainedDetails) {
+          reconciledSummary = {
+            ...summary,
+            artifacts: { ...retainedDetails.summaryMetadata },
+          };
+        } else {
+          reconciledSummary = summaryWithoutArtifacts(summary);
+        }
+        if (!summaryHasArtifactMetadata(summary, reconciledSummary.artifacts)) {
+          summaries.put(reconciledSummary);
+        }
+        return reconciledSummary;
+      });
+
+      done({
+        retainedById,
+        retainedLifecycleById,
+        retainedBytes,
+        retainedBytesOverflow,
+        expiredCount,
+        cleanedCount,
+        summaries: reconciledSummaries,
+      });
     } catch (error) {
       abortTransaction(transaction, error);
     }
@@ -543,8 +600,12 @@ function reconcileArtifactState(transaction, nowMs, done) {
       if (logicalBytes === null) {
         cursor.delete();
         lifecycle.delete(key);
+        invalidArtifactCount += 1;
       } else {
-        artifactBytesById.set(key, logicalBytes);
+        artifactDetailsById.set(key, {
+          logicalBytes,
+          summaryMetadata: artifactSummaryMetadata(artifact),
+        });
       }
       cursor.continue();
     } catch (error) {
@@ -646,6 +707,63 @@ async function cleanupExpiredCoachingArtifacts() {
 export async function readCoachingSummaries() {
   await cleanupExpiredCoachingArtifacts();
   return withCoachStore(COACH_STORE, "readonly", (store) => store.getAll());
+}
+
+export async function readCoachingProgressSnapshot() {
+  const outcome = {
+    summaries: [],
+    artifactUsage: {
+      logicalBytes: 0,
+      limitBytes: ARTIFACT_MAX_LOGICAL_BYTES,
+      artifactCount: 0,
+      nextExpiresAtMs: null,
+      legacyGraceCount: 0,
+      cleanedCount: 0,
+      sessions: [],
+    },
+  };
+  await withCoachTransaction(
+    [COACH_STORE, COACH_ARTIFACT_STORE, COACH_ARTIFACT_LIFECYCLE_STORE],
+    "readwrite",
+    (transaction) => {
+      const nowMs = Date.now();
+      if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
+        throw new TypeError("The coaching artifact expiry time is invalid.");
+      }
+      reconcileArtifactState(transaction, nowMs, (state) => {
+        if (state.retainedBytesOverflow) {
+          throw new RangeError("Coaching artifact usage exceeds the safe numeric range.");
+        }
+        const sessions = [...state.retainedLifecycleById.values()].sort((left, right) => {
+          if (left.expiresAtMs !== right.expiresAtMs) {
+            return left.expiresAtMs < right.expiresAtMs ? -1 : 1;
+          }
+          if (left.id === right.id) return 0;
+          return left.id < right.id ? -1 : 1;
+        });
+        outcome.artifactUsage = {
+          logicalBytes: state.retainedBytes,
+          limitBytes: ARTIFACT_MAX_LOGICAL_BYTES,
+          artifactCount: sessions.length,
+          nextExpiresAtMs: sessions[0]?.expiresAtMs ?? null,
+          legacyGraceCount: sessions.reduce(
+            (count, session) => count + (session.legacyGrace ? 1 : 0),
+            0,
+          ),
+          cleanedCount: state.cleanedCount,
+          sessions,
+        };
+        // Queue the read after reconciliation's scrubs/normalizations so the
+        // returned summaries and the committed database state are identical.
+        const summariesRequest = transaction.objectStore(COACH_STORE).getAll();
+        summariesRequest.onsuccess = () => {
+          outcome.summaries = summariesRequest.result;
+        };
+      }, true);
+      return outcome;
+    },
+  );
+  return outcome;
 }
 
 export async function readCoachingSummary(id) {

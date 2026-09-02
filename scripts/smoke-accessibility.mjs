@@ -108,7 +108,14 @@ async function runAccessibilityFlow(browser, origin) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const page = await context.newPage();
   const pageErrors = [];
+  const coachingDataRequests = [];
+  let trackProgressRequests = false;
   page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("request", (request) => {
+    if (trackProgressRequests && new URL(request.url()).pathname.startsWith("/api/")) {
+      coachingDataRequests.push(request.url());
+    }
+  });
 
   await page.goto(origin);
   await page.getByRole("heading", { level: 1, name: "Find your voice." }).waitFor();
@@ -139,14 +146,26 @@ async function runAccessibilityFlow(browser, origin) {
   await assertSinglePageStructure(page, "Practice page");
   await assertNoAxeViolations(page, "Practice page");
 
+  trackProgressRequests = true;
   await page.getByRole("link", { name: "Progress", exact: true }).click();
   await page.getByRole("heading", { level: 1, name: "Your baseline, not a leaderboard." }).waitFor();
   await page.waitForFunction(() => document.activeElement?.tagName === "H1");
   assert(await page.title() === "Progress · NonStopTalk", "Progress must update the document title");
   assert(await page.getByRole("link", { name: "Progress", exact: true }).getAttribute("aria-current") === "page",
     "Progress must be identified as the current page");
+  const emptyArtifactDashboard = page.locator('[data-artifact-usage="ready"]');
+  await emptyArtifactDashboard.waitFor();
+  assert(await emptyArtifactDashboard.getByRole("heading", { level: 2 }).innerText() === "0 B of 128 MiB app limit",
+    "Empty Progress must present a clear zero-usage artifact dashboard");
+  const emptyArtifactMeter = emptyArtifactDashboard.locator("progress");
+  assert(await emptyArtifactMeter.getAttribute("value") === "0"
+    && await emptyArtifactMeter.getAttribute("max") === "134217728"
+    && await emptyArtifactMeter.getAttribute("aria-label")
+      === "0 bytes used of the 134217728 byte NonStopTalk artifact limit",
+  "The empty artifact dashboard must expose exact accessible meter values");
   await assertSinglePageStructure(page, "Progress page");
   await assertNoAxeViolations(page, "Progress page");
+  trackProgressRequests = false;
 
   await page.goBack();
   await page.getByRole("heading", { level: 1, name: "Practice with a signal, not a score." }).waitFor();
@@ -223,6 +242,16 @@ async function runAccessibilityFlow(browser, origin) {
   assert(transitionDurations.split(",").every((duration) => Number.parseFloat(duration) === 0),
     `Reduced-motion mode must remove interface transitions, got ${JSON.stringify(transitionDurations)}`);
 
+  trackProgressRequests = true;
+  await page.goto(`${origin}/progress`);
+  await page.waitForSelector('[data-artifact-usage="ready"]');
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    "The empty artifact dashboard must reflow at 320 CSS pixels without page-level horizontal scrolling");
+  await assertSinglePageStructure(page, "Progress page at 320 CSS pixels");
+  await assertNoAxeViolations(page, "Progress page at 320 CSS pixels");
+
+  assert(coachingDataRequests.length === 0,
+    `Local Progress unexpectedly sent coaching data over the network: ${coachingDataRequests.join(", ")}`);
   assert(pageErrors.length === 0, `Accessibility smoke emitted page errors: ${JSON.stringify(pageErrors)}`);
   await context.close();
 }

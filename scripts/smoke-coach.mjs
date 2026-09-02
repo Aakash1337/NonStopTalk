@@ -434,6 +434,14 @@ async function runMixedGenerationRetentionDisclosureFlow(browser, origin) {
   });
   try {
     const page = await context.newPage();
+    const pageErrors = [];
+    const coachingDataRequests = [];
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname.startsWith("/api/")) {
+        coachingDataRequests.push(request.url());
+      }
+    });
     await page.goto(`${origin}/practice`, { waitUntil: "domcontentloaded" });
     const disclosure = normalizeHyphenatedText(
       await page.getByLabel("Optional full session retention").innerText(),
@@ -442,6 +450,344 @@ async function runMixedGenerationRetentionDisclosureFlow(browser, origin) {
       && disclosure.includes("artifacts either remain until you delete them or follow a 30 day local retention policy")
       && disclosure.includes("never uploaded"),
     "App B paired with the Release-A storage module must retain the conservative lifecycle disclosure");
+    const releaseASave = await page.evaluate(async () => {
+      const { saveCoachingSession } = await import("/coach-storage.js");
+      const id = "release-a-progress-artifact";
+      return saveCoachingSession({
+        id,
+        createdAt: new Date().toISOString(),
+        scenario: "interview",
+        goal: "pace",
+        targetDurationMs: 45_000,
+        metrics: { durationMs: 30_000, speakingRatio: 0.6, pauseCount: 2 },
+        advice: { focus: "Release-A history remains usable" },
+        artifacts: {
+          audioStored: true,
+          audioBytes: 1,
+          audioMimeType: "audio/webm",
+          transcriptStored: true,
+          transcriptMayBePartial: false,
+        },
+      }, {
+        id,
+        createdAt: new Date().toISOString(),
+        audioBlob: new Blob(["a"], { type: "audio/webm" }),
+        audioMimeType: "audio/webm",
+        transcript: "Release-A transcript",
+        transcriptMayBePartial: false,
+      });
+    });
+    assert(releaseASave?.artifactStatus === "stored",
+      "The immutable Release-A storage module must seed its compatibility fixture");
+
+    await page.goto(`${origin}/progress`);
+    await page.waitForSelector("[data-coach-progress]");
+    const fallback = page.locator('[data-artifact-usage="unavailable"]');
+    await fallback.waitFor();
+    const fallbackText = normalizeHyphenatedText(await fallback.innerText());
+    assert(fallbackText.includes("usage details unavailable")
+      && fallbackText.includes("compatible storage release")
+      && fallbackText.includes("newer lifecycle readout is unavailable"),
+    "App B paired with the Release-A storage module must keep Progress usable with an explicit lifecycle-readout fallback");
+    assert(/1\s+attempt for this site/i.test(await page.locator("[data-coach-progress]").innerText()),
+      "The Release-A storage fallback must preserve existing local Progress history");
+    assert(await page.getByRole("button", { name: "Download recording" }).count() === 1
+      && await page.getByRole("button", { name: "Download transcript" }).count() === 1
+      && await page.getByRole("button", { name: "Delete saved artifacts" }).count() === 1,
+    "The Release-A storage fallback must preserve per-attempt artifact controls");
+    assert(await page.locator(".artifact-retention-detail").innerText()
+      === "Local retention timing is temporarily unavailable.",
+    "Release-A artifacts must not be assigned lifecycle timing the older module cannot supply");
+    await assertNoAxeViolations(page, "Release-A storage module Progress fallback");
+    assert(coachingDataRequests.length === 0,
+      `The local Release-A Progress fallback unexpectedly sent coaching data requests: ${coachingDataRequests.join(", ")}`);
+    assert(pageErrors.length === 0,
+      `Release-A storage module Progress fallback emitted errors: ${JSON.stringify(pageErrors)}`);
+  } finally {
+    await context.close();
+  }
+}
+
+async function runArtifactUsageDashboardFlow(browser, origin) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const page = await context.newPage();
+  const pageErrors = [];
+  const coachingDataRequests = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.startsWith("/api/")) {
+      coachingDataRequests.push(request.url());
+    }
+  });
+
+  try {
+    await page.goto(origin);
+    const fixture = await page.evaluate(async () => {
+      const validId = "artifact-dashboard-valid";
+      const orphanId = "artifact-dashboard-orphan";
+      const audioBytes = 2_048;
+      const transcript = "é🙂";
+      const transcriptBytes = new TextEncoder().encode(transcript).byteLength;
+      const logicalBytes = audioBytes + transcriptBytes;
+      const limitBytes = 128 * 1_024 * 1_024;
+      const retainedAtMs = Date.now() - 60_000;
+      const expiresAtMs = retainedAtMs + (30 * 24 * 60 * 60 * 1_000);
+      const database = await new Promise((resolve, reject) => {
+        const request = indexedDB.open("nonstoptalk-coaching", 3);
+        request.onupgradeneeded = () => {
+          const summaries = request.result.createObjectStore("session-summaries", { keyPath: "id" });
+          summaries.createIndex("createdAt", "createdAt");
+          const artifacts = request.result.createObjectStore("session-artifacts", { keyPath: "id" });
+          artifacts.createIndex("createdAt", "createdAt");
+          const lifecycle = request.result.createObjectStore("artifact-lifecycle", { keyPath: "id" });
+          lifecycle.createIndex("expiresAtMs", "expiresAtMs");
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      await new Promise((resolve, reject) => {
+        const transaction = database.transaction(
+          ["session-summaries", "session-artifacts", "artifact-lifecycle"],
+          "readwrite",
+        );
+        const summaries = transaction.objectStore("session-summaries");
+        const artifacts = transaction.objectStore("session-artifacts");
+        summaries.put({
+          id: validId,
+          createdAt: new Date(retainedAtMs).toISOString(),
+          scenario: "interview",
+          goal: "pace",
+          targetDurationMs: 45_000,
+          metrics: { durationMs: 30_000, speakingRatio: 0.6, pauseCount: 2 },
+          advice: { focus: "Retained fixture" },
+          artifacts: {
+            audioStored: true,
+            audioBytes,
+            audioMimeType: "audio/webm",
+            transcriptStored: true,
+            transcriptMayBePartial: false,
+          },
+        });
+        artifacts.put({
+          id: validId,
+          createdAt: new Date(retainedAtMs).toISOString(),
+          audioBlob: new Blob([new Uint8Array(audioBytes)], { type: "audio/webm" }),
+          audioMimeType: "audio/webm",
+          transcript,
+          transcriptMayBePartial: false,
+        });
+        transaction.objectStore("artifact-lifecycle").put({
+          id: validId,
+          retainedAtMs,
+          expiresAtMs,
+          logicalBytes,
+          lifecycleSchemaVersion: 1,
+          legacyGrace: true,
+        });
+
+        // A valid payload without lifecycle bookkeeping is intentionally
+        // irreconcilable. Progress must report its cleanup without exposing
+        // any payload content in the aggregate readout.
+        summaries.put({
+          id: orphanId,
+          createdAt: new Date(retainedAtMs - 1_000).toISOString(),
+          scenario: "presentation",
+          goal: "pauses",
+          targetDurationMs: 45_000,
+          metrics: { durationMs: 30_000, speakingRatio: 0.5, pauseCount: 3 },
+          advice: { focus: "Orphan fixture" },
+          artifacts: {
+            audioStored: true,
+            audioBytes: 6,
+            audioMimeType: "audio/webm",
+            transcriptStored: false,
+            transcriptMayBePartial: false,
+          },
+        });
+        artifacts.put({
+          id: orphanId,
+          createdAt: new Date(retainedAtMs - 1_000).toISOString(),
+          audioBlob: new Blob(["orphan"], { type: "audio/webm" }),
+          audioMimeType: "audio/webm",
+          transcript: "",
+          transcriptMayBePartial: false,
+        });
+        transaction.oncomplete = resolve;
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error || new Error("Artifact dashboard fixture transaction aborted"));
+      });
+      database.close();
+      return {
+        validId,
+        orphanId,
+        audioBytes,
+        transcriptBytes,
+        logicalBytes,
+        limitBytes,
+        retainedAtMs,
+        expiresAtMs,
+      };
+    });
+    assert(fixture.logicalBytes === fixture.audioBytes + fixture.transcriptBytes
+      && fixture.transcriptBytes === 6,
+    "The dashboard fixture must independently exercise UTF-8 transcript byte accounting");
+
+    await page.goto(`${origin}/progress`);
+    await page.waitForSelector('[data-artifact-usage="ready"]');
+    const dashboard = page.locator('[data-artifact-usage="ready"]');
+    const meter = dashboard.locator("progress");
+    const formattedDeadline = await page.evaluate((expiresAtMs) => (
+      new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" })
+        .format(new Date(expiresAtMs))
+    ), fixture.expiresAtMs);
+    assert(Number(await meter.getAttribute("value")) === fixture.logicalBytes,
+      "Progress must meter the exact recording Blob bytes plus UTF-8 transcript bytes");
+    assert(Number(await meter.getAttribute("max")) === fixture.limitBytes,
+      "Progress must expose the exact 128 MiB logical app limit");
+    assert(await meter.getAttribute("aria-label")
+      === `${fixture.logicalBytes} bytes used of the ${fixture.limitBytes} byte NonStopTalk artifact limit`,
+    "The artifact usage meter must expose exact byte values to assistive technology");
+    const dashboardText = normalizeHyphenatedText(await dashboard.innerText());
+    assert(dashboardText.includes("2.0 kib of 128 mib app limit")
+      && dashboardText.includes(`exact logical use: ${fixture.logicalBytes} bytes`)
+      && dashboardText.includes("1 attempt retains artifacts")
+      && dashboardText.includes(normalizeHyphenatedText(`Earliest retention deadline: ${formattedDeadline}.`))
+      && dashboardText.includes("1 migrated artifact is in a one time retention grace window")
+      && dashboardText.includes("this visit removed 1 expired or invalid local artifact"),
+    "Populated Progress must show exact usage, the earliest deadline, migrated grace, and reconciliation cleanup");
+    const retentionDetail = normalizeHyphenatedText(
+      await page.locator(`[data-command="coach-delete-artifacts"][data-session-id="${fixture.validId}"]`)
+        .locator("xpath=following-sibling::p[contains(@class, 'artifact-retention-detail')]")
+        .innerText(),
+    );
+    assert(retentionDetail
+      === normalizeHyphenatedText(`2.0 KiB (${fixture.logicalBytes} bytes) stored locally · retention deadline ${formattedDeadline} · migrated retention grace`),
+    "The retained attempt must show its exact local size and lifecycle deadline");
+    assert(await page.locator(`[data-command="coach-delete-artifacts"][data-session-id="${fixture.orphanId}"]`).count() === 0,
+      "Progress must not expose controls for an artifact removed during reconciliation");
+    const orphanState = await page.evaluate(async (orphanId) => {
+      const database = await new Promise((resolve, reject) => {
+        const request = indexedDB.open("nonstoptalk-coaching");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      try {
+        return await new Promise((resolve, reject) => {
+          const transaction = database.transaction(
+            ["session-summaries", "session-artifacts", "artifact-lifecycle"],
+            "readonly",
+          );
+          const summary = transaction.objectStore("session-summaries").get(orphanId);
+          const artifact = transaction.objectStore("session-artifacts").get(orphanId);
+          const lifecycle = transaction.objectStore("artifact-lifecycle").get(orphanId);
+          transaction.oncomplete = () => resolve({
+            summary: summary.result,
+            artifact: artifact.result,
+            lifecycle: lifecycle.result,
+          });
+          transaction.onerror = () => reject(transaction.error);
+        });
+      } finally {
+        database.close();
+      }
+    }, fixture.orphanId);
+    assert(orphanState.summary?.artifacts?.audioStored === false
+      && orphanState.summary?.artifacts?.transcriptStored === false
+      && !orphanState.artifact
+      && !orphanState.lifecycle,
+    "The cleanup notice must correspond to an atomic payload/ledger removal and summary scrub");
+    await assertNoAxeViolations(page, "Populated artifact usage dashboard");
+
+    await page.setViewportSize({ width: 320, height: 800 });
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+      "The populated artifact dashboard must reflow at 320 CSS pixels without page-level horizontal scrolling");
+    await assertNoAxeViolations(page, "Populated artifact usage dashboard at 320 CSS pixels");
+
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.locator(`[data-command="coach-delete-artifacts"][data-session-id="${fixture.validId}"]`).click();
+    await page.waitForFunction(() => (
+      document.querySelector('[data-artifact-usage="ready"] progress')?.getAttribute("value") === "0"
+      && document.querySelector("#toast")?.textContent?.includes("compact summary remains")
+    ));
+    const emptyUsageText = normalizeHyphenatedText(await dashboard.innerText());
+    assert(Number(await meter.getAttribute("value")) === 0
+      && Number(await meter.getAttribute("max")) === fixture.limitBytes
+      && emptyUsageText.includes("0 b of 128 mib app limit")
+      && emptyUsageText.includes("0 attempts retain artifacts")
+      && emptyUsageText.includes("no artifact retention deadline is currently active")
+      && !emptyUsageText.includes("this visit removed"),
+    "Per-attempt deletion must refresh the aggregate usage and retention dashboard to zero");
+
+    const staleId = await page.evaluate(async () => {
+      const { saveCoachingSession } = await import("/coach-storage.js");
+      const id = "artifact-dashboard-expires-after-render";
+      const createdAt = new Date().toISOString();
+      const result = await saveCoachingSession({
+        id,
+        createdAt,
+        scenario: "interview",
+        goal: "pace",
+        targetDurationMs: 45_000,
+        metrics: { durationMs: 30_000, speakingRatio: 0.6, pauseCount: 2 },
+        advice: { focus: "Expiry refresh fixture" },
+      }, {
+        id,
+        createdAt,
+        audioBlob: new Blob(["stale"], { type: "audio/webm" }),
+        audioMimeType: "audio/webm",
+        transcript: "",
+        transcriptMayBePartial: false,
+      });
+      if (result?.artifactStatus !== "stored") throw new Error("Could not seed stale-download fixture");
+      return id;
+    });
+    await page.goto(`${origin}/progress`);
+    await page.waitForSelector(`[data-command="coach-download-audio"][data-session-id="${staleId}"]`);
+    await page.evaluate(async (id) => {
+      const database = await new Promise((resolve, reject) => {
+        const request = indexedDB.open("nonstoptalk-coaching");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      try {
+        await new Promise((resolve, reject) => {
+          const transaction = database.transaction("artifact-lifecycle", "readwrite");
+          const expiresAtMs = Date.now() - 1;
+          transaction.objectStore("artifact-lifecycle").put({
+            id,
+            retainedAtMs: expiresAtMs - (30 * 24 * 60 * 60 * 1_000),
+            expiresAtMs,
+            logicalBytes: 5,
+            lifecycleSchemaVersion: 1,
+            legacyGrace: false,
+          });
+          transaction.oncomplete = resolve;
+          transaction.onerror = () => reject(transaction.error);
+          transaction.onabort = () => reject(transaction.error || new Error("Could not expire stale-download fixture"));
+        });
+      } finally {
+        database.close();
+      }
+    }, staleId);
+    await page.locator(`[data-command="coach-download-audio"][data-session-id="${staleId}"]`).click();
+    await page.waitForFunction((id) => (
+      !document.querySelector(`[data-command="coach-download-audio"][data-session-id="${id}"]`)
+      && document.querySelector('[data-artifact-usage="ready"] progress')?.getAttribute("value") === "0"
+      && document.querySelector("#toast")?.textContent?.includes("artifact is unavailable")
+    ), staleId);
+    assert(normalizeHyphenatedText(await dashboard.innerText()).includes("0 attempts retain artifacts"),
+      "An artifact expiring after render must refresh stale usage and controls when download revalidates it");
+
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: "Delete local history" }).click();
+    await page.waitForSelector(".empty-progress");
+    assert(Number(await meter.getAttribute("value")) === 0
+      && normalizeHyphenatedText(await dashboard.innerText()).includes("no artifact retention deadline is currently active"),
+    "The no-history Progress state must keep an explicit zero-usage dashboard");
+    assert(coachingDataRequests.length === 0,
+      `The local artifact dashboard unexpectedly sent coaching data requests: ${coachingDataRequests.join(", ")}`);
+    assert(pageErrors.length === 0,
+      `Artifact usage dashboard flow emitted errors: ${JSON.stringify(pageErrors)}`);
   } finally {
     await context.close();
   }
@@ -1128,11 +1474,17 @@ async function runComposedStorageWarningFlow(browser, origin) {
   await context.addInitScript(syntheticCoachAudio);
   const page = await context.newPage();
   const pageErrors = [];
+  const coachingDataRequests = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.startsWith("/api/")) {
+      coachingDataRequests.push(request.url());
+    }
+  });
   await page.goto(origin);
   await page.evaluate(async () => {
     await new Promise((resolve, reject) => {
-      const request = indexedDB.open("nonstoptalk-coaching", 3);
+      const request = indexedDB.open("nonstoptalk-coaching", 2);
       request.onupgradeneeded = () => {
         const database = request.result;
         const capacityId = "existing-capacity";
@@ -1141,30 +1493,20 @@ async function runComposedStorageWarningFlow(browser, origin) {
         summaries.createIndex("createdAt", "createdAt");
         const artifacts = database.createObjectStore("session-artifacts", { keyPath: "id" });
         artifacts.createIndex("createdAt", "createdAt");
-        const lifecycle = database.createObjectStore("artifact-lifecycle", { keyPath: "id" });
-        lifecycle.createIndex("expiresAtMs", "expiresAtMs");
         summaries.put({
           id: capacityId,
           createdAt: new Date(retainedAtMs).toISOString(),
           scenario: "interview",
           goal: "pace",
-          artifacts: { audioStored: true, audioBytes: 134_217_728, audioMimeType: "audio/webm", transcriptStored: false, transcriptMayBePartial: false },
+          artifacts: { audioStored: true, audioBytes: 134_217_729, audioMimeType: "audio/webm", transcriptStored: false, transcriptMayBePartial: false },
         });
         artifacts.put({
           id: capacityId,
           createdAt: new Date(retainedAtMs).toISOString(),
-          audioBlob: new Blob([new ArrayBuffer(134_217_728)], { type: "audio/webm" }),
+          audioBlob: new Blob([new ArrayBuffer(134_217_729)], { type: "audio/webm" }),
           audioMimeType: "audio/webm",
           transcript: "",
           transcriptMayBePartial: false,
-        });
-        lifecycle.put({
-          id: capacityId,
-          retainedAtMs,
-          expiresAtMs: retainedAtMs + 2_592_000_000,
-          logicalBytes: 134_217_728,
-          lifecycleSchemaVersion: 1,
-          legacyGrace: false,
         });
       };
       request.onsuccess = () => {
@@ -1198,6 +1540,25 @@ async function runComposedStorageWarningFlow(browser, origin) {
   const artifacts = await storedArtifacts(page);
   assert(artifacts.length === 1 && artifacts[0]?.id === "existing-capacity",
     "The app-limit fallback must preserve existing artifacts without retaining the rejected recording or transcript");
+  await page.goto(`${origin}/progress`);
+  await page.waitForSelector('[data-artifact-usage="ready"]');
+  const dashboard = page.locator('[data-artifact-usage="ready"]');
+  const dashboardText = normalizeHyphenatedText(await dashboard.innerText());
+  const meter = dashboard.locator("progress");
+  assert(Number(await meter.getAttribute("value")) === 134_217_728
+    && Number(await meter.getAttribute("max")) === 134_217_728,
+  "An over-limit migrated artifact must clamp the visual meter at the app limit");
+  assert(await meter.getAttribute("aria-label")
+    === "134217729 bytes used of the 134217728 byte NonStopTalk artifact limit",
+  "The clamped meter must still expose the exact over-limit usage to assistive technology");
+  assert(dashboardText.includes("1 attempt retains artifacts")
+    && dashboardText.includes("usage is 1 b (1 byte) above the app limit")
+    && dashboardText.includes("new artifact retention is blocked until it fits")
+    && dashboardText.includes("1 migrated artifact is in a one time retention grace window")
+    && dashboardText.includes("existing content is not evicted"),
+  "Progress must explain the over-limit migrated-grace state without implying eviction");
+  assert(coachingDataRequests.length === 0,
+    `The local over-limit Progress dashboard unexpectedly sent coaching data requests: ${coachingDataRequests.join(", ")}`);
   assert(pageErrors.length === 0, `Composed storage-warning flow emitted errors: ${JSON.stringify(pageErrors)}`);
   await context.close();
 }
@@ -1523,6 +1884,7 @@ try {
   browser = await launchBrowser();
   await runPracticeFlow(browser, origin);
   await runMixedGenerationRetentionDisclosureFlow(browser, origin);
+  await runArtifactUsageDashboardFlow(browser, origin);
   await runPracticeLoopFlow(browser, origin);
   await runDefaultRetentionFlow(browser, origin);
   await runTranscriptFinalizationTimeoutFlow(browser, origin);
