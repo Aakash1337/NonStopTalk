@@ -38,6 +38,7 @@ jobs:
       - run: go vet ./...
       - run: npm run test:coach
       - run: npm run test:cloud-progress
+      - run: npm run test:setup-kits
       - run: npm run test:admin
       - run: npm run test:production-monitor
       - run: npm run test:deployment-contract

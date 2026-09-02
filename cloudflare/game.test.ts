@@ -94,6 +94,157 @@ test("newer topic generations and manual edits invalidate stale drafts", () => {
 	);
 });
 
+test("applies a built-in setup kit as one canonical room mutation", () => {
+	const room = createRoomState("ABC234", host, "Alice", 100);
+	const pack = TOPIC_PACKS.find((candidate) => candidate.id === "absurd");
+	assert.ok(pack);
+	room.deck = room.topics.map((_, index) => index);
+	room.deckCursor = 3;
+	room.lastTopicIndex = 2;
+	const beforeVersion = room.version;
+
+	applyAction(room, host, {
+		type: "apply-setup-kit",
+		duration: "45",
+		silence: "3",
+		rounds: "2",
+		topicPack: pack.id,
+		topics: ["A browser-modified replacement must be ignored"],
+	}, 250);
+
+	assert.deepEqual(room.settings, { duration: 45, silence: 3, rounds: 2, topicPack: "absurd" });
+	assert.deepEqual(room.topics, [...pack.topics]);
+	assert.deepEqual(room.deck, []);
+	assert.equal(room.deckCursor, 0);
+	assert.equal(room.lastTopicIndex, null);
+	assert.equal(room.topicGeneration, 1);
+	assert.equal(room.version, beforeVersion + 1);
+	assert.equal(room.updatedAt, 250);
+	assert.equal(room.hostDisconnectedAt, 250);
+});
+
+test("applies and normalizes a custom setup kit", () => {
+	const room = createRoomState("ABC234", host, "Alice", 100);
+	room.topicGeneration = 7;
+	room.deck = room.topics.map((_, index) => index);
+	room.deckCursor = 2;
+	room.lastTopicIndex = 1;
+
+	applyAction(room, host, {
+		type: "apply-setup-kit",
+		duration: "999",
+		silence: "-8",
+		rounds: "0",
+		topicPack: "custom",
+		topics: "  First topic  \r\nFIRST TOPIC\r\nSecond topic  ",
+	}, 200);
+
+	assert.deepEqual(room.settings, { duration: 300, silence: 1, rounds: 1, topicPack: "custom" });
+	assert.deepEqual(room.topics, ["First topic", "Second topic"]);
+	assert.equal(room.topicGeneration, 8);
+	assert.deepEqual(room.deck, []);
+	assert.equal(room.deckCursor, 0);
+	assert.equal(room.lastTopicIndex, null);
+});
+
+test("setup-kit topic deduplication uses locale-independent casing", () => {
+	const room = createRoomState("ABC234", host, "Alice", 100);
+	applyAction(room, host, {
+		type: "apply-setup-kit",
+		duration: 60,
+		silence: 2,
+		rounds: 1,
+		topicPack: "custom",
+		topics: ["İ", "i\u0307"],
+	}, 200);
+	assert.deepEqual(room.topics, ["İ"]);
+});
+
+test("invalid setup kits reject without mutating any room state", () => {
+	const invalidKits = [
+		{ topicPack: "custom", topics: " \r\n\t" },
+		{ topicPack: "not-a-pack", topics: ["Otherwise valid topic"] },
+	];
+
+	for (const invalid of invalidKits) {
+		const room = createRoomState("ABC234", host, "Alice", 100);
+		room.settings = { duration: 90, silence: 4, rounds: 3, topicPack: "story" };
+		room.topics = ["Existing one", "Existing two"];
+		room.deck = [1, 0];
+		room.deckCursor = 1;
+		room.lastTopicIndex = 0;
+		room.topicGeneration = 9;
+		room.hostDisconnectedAt = 75;
+		const before = structuredClone(room);
+
+		assert.throws(
+			() => applyAction(room, host, {
+				type: "apply-setup-kit",
+				duration: 10,
+				silence: 1,
+				rounds: 1,
+				...invalid,
+			}, 500),
+			(error: unknown) => error instanceof GameError && error.status === 400,
+		);
+		assert.deepEqual(room, before);
+	}
+});
+
+test("setup kits are host-only and setup-only", () => {
+	const room = createRoomState("ABC234", host, "Alice", 100);
+	joinRoom(room, guest, "Bob", 150);
+	const kit = {
+		type: "apply-setup-kit",
+		duration: 45,
+		silence: 3,
+		rounds: 2,
+		topicPack: "story",
+		topics: [],
+	};
+	const beforeGuestAttempt = structuredClone(room);
+	assert.throws(
+		() => applyAction(room, guest, kit, 200),
+		(error: unknown) => error instanceof GameError && error.status === 403,
+	);
+	assert.deepEqual(room, beforeGuestAttempt);
+
+	applyAction(room, host, { type: "start-game" }, 250);
+	const beforeStartedAttempt = structuredClone(room);
+	assert.throws(
+		() => applyAction(room, host, kit, 300),
+		(error: unknown) => error instanceof GameError && error.status === 409,
+	);
+	assert.deepEqual(room, beforeStartedAttempt);
+});
+
+test("applying a setup kit invalidates an outstanding generated-topic draft", () => {
+	const room = createRoomState("ABC234", host, "Alice", 100);
+	const draftGeneration = beginTopicGeneration(room, host, 150);
+	const beforeVersion = room.version;
+	applyAction(room, host, {
+		type: "apply-setup-kit",
+		duration: 60,
+		silence: 2,
+		rounds: 1,
+		topicPack: "debate",
+		topics: ["Ignored browser copy"],
+	}, 200);
+	assert.equal(room.topicGeneration, draftGeneration + 1);
+	assert.equal(room.version, beforeVersion + 1);
+	const applied = structuredClone(room);
+
+	assert.throws(
+		() => applyAction(room, host, {
+			type: "custom-topics",
+			topics: ["Late generated topic"],
+			topicGeneration: draftGeneration,
+		}, 250),
+		(error: unknown) => error instanceof GameError && error.status === 409,
+	);
+	assert.deepEqual(room, applied);
+});
+
 test("plays and scores a complete round with authoritative turn IDs", () => {
 	const room = createRoomState("ABC234", host, "Alice", 0);
 	joinRoom(room, guest, "Bob", 1);

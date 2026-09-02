@@ -1,10 +1,14 @@
+import { readFile } from "node:fs/promises";
 import process from "node:process";
 
 import {
   assertExpectedAnalyticsDelivery,
   resolveExpectedAnalyticsDelivery,
 } from "./smoke-production-policy.mjs";
-import { waitForPublicModuleGraph } from "./smoke-production-support.mjs";
+import {
+  readBoundedJavaScriptBody,
+  waitForExactPublicModuleGraph,
+} from "./smoke-production-support.mjs";
 
 const configuredOrigin = process.argv[2]
   || process.env.NONSTOPTALK_PRODUCTION_ORIGIN
@@ -18,6 +22,18 @@ const WEB_ANALYTICS_ORIGIN = "https://static.cloudflareinsights.com";
 const PLATFORM_STATUS_ATTEMPTS = 5;
 const PLATFORM_STATUS_RETRY_MS = 1_000;
 const SUPPORTED_PLATFORM_SCHEMA_VERSIONS = new Set([5, 6]);
+const PUBLIC_JAVASCRIPT_ASSET_PATHS = [
+  "/app.js",
+  "/coach-storage.js",
+  "/coach-engine.js",
+  "/setup-kits.js",
+];
+const expectedJavaScriptAssets = new Map(await Promise.all(
+  PUBLIC_JAVASCRIPT_ASSET_PATHS.map(async (pathname) => [
+    pathname,
+    await readFile(new URL(`../cloudflare/public${pathname}`, import.meta.url), "utf8"),
+  ]),
+));
 if (!/^https:$/.test(origin.protocol) || origin.pathname !== "/") {
   throw new Error("NONSTOPTALK_PRODUCTION_ORIGIN must be an HTTPS origin without a path.");
 }
@@ -100,7 +116,7 @@ async function getJavaScriptAsset(pathname) {
     `${pathname} did not return JavaScript`);
   assert(response.headers.get("x-content-type-options") === "nosniff",
     `${pathname} is missing MIME-sniffing protection`);
-  const source = await response.text();
+  const source = await readBoundedJavaScriptBody(response, pathname);
   assert(source.trim().length > 0 && !/^\s*(?:<!doctype\s+html|<html\b)/iu.test(source),
     `${pathname} returned an empty or HTML fallback document`);
   return source;
@@ -127,7 +143,10 @@ for (const pathname of ["/", "/practice", "/progress"]) {
     `${pathname} must permit only same-origin scripts and the configured Cloudflare Web Analytics beacon origin`);
 }
 
-await waitForPublicModuleGraph({ loadJavaScriptAsset: getJavaScriptAsset });
+await waitForExactPublicModuleGraph({
+  loadJavaScriptAsset: getJavaScriptAsset,
+  expectedJavaScriptAssets,
+});
 
 const adminDocumentResponse = await get("/admin/analytics", "text/html");
 assert(adminDocumentResponse.headers.get("content-type")?.startsWith("text/html"),
@@ -191,6 +210,6 @@ console.log(JSON.stringify({
   analyticsDelivery: observedAnalyticsDelivery,
   checkedRoutes: [
     "/", "/practice", "/progress", "/app.js", "/coach-storage.js", "/coach-engine.js",
-    "/admin/analytics", "/api/v1/platform/status",
+    "/setup-kits.js", "/admin/analytics", "/api/v1/platform/status",
   ],
 }));

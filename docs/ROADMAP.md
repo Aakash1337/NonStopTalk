@@ -60,6 +60,7 @@ The game loop is playable. Formal accessibility and broad hardware/browser valid
 - Six-character room codes
 - Remote join, leave, browser-token reconnect, and live presence
 - Host-gated setup and scoring controls
+- Host-only device/origin-local setup kits in the Cloudflare source, applied through one atomic room action without exposing the undrawn topic list to guests
 - Pass-and-play and remote seats in one room
 - Server-Sent Events synchronization in the Go edition and hibernatable WebSockets on Cloudflare
 - Server-side turn clock for remote score caps
@@ -86,15 +87,16 @@ The first incremental platform slice is being built without replacing the playab
 - Modular separation among Durable Object room authority, D1 repositories, identity, coaching backup, analytics, and topic providers
 - Local coaching and gameplay that continue to work when D1 or analytics is unavailable
 
-This phase remains free-or-cheap by default: it uses existing Cloudflare primitives, keeps routine generation offline unless enabled, makes the larger model an explicit escalation, and caps aggregate external calls. The identity foundation adds only two small D1 metadata rows per browser; cleanup health adds one global row and one write per successful day. The receipt/outbox lane adds no Cloudflare service, binding, provider call, paid product, or per-user row; it reuses each room's SQLite Durable Object, its alarm, central D1 schema 6, and the existing room-fact secret. Production `best-effort` traffic adds no local outbox table or receipt write; staging exact mode adds one bounded local event and one expiring D1 receipt per delivered room milestone. Accounts, cross-device authentication/progress, external coaching AI, Queue-backed work, and R2 media storage remain later phases. The next identity slice may add bilateral numeric-code linking only with a separate `IDENTITY_HASH_KEY` and explicit consent on both browsers; it must not silently grant cloud-summary consent. See the [Web platform plan](WEB_PLATFORM_PLAN.md).
+This phase remains free-or-cheap by default: it uses existing Cloudflare primitives, keeps routine generation offline unless enabled, makes the larger model an explicit escalation, and caps aggregate external calls. The identity foundation adds only two small D1 metadata rows per browser; cleanup health adds one global row and one write per successful day. The receipt/outbox lane adds no Cloudflare service, binding, provider call, paid product, or per-user row; it reuses each room's SQLite Durable Object, its alarm, central D1 schema 6, and the existing room-fact secret. Device-local setup kits likewise add no Cloudflare resource, binding, migration, provider call, or cloud-storage cost: only explicit Apply uses the existing room Durable Object action. Production `best-effort` traffic adds no local outbox table or receipt write; staging exact mode adds one bounded local event and one expiring D1 receipt per delivered room milestone. Accounts, cross-device authentication/progress, external coaching AI, Queue-backed work, and R2 media storage remain later phases. The next identity slice may add bilateral numeric-code linking only with a separate `IDENTITY_HASH_KEY` and explicit consent on both browsers; it must not silently grant cloud-summary consent. See the [Web platform plan](WEB_PLATFORM_PLAN.md).
 
-## 5. Content, sharing, and retention — Implemented locally
+## 5. Content, sharing, and retention — Implemented
 
 - Preset packs with difficulty labels
 - Offline, Anthropic-assisted, or Z.AI GLM-assisted theme generation in the local Go edition, selected with `NONSTOPTALK_AI_PROVIDER`; invalid or incomplete selections warn and fail closed to offline templates
 - Editable Cloudflare topic drafts from deterministic templates, optional direct GLM-4.7 or Workers AI GLM-5.3-Flash routine generation, or explicitly selected Gemma 4 31B escalation
-- Browser-local saved presets
-- Plain-text custom-topic import/export
+- Browser-local saved presets in the Go edition and host-only named setup kits in the Cloudflare source. A Cloudflare kit stores the currently applied duration, silence, rounds, topic-pack choice, and custom topics in unencrypted `localStorage` for that origin/browser only; it is best effort, unsynced, and has no recovery
+- Plain-text custom-topic import/export in both editions. In Cloudflare, import fills only the editor draft until explicit use, while the downloaded `.txt` is outside app deletion/control
+- Cloudflare local limits of 25 kits, 40 Unicode code points per name, 500 custom topics of 200 code points each, 20,000 editor characters, 64 KiB per imported topic file, and 512 KiB for the serialized store. Local save/delete/import/export calls no API, model, analytics sink, D1, or Durable Object; one explicit Apply sends the selected settings/topics to the existing same-origin room object
 - Per-room history for the last 20 completed games
 - Local web JSON snapshots with restore and 10-second autosave
 
@@ -143,12 +145,13 @@ Implemented work includes:
 - Schema-v5 cleanup heartbeat with monotonic cron timestamps, backlog/staleness readiness, and a twice-hourly zero-secret read-only matrix that independently checks production `best-effort` and staging `durable-outbox` policy
 - A deployed schema-5/6 compatibility bridge plus the additive schema-v6 milestone-receipt table, strict internal receiver, bounded expiry cleanup, Release-A retry consumer, and configuration-gated Release-B normal-room producer, with canonical-payload, replay/conflict, post-commit analytics, physical-upgrade, rollback, FIFO retry/dead-letter, transaction replay, atomic alarm/state/event, capacity, exactly-one-routing, and schema-skew tests
 - Host-authorized Cloudflare topic generation with separate provider adapters, per-attempt consent, aggregate daily cost controls, and deterministic failure fallback
+- Bounded Cloudflare setup-kit storage, plain-text topic transfer, one-action atomic apply, host/phase authorization, browser-storage failure handling, and guest topic privacy coverage
 - A separate-document operator analytics dashboard with strict CSP/no-transform isolation, source-quality tests, and narrow/mobile browser smoke coverage
 - Separate production/staging databases, analytics datasets, rate limits, secrets, cron schedules, deployment probes, migration checks, and production incident/recovery guidance
 
 Remaining hardening:
 
-- Game-feature parity between the Go and Cloudflare editions
+- Game-feature parity between the Go and Cloudflare editions; the remaining known gaps are the AI judge, microphone picker, and sound cues
 - Expansion of the automated cross-edition contract beyond the implemented core rules
 - Broader browser/device testing
 - Formal security and accessibility reviews

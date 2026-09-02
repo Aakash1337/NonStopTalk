@@ -93,6 +93,14 @@ textarea { resize: vertical; line-height: 1.5; }
 .topic-model-fields { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(14rem, .8fr); gap: .7rem; }
 .topic-model-actions { justify-content: flex-start; }
 .topic-model-actions .hint { max-width: 48rem; margin: 0; }
+.topic-editor-actions { justify-content: flex-start; align-items: flex-end; }
+.topic-file-input { min-width: min(100%, 18rem); }
+.setup-kits { display: grid; gap: .8rem; min-width: 0; }
+.setup-kits > .hint { margin-bottom: 0; }
+.setup-kit-library, .setup-kit-save { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .7rem; align-items: end; min-width: 0; }
+.setup-kit-actions { justify-content: flex-start; }
+.setup-feedback { min-height: 1.3em; margin: 0; color: var(--muted); font-size: .84rem; line-height: 1.5; overflow-wrap: anywhere; }
+.setup-feedback.error { color: var(--danger); }
 
 .turn-card { min-height: 31rem; padding: clamp(1.25rem, 4vw, 3rem); display: grid; align-content: center; text-align: center; }
 .turn-card .room-state-title { margin-inline: auto; max-width: 18ch; font-size: clamp(2.2rem, 7vw, 5.5rem); line-height: .98; }
@@ -346,6 +354,10 @@ textarea { resize: vertical; line-height: 1.5; }
   .settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .settings .pack { grid-column: 1 / -1; }
   .topic-model-fields { grid-template-columns: 1fr; }
+  .topic-editor-actions, .setup-kit-actions { width: 100%; align-items: stretch; flex-direction: column; }
+  .topic-editor-actions .button, .topic-editor-actions .topic-file-input, .setup-kit-actions .button { width: 100%; }
+  .setup-kit-library, .setup-kit-save { grid-template-columns: 1fr; }
+  .setup-kit-save .button { width: 100%; }
   .player-row { align-items: flex-start; }
   .room-code { font-size: 1.7rem; }
   .site-header { flex-wrap: wrap; gap: .75rem; }

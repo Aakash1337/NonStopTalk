@@ -9,6 +9,15 @@ import {
   relationshipForSummary,
 } from "./coach-loop.js";
 import * as coachingStorage from "./coach-storage.js";
+import {
+  SETUP_KIT_MAX_NAME_CODE_POINTS,
+  SETUP_KIT_STORAGE_KEY,
+  createSetupKitStore,
+  normalizeSetupKit,
+  parseTopicText,
+  readTopicTextFile,
+  serializeTopicText,
+} from "./setup-kits.js";
 
 const {
   clearCoachingSummaries,
@@ -23,6 +32,7 @@ const {
 const app = document.querySelector("#app");
 const announcer = document.querySelector("#announcer");
 const toast = document.querySelector("#toast");
+const setupKitStore = createSetupKitStore();
 
 let room = null;
 let roomCode = "";
@@ -44,6 +54,7 @@ let practice = freshPracticeState();
 let progressSessions = [];
 let progressArtifactSessions = new Map();
 let pendingPracticeResume = null;
+let roomSetupView = freshRoomSetupView();
 
 const PRACTICE_SCENARIOS = [
   { id: "interview", name: "Interview answer", prompt: "Tell me about a time you solved a difficult problem." },
@@ -61,10 +72,13 @@ const HAS_REQUIRED_ARTIFACT_LIFECYCLE = coachingStorageSchema.version >= 3
 
 document.addEventListener("click", handleClick);
 document.addEventListener("submit", handleSubmit);
+document.addEventListener("input", handleSetupDraftInput);
+document.addEventListener("change", handleSetupChange);
 window.addEventListener("popstate", () => {
   routeFocusRequested = true;
   loadRoute();
 });
+window.addEventListener("storage", handleSetupStorage);
 window.addEventListener("pagehide", shutdown);
 
 loadRoute();
@@ -72,6 +86,7 @@ loadRoute();
 async function loadRoute() {
   const generation = ++routeGeneration;
   stopRoomLifecycle();
+  roomSetupView = freshRoomSetupView();
   const finishingIntoProgress = practice.phase === "finishing" && /^\/progress\/?$/i.test(location.pathname);
   if (!finishingIntoProgress) stopCoachingLifecycle();
   room = null;
@@ -144,6 +159,24 @@ function renderLanding(message = "") {
         </form>
       </div>
     </section>`;
+}
+
+function freshRoomSetupView(code = "") {
+  return {
+    roomCode: code,
+    selectedKit: "",
+    kitNameDraft: "",
+    kitStatus: "",
+    kitStatusError: false,
+    topicDraft: null,
+    topicStatus: "",
+    topicStatusError: false,
+  };
+}
+
+function ensureRoomSetupView() {
+  if (roomSetupView.roomCode !== roomCode) roomSetupView = freshRoomSetupView(roomCode);
+  return roomSetupView;
 }
 
 function freshPracticeState(setup = {}, loop = null) {
@@ -1722,6 +1755,7 @@ function renderRoom() {
 
 function renderSetup() {
   const viewer = room.viewer;
+  const setupView = ensureRoomSetupView();
   const selectedPack = room.topicPacks.find((pack) => pack.id === room.settings.topicPack);
   return `
     <section class="room-grid">
@@ -1774,10 +1808,19 @@ function renderSetup() {
           <form class="stack" data-room-action>
             <input type="hidden" name="type" value="custom-topics">
             <label class="sr-only" for="room-custom-topics">Custom topics, one per line</label>
-            <textarea id="room-custom-topics" name="topics" rows="7" maxlength="20000">${escapeHTML(room.topics.join("\n"))}</textarea>
-            <div class="action-row" style="justify-content:flex-start"><button class="button" type="submit">Use custom list</button></div>
+            <textarea id="room-custom-topics" name="topics" rows="7" maxlength="20000">${escapeHTML(setupView.topicDraft ?? room.topics.join("\n"))}</textarea>
+            <div class="action-row topic-editor-actions">
+              <button class="button" type="submit">Use custom list</button>
+              <button class="button ghost" type="button" data-command="topic-export" data-setup-focus="topic-export">Export topic list</button>
+              <label class="topic-file-input" for="room-topic-import">Import topic list (.txt)
+                <input id="room-topic-import" type="file" accept=".txt,text/plain" aria-describedby="topic-file-hint" data-topic-import data-setup-focus="topic-import">
+              </label>
+            </div>
+            <p class="hint" id="topic-file-hint">Import changes only this editor. Files are limited to 64 KiB. Choose Use custom list to apply the draft to the room.</p>
+            <p class="setup-feedback${setupView.topicStatusError ? " error" : ""}" data-topic-status role="status" aria-live="polite" aria-atomic="true">${escapeHTML(setupView.topicStatus)}</p>
           </form>
         </div>
+        ${renderSetupKits()}
         <div class="panel wide action-row">
           <div><p class="eyebrow">Ready?</p><h2>${room.settings.duration}s to survive · ${room.settings.silence}s silence limit</h2></div>
           <button class="button primary" type="button" data-command="start-game">Start game</button>
@@ -1819,6 +1862,47 @@ function renderHostSettings() {
     <button class="button" type="submit">Apply settings</button>
     <p class="hint wide">The free online edition uses classic scoring. The optional AI judge remains available in the local Go edition.</p>
   </form>`;
+}
+
+function renderSetupKits() {
+  const setupView = ensureRoomSetupView();
+  let kits = [];
+  let storageError = "";
+  try {
+    kits = setupKitStore.list();
+  } catch (error) {
+    storageError = setupKitErrorMessage(error);
+  }
+  if (!kits.some((kit) => kit.name === setupView.selectedKit)) {
+    setupView.selectedKit = kits[0]?.name || "";
+  }
+  const unavailable = Boolean(storageError);
+  const empty = kits.length === 0;
+  const feedback = storageError || setupView.kitStatus;
+  const feedbackError = unavailable || setupView.kitStatusError;
+  return `<section class="panel wide setup-kits" data-setup-kits aria-labelledby="setup-kits-title">
+    <div class="section-head"><div><p class="eyebrow">On this device</p><h2 id="setup-kits-title">Local setup kits</h2></div><span>${kits.length} saved</span></div>
+    <p class="hint">Save this room’s applied timing, topic pack, and custom topics in this browser. Applying a kit sends those settings and topics to this Cloudflare room.</p>
+    <form class="setup-kit-library" data-setup-kit-library>
+      <label for="room-setup-kit-list">Saved setup kit
+        <select id="room-setup-kit-list" name="selectedKit" data-setup-kit-list data-setup-focus="kit-list" ${unavailable ? "disabled" : ""}>
+          ${empty ? `<option value="">No saved kits</option>` : kits.map((kit) => `<option value="${escapeHTML(kit.name)}" ${kit.name === setupView.selectedKit ? "selected" : ""}>${escapeHTML(kit.name)}</option>`).join("")}
+        </select>
+      </label>
+      <div class="action-row setup-kit-actions">
+        <button class="button" type="button" data-command="setup-kit-apply" data-setup-focus="kit-apply" ${empty || unavailable ? "disabled" : ""}>Apply selected kit</button>
+        <button class="button ghost danger" type="button" data-command="setup-kit-delete" data-setup-focus="kit-delete" ${empty || unavailable ? "disabled" : ""}>Delete selected kit</button>
+      </div>
+    </form>
+    <form class="setup-kit-save" data-setup-kit-save>
+      <label for="room-setup-kit-name">Kit name
+        <input id="room-setup-kit-name" name="kitName" value="${escapeHTML(setupView.kitNameDraft)}" autocomplete="off" aria-describedby="setup-kit-name-hint" data-setup-focus="kit-name" ${unavailable ? "disabled" : ""} required>
+      </label>
+      <button class="button ghost" type="submit" data-setup-focus="kit-save" ${unavailable ? "disabled" : ""}>Save applied setup</button>
+    </form>
+    <p class="hint" id="setup-kit-name-hint">Use 1–${SETUP_KIT_MAX_NAME_CODE_POINTS} characters. Kit names stay in this browser.</p>
+    <p class="setup-feedback${feedbackError ? " error" : ""}" data-setup-kit-status role="status" aria-live="polite" aria-atomic="true">${escapeHTML(feedback)}</p>
+  </section>`;
 }
 
 function renderSettingsSummary() {
@@ -1905,6 +1989,176 @@ function actionButton(type, label, values, aria, extraClass = "") {
   return `<button class="button small icon ${extraClass}" type="button" data-command="action" data-action-type="${escapeHTML(type)}" data-action-values="${escapeHTML(JSON.stringify(values))}" aria-label="${escapeHTML(aria)}">${escapeHTML(label)}</button>`;
 }
 
+function isCurrentHostSetup(code = roomCode, generation = routeGeneration) {
+  return code === roomCode
+    && generation === routeGeneration
+    && room?.phase === "setup"
+    && room.viewer?.isHost;
+}
+
+function setupKitErrorMessage(error) {
+  if (error?.name === "SetupKitError" && typeof error.message === "string") return error.message;
+  return error instanceof Error && error.message
+    ? error.message
+    : "Local setup kits are unavailable in this browser.";
+}
+
+function setSetupFeedback(kind, message, error = false) {
+  const setupView = ensureRoomSetupView();
+  if (kind === "topic") {
+    setupView.topicStatus = message;
+    setupView.topicStatusError = error;
+  } else {
+    setupView.kitStatus = message;
+    setupView.kitStatusError = error;
+  }
+  const target = app.querySelector(kind === "topic" ? "[data-topic-status]" : "[data-setup-kit-status]");
+  if (!target) return;
+  target.textContent = message;
+  target.classList.toggle("error", error);
+}
+
+function focusSetupControl(key) {
+  if (!key) return false;
+  const control = Array.from(app.querySelectorAll("[data-setup-focus]"))
+    .find((candidate) => candidate.dataset.setupFocus === key && !candidate.disabled);
+  if (!control) return false;
+  control.focus({ preventScroll: true });
+  return true;
+}
+
+function refreshSetupKitPanel(focusKey = "") {
+  if (!isCurrentHostSetup()) return;
+  const panel = app.querySelector("[data-setup-kits]");
+  if (!panel) return;
+  const previousFocus = captureSetupControlFocus();
+  panel.outerHTML = renderSetupKits();
+  if (!focusSetupControl(focusKey)) restoreSetupControlFocus(previousFocus);
+}
+
+function currentAppliedSetupKit(name) {
+  if (!isCurrentHostSetup()) throw new Error("Only the host can save setup kits before the game starts.");
+  return normalizeSetupKit({
+    name,
+    duration: room.settings.duration,
+    silence: room.settings.silence,
+    rounds: room.settings.rounds,
+    topicPack: room.settings.topicPack,
+    topics: room.settings.topicPack === "custom" ? room.topics : [],
+  });
+}
+
+function saveAppliedSetupKit(name) {
+  const kit = currentAppliedSetupKit(name);
+  const existing = setupKitStore.get(kit.name);
+  if (existing && !window.confirm(`Replace the saved “${kit.name}” kit in this browser?`)) return;
+  const saved = setupKitStore.save(kit, { overwrite: Boolean(existing) });
+  const setupView = ensureRoomSetupView();
+  setupView.selectedKit = saved.name;
+  setupView.kitNameDraft = saved.name;
+  setupView.kitStatus = `Saved “${saved.name}” on this device.`;
+  setupView.kitStatusError = false;
+  refreshSetupKitPanel("kit-save");
+}
+
+async function applySelectedSetupKit() {
+  if (!isCurrentHostSetup()) throw new Error("Only the host can apply setup kits before the game starts.");
+  const selected = ensureRoomSetupView().selectedKit;
+  const kit = selected ? setupKitStore.get(selected) : null;
+  if (!kit) throw new Error("Choose a saved setup kit first.");
+  const accepted = await doAction({
+    type: "apply-setup-kit",
+    duration: kit.duration,
+    silence: kit.silence,
+    rounds: kit.rounds,
+    topicPack: kit.topicPack,
+    topics: kit.topics,
+  });
+  if (!accepted || !isCurrentHostSetup()) return;
+  setSetupFeedback("kit", `Applied “${kit.name}” to room ${roomCode}.`);
+}
+
+function deleteSelectedSetupKit() {
+  if (!isCurrentHostSetup()) throw new Error("Only the host can delete setup kits before the game starts.");
+  const setupView = ensureRoomSetupView();
+  const selected = setupView.selectedKit;
+  if (!selected || !setupKitStore.get(selected)) throw new Error("Choose a saved setup kit first.");
+  if (!window.confirm(`Delete “${selected}” from this browser? This does not change the room.`)) return;
+  setupKitStore.remove(selected);
+  setupView.selectedKit = "";
+  setupView.kitStatus = `Deleted “${selected}” from this device.`;
+  setupView.kitStatusError = false;
+  refreshSetupKitPanel("kit-list");
+}
+
+function handleSetupDraftInput(event) {
+  const control = event.target instanceof Element ? event.target : null;
+  if (!control || !isCurrentHostSetup()) return;
+  const setupView = ensureRoomSetupView();
+  if (control.matches('[data-setup-kit-save] input[name="kitName"]')) {
+    setupView.kitNameDraft = control.value;
+  } else if (control.matches("[data-setup-kit-list]")) {
+    setupView.selectedKit = control.value;
+  } else if (control.matches('#room-custom-topics[name="topics"]')) {
+    setupView.topicDraft = control.value;
+  }
+}
+
+async function handleSetupChange(event) {
+  const control = event.target instanceof Element ? event.target : null;
+  if (!control) return;
+  if (control.matches("[data-setup-kit-list]") && isCurrentHostSetup()) {
+    ensureRoomSetupView().selectedKit = control.value;
+    return;
+  }
+  if (!control.matches("[data-topic-import]")) return;
+  const file = control.files?.[0];
+  if (!file || busy || !isCurrentHostSetup()) return;
+  const code = roomCode;
+  const generation = routeGeneration;
+  try {
+    setBusy(true);
+    if (!/\.txt$/iu.test(file.name)) throw new Error("Choose a plain-text .txt topic file.");
+    const topics = await readTopicTextFile(file);
+    if (!isCurrentHostSetup(code, generation)) return;
+    const setupView = ensureRoomSetupView();
+    setupView.topicDraft = topics.join("\n");
+    const textarea = app.querySelector("#room-custom-topics");
+    if (textarea) {
+      textarea.value = setupView.topicDraft;
+      textarea.focus({ preventScroll: true });
+    }
+    setSetupFeedback("topic", `Imported ${topics.length} ${topics.length === 1 ? "topic" : "topics"} from “${file.name}”. Review the draft, then choose Use custom list.`);
+  } catch (error) {
+    if (isCurrentHostSetup(code, generation)) setSetupFeedback("topic", setupKitErrorMessage(error), true);
+  } finally {
+    if (control.isConnected) control.value = "";
+    setBusy(false);
+  }
+}
+
+function handleSetupStorage(event) {
+  if (event.key !== null && event.key !== SETUP_KIT_STORAGE_KEY) return;
+  if (!isCurrentHostSetup()) return;
+  refreshSetupKitPanel();
+}
+
+function exportTopicDraft() {
+  if (!isCurrentHostSetup()) throw new Error("Only the host can export the topic editor before the game starts.");
+  const textarea = app.querySelector("#room-custom-topics");
+  if (!textarea) throw new Error("The topic editor is unavailable.");
+  const content = serializeTopicText(parseTopicText(textarea.value));
+  const url = URL.createObjectURL(new Blob([content], { type: "text/plain;charset=utf-8" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "nonstoptalk-topics.txt";
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+  setSetupFeedback("topic", "Topic-list download started.");
+}
+
 async function handleSubmit(event) {
   const form = event.target.closest("form");
   if (!form) return;
@@ -1926,6 +2180,8 @@ async function handleSubmit(event) {
     } else if (form.matches("[data-join-current-room]")) {
       const payload = await api(`/api/rooms/${roomCode}/join`, { name: values.name }, "POST");
       acceptRoom(payload.room);
+    } else if (form.matches("[data-setup-kit-save]")) {
+      saveAppliedSetupKit(values.kitName);
     } else if (form.matches("[data-model-topics]")) {
       const code = roomCode;
       const generation = routeGeneration;
@@ -1964,7 +2220,8 @@ async function handleSubmit(event) {
       await doAction(values);
     }
   } catch (error) {
-    showToast(error.message);
+    if (form.matches("[data-setup-kit-save]")) setSetupFeedback("kit", setupKitErrorMessage(error), true);
+    else showToast(error.message);
   } finally {
     setBusy(false);
   }
@@ -1992,6 +2249,12 @@ async function handleClick(event) {
     if (command === "copy-room") {
       await navigator.clipboard.writeText(`${location.origin}/room/${room.code}`);
       showToast("Invite link copied.");
+    } else if (command === "setup-kit-apply") {
+      await applySelectedSetupKit();
+    } else if (command === "setup-kit-delete") {
+      deleteSelectedSetupKit();
+    } else if (command === "topic-export") {
+      exportTopicDraft();
     } else if (command === "action") {
       await doAction({ type: button.dataset.actionType, ...JSON.parse(button.dataset.actionValues || "{}") });
     } else if (command === "start-game") {
@@ -2103,9 +2366,17 @@ async function handleClick(event) {
       }
     }
   } catch (error) {
-    showToast(error.message);
+    if (command === "setup-kit-apply" || command === "setup-kit-delete") {
+      setSetupFeedback("kit", setupKitErrorMessage(error), true);
+    } else if (command === "topic-export") {
+      setSetupFeedback("topic", setupKitErrorMessage(error), true);
+    } else {
+      showToast(error.message);
+    }
   } finally {
     setBusy(false);
+    if (command === "setup-kit-apply" && isCurrentHostSetup()) focusSetupControl("kit-apply");
+    if (command === "topic-export" && isCurrentHostSetup()) focusSetupControl("topic-export");
   }
 }
 
@@ -2249,8 +2520,12 @@ async function doAction(action) {
   const code = roomCode;
   const generation = routeGeneration;
   const payload = await api(`/api/rooms/${code}/action`, action, "POST");
-  if (code !== roomCode || generation !== routeGeneration) return;
+  if (code !== roomCode || generation !== routeGeneration) return false;
+  if (action.type === "custom-topics" || action.type === "apply-setup-kit") {
+    ensureRoomSetupView().topicDraft = null;
+  }
   acceptRoom(payload.room);
+  return true;
 }
 
 function acceptRoom(next) {
@@ -2263,6 +2538,7 @@ function acceptRoom(next) {
   const routeHeadingHadFocus = app.contains(document.activeElement)
     && document.activeElement.matches("h1[tabindex='-1']");
   const focusedDraft = captureFocusedDraft();
+  const setupControlFocus = captureSetupControlFocus();
   const announcement = roomAnnouncement(previous, next);
   room = next;
   clockOffset = room.serverNow - Date.now();
@@ -2274,7 +2550,7 @@ function acceptRoom(next) {
       heading.focus({ preventScroll: true });
     }
   } else {
-    restoreFocusedDraft(focusedDraft);
+    if (!restoreFocusedDraft(focusedDraft)) restoreSetupControlFocus(setupControlFocus);
   }
   announce(announcement);
   if (room.viewer.isMember) connectSocket();
@@ -2419,7 +2695,17 @@ function updatePrimaryNavigation() {
 
 function setBusy(value) {
   busy = value;
-  for (const button of document.querySelectorAll("button")) button.disabled = value;
+  if (value) {
+    for (const button of document.querySelectorAll("button")) {
+      button.dataset.busyPreviousDisabled = button.disabled ? "true" : "false";
+      button.disabled = true;
+    }
+    return;
+  }
+  for (const button of document.querySelectorAll("button[data-busy-previous-disabled]")) {
+    button.disabled = button.dataset.busyPreviousDisabled === "true";
+    delete button.dataset.busyPreviousDisabled;
+  }
 }
 
 function showToast(message) {
@@ -2431,6 +2717,23 @@ function showToast(message) {
 
 function notice(message, error = false) {
   return `<div class="notice ${error ? "error" : ""}"${error ? ` role="alert"` : ""}>${escapeHTML(message)}</div>`;
+}
+
+function captureSetupControlFocus() {
+  if (!room || !roomCode) return null;
+  const control = document.activeElement?.closest?.("[data-setup-focus]");
+  if (!control || !app.contains(control)) return null;
+  return {
+    code: roomCode,
+    phase: room.phase,
+    generation: routeGeneration,
+    key: control.dataset.setupFocus,
+  };
+}
+
+function restoreSetupControlFocus(snapshot) {
+  if (!snapshot || snapshot.code !== roomCode || snapshot.phase !== room?.phase || snapshot.generation !== routeGeneration) return false;
+  return focusSetupControl(snapshot.key);
 }
 
 function captureFocusedDraft() {
@@ -2463,19 +2766,20 @@ function captureFocusedDraft() {
 }
 
 function restoreFocusedDraft(draft) {
-  if (!draft || draft.code !== roomCode || draft.phase !== room?.phase || draft.generation !== routeGeneration) return;
+  if (!draft || draft.code !== roomCode || draft.phase !== room?.phase || draft.generation !== routeGeneration) return false;
   const control = Array.from(app.querySelectorAll("input, select, textarea"))
     .find((candidate) => isEditableControl(candidate) && editableControlKey(candidate) === draft.key);
-  if (!control) return;
+  if (!control) return false;
   control.value = draft.value;
   if (draft.checked !== null && "checked" in control) control.checked = draft.checked;
   control.focus({ preventScroll: true });
-  if (draft.selectionStart === null || typeof control.setSelectionRange !== "function") return;
+  if (draft.selectionStart === null || typeof control.setSelectionRange !== "function") return true;
   try {
     control.setSelectionRange(draft.selectionStart, draft.selectionEnd, draft.selectionDirection);
   } catch {
     // The restored control may not support a text selection.
   }
+  return true;
 }
 
 function isEditableControl(control) {
@@ -2489,6 +2793,9 @@ function editableControlKey(control) {
   const form = control.form;
   if (!form || !app.contains(form)) return "";
   if (form.matches("[data-join-current-room]")) return `join-current:${control.name}`;
+  if (form.matches("[data-model-topics]")) return `model-topics:${control.name}`;
+  if (form.matches("[data-setup-kit-save]")) return `setup-kit-save:${control.name}`;
+  if (form.matches("[data-setup-kit-library]")) return `setup-kit-library:${control.name}`;
   if (!form.matches("[data-room-action]")) return "";
   const action = formFieldValue(form, "type");
   const target = formFieldValue(form, "playerId") || formFieldValue(form, "id");
