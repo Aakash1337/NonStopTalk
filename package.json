@@ -40,7 +40,7 @@
     "smoke:admin": "node scripts/smoke-admin.mjs",
     "smoke:platform": "node scripts/smoke-platform.mjs",
     "smoke:production": "node scripts/smoke-production.mjs",
-    "smoke:staging": "node scripts/smoke-production.mjs https://nonstoptalk-staging.aakashplays656.workers.dev && node scripts/smoke-staging.mjs https://nonstoptalk-staging.aakashplays656.workers.dev",
+    "smoke:staging": "node scripts/smoke-production.mjs https://nonstoptalk-staging.aakashplays656.workers.dev durable-outbox && node scripts/smoke-staging.mjs https://nonstoptalk-staging.aakashplays656.workers.dev",
     "smoke:staging-outbox": "node scripts/smoke-staging-outbox.mjs",
     "drill:staging-outbox-rollback": "node scripts/drill-staging-outbox-rollback.mjs"
   },

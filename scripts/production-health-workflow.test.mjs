@@ -7,6 +7,13 @@ import {
   PUBLIC_MODULE_GRAPH_RETRY_MS,
   waitForPublicModuleGraph,
 } from "./smoke-production-support.mjs";
+import {
+  DEFAULT_EXPECTED_ANALYTICS_DELIVERY,
+  OBSERVED_ANALYTICS_DELIVERY_LABEL_LIMIT,
+  assertExpectedAnalyticsDelivery,
+  formatObservedAnalyticsDelivery,
+  resolveExpectedAnalyticsDelivery,
+} from "./smoke-production-policy.mjs";
 
 const workflowURL = new URL("../.github/workflows/production-health.yml", import.meta.url);
 const workflow = await readFile(workflowURL, "utf8");
@@ -16,11 +23,18 @@ const productionProbeSupport = await readFile(
   new URL("./smoke-production-support.mjs", import.meta.url),
   "utf8",
 );
+const productionProbePolicy = await readFile(
+  new URL("./smoke-production-policy.mjs", import.meta.url),
+  "utf8",
+);
 const stagingProbe = await readFile(new URL("./smoke-staging.mjs", import.meta.url), "utf8");
 
 test("production health workflow stays scheduled, bounded, and manually runnable", () => {
   assert.match(workflow, /^  schedule:\n    - cron: "17,47 \* \* \* \*"$/mu);
   assert.match(workflow, /^  workflow_dispatch:$/mu);
+  assert.match(workflow, /^  workflow_dispatch:\n\nconcurrency:$/mu);
+  assert.doesNotMatch(workflow, /^\s+inputs\s*:/mu);
+  assert.doesNotMatch(workflow, /\bcontinue-on-error\s*:/iu);
   assert.match(workflow, /^  group: production-health$/mu);
   assert.match(workflow, /^  cancel-in-progress: true$/mu);
   assert.match(workflow, /^    timeout-minutes: 5$/mu);
@@ -44,16 +58,148 @@ test("production health workflow runs only the existing read-only probe", () => 
   assert.deepEqual(jobNames, ["probe"], "the monitor must contain only its bounded probe job");
   assert.deepEqual(runCommands, ["npm run smoke:production"]);
   assert.equal(packageJSON.scripts["smoke:production"], "node scripts/smoke-production.mjs");
-  assert.match(
-    workflow,
-    /^          NONSTOPTALK_PRODUCTION_ORIGIN: https:\/\/dontstoptalking\.org$/mu,
-  );
+  assert.match(workflow,
+    /^          NONSTOPTALK_PRODUCTION_ORIGIN: \$\{\{ matrix\.origin \}\}$/mu);
+  assert.match(workflow,
+    /^          NONSTOPTALK_EXPECTED_ANALYTICS_DELIVERY: \$\{\{ matrix\.expected_delivery \}\}$/mu);
   assert.doesNotMatch(workflow, /\bnpm\s+(?:ci|install|clean-install)\b/iu);
   assert.doesNotMatch(workflow, /\bwrangler\b|\b(?:deploy|migrate|rollback)\b/iu);
-  for (const source of [productionProbe, productionProbeSupport]) {
-    assert.doesNotMatch(source, /\b(?:POST|PUT|PATCH|DELETE)\b/u);
+  for (const source of [productionProbe, productionProbeSupport, productionProbePolicy]) {
+    assert.doesNotMatch(source, /\b(?:POST|PUT|PATCH|DELETE)\b/iu);
+    assert.doesNotMatch(source, /\bmethod\s*:/iu);
     assert.doesNotMatch(source, /\bAuthorization\b|ANALYTICS_ADMIN_TOKEN/u);
   }
+});
+
+test("production health workflow probes exactly the reviewed delivery policies", () => {
+  const strategyBlock = workflow.match(/^    strategy:\n([\s\S]*?)^    steps:$/mu)?.[1];
+  assert.equal(strategyBlock,
+    "      fail-fast: false\n"
+      + "      matrix:\n"
+      + "        include:\n"
+      + "          - environment: production\n"
+      + "            origin: https://dontstoptalking.org\n"
+      + "            expected_delivery: best-effort\n"
+      + "          - environment: staging\n"
+      + "            origin: https://nonstoptalk-staging.aakashplays656.workers.dev\n"
+      + "            expected_delivery: durable-outbox\n",
+    "the bounded two-row matrix must not gain another axis, entry, or key",
+  );
+  const entries = [...workflow.matchAll(
+    /^          - environment: ([a-z]+)\n            origin: (https:\/\/[^\s]+)\n            expected_delivery: ([a-z-]+)$/gmu,
+  )].map((match) => ({
+    environment: match[1],
+    origin: match[2],
+    expectedDelivery: match[3],
+  }));
+
+  assert.deepEqual(entries, [
+    {
+      environment: "production",
+      origin: "https://dontstoptalking.org",
+      expectedDelivery: "best-effort",
+    },
+    {
+      environment: "staging",
+      origin: "https://nonstoptalk-staging.aakashplays656.workers.dev",
+      expectedDelivery: "durable-outbox",
+    },
+  ]);
+  assert.match(workflow, /^      fail-fast: false$/mu);
+});
+
+test("production probe defaults and accepts only reviewed analytics delivery policies", () => {
+  assert.equal(DEFAULT_EXPECTED_ANALYTICS_DELIVERY, "best-effort");
+  assert.equal(resolveExpectedAnalyticsDelivery(undefined, undefined), "best-effort");
+  for (const value of ["best-effort", "durable-outbox"]) {
+    assert.equal(resolveExpectedAnalyticsDelivery(value, undefined), value);
+    assert.equal(resolveExpectedAnalyticsDelivery(undefined, value), value);
+  }
+
+  assert.equal(
+    resolveExpectedAnalyticsDelivery("durable-outbox", "best-effort"),
+    "durable-outbox",
+    "the explicit command-line policy must override the environment",
+  );
+  assert.equal(
+    resolveExpectedAnalyticsDelivery("best-effort", "not-reviewed"),
+    "best-effort",
+    "a valid command-line policy must fully replace an ambient environment value",
+  );
+  assert.throws(
+    () => resolveExpectedAnalyticsDelivery("", "best-effort"),
+    /expected analytics delivery policy .*must be exactly/iu,
+    "an explicitly empty CLI value must not fall through to a valid environment value",
+  );
+
+  for (const value of [
+    null,
+    "",
+    "outbox",
+    "degraded-outbox",
+    "BEST-EFFORT",
+    " best-effort ",
+    "durable-outbox\n",
+    1,
+    {},
+  ]) {
+    assert.throws(
+      () => resolveExpectedAnalyticsDelivery(value, undefined),
+      /expected analytics delivery policy .*must be exactly/iu,
+    );
+    assert.throws(
+      () => resolveExpectedAnalyticsDelivery(undefined, value),
+      /expected analytics delivery policy .*must be exactly/iu,
+    );
+  }
+});
+
+test("production probe checks and reports the observed analytics delivery policy", () => {
+  assert.match(productionProbe,
+    /process\.env\.NONSTOPTALK_EXPECTED_ANALYTICS_DELIVERY/u);
+  assert.match(productionProbe,
+    /resolveExpectedAnalyticsDelivery\(\s*process\.argv\[3\],\s*process\.env\.NONSTOPTALK_EXPECTED_ANALYTICS_DELIVERY,/u);
+  assert.match(productionProbe,
+    /assertExpectedAnalyticsDelivery\(\s*status\.capabilities\.aggregateAnalytics\.delivery,\s*expectedAnalyticsDelivery,/u);
+  assert.match(productionProbe,
+    /analyticsDelivery: observedAnalyticsDelivery/u);
+  assert.match(packageJSON.scripts["smoke:staging"],
+    /^node scripts\/smoke-production\.mjs https:\/\/nonstoptalk-staging\.aakashplays656\.workers\.dev durable-outbox && /u);
+});
+
+test("delivery-policy equality rejects mismatches and returns only a verified observation", () => {
+  for (const value of ["best-effort", "durable-outbox"]) {
+    assert.equal(assertExpectedAnalyticsDelivery(value, value), value);
+  }
+  assert.throws(
+    () => assertExpectedAnalyticsDelivery("best-effort", "durable-outbox"),
+    /expected "durable-outbox", observed "best-effort"/u,
+  );
+  assert.throws(
+    () => assertExpectedAnalyticsDelivery("x".repeat(100_000), "best-effort"),
+    new RegExp(`observed "${"x".repeat(OBSERVED_ANALYTICS_DELIVERY_LABEL_LIMIT)}…"$`, "u"),
+  );
+  assert.throws(
+    () => assertExpectedAnalyticsDelivery("best-effort", "degraded-outbox"),
+    /expectedValue must be a reviewed analytics delivery policy/u,
+  );
+});
+
+test("delivery-policy diagnostics stay bounded and do not reflect non-string values", () => {
+  assert.equal(formatObservedAnalyticsDelivery(undefined), "<missing or non-string>");
+  assert.equal(formatObservedAnalyticsDelivery({ delivery: "secret-like" }),
+    "<missing or non-string>");
+  assert.equal(formatObservedAnalyticsDelivery("best-effort"), '"best-effort"');
+
+  const longValue = "x".repeat(OBSERVED_ANALYTICS_DELIVERY_LABEL_LIMIT + 100_000);
+  const formatted = formatObservedAnalyticsDelivery(longValue);
+  assert.equal(formatted, `"${"x".repeat(OBSERVED_ANALYTICS_DELIVERY_LABEL_LIMIT)}…"`);
+  assert.ok(formatted.length <= OBSERVED_ANALYTICS_DELIVERY_LABEL_LIMIT + 3);
+  const controlCharacters = `"\\\n\r\t${"\u0000".repeat(100_000)}`;
+  const sanitized = formatObservedAnalyticsDelivery(controlCharacters);
+  assert.doesNotMatch(sanitized.slice(1, -1), /[\u0000-\u001f"\\]/u);
+  assert.ok(sanitized.length <= OBSERVED_ANALYTICS_DELIVERY_LABEL_LIMIT + 3);
+  assert.doesNotMatch(productionProbePolicy, /process\.env|console\.|fetch\(/u);
 });
 
 test("production health workflow pins its two third-party actions", () => {

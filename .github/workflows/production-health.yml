@@ -14,9 +14,19 @@ permissions:
 
 jobs:
   probe:
-    name: Read-only production probe
+    name: Read-only ${{ matrix.environment }} policy probe
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - environment: production
+            origin: https://dontstoptalking.org
+            expected_delivery: best-effort
+          - environment: staging
+            origin: https://nonstoptalk-staging.aakashplays656.workers.dev
+            expected_delivery: durable-outbox
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -28,5 +38,6 @@ jobs:
 
       - name: Check public routes and platform readiness
         env:
-          NONSTOPTALK_PRODUCTION_ORIGIN: https://dontstoptalking.org
+          NONSTOPTALK_PRODUCTION_ORIGIN: ${{ matrix.origin }}
+          NONSTOPTALK_EXPECTED_ANALYTICS_DELIVERY: ${{ matrix.expected_delivery }}
         run: npm run smoke:production

@@ -105,13 +105,14 @@ Windows, where the script fails before spawning a child process.
 
 `npm run deploy` applies pending production D1 migrations, deploys in Wrangler strict mode, and probes `https://dontstoptalking.org`. The configured Worker name is `nonstoptalk`; its Workers.dev route remains available as a diagnostic fallback.
 
-GitHub's `Production health` workflow repeats the same read-only production
-probe every 30 minutes and on manual dispatch. It does not install dependencies
-or receive Cloudflare credentials, so it cannot deploy, migrate, or write
-production data. A failed run is visible in Actions, but GitHub schedules and
-their actor-scoped notifications are only a best-effort pilot signal; see the
-production runbook for auto-disable, notification, and independent-monitoring
-guidance.
+GitHub's `Production health` workflow runs a fixed read-only matrix every 30
+minutes and on manual dispatch. It requires production to report
+`best-effort` room-milestone delivery and the isolated staging Worker to report
+`durable-outbox`. It does not install dependencies or receive Cloudflare
+credentials, so it cannot deploy, migrate, or write either environment. A
+failed run is visible in Actions, but GitHub schedules and their actor-scoped
+notifications are only a best-effort pilot signal; see the production runbook
+for auto-disable, notification, and independent-monitoring guidance.
 
 `npm run check:cloudflare` performs a strict Wrangler dry run. It validates the TypeScript bundle, assets, and declared bindings without changing a Cloudflare account. `db:create` is a one-time environment step; D1 migrations are append-only and run before code in both deployment scripts.
 
