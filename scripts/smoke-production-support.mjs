@@ -26,6 +26,7 @@ const REQUIRED_PUBLIC_MODULE_PATHS = [
   "/coach-engine.js",
   "/setup-kits.js",
   "/microphone-selection.js",
+  "/sound-cues.js",
 ];
 
 const JAVASCRIPT_SYNTAX_TIMEOUT_MS = 5_000;
@@ -279,11 +280,13 @@ export async function waitForPublicModuleGraph({
       const coachEngineSource = observedJavaScriptAssets.get("/coach-engine.js");
       const setupKitsSource = observedJavaScriptAssets.get("/setup-kits.js");
       const microphoneSelectionSource = observedJavaScriptAssets.get("/microphone-selection.js");
+      const soundCuesSource = observedJavaScriptAssets.get("/sound-cues.js");
       const appTokens = tokenizeJavaScript(appSource);
       const coachStorageTokens = tokenizeJavaScript(coachStorageSource);
       const coachEngineTokens = tokenizeJavaScript(coachEngineSource);
       const setupKitsTokens = tokenizeJavaScript(setupKitsSource);
       const microphoneSelectionTokens = tokenizeJavaScript(microphoneSelectionSource);
+      const soundCuesTokens = tokenizeJavaScript(soundCuesSource);
       if (!hasNamespaceModuleImport(
         appTokens,
         "./coach-storage.js",
@@ -327,6 +330,16 @@ export async function waitForPublicModuleGraph({
       )) {
         throw new Error("/app.js does not consume the microphone-selection boundary");
       }
+      if (!hasNamedModuleImport(
+        appTokens,
+        "./sound-cues.js",
+        "createSoundCues",
+      )) {
+        throw new Error("/app.js does not reference the required sound-cue module");
+      }
+      if (!hasAssignedFactoryCall(appTokens, "soundCues", "createSoundCues")) {
+        throw new Error("/app.js does not consume the sound-cue boundary");
+      }
       if (!hasExportedFunction(coachStorageTokens, "openCoachDatabase", { async: true })) {
         throw new Error("/coach-storage.js does not expose the expected storage boundary");
       }
@@ -339,6 +352,9 @@ export async function waitForPublicModuleGraph({
       if (!hasExportedFunction(microphoneSelectionTokens, "createMicrophoneSelection")) {
         throw new Error("/microphone-selection.js does not expose createMicrophoneSelection");
       }
+      if (!hasExportedFunction(soundCuesTokens, "createSoundCues")) {
+        throw new Error("/sound-cues.js does not expose createSoundCues");
+      }
       remainingDeadlineMs(deadlineMs, now);
       return {
         observedJavaScriptAssets,
@@ -347,6 +363,7 @@ export async function waitForPublicModuleGraph({
         coachEngineSource,
         setupKitsSource,
         microphoneSelectionSource,
+        soundCuesSource,
       };
     } catch (error) {
       lastError = asError(error);

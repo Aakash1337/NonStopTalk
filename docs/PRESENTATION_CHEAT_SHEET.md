@@ -108,6 +108,7 @@ npm run test:cloudflare
 npm run test:coach
 npm run test:cloud-progress
 npm run test:microphone-selection
+npm run test:sound-cues
 npm run check:cloudflare
 npm run smoke:platform
 npm run smoke:coach-storage

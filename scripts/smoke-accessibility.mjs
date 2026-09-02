@@ -34,6 +34,50 @@ const syntheticAccessibilityMicrophones = () => {
       }),
     },
   });
+
+  class SilentAudioNode {
+    connect(target) { return target; }
+    disconnect() {}
+  }
+
+  class SilentAudioContext {
+    constructor() {
+      this.currentTime = 0;
+      this.destination = new SilentAudioNode();
+      this.state = "running";
+    }
+
+    resume() {
+      this.state = "running";
+      return Promise.resolve();
+    }
+
+    close() {
+      this.state = "closed";
+      return Promise.resolve();
+    }
+
+    createOscillator() {
+      const oscillator = new SilentAudioNode();
+      oscillator.type = "sine";
+      oscillator.frequency = { value: 0 };
+      oscillator.start = () => {};
+      oscillator.stop = () => {};
+      return oscillator;
+    }
+
+    createGain() {
+      const gain = new SilentAudioNode();
+      gain.gain = {
+        setValueAtTime() {},
+        exponentialRampToValueAtTime() {},
+      };
+      return gain;
+    }
+  }
+
+  window.AudioContext = SilentAudioContext;
+  window.webkitAudioContext = SilentAudioContext;
 };
 
 async function getFreePort() {
@@ -356,6 +400,22 @@ async function runAccessibilityFlow(browser, origin) {
     "The multiplayer countdown must expose timer semantics");
   assert((await page.locator("[data-timer]").getAttribute("aria-label"))?.endsWith(" seconds remaining"),
     "The multiplayer countdown must expose its remaining time");
+  const soundCues = page.getByRole("button", { name: "Sound cues", exact: true });
+  assert(await soundCues.count() === 1,
+    "Only the current turn driver must receive one sound-cue preference control");
+  assert(await soundCues.getAttribute("aria-pressed") === "true",
+    "Sound cues must default on and expose their state with aria-pressed");
+  await soundCues.focus();
+  await page.keyboard.press("Space");
+  assert(await soundCues.getAttribute("aria-pressed") === "false",
+    "Space must turn sound cues off");
+  assert(await soundCues.evaluate((button) => document.activeElement === button),
+    "Changing sound cues must preserve keyboard focus");
+  await page.keyboard.press("Enter");
+  assert(await soundCues.getAttribute("aria-pressed") === "true",
+    "Enter must turn sound cues back on");
+  assert(await soundCues.evaluate((button) => document.activeElement === button),
+    "Previewing sound cues must preserve keyboard focus");
   await assertSinglePageStructure(page, "Active room turn");
   await assertNoAxeViolations(page, "Active room turn");
 
@@ -364,6 +424,8 @@ async function runAccessibilityFlow(browser, origin) {
     "The active room must reflow at 320 CSS pixels without page-level horizontal scrolling");
 
   await page.emulateMedia({ reducedMotion: "reduce" });
+  assert(await soundCues.getAttribute("aria-pressed") === "true",
+    "Reduced-motion mode must not silently change the independent sound preference");
   const transitionDurations = await page.evaluate(() => {
     const probe = document.createElement("div");
     probe.className = "coach-tip";

@@ -51,6 +51,7 @@ go vet ./...
 npm run test:coach
 npm run test:cloud-progress
 npm run test:microphone-selection
+npm run test:sound-cues
 npm run test:admin
 npm run test:production-monitor
 npm run test:deployment-contract
@@ -151,8 +152,9 @@ repository watchers receive them. The probe retries ordinary page and API GETs
 up to five times before failing, which absorbs a short network interruption
 without concealing a sustained outage. It recursively discovers every deployable
 `.js` or `.mjs` file under `cloudflare/public` and validates that complete Static Assets
-set as one generation for up to eight bounded attempts. There are currently ten:
-the public SPA modules, the coaching audio worklet, and the two isolated admin
+set as one generation for up to eight bounded attempts. There are currently
+eleven: the public SPA modules (including the sound-cue boundary), the coaching
+audio worklet, and the two isolated admin
 modules. `cloudflare/public/.assetsignore` excludes exact `*.test.js` and
 `*.test.mjs` paths from both deployments with Wrangler's case-insensitive
 gitignore semantics. The deployment contract locks that packaging boundary, and

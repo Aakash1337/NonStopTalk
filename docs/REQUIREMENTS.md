@@ -113,6 +113,7 @@ The slice is modular and designed around Workers, Durable Objects, D1, Static As
 
 - The active player, topic, round, timer, voice state, and standings are shown.
 - Both editions support explicit microphone selection and local Web Audio voice-activity detection. The Cloudflare SPA shares one origin-local choice between Practice and the current Play driver, persists only the browser's opaque device ID, and keeps labels in memory.
+- Both editions provide short Web Audio turn cues. Cloudflare exposes the persistent browser-local preference only to the current driver, never treats sound as the only source of state, and sends no application or analytics request when it changes.
 - A microphone-driven turn ends at full duration or after the configured silence period.
 - Timer completion takes precedence if completion and silence cross in the same update.
 - A manual timer handles denied, missing, or unsupported microphone access.
@@ -178,7 +179,8 @@ The repository's playable baseline is:
 7. The Cloudflare host can turn a bounded theme into an editable deterministic topic draft without a model key; when an external tier is configured, missing budget/credentials or provider failure preserves that fallback, while missing consent prevents the external attempt entirely.
 8. The Cloudflare host can save the applied setup as a bounded device-local named kit, reload and reapply it with exactly one atomic room action, and import/export custom-topic text without a network or analytics request. An import remains only an editor draft until explicit use, while guests never receive undrawn topics.
 9. The current Cloudflare turn driver can choose a browser input without a room/API/analytics request; the same saved choice drives Practice and Play, survives reload, falls back safely when an input disappears, and leaves manual timing available.
-10. The local Go app and native Cloudflare edition both provide the documented core game flow.
+10. The current Cloudflare turn driver can disable or enable local sound cues without changing room state; reload and same-profile tabs preserve the choice, while spectators, passive state updates, and other browser identities do not emit or inherit those cues.
+11. The local Go app and native Cloudflare edition both provide the documented core game flow.
 
 The coaching-prototype baseline is:
 
@@ -214,7 +216,7 @@ The coaching-prototype baseline is:
 - Visible user profiles and profile management
 - Family/content filters
 - Post-turn AI summaries
-- Full multiplayer-game feature parity between the Go and Cloudflare editions beyond the implemented online topic-draft, setup-kit, and microphone-selection slices; AI judge and sound cues remain
+- Full multiplayer-game feature parity between the Go and Cloudflare editions beyond the implemented online topic-draft, setup-kit, microphone-selection, and sound-cue slices; the AI judge remains
 - A formal accessibility audit
 - Validated audio thresholds and confidence across representative microphones, browsers, room noise, and assistive setups
 - Validated learning outcomes, repeatability, and interpretation for the implemented baseline → review → unassisted-retry comparisons

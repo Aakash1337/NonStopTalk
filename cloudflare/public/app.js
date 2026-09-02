@@ -15,6 +15,12 @@ import {
   microphoneDeviceLabel,
 } from "./microphone-selection.js";
 import {
+  SOUND_CUE_LEGACY_STORAGE_KEY,
+  SOUND_CUE_NAMES,
+  SOUND_CUE_STORAGE_KEY,
+  createSoundCues,
+} from "./sound-cues.js";
+import {
   SETUP_KIT_MAX_NAME_CODE_POINTS,
   SETUP_KIT_STORAGE_KEY,
   createSetupKitStore,
@@ -44,6 +50,10 @@ const setupKitStore = createSetupKitStore();
 const microphoneSelection = createMicrophoneSelection({
   getStorage: () => window.localStorage,
   getMediaDevices: () => navigator.mediaDevices,
+});
+const soundCues = createSoundCues({
+  getStorage: () => window.localStorage,
+  getAudioContextConstructor: () => window.AudioContext || window.webkitAudioContext,
 });
 
 let room = null;
@@ -96,6 +106,7 @@ window.addEventListener("popstate", () => {
 });
 window.addEventListener("storage", handleSetupStorage);
 window.addEventListener("storage", handleMicrophoneStorage);
+window.addEventListener("storage", handleSoundCueStorage);
 window.addEventListener("pagehide", shutdown);
 microphoneDialog.addEventListener("cancel", () => { microphoneDialogToken = null; });
 microphoneDialog.addEventListener("close", handleMicrophoneDialogClose);
@@ -471,6 +482,33 @@ function handleMicrophoneStorage(event) {
   microphoneSelection.reload();
   syncMicrophoneChoiceLabels();
   if (microphoneDialog?.open) populateMicrophoneList();
+}
+
+function handleSoundCueStorage(event) {
+  if (
+    event.key !== null
+    && event.key !== SOUND_CUE_STORAGE_KEY
+    && event.key !== SOUND_CUE_LEGACY_STORAGE_KEY
+  ) return;
+  const enabled = soundCues.reload();
+  if (!enabled) soundCues.release();
+  syncSoundCueControls();
+}
+
+function syncSoundCueControls() {
+  const enabled = soundCues.enabled;
+  for (const button of document.querySelectorAll("[data-sound-toggle]")) {
+    button.textContent = enabled ? "Sound On" : "Sound Off";
+    button.setAttribute("aria-pressed", enabled ? "true" : "false");
+  }
+}
+
+function playSoundCue(name) {
+  void soundCues.play(name);
+}
+
+function unlockSoundCues() {
+  void soundCues.unlock();
 }
 
 async function acquireSelectedMicrophone(baseAudioConstraints = true, isCurrent = () => true) {
@@ -2274,12 +2312,14 @@ function renderTurnControls(turn) {
     disabled: controller?.turnId === turn.id,
     scope: "room",
   });
+  const soundCueToggle = renderSoundCueToggle();
   if (turn.begunAt === null) {
     return `${microphoneChoice}<div class="action-row">
       <button class="button primary" type="button" data-command="start-mic">Start with microphone</button>
       <button class="button" type="button" data-command="start-manual">Manual timer</button>
       <button class="button ghost" type="button" data-command="redraw">Redraw topic</button>
       ${room.viewer.isHost ? `<button class="button ghost" type="button" data-command="mark-complete">Mark complete</button>` : ""}
+      ${soundCueToggle}
     </div>`;
   }
   const runningLocally = controller?.turnId === turn.id;
@@ -2287,7 +2327,13 @@ function renderTurnControls(turn) {
     ${runningLocally ? "" : `<button class="button" type="button" data-command="resume-mic">Resume microphone</button><button class="button" type="button" data-command="resume-manual">Resume manual</button>`}
     <button class="button ghost" type="button" data-command="end-turn">End turn</button>
     ${room.viewer.isHost ? `<button class="button ghost" type="button" data-command="mark-complete">Mark complete</button>` : ""}
+    ${soundCueToggle}
   </div>`;
+}
+
+function renderSoundCueToggle() {
+  const enabled = soundCues.enabled;
+  return `<button class="button ghost" type="button" data-command="sound-cues-toggle" data-sound-toggle aria-label="Sound cues" aria-pressed="${enabled ? "true" : "false"}">${enabled ? "Sound On" : "Sound Off"}</button>`;
 }
 
 function renderWinner() {
@@ -2592,6 +2638,15 @@ async function handleClick(event) {
     closeMicrophoneDialog();
     return;
   }
+  if (command === "sound-cues-toggle") {
+    const result = soundCues.toggle();
+    if (result.enabled) playSoundCue(SOUND_CUE_NAMES.TICK);
+    else soundCues.release();
+    syncSoundCueControls();
+    const scope = result.persisted ? "" : " for this page; the browser could not save the preference";
+    showToast(`Sound cues are ${result.enabled ? "on" : "off"}${scope}.`);
+    return;
+  }
   if (busy) return;
   try {
     setBusy(true);
@@ -2732,25 +2787,37 @@ async function handleClick(event) {
 async function startManual(notifyBegin) {
   const turn = room?.activeTurn;
   if (!turn) return;
+  unlockSoundCues();
   const code = roomCode;
   const generation = routeGeneration;
+  const driver = microphoneDriverIdentity();
+  if (!driver) return;
   if (notifyBegin && turn.begunAt === null) await doAction({ type: "begin-turn", turnId: turn.id });
-  if (!isCurrentTurn(code, generation, turn.id)) return;
+  if (!isCurrentTurnDriver(code, generation, turn.id, driver)) return;
   stopController();
-  controller = { turnId: turn.id, mode: "manual", submitting: false };
+  controller = {
+    turnId: turn.id,
+    driver,
+    mode: "manual",
+    submitting: false,
+    lastTickCueSecond: -1,
+    silenceWarningPlayed: false,
+  };
+  playSoundCue(SOUND_CUE_NAMES.START);
   renderRoom();
 }
 
 async function startMicrophone(notifyBegin) {
   const turn = room?.activeTurn;
   if (!turn) return;
+  unlockSoundCues();
   const code = roomCode;
   const generation = routeGeneration;
   const driver = microphoneDriverIdentity();
   if (!driver) return;
   let stream;
   let context;
-  const remainsCurrent = () => isCurrentMicrophoneDriver(code, generation, turn.id, driver);
+  const remainsCurrent = () => isCurrentTurnDriver(code, generation, turn.id, driver);
   const releasePendingMicrophone = async () => {
     stream?.getTracks().forEach((track) => track.stop());
     if (context && context.state !== "closed") await context.close().catch(() => {});
@@ -2792,7 +2859,10 @@ async function startMicrophone(notifyBegin) {
       samples: new Uint8Array(analyser.fftSize),
       lastVoiceAt: performance.now(),
       raf: 0,
+      lastTickCueSecond: -1,
+      silenceWarningPlayed: false,
     };
+    playSoundCue(SOUND_CUE_NAMES.START);
     renderRoom();
     monitorMicrophone();
   } catch (error) {
@@ -2807,13 +2877,14 @@ function isCurrentTurn(code, generation, turnId) {
   return code === roomCode && generation === routeGeneration && room?.activeTurn?.id === turnId;
 }
 
-function isCurrentMicrophoneDriver(code, generation, turnId, driver) {
+function isCurrentTurnDriver(code, generation, turnId, driver) {
   return isCurrentTurn(code, generation, turnId) && driver === microphoneDriverIdentity();
 }
 
 function monitorMicrophone() {
   const active = controller;
   if (!active || active.mode !== "mic" || !room?.activeTurn || active.turnId !== room.activeTurn.id) return;
+  const now = performance.now();
   active.analyser.getByteTimeDomainData(active.samples);
   let energy = 0;
   for (const sample of active.samples) {
@@ -2824,8 +2895,12 @@ function monitorMicrophone() {
   const normalized = Math.min(1, level * 8);
   const meter = document.querySelector("[data-meter]");
   if (meter) meter.style.width = `${Math.round(normalized * 100)}%`;
-  if (level > 0.035) active.lastVoiceAt = performance.now();
-  const silentFor = (performance.now() - active.lastVoiceAt) / 1000;
+  const speaking = level > 0.035;
+  if (speaking) {
+    active.lastVoiceAt = now;
+    active.silenceWarningPlayed = false;
+  }
+  const silentFor = (now - active.lastVoiceAt) / 1000;
   const voice = document.querySelector("[data-voice]");
   if (voice) voice.textContent = silentFor > room.activeTurn.silence * 0.65 ? "Keep talking…" : "Voice detected";
   // Completion wins when the duration and silence thresholds are crossed in
@@ -2833,6 +2908,11 @@ function monitorMicrophone() {
   if (remainingSeconds(room.activeTurn) <= 0 && !active.submitting) {
     finishTurn(true, false, room.activeTurn.duration).catch((error) => showToast(error.message));
     return;
+  }
+  const silenceRemaining = Math.max(0, room.activeTurn.silence - silentFor);
+  if (!speaking && silenceRemaining <= 1 && !active.silenceWarningPlayed) {
+    active.silenceWarningPlayed = true;
+    playSoundCue(SOUND_CUE_NAMES.SILENCE_WARNING);
   }
   if (silentFor >= room.activeTurn.silence && !active.submitting) {
     finishTurn(false, true).catch((error) => showToast(error.message));
@@ -2845,10 +2925,18 @@ async function finishTurn(completed, eliminated, forcedSpoken) {
   const turn = room?.activeTurn;
   if (!turn) return;
   if (controller?.submitting) return;
+  if (completed || eliminated) unlockSoundCues();
+  const code = roomCode;
+  const generation = routeGeneration;
+  const turnId = turn.id;
   if (controller) controller.submitting = true;
   const spokenSeconds = forcedSpoken ?? elapsedSeconds(turn);
   stopController();
-  await doAction({ type: "submit-turn", turnId: turn.id, spokenSeconds, completed, eliminated });
+  const accepted = await doAction({ type: "submit-turn", turnId, spokenSeconds, completed, eliminated });
+  if (!accepted || code !== roomCode || generation !== routeGeneration) return;
+  const scoredTurn = room?.completedTurns?.find((candidate) => candidate.id === turnId);
+  if (scoredTurn?.eliminated) playSoundCue(SOUND_CUE_NAMES.ELIMINATED);
+  else if (scoredTurn?.completed) playSoundCue(SOUND_CUE_NAMES.COMPLETED);
 }
 
 function updateClock() {
@@ -2858,7 +2946,18 @@ function updateClock() {
   const remaining = remainingSeconds(turn);
   timer.textContent = String(remaining);
   timer.setAttribute("aria-label", `${remaining} seconds remaining`);
-  if (controller?.turnId === turn.id && remaining <= 0 && !controller.submitting) {
+  const active = controller?.turnId === turn.id ? controller : null;
+  if (
+    active
+    && !active.submitting
+    && remaining >= 1
+    && remaining <= 5
+    && (active.lastTickCueSecond === -1 || remaining < active.lastTickCueSecond)
+  ) {
+    active.lastTickCueSecond = remaining;
+    playSoundCue(SOUND_CUE_NAMES.TICK);
+  }
+  if (active && remaining <= 0 && !active.submitting) {
     finishTurn(true, false, turn.duration).catch((error) => showToast(error.message));
   }
 }
@@ -2936,7 +3035,7 @@ function reconcileController() {
   if (controller && (
     !room.activeTurn
     || room.activeTurn.id !== controller.turnId
-    || (controller.mode === "mic" && controller.driver !== microphoneDriverIdentity())
+    || controller.driver !== microphoneDriverIdentity()
   )) stopController();
 }
 
@@ -2950,6 +3049,7 @@ function stopController() {
 
 function stopRoomLifecycle() {
   stopController();
+  soundCues.release();
   disconnectSocket();
   clearInterval(clockTimer);
   clearTimeout(claimRefreshTimer);

@@ -28,6 +28,7 @@ const EXPECTED_DEPLOYED_JAVASCRIPT_PATHS = [
   "/coach-storage.js",
   "/microphone-selection.js",
   "/setup-kits.js",
+  "/sound-cues.js",
 ];
 const EXPECTED_EXCLUDED_JAVASCRIPT_PATHS = [
   "/admin-analytics.test.js",
@@ -37,6 +38,7 @@ const EXPECTED_EXCLUDED_JAVASCRIPT_PATHS = [
   "/coach-storage.test.js",
   "/microphone-selection.test.js",
   "/setup-kits.TEST.mjs",
+  "/sound-cues.test.js",
 ];
 
 async function temporaryAssets(t) {
