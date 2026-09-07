@@ -2,7 +2,7 @@ module github.com/Aakash1337/NonStopTalk
 
 go 1.26
 
-require github.com/anthropics/anthropic-sdk-go v1.68.0
+require github.com/anthropics/anthropic-sdk-go v1.70.1
 
 require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
