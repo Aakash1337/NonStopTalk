@@ -51,15 +51,15 @@
   },
   "devDependencies": {
     "@axe-core/playwright": "4.13.0",
-    "@cloudflare/vitest-plugin": "1.1.2",
-    "@cloudflare/workers-types": "5.20260901.1",
-    "@types/node": "24.13.3",
+    "@cloudflare/vitest-plugin": "1.1.7",
+    "@cloudflare/workers-types": "5.20260911.1",
+    "@types/node": "26.5.1",
     "htmx.org": "2.0.10",
-    "playwright": "1.62.1",
-    "tsx": "4.23.12",
+    "playwright": "1.63.0",
+    "tsx": "4.23.13",
     "typescript": "7.0.2",
-    "vitest": "4.1.11",
-    "wrangler": "4.128.0"
+    "vitest": "5.0.0",
+    "wrangler": "4.131.0"
   },
   "overrides": {
     "undici": "7.29.0"
